@@ -1,8 +1,7 @@
 /**
- * Single owner for harness Linear policy that used to be copied across
- * delivery / ship / normalize / What’s New.
- *
- * SSOT docs: docs/linear-status-contract.md, docs/linear-label-contract.md
+ * Delivery-loop policy: intake, graph readiness, leases, and the page budget.
+ * Status names come from the project file. These defaults apply when a caller
+ * does not pass its own.
  */
 
 /** `/sweep` intake — archived mid-states (In Progress, Ready for Dev) are not restored. */
@@ -15,8 +14,8 @@ export function isSweepIntakeState(stateName: string | null | undefined): boolea
   return SWEEP_INTAKE_STATES.some((s) => s.toLowerCase() === n);
 }
 
-export const TERMINAL_DEV_STATE = "Deployed to Dev";
-export const TERMINAL_PROD_STATE = "Deployed to Prod";
+export const TERMINAL_DEV_STATE = "Dev";
+export const TERMINAL_PROD_STATE = "Prod";
 
 /**
  * `blockedBy` is satisfied when the blocker is a delivery/closed terminal.
@@ -355,12 +354,10 @@ export type ProdWorkflowGate = {
 };
 
 /**
- * QUI-848: branch↔workflow filter for mobile store deploys.
- * `ios-*` → names starting with `iOS`; `android-*` → `Android`; else passthrough.
- * Prefix-only — do not maintain a second workflow-name allowlist.
- * Callers must fail-closed when a platform branch filters to empty (do not
- * silently skip deploys). Quality stays unfiltered at the promote.sh watch
- * (on trunk, where the quality workflow actually runs).
+ * Branch-to-workflow filter for store deploys.
+ * `ios-*` keeps workflow names starting with `iOS`. `android-*` keeps names
+ * starting with `Android`. Any other branch keeps the list.
+ * Callers fail closed when a platform branch filters to an empty list.
  */
 export function filterDeployWorkflowsForBranch(
   branch: string,
@@ -380,7 +377,7 @@ export function isMobileStoreDeployBranch(branch: string): boolean {
   return branch.startsWith("ios-") || branch.startsWith("android-");
 }
 
-/** Empty prod deploy list + quality_workflow → observe quality (QUI-807). */
+/** Empty prod deploy list falls back to the quality workflow. */
 export function prodWorkflowsToObserve(cfg: {
   prod_branches?: string[];
   quality_workflow?: string | null;
@@ -416,30 +413,30 @@ export type ContinueRepoFact = {
   alreadyOnProd: boolean;
 };
 
-/** QUI-781: continue never bulk-FF; only skip, already-on-prod, or selective. */
+/** Continue promotes one repo at a time: skip, already on prod, or selective. */
 export function classifyContinueWebApi(rows: ContinueRepoFact[]): {
   toPromote: string[];
   alreadyOnProd: string[];
-  noQuiEvidence: string[];
+  missingTicketEvidence: string[];
   notes: string[];
 } {
   const toPromote: string[] = [];
   const alreadyOnProd: string[] = [];
-  const noQuiEvidence: string[] = [];
+  const missingTicketEvidence: string[] = [];
   const notes: string[] = [];
   for (const row of rows) {
     if (row.neverLanded) {
-      noQuiEvidence.push(row.repo);
-      notes.push(`${row.repo}: no QUI on trunk — skip (no bulk drag)`);
+      missingTicketEvidence.push(row.repo);
+      notes.push(`${row.repo}: no ticket on trunk — skip`);
     } else if (row.alreadyOnProd) {
       alreadyOnProd.push(row.repo);
       notes.push(`${row.repo}: already on prod tip`);
     } else {
       toPromote.push(row.repo);
-      notes.push(`${row.repo}: pending QUI commits → selective promote`);
+      notes.push(`${row.repo}: pending ticket commits → selective promote`);
     }
   }
-  return { toPromote, alreadyOnProd, noQuiEvidence, notes };
+  return { toPromote, alreadyOnProd, missingTicketEvidence, notes };
 }
 
 /** ASC / Fastlane: marketing must be strictly greater than released floor. */
@@ -473,8 +470,8 @@ export function marketingBeatsReleasedFloor(
   };
 }
 
-/** What’s New train: shipped-to-dev tickets, not archived mid-pipeline names. */
-export const WHATS_NEW_TRAIN_STATES = [
+/** States that still belong to an open delivery, including dev-landed work. */
+export const DELIVERY_TRAIN_STATES = [
   TERMINAL_DEV_STATE,
   "In Review",
   "Todo",
@@ -1194,8 +1191,8 @@ export function programIssueIndex(
 export const PROGRAM_WIP_LIMIT = 1;
 
 export function compareIssueIdentifiers(a: string, b: string): number {
-  const na = parseInt(a.replace(/^QUI-/i, ""), 10);
-  const nb = parseInt(b.replace(/^QUI-/i, ""), 10);
+  const na = parseInt(a.replace(/^[A-Za-z][A-Za-z0-9]*-/i, ""), 10);
+  const nb = parseInt(b.replace(/^[A-Za-z][A-Za-z0-9]*-/i, ""), 10);
   if (Number.isFinite(na) && Number.isFinite(nb) && na !== nb) return na - nb;
   return a.toUpperCase().localeCompare(b.toUpperCase());
 }

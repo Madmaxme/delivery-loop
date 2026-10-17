@@ -24,7 +24,7 @@ import type { ForgeAdapter, TrackerAdapter, WorkerAdapter } from "../adapters/ty
 import { findConnector } from "../connectors/catalog.js";
 import { deliver, ship, sweep } from "../engine/loop.js";
 import { ghaDispatchFields, planDeliveryInvocation } from "../engine/delivery-runtime.js";
-import { loadPack, type ProjectPack } from "../schema/pack.js";
+import { defaultStatus, loadPack, type ProjectPack } from "../schema/pack.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -182,7 +182,7 @@ function dispatchOrRun(mode: string, argv: string[]): void {
   }
   const pack = loadPack(packPath(process.cwd()));
   const started = Number(
-    process.env.DELIVERY_LOOP_PAGE_STARTED_MS || process.env.QWS_DELIVERY_PAGE_STARTED_MS || "",
+    process.env.DELIVERY_LOOP_PAGE_STARTED_MS || "",
   );
   const deps = {
     pack,
@@ -225,9 +225,8 @@ function init(argv: string[]): void {
     qualityWorkflow: arg("--quality-workflow", argv) ?? "quality",
     invariantsFile: "invariants.md",
     status: {
+      ...defaultStatus(),
       intake: tracker === "github" ? "todo" : "Todo",
-      dev: "Deployed to Dev",
-      prod: "Deployed to Prod",
     },
     connectors: [],
     dev: { steps: [] },

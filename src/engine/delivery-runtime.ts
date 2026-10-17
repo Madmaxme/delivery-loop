@@ -18,7 +18,7 @@ export type DeliveryPlan = {
   noFillGraph: boolean;
   fillGraph: boolean;
   noPruneStaleGraph: boolean;
-  /** Args to pass through to `npm run linear:*` when runtime is local. */
+  /** Args to pass through when runtime is local. */
   localArgs: string[];
   reason: string;
 };
@@ -152,7 +152,7 @@ export function planDeliveryInvocation(input: {
     runtime = "local";
     reason = flagRuntime === "local"
       ? "--local / --runtime=local requested"
-      : "QWS_DELIVERY_RUNTIME=local";
+      : "DELIVERY_LOOP_RUNTIME=local";
   } else if (flagRuntime === "gha" || envRuntime === "gha") {
     runtime = "gha";
     reason = "explicit GHA runtime";
@@ -196,7 +196,7 @@ if (isMainModule()) {
   }
   const plan = planDeliveryInvocation({
     githubActions: process.env.GITHUB_ACTIONS === "true",
-    envRuntime: process.env.QWS_DELIVERY_RUNTIME,
+    envRuntime: process.env.DELIVERY_LOOP_RUNTIME,
     mode,
     argv: process.argv.slice(3),
   });

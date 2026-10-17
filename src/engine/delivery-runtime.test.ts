@@ -10,13 +10,13 @@ describe("planDeliveryInvocation", () => {
     const plan = planDeliveryInvocation({
       githubActions: false,
       mode: "sweep",
-      argv: ["--project", "Detailer OS"],
+      argv: ["--project", "Payments"],
     });
     assert.equal(plan.runtime, "gha");
-    assert.equal(plan.project, "Detailer OS");
+    assert.equal(plan.project, "Payments");
     assert.deepEqual(ghaDispatchFields(plan), {
       mode: "sweep",
-      project: "Detailer OS",
+      project: "Payments",
     });
   });
 
@@ -25,7 +25,7 @@ describe("planDeliveryInvocation", () => {
       const plan = planDeliveryInvocation({
         githubActions: false,
         mode,
-        argv: ["QUI-1"],
+        argv: ["APP-1"],
       });
       assert.equal(plan.runtime, "local", mode);
     }
@@ -35,7 +35,7 @@ describe("planDeliveryInvocation", () => {
     const plan = planDeliveryInvocation({
       githubActions: false,
       mode: "pipeline",
-      argv: ["QUI-713"],
+      argv: ["APP-713"],
     });
     assert.equal(plan.runtime, "gha");
   });
@@ -45,7 +45,7 @@ describe("planDeliveryInvocation", () => {
       githubActions: true,
       envRuntime: "gha",
       mode: "sweep",
-      argv: ["--runtime=gha", "--project", "Detailer OS"],
+      argv: ["--runtime=gha", "--project", "Payments"],
     });
     assert.equal(plan.runtime, "local");
     assert.match(plan.reason, /already inside GitHub Actions/);
@@ -55,24 +55,24 @@ describe("planDeliveryInvocation", () => {
     const plan = planDeliveryInvocation({
       githubActions: false,
       mode: "pipeline",
-      argv: ["--local", "QUI-713"],
+      argv: ["--local", "APP-713"],
     });
     assert.equal(plan.runtime, "local");
-    assert.equal(plan.issue, "QUI-713");
-    assert.deepEqual(plan.localArgs, ["--issue", "QUI-713"]);
+    assert.equal(plan.issue, "APP-713");
+    assert.deepEqual(plan.localArgs, ["--issue", "APP-713"]);
   });
 
   it("rebuilds sweep localArgs from --project so --local still works", () => {
     const plan = planDeliveryInvocation({
       githubActions: false,
       mode: "sweep",
-      argv: ["--local", "--project", "Detailer OS"],
+      argv: ["--local", "--project", "Payments"],
     });
     assert.equal(plan.runtime, "local");
-    assert.deepEqual(plan.localArgs, ["--project", "Detailer OS"]);
+    assert.deepEqual(plan.localArgs, ["--project", "Payments"]);
   });
 
-  it("honors QWS_DELIVERY_RUNTIME=local", () => {
+  it("honors DELIVERY_LOOP_RUNTIME=local", () => {
     const plan = planDeliveryInvocation({
       githubActions: false,
       envRuntime: "local",
@@ -86,11 +86,11 @@ describe("planDeliveryInvocation", () => {
     const plan = planDeliveryInvocation({
       githubActions: false,
       mode: "sweep",
-      argv: ["--surface", "api,operator-app", "--no-fill-graph"],
+      argv: ["--surface", "api,web", "--no-fill-graph"],
     });
     assert.deepEqual(ghaDispatchFields(plan), {
       mode: "sweep",
-      surface: "api,operator-app",
+      surface: "api,web",
       no_fill_graph: "true",
     });
   });
@@ -99,12 +99,12 @@ describe("planDeliveryInvocation", () => {
     const plan = planDeliveryInvocation({
       githubActions: false,
       mode: "sweep",
-      argv: ["--project", "Detailer OS", "--fill-graph"],
+      argv: ["--project", "Payments", "--fill-graph"],
     });
     assert.equal(plan.fillGraph, true);
     assert.deepEqual(ghaDispatchFields(plan), {
       mode: "sweep",
-      project: "Detailer OS",
+      project: "Payments",
       fill_graph: "true",
     });
   });
@@ -113,9 +113,9 @@ describe("planDeliveryInvocation", () => {
     const plan = planDeliveryInvocation({
       githubActions: false,
       mode: "ground",
-      argv: ["--runtime", "local", "--issue", "qui-1"],
+      argv: ["--runtime", "local", "--issue", "app-1"],
     });
     assert.equal(plan.runtime, "local");
-    assert.equal(plan.issue, "QUI-1");
+    assert.equal(plan.issue, "APP-1");
   });
 });

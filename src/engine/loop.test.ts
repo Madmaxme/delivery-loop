@@ -12,7 +12,7 @@ const pack: ProjectPack = {
   qualityCommand: "npm test",
   qualityWorkflow: "quality",
   invariantsFile: "invariants.md",
-  status: { intake: "Todo", dev: "Deployed to Dev", prod: "Deployed to Prod" },
+  status: { intake: "Todo", dev: "Dev", prod: "Prod" },
   connectors: ["sentry"],
 };
 
@@ -101,7 +101,7 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
     assert.equal(env.merged(), true);
-    assert.equal(env.state(), "Deployed to Dev");
+    assert.equal(env.state(), "Dev");
   });
 
   it("does not build when the verdict is not BUILDABLE", async () => {
@@ -134,7 +134,7 @@ describe("loop", () => {
 
   it("leaves prod status to the pack when markStatus is false", async () => {
     const env = harness(BUILDABLE);
-    let state = "Deployed to Dev";
+    let state = "Dev";
     env.deps.tracker.setState = async (_id, next) => {
       state = next;
     };
@@ -143,6 +143,6 @@ describe("loop", () => {
       ship: { steps: ["true"], markStatus: false },
     };
     await ship(env.deps, "API-1");
-    assert.equal(state, "Deployed to Dev");
+    assert.equal(state, "Dev");
   });
 });

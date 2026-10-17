@@ -18,7 +18,7 @@ describe("installer", () => {
       qualityCommand: "npm test",
       qualityWorkflow: "quality",
       invariantsFile: "invariants.md",
-      status: { intake: "todo", dev: "Deployed to Dev", prod: "Deployed to Prod" },
+      status: { intake: "todo", dev: "Dev", prod: "Prod" },
       connectors: [],
       workerHttp: { startUrl: "https://host/start", statusUrl: "https://host/status" },
     });

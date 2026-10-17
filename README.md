@@ -2,7 +2,7 @@
 
 Versioned autonomous delivery loop. Conduct rules, a GitHub Actions runner, and a swappable coding agent.
 
-QuickWash is the first install. This repository is the product. It does not live under the QuickWash GitHub organization.
+An install keeps its own `delivery-loop.yaml` and invariants file. This repository does not name those projects.
 
 Licensed under Apache-2.0. See `LICENSE`. The repository stays private while it is in development. Making it public is a visibility change. The grant is already in place.
 

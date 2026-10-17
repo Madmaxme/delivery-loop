@@ -14,7 +14,7 @@ export type ProjectPack = {
   worker: "cursor" | "claude" | "codex" | "copilot" | "http";
   /** owner/repo used when the tracker is GitHub Issues. */
   githubRepo?: string;
-  /** Linear team key, such as QUI. */
+  /** Tracker team key, such as ENG. */
   linearTeam?: string;
   workerHttp?: { startUrl: string; statusUrl: string };
   repos: RepoSpec[];
@@ -35,8 +35,8 @@ export type ProjectPack = {
 export function defaultStatus(): ProjectPack["status"] {
   return {
     intake: "Todo",
-    dev: "Deployed to Dev",
-    prod: "Deployed to Prod",
+    dev: "Dev",
+    prod: "Prod",
   };
 }
 
