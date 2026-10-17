@@ -41,14 +41,26 @@ jobs:
         env:
           GITHUB_ACTIONS: "true"
           DELIVERY_LOOP_RUNTIME: local
+          DELIVERY_LOOP_DEPLOY_KEY: ${{ secrets.DELIVERY_LOOP_DEPLOY_KEY }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          git clone --depth 1 "https://github.com/Madmaxme/delivery-loop.git" /tmp/delivery-loop-src
-          npm install -g /tmp/delivery-loop-src
+          set -euo pipefail
+          DEST="$(mktemp -d)"
+          if [ -n "${DELIVERY_LOOP_DEPLOY_KEY:-}" ]; then
+            install -d -m 700 ~/.ssh
+            printf '%s\n' "$DELIVERY_LOOP_DEPLOY_KEY" > ~/.ssh/delivery-loop
+            chmod 600 ~/.ssh/delivery-loop
+            ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts
+            GIT_SSH_COMMAND="ssh -i ~/.ssh/delivery-loop -o IdentitiesOnly=yes" \
+              git clone --depth 1 git@github.com:Madmaxme/delivery-loop.git "$DEST/delivery-loop"
+          else
+            git clone --depth 1 "https://github.com/Madmaxme/delivery-loop.git" "$DEST/delivery-loop"
+          fi
+          npm install -g "$DEST/delivery-loop"
           if [ "${{ inputs.mode }}" = "sweep" ]; then
             delivery-loop sweep
           elif [ "${{ inputs.mode }}" = "ship" ]; then

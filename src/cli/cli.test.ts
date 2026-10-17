@@ -25,7 +25,10 @@ describe("installer", () => {
     const before = readFileSync(join(dir, "delivery-loop.yaml"), "utf8");
     const invariants = readFileSync(join(dir, "invariants.md"), "utf8");
     assert.match(readFileSync(join(dir, ".cursor/skills/conduct/SKILL.md"), "utf8"), /One code path/);
-    assert.match(readFileSync(join(dir, ".github/workflows/delivery-loop.yml"), "utf8"), /workflow_dispatch/);
+    const workflow = readFileSync(join(dir, ".github/workflows/delivery-loop.yml"), "utf8");
+    assert.match(workflow, /workflow_dispatch/);
+    assert.match(workflow, /DELIVERY_LOOP_DEPLOY_KEY/);
+    assert.match(workflow, /https:\/\/github.com\/Madmaxme\/delivery-loop.git/);
     update(["--dir", dir]);
     assert.equal(readFileSync(join(dir, "delivery-loop.yaml"), "utf8"), before);
     assert.equal(readFileSync(join(dir, "invariants.md"), "utf8"), invariants);

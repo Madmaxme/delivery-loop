@@ -15,6 +15,8 @@ delivery-loop update
 
 `init` and `update` replace installed skills, the runner workflow, and adapters. They leave `delivery-loop.yaml` and the invariants file alone.
 
+While this repository is private, the runner clones it with a read-only deploy key stored as the Actions secret `DELIVERY_LOOP_DEPLOY_KEY`. When the repository is public, that secret can be empty and the runner clones over HTTPS.
+
 The product remote is https://github.com/Madmaxme/delivery-loop. `bash scripts/bootstrap-remote.sh` pushes `main` there.
 
 ## Contribute
