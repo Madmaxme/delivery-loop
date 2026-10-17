@@ -1,0 +1,57 @@
+name: Delivery loop
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Ticket id. Required except for sweep.
+        required: false
+        type: string
+        default: ""
+      mode:
+        description: sweep, deliver, or ship
+        required: true
+        type: choice
+        options:
+          - sweep
+          - deliver
+          - ship
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+jobs:
+  delivery-loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pack prepare
+        run: |
+          if [ -x scripts/delivery-loop-prepare.sh ]; then
+            bash scripts/delivery-loop-prepare.sh
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run the loop
+        env:
+          GITHUB_ACTIONS: "true"
+          DELIVERY_LOOP_RUNTIME: local
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          npm install -g @delivery-loop/cli
+          if [ "${{ inputs.mode }}" = "sweep" ]; then
+            delivery-loop sweep
+          elif [ "${{ inputs.mode }}" = "ship" ]; then
+            delivery-loop ship ${{ inputs.issue }}
+          else
+            delivery-loop deliver ${{ inputs.issue }}
+          fi

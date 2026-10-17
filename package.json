@@ -1,0 +1,26 @@
+{
+  "name": "@delivery-loop/cli",
+  "version": "0.1.0",
+  "description": "Autonomous ticket loop. Conduct rules, a durable runner, and swappable coding agents.",
+  "type": "module",
+  "bin": {
+    "delivery-loop": "./bin/delivery-loop.js"
+  },
+  "exports": {
+    ".": "./src/cli/main.ts",
+    "./engine/policy": "./src/engine/linear-harness-policy.ts",
+    "./schema/pack": "./src/schema/pack.ts"
+  },
+  "scripts": {
+    "test": "tsx --test src/engine/*.test.ts src/cli/*.test.ts src/adapters/*.test.ts src/connectors/*.test.ts"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.26",
+    "tsx": "^4.21.0",
+    "yaml": "^2.8.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "UNLICENSED"
+}
