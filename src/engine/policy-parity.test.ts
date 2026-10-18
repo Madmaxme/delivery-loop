@@ -74,6 +74,14 @@ describe("ported policy", () => {
     );
   });
 
+  it("lets a later release supersede a longer lease", () => {
+    const stamp = latestDeliveryLeaseStamp([
+      "<!-- DELIVERY_LEASE expires=2026-06-01T00:00:00.000Z cursor_run=run-1 cursor_phase=ground -->",
+      "<!-- DELIVERY_LEASE released=1 -->",
+    ]);
+    assert.equal(stamp.expiresAt, null);
+  });
+
   it("stops a page inside the reserve window", () => {
     const started = 0;
     const remaining = pageBudgetRemainingMs({

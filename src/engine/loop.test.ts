@@ -159,6 +159,37 @@ describe("loop", () => {
     assert.equal(result.outcome, "skipped-graph");
   });
 
+  it("steals a pending lease from a finished parent and releases it", async () => {
+    const env = harness("**Verdict:** NEEDS DIAGNOSIS");
+    const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const result = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          `<!-- DELIVERY_LEASE expires=${future} cursor_run=pending cursor_phase=ground -->`,
+        ],
+      }),
+    );
+    assert.equal(result.outcome, "verdict");
+    assert.equal(env.comments.at(-1), "<!-- DELIVERY_LEASE released=1 -->");
+  });
+
+  it("keeps a lease whose Actions run is still live", async () => {
+    const env = harness("**Verdict:** NEEDS DIAGNOSIS");
+    env.deps.githubRunActive = () => true;
+    const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const result = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          `<!-- DELIVERY_LEASE expires=${future} gha_run=42 cursor_run=run-9 cursor_phase=ground -->`,
+        ],
+      }),
+    );
+    assert.equal(result.outcome, "skipped-lease");
+    assert.equal(env.comments.length, 0);
+  });
+
   it("leaves prod status to the pack when markStatus is false", async () => {
     const env = harness(BUILDABLE);
     let state = "Dev";

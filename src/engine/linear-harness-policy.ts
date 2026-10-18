@@ -517,12 +517,13 @@ export function parseDeliveryLeaseStamp(
   const m = body.match(DELIVERY_LEASE_COMMENT_RE);
   if (!m) return null;
   const attrs = m[1] ?? "";
+  const released = attrValue(attrs, "released") === "1";
   const expiresAt = Date.parse(attrValue(attrs, "expires"));
   const ghaRaw = attrValue(attrs, "gha_run");
   const cursorAgentRaw = attrValue(attrs, "cursor_agent");
   const cursorRunRaw = attrValue(attrs, "cursor_run");
   return {
-    expiresAt: Number.isFinite(expiresAt) ? expiresAt : null,
+    expiresAt: released || !Number.isFinite(expiresAt) ? null : expiresAt,
     ghaRunId: /^\d+$/.test(ghaRaw) ? ghaRaw : null,
     cursorAgentId: /^bc-[a-z0-9-]+$/i.test(cursorAgentRaw)
       ? cursorAgentRaw
@@ -643,28 +644,14 @@ export function shouldStealShipLease(input: {
   return expired;
 }
 
+/** Last stamp in chronological comment order. A later release supersedes a longer TTL. */
 export function latestDeliveryLeaseStamp(
   commentBodies: readonly string[],
 ): DeliveryLeaseStamp {
   let best: DeliveryLeaseStamp = emptyDeliveryLeaseStamp();
   for (const body of commentBodies) {
     const s = parseDeliveryLeaseStamp(body);
-    if (!s) continue;
-    if (
-      s.expiresAt !== null &&
-      (best.expiresAt === null || s.expiresAt > best.expiresAt)
-    ) {
-      best = s;
-      continue;
-    }
-    if (
-      s.expiresAt !== null &&
-      s.expiresAt === best.expiresAt &&
-      ((s.ghaRunId && !best.ghaRunId) ||
-        (s.cursorRunId && !best.cursorRunId))
-    ) {
-      best = s;
-    }
+    if (s) best = s;
   }
   return best;
 }

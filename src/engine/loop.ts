@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { agentHome, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
+import { isGithubActionsRunActive } from "./github-run-status.js";
 import {
   evaluateGraphReady,
   latestDeliveryLeaseStamp,
@@ -11,6 +12,7 @@ import {
   shouldStealDeliveryLease,
   shouldStopForPageReserve,
   DELIVERY_LEASE_TTL_MS,
+  type DeliveryLeaseStamp,
 } from "./linear-harness-policy.js";
 import { invariantExists, parkStateForVerdict, parseVerdict, parseWorkOrder, type Verdict } from "./packet.js";
 
@@ -26,6 +28,8 @@ export type LoopDeps = {
   maxQualityPolls?: number;
   /** Linear project name. Limits intake. GitHub Issues ignores it. */
   project?: string | null;
+  /** Override for tests. Default asks `gh` whether the stamped run is still live. */
+  githubRunActive?: (runId: string | null) => boolean | null;
 };
 
 export type TicketResult = {
@@ -45,7 +49,39 @@ export type TicketResult = {
 
 function leaseComment(nowMs: number, phase: string, runId: string): string {
   const expires = new Date(nowMs + DELIVERY_LEASE_TTL_MS).toISOString();
-  return `<!-- DELIVERY_LEASE expires=${expires} cursor_run=${runId} cursor_phase=${phase} -->`;
+  const gha = process.env.GITHUB_RUN_ID?.trim() ?? "";
+  const ghaAttr = /^\d+$/.test(gha) ? ` gha_run=${gha}` : "";
+  return `<!-- DELIVERY_LEASE expires=${expires}${ghaAttr} cursor_run=${runId} cursor_phase=${phase} -->`;
+}
+
+const RELEASE_LEASE = "<!-- DELIVERY_LEASE released=1 -->";
+
+/**
+ * A `cursor_run=pending` stamp is the placeholder written before a child
+ * exists. With no Actions run id there is nothing to join, so the parent
+ * that wrote it is already gone. A real run id without `gha_run` stays
+ * fail-closed until `expires`.
+ */
+function previousOwnerActive(
+  stamp: DeliveryLeaseStamp,
+  deps: LoopDeps,
+): boolean | null {
+  if (stamp.ghaRunId) {
+    const ask = deps.githubRunActive ?? ((id) => isGithubActionsRunActive(id));
+    return ask(stamp.ghaRunId);
+  }
+  if (stamp.cursorRunId === "pending") return false;
+  return null;
+}
+
+function leaseIsHeld(stamp: DeliveryLeaseStamp, nowMs: number, deps: LoopDeps): boolean {
+  if (stamp.expiresAt === null || nowMs >= stamp.expiresAt) return false;
+  return !shouldStealDeliveryLease({
+    hasLeaseLabel: true,
+    expiresAt: stamp.expiresAt,
+    nowMs,
+    previousGhaRunActive: previousOwnerActive(stamp, deps),
+  });
 }
 
 function groundPrompt(ticket: Ticket, pack: ProjectPack): string {
@@ -155,20 +191,24 @@ export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketR
   }
 
   const lease = latestDeliveryLeaseStamp(ticket.comments);
-  const live =
-    lease.expiresAt !== null &&
-    !shouldStealDeliveryLease({
-      hasLeaseLabel: true,
-      expiresAt: lease.expiresAt,
-      nowMs: now,
-      previousGhaRunActive: true,
-    });
-  if (live) {
+  if (leaseIsHeld(lease, now, deps)) {
     return { identifier: ticket.identifier, outcome: "skipped-lease", detail: "lease held" };
   }
 
   const home = agentHome(deps.pack);
   await deps.tracker.comment(ticket.identifier, leaseComment(now, "ground", "pending"));
+  try {
+    return await runHeldTicket(deps, ticket, home);
+  } finally {
+    await deps.tracker.comment(ticket.identifier, RELEASE_LEASE).catch(() => undefined);
+  }
+}
+
+async function runHeldTicket(
+  deps: LoopDeps,
+  ticket: Ticket,
+  home: { url: string; trunk: string },
+): Promise<TicketResult> {
   let ground;
   try {
     const started = await deps.worker.start({

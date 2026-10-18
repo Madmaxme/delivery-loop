@@ -13,7 +13,7 @@ type LinearIssue = {
       issue?: { identifier: string; state?: { name: string } };
     }[];
   };
-  comments?: { nodes: { body: string }[] };
+  comments?: { nodes: { body: string; createdAt?: string }[] };
 };
 
 export function linearTracker(opts: {
@@ -57,7 +57,9 @@ export function linearTracker(opts: {
           identifier: rel.issue!.identifier,
           stateName: rel.issue!.state?.name ?? "",
         })),
-      comments: (issue.comments?.nodes ?? []).map((c) => c.body),
+      comments: [...(issue.comments?.nodes ?? [])]
+        .sort((a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? ""))
+        .map((c) => c.body),
     };
   }
 
@@ -65,7 +67,7 @@ export function linearTracker(opts: {
     id identifier title description
     state { name }
     labels { nodes { name } }
-    comments { nodes { body } }
+    comments { nodes { body createdAt } }
     inverseRelations { nodes { type issue { identifier state { name } } } }
   `;
 
@@ -164,7 +166,7 @@ export function githubIssuesTracker(opts: {
   }): Promise<Ticket> {
     const comments = (await api(
       `/repos/${opts.repo}/issues/${issue.number}/comments`,
-    )) as { body: string }[];
+    )) as { body: string; created_at?: string }[];
     const blocked = [...(issue.body ?? "").matchAll(/blocked by ([A-Za-z0-9]+-\d+)/gi)].map(
       (m) => m[1],
     );
@@ -177,7 +179,9 @@ export function githubIssuesTracker(opts: {
         ?? (issue.state === "open" ? opts.intakeLabel : "closed"),
       labels: issue.labels.map((l) => l.name),
       blockedBy: blocked.map((identifier) => ({ identifier, stateName: "unknown" })),
-      comments: comments.map((c) => c.body),
+      comments: [...comments]
+        .sort((a, b) => Date.parse(a.created_at ?? "") - Date.parse(b.created_at ?? ""))
+        .map((c) => c.body),
     };
   }
 
