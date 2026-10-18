@@ -66,6 +66,32 @@ export function parseWorkOrder(text: string): WorkOrder | null {
   };
 }
 
+/** Status to move to after a non-BUILDABLE verdict. Null stays in intake. */
+export function parkStateForVerdict(input: {
+  verdict: Verdict;
+  text: string;
+  priorComments: readonly string[];
+  devStatus: string;
+  /** True when this ticket's commits are already on the named trunks. */
+  trunkCommit?: boolean | null;
+}): string | null {
+  if (input.verdict === "WRONG DIAGNOSIS") return "Canceled";
+  if (input.verdict === "NEEDS RESCOPE") {
+    const cited =
+      /\*\*Harness packet:\*\*/i.test(input.text) ||
+      input.priorComments.some((comment) => /\*\*Harness packet:\*\*/i.test(comment));
+    return cited ? "Shaping" : null;
+  }
+  if (input.verdict === "ALREADY SHIPPED") {
+    const repos = words(field(input.text, "Repos"));
+    if (repos.length === 0) return "Canceled";
+    if (input.trunkCommit === true) return input.devStatus;
+    if (input.trunkCommit === false) return "Canceled";
+    return null;
+  }
+  return null;
+}
+
 export function invariantExists(markdown: string, id: string): boolean {
   const needle = id.trim().toLowerCase();
   if (!needle) return false;

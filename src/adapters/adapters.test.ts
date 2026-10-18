@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 
 import { githubForge } from "./forge-github.ts";
 import { githubIssuesTracker, linearTracker } from "./trackers.ts";
-import { copilotWorker, httpWorker } from "./workers.ts";
+import { copilotWorker, cursorReceiptText, cursorWorker, httpWorker } from "./workers.ts";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -132,5 +132,60 @@ describe("adapters", () => {
     });
     const issues = await github.listIntake();
     assert.equal(issues[0]?.blockedBy[0]?.identifier, "API-1");
+  });
+
+  it("uses the Cursor run result string, not the run envelope", async () => {
+    const receipt = "**Verdict:** WRONG DIAGNOSIS\n\nThe calendar already filters that row.";
+    assert.equal(
+      cursorReceiptText(
+        {
+          status: "finished",
+          id: "run-1",
+          result: receipt,
+        } as { status: string; result: string },
+        [],
+      ),
+      receipt,
+    );
+    const worker = cursorWorker({
+      apiKey: "k",
+      sdk: {
+        async create() {
+          return {
+            agentId: "agent-1",
+            async send() {
+              return {
+                async wait() {
+                  return {
+                    status: "finished",
+                    result: receipt,
+                    git: {
+                      branches: [
+                        { repoUrl: "https://github.com/acme/api", branch: "cursor/qui-1" },
+                      ],
+                    },
+                  };
+                },
+              };
+            },
+            async [Symbol.asyncDispose]() {},
+          };
+        },
+        messages: {
+          async list() {
+            return [];
+          },
+        },
+      },
+    });
+    const started = await worker.start({
+      prompt: "ground",
+      repoUrl: "https://github.com/acme/workspace",
+      baseRef: "main",
+    });
+    const joined = await worker.join(started.runId);
+    assert.equal(joined.text, receipt);
+    assert.equal(joined.text.includes('"status":"finished"'), false);
+    assert.equal(joined.branches?.[0]?.branch, "cursor/qui-1");
   });
 });

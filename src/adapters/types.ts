@@ -19,6 +19,8 @@ export type WorkerResult = {
   status: "running" | "finished" | "failed";
   branch?: string;
   head?: string;
+  /** Every repo the agent pushed. Land matches these to the work order. */
+  branches?: { repoUrl: string; branch: string }[];
   text: string;
 };
 

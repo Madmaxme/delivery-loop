@@ -14,6 +14,11 @@ export type ProjectPack = {
   worker: "cursor" | "claude" | "codex" | "copilot" | "http";
   /** owner/repo used when the tracker is GitHub Issues. */
   githubRepo?: string;
+  /**
+   * Cloud agent checkout. Set this when product repos are mounted inside a
+   * workspace repo (the agent must start there, not on repos[0]).
+   */
+  agent?: { url: string; trunk: string };
   /** Tracker team key, such as ENG. */
   linearTeam?: string;
   workerHttp?: { startUrl: string; statusUrl: string };
@@ -61,4 +66,13 @@ export function unblockingStates(pack: ProjectPack): string[] {
 
 export function repoByName(pack: ProjectPack, name: string): RepoSpec | undefined {
   return pack.repos.find((r) => r.name === name);
+}
+
+/** Where the coding agent checks out. Product pull requests stay on `repos`. */
+export function agentHome(pack: ProjectPack): { url: string; trunk: string } {
+  if (pack.agent?.url && pack.agent.trunk) {
+    return { url: pack.agent.url, trunk: pack.agent.trunk };
+  }
+  const first = pack.repos[0];
+  return { url: first.url, trunk: first.trunk };
 }

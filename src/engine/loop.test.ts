@@ -109,6 +109,33 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "verdict");
     assert.equal(env.merged(), false);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("cancels a wrong diagnosis and starts the agent on the workspace", async () => {
+    const env = harness("**Verdict:** WRONG DIAGNOSIS\n\nThe code already does this.");
+    const starts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      starts.push(input.repoUrl);
+      return start(input);
+    };
+    env.deps.pack = {
+      ...env.deps.pack,
+      agent: { url: "https://github.com/acme/workspace", trunk: "main" },
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "verdict");
+    assert.equal(env.state(), "Canceled");
+    assert.deepEqual(starts, ["https://github.com/acme/workspace"]);
+    assert.equal(env.comments.some((body) => body.includes('"id":')), false);
+  });
+
+  it("moves a packet-cited needs-rescope to shaping", async () => {
+    const env = harness("**Verdict:** NEEDS RESCOPE\n\n**Harness packet:** no safe default remains.");
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "verdict");
+    assert.equal(env.state(), "Shaping");
   });
 
   it("stops one ticket when a connector is missing and continues the sweep", async () => {

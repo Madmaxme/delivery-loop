@@ -212,19 +212,86 @@ export function claudeWorker(opts: { apiKey: string; fetch?: FetchLike }): Worke
   };
 }
 
+export type CursorRunResult = {
+  status?: string;
+  result?: unknown;
+  git?: {
+    branches?: { repoUrl?: string; branch?: string; prUrl?: string }[];
+  };
+};
+
 export type CursorSdk = {
   create(options: {
     apiKey: string;
     cloud: { repos: { url: string; startingRef: string }[]; autoCreatePR: boolean };
   }): Promise<{
     agentId: string;
-    send(prompt: string): Promise<{
-      wait(): Promise<{ status?: string; git?: { branch?: string; sha?: string } }>;
-    }>;
+    send(prompt: string): Promise<{ wait(): Promise<CursorRunResult> }>;
     [Symbol.asyncDispose](): Promise<void>;
   }>;
-  messages: { list(agentId: string): Promise<{ content?: { text?: string }[] } | unknown> };
+  messages: { list(agentId: string): Promise<unknown> };
 };
+
+const CLOSED_HANDOFF =
+  /<!--\s*(?:GROUNDING_HANDOFF|BUILD_HANDOFF)\b[\s\S]*?\b(?:GROUNDING_HANDOFF|BUILD_HANDOFF)\s*-->|\*\*Verdict:\*\*/i;
+
+function textBlocks(message: unknown): string {
+  if (typeof message === "string") return message;
+  if (!message || typeof message !== "object") return "";
+  const record = message as { text?: unknown; content?: unknown };
+  if (typeof record.text === "string" && record.text.trim()) return record.text;
+  if (!Array.isArray(record.content)) return "";
+  const bits: string[] = [];
+  for (const block of record.content) {
+    if (!block || typeof block !== "object") continue;
+    const item = block as { type?: string; text?: unknown };
+    if (item.type === "text" && typeof item.text === "string") bits.push(item.text);
+  }
+  return bits.join("");
+}
+
+export function assistantTextFromMessages(messages: unknown): string {
+  const list = Array.isArray(messages)
+    ? messages
+    : messages && typeof messages === "object" && Array.isArray((messages as { messages?: unknown }).messages)
+      ? (messages as { messages: unknown[] }).messages
+      : [];
+  const parts: string[] = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object") continue;
+    const row = entry as { type?: string; message?: unknown };
+    if ((row.type ?? "").toLowerCase() !== "assistant") continue;
+    const text = textBlocks(row.message);
+    if (text) parts.push(text);
+  }
+  return parts.join("\n");
+}
+
+/**
+ * The run receipt is the assistant transcript. `wait()` returns a RunResult
+ * whose `result` string is that transcript; `Agent.messages` is the same
+ * text when the result string is empty. The RunResult object itself is not
+ * the receipt.
+ */
+export function cursorReceiptText(done: CursorRunResult, messages: unknown): string {
+  const stored = assistantTextFromMessages(messages);
+  const result = typeof done.result === "string" ? done.result : "";
+  if (stored.trim() && CLOSED_HANDOFF.test(stored) && stored.length >= result.length) {
+    return stored;
+  }
+  if (result.trim()) return result;
+  return stored;
+}
+
+export function cursorBranches(done: CursorRunResult): { repoUrl: string; branch: string }[] {
+  const rows = done.git?.branches ?? [];
+  const out: { repoUrl: string; branch: string }[] = [];
+  for (const row of rows) {
+    if (!row.repoUrl || !row.branch) continue;
+    out.push({ repoUrl: row.repoUrl, branch: row.branch });
+  }
+  return out;
+}
 
 export function cursorWorker(opts: {
   apiKey: string;
@@ -245,14 +312,23 @@ export function cursorWorker(opts: {
       });
       const run = await agent.send(input.prompt);
       const done = await run.wait();
+      let messages: unknown = [];
+      try {
+        messages = await sdk.messages.list(agent.agentId);
+      } catch {
+        messages = [];
+      }
       await agent[Symbol.asyncDispose]();
-      const text = JSON.stringify(done);
+      const text = cursorReceiptText(done, messages);
+      const branches = cursorBranches(done);
+      const own = branches.find((row) => sameGithubRepo(row.repoUrl, input.repoUrl));
+      const failed = done.status === "error" || done.status === "cancelled";
       return {
         runId: JSON.stringify({
           agentId: agent.agentId,
-          status: done.status ?? "finished",
-          branch: done.git?.branch,
-          head: done.git?.sha,
+          status: failed ? "failed" : (done.status ?? "finished"),
+          branch: own?.branch ?? branches[0]?.branch,
+          branches,
           text,
         }),
       };
@@ -264,8 +340,17 @@ export function cursorWorker(opts: {
         status,
         branch: stored.branch,
         head: stored.head,
+        branches: stored.branches,
         text: stored.text,
       };
     },
   };
+}
+
+function sameGithubRepo(a: string, b: string): boolean {
+  const normalize = (value: string) => {
+    const match = value.match(/github\.com[:/]([^/]+)\/([^/.]+)/i);
+    return match ? `${match[1]}/${match[2]}`.toLowerCase() : value.replace(/\.git$/, "").toLowerCase();
+  };
+  return normalize(a) === normalize(b);
 }

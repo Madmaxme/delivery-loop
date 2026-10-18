@@ -1,8 +1,9 @@
-import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
-import { repoByName, unblockingStates, type ProjectPack } from "../schema/pack.js";
+import { agentHome, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
 import {
   evaluateGraphReady,
   latestDeliveryLeaseStamp,
@@ -11,7 +12,7 @@ import {
   shouldStopForPageReserve,
   DELIVERY_LEASE_TTL_MS,
 } from "./linear-harness-policy.js";
-import { invariantExists, parseVerdict, parseWorkOrder, type Verdict } from "./packet.js";
+import { invariantExists, parkStateForVerdict, parseVerdict, parseWorkOrder, type Verdict } from "./packet.js";
 
 export type LoopDeps = {
   pack: ProjectPack;
@@ -70,6 +71,58 @@ function buildPrompt(ticket: Ticket, orderText: string): string {
   ].join("\n");
 }
 
+function githubSlug(url: string): string {
+  const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/i);
+  return match ? `${match[1]}/${match[2]}`.toLowerCase() : url.toLowerCase();
+}
+
+function landingTargets(
+  pack: ProjectPack,
+  orderRepos: string[],
+  branches: { repoUrl: string; branch: string }[] | undefined,
+  fallbackBranch: string | undefined,
+  fallbackRepo: RepoSpec,
+): { repo: RepoSpec; branch: string }[] | null {
+  const pushed = (branches ?? []).filter((row) => row.branch);
+  if (pushed.length === 0) {
+    return fallbackBranch ? [{ repo: fallbackRepo, branch: fallbackBranch }] : null;
+  }
+  const targets: { repo: RepoSpec; branch: string }[] = [];
+  for (const name of orderRepos) {
+    const repo = repoByName(pack, name);
+    if (!repo) return null;
+    const hit = pushed.find((row) => githubSlug(row.repoUrl) === githubSlug(repo.url));
+    if (!hit) return null;
+    targets.push({ repo, branch: hit.branch });
+  }
+  return targets.length ? targets : null;
+}
+
+function trunkHasTicketCommit(deps: LoopDeps, identifier: string, text: string): boolean | null {
+  const named = [...text.matchAll(/\*\*Repos:\*\*\s*(.+)/gi)].flatMap((match) =>
+    [...match[1].matchAll(/`([^`]+)`/g)].map((item) => item[1].trim()),
+  );
+  const repos = named.length ? named : [];
+  if (repos.length === 0) return false;
+  const cwd = deps.cwd ?? process.cwd();
+  let unknown = false;
+  for (const name of repos) {
+    const spec = repoByName(deps.pack, name);
+    const dir = name === "qws-workspace" ? cwd : join(cwd, name);
+    if (!spec || !existsSync(join(dir, ".git"))) {
+      unknown = true;
+      continue;
+    }
+    const result = spawnSync(
+      "git",
+      ["-C", dir, "log", spec.trunk, "--grep", identifier, "-1", "--format=%H"],
+      { encoding: "utf8" },
+    );
+    if (result.status === 0 && result.stdout.trim()) return true;
+  }
+  return unknown ? null : false;
+}
+
 async function finishWorker(worker: WorkerAdapter, runId: string) {
   const joined = await worker.join(runId);
   if (joined.status === "failed") {
@@ -114,14 +167,14 @@ export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketR
     return { identifier: ticket.identifier, outcome: "skipped-lease", detail: "lease held" };
   }
 
-  const repo = deps.pack.repos[0];
+  const home = agentHome(deps.pack);
   await deps.tracker.comment(ticket.identifier, leaseComment(now, "ground", "pending"));
   let ground;
   try {
     const started = await deps.worker.start({
       prompt: groundPrompt(ticket, deps.pack),
-      repoUrl: repo.url,
-      baseRef: repo.trunk,
+      repoUrl: home.url,
+      baseRef: home.trunk,
     });
     ground = await finishWorker(deps.worker, started.runId);
   } catch (error) {
@@ -138,6 +191,19 @@ export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketR
       ticket.identifier,
       `**Verdict:** ${verdict ?? "MISSING"}\n\n${ground.text}`,
     );
+    if (verdict) {
+      const parked = parkStateForVerdict({
+        verdict,
+        text: ground.text,
+        priorComments: ticket.comments,
+        devStatus: deps.pack.status.dev,
+        trunkCommit:
+          verdict === "ALREADY SHIPPED"
+            ? trunkHasTicketCommit(deps, ticket.identifier, ground.text)
+            : null,
+      });
+      if (parked) await deps.tracker.setState(ticket.identifier, parked);
+    }
     return {
       identifier: ticket.identifier,
       outcome: "verdict",
@@ -187,8 +253,8 @@ export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketR
   try {
     const started = await deps.worker.start({
       prompt: buildPrompt(ticket, ground.text),
-      repoUrl: target.url,
-      baseRef: target.trunk,
+      repoUrl: home.url,
+      baseRef: home.trunk,
     });
     built = await finishWorker(deps.worker, started.runId);
   } catch (error) {
@@ -198,33 +264,46 @@ export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketR
       detail: error instanceof Error ? error.message : String(error),
     };
   }
-  if (!built.branch) {
+  const landings = landingTargets(deps.pack, order.repos, built.branches, built.branch, target);
+  if (!landings) {
     return { identifier: ticket.identifier, outcome: "worker-failed", detail: "no branch" };
   }
 
-  const pr = await deps.forge.openPullRequest({
-    repoUrl: target.url,
-    title: `${ticket.identifier}: ${order.decision}`,
-    body: ground.text,
-    head: built.branch,
-    base: target.trunk,
-  });
-  const head = built.head || pr.headSha;
-  let quality: "success" | "failure" | "pending" = "pending";
-  const polls = deps.maxQualityPolls ?? 5;
-  for (let i = 0; i < polls; i++) {
-    quality = await deps.forge.quality({
-      repoUrl: target.url,
-      headSha: head,
-      workflow: deps.pack.qualityWorkflow,
+  const opened: { repo: RepoSpec; number: number; url: string; headSha: string }[] = [];
+  for (const landing of landings) {
+    const pr = await deps.forge.openPullRequest({
+      repoUrl: landing.repo.url,
+      title: `${ticket.identifier}: ${order.decision}`,
+      body: ground.text,
+      head: landing.branch,
+      base: landing.repo.trunk,
     });
-    if (quality !== "pending") break;
+    opened.push({
+      repo: landing.repo,
+      number: pr.number,
+      url: pr.url,
+      headSha: built.head || pr.headSha,
+    });
   }
-  if (quality !== "success") {
-    await deps.tracker.comment(ticket.identifier, `Quality ${quality} on ${pr.url}`);
-    return { identifier: ticket.identifier, outcome: "quality-failed", detail: pr.url };
+  const polls = deps.maxQualityPolls ?? 5;
+  for (const pr of opened) {
+    let quality: "success" | "failure" | "pending" = "pending";
+    for (let i = 0; i < polls; i++) {
+      quality = await deps.forge.quality({
+        repoUrl: pr.repo.url,
+        headSha: pr.headSha,
+        workflow: deps.pack.qualityWorkflow,
+      });
+      if (quality !== "pending") break;
+    }
+    if (quality !== "success") {
+      await deps.tracker.comment(ticket.identifier, `Quality ${quality} on ${pr.url}`);
+      return { identifier: ticket.identifier, outcome: "quality-failed", detail: pr.url };
+    }
   }
-  await deps.forge.squashMerge({ repoUrl: target.url, number: pr.number });
+  for (const pr of opened) {
+    await deps.forge.squashMerge({ repoUrl: pr.repo.url, number: pr.number });
+  }
   for (const step of deps.pack.dev?.steps ?? []) {
     const result = spawnSync(step, { shell: true, cwd: deps.cwd ?? process.cwd(), stdio: "inherit" });
     if (result.status !== 0) {
@@ -236,7 +315,11 @@ export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketR
     }
   }
   await deps.tracker.setState(ticket.identifier, deps.pack.status.dev);
-  return { identifier: ticket.identifier, outcome: "landed", detail: pr.url };
+  return {
+    identifier: ticket.identifier,
+    outcome: "landed",
+    detail: opened.map((pr) => pr.url).join(" "),
+  };
 }
 
 export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
