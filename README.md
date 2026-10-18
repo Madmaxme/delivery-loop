@@ -26,3 +26,16 @@ Clone this repo, branch from `main`, and open a pull request. The `quality` work
 A new tracker or worker is a file in `src/adapters` plus a test. Trackers implement `listIntake`, `get`, `comment`, and `setState`. Workers implement `start` and `join`.
 
 An install keeps its repos, trunk branches, status names, and promote commands in its own `delivery-loop.yaml`. Those facts do not belong in this repository.
+
+`prompts.ground` and `prompts.build` are workspace-relative files the runner puts in the worker prompt. `invariantHeadings` lists heading files that count as invariant ids beside `invariantsFile`. A heading titled `Commission resolution` in a file with `prefix: billing` is the id `billing/commission-resolution`.
+
+```yaml
+prompts:
+  ground:
+    - docs/grounding.md
+  build:
+    - docs/build.md
+invariantHeadings:
+  - prefix: billing
+    file: docs/rules/billing.md
+```

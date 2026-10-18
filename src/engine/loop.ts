@@ -84,45 +84,63 @@ function leaseIsHeld(stamp: DeliveryLeaseStamp, nowMs: number, deps: LoopDeps): 
   });
 }
 
-const GROUND_DOCS = [
-  "docs/automation-prompts/linear-ticket-grounding.md",
-  ".cursor/skills/ground-linear-ticket/SKILL.md",
-  "docs/async-delivery-loop-contract.md",
-];
-
 function readIfPresent(cwd: string, rel: string): string {
   const abs = join(cwd, rel);
   return existsSync(abs) ? readFileSync(abs, "utf8") : "";
 }
 
+function listedDocs(cwd: string, paths: string[] | undefined): string[] {
+  return (paths ?? []).map((rel) => readIfPresent(cwd, rel)).filter(Boolean);
+}
+
+const GENERIC_GROUND = [
+  "Check the ticket against the code. Do not edit files. Do not call the tracker.",
+  "Reply with one handoff:",
+  "<!-- GROUNDING_HANDOFF",
+  "VERDICT: BUILDABLE | NEEDS DIAGNOSIS | NEEDS RESCOPE | WRONG DIAGNOSIS | ALREADY SHIPPED",
+  "COMMENT:",
+  "BUILD_PACKET:",
+  "**Repos:** `name`",
+  "**Invariant:** `heading-or-prefix/slug`",
+  "**Decision:** one sentence that cites the invariant id.",
+  "**Symbols:** `path#symbol`",
+  "## Allowlist",
+  "## Validation",
+  "## Stop",
+  "GROUNDING_HANDOFF -->",
+].join("\n");
+
 function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
   const cwd = deps.cwd ?? process.cwd();
-  const docs = GROUND_DOCS.map((rel) => readIfPresent(cwd, rel)).filter(Boolean);
+  const docs = listedDocs(cwd, deps.pack.prompts?.ground);
   const comments = ticket.comments.slice(-8).join("\n---\n").slice(0, 8000);
   return [
-    ...docs,
+    ...(docs.length > 0 ? docs : [GENERIC_GROUND]),
     `Ticket ${ticket.identifier}: ${ticket.title}`,
     ticket.body,
     "",
     "## Existing comments",
     comments || "(none)",
     "",
-    "This send is for this issue only. Do not edit files. Do not call Linear.",
-    "Emit GROUNDING_HANDOFF. VERDICT is one of BUILDABLE, NEEDS DIAGNOSIS, NEEDS RESCOPE, WRONG DIAGNOSIS, ALREADY SHIPPED.",
-    "When BUILDABLE, put the work order under BUILD_PACKET: inside that handoff.",
-    "The invariant id is one existing heading: `scope/slug` (`money/`, `booking/`, `people/`, `core/`) or the exact heading from the invariants file.",
+    "This send is for this issue only. Do not edit files. Do not call the tracker.",
+    "Follow the documents above. A verdict is a VERDICT: or **Verdict:** line.",
+    "When the verdict is BUILDABLE, put the work order under BUILD_PACKET: inside the handoff.",
+    "The invariant id is a heading in the invariants file, or `prefix/slug` from a heading file the install lists.",
     "One **Decision:** sentence that cites that id. **Symbols:** `repo/path#symbol`. **Repos:** in backticks.",
     `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
     `Repos: ${deps.pack.repos.map((r) => r.name).join(", ")}`,
   ].join("\n\n");
 }
 
-function buildPrompt(ticket: Ticket, orderText: string): string {
+function buildPrompt(ticket: Ticket, orderText: string, deps: LoopDeps): string {
+  const cwd = deps.cwd ?? process.cwd();
+  const docs = listedDocs(cwd, deps.pack.prompts?.build);
   return [
+    ...docs,
     `Implement only this work order for ${ticket.identifier}.`,
     orderText,
-    "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit.",
-  ].join("\n");
+    "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
+  ].join("\n\n");
 }
 
 function githubSlug(url: string): string {
@@ -280,7 +298,14 @@ async function runHeldTicket(
   const invariants =
     deps.invariantsMarkdown ??
     readFileSync(deps.pack.invariantsFile, "utf8");
-  if (!invariantExists(invariants, order.invariant, deps.cwd ?? process.cwd())) {
+  if (
+    !invariantExists(
+      invariants,
+      order.invariant,
+      deps.cwd ?? process.cwd(),
+      deps.pack.invariantHeadings,
+    )
+  ) {
     return {
       identifier: ticket.identifier,
       outcome: "invalid-packet",
@@ -313,7 +338,7 @@ async function runHeldTicket(
   let built;
   try {
     const started = await deps.worker.start({
-      prompt: buildPrompt(ticket, ground.text),
+      prompt: buildPrompt(ticket, ground.text, deps),
       repoUrl: home.url,
       baseRef: home.trunk,
     });

@@ -9,11 +9,24 @@ export type RepoSpec = {
   packages?: string[];
 };
 
+/** A heading file the install owns. `prefix/slug` matches a heading in `file`. */
+export type InvariantHeading = {
+  prefix: string;
+  file: string;
+};
+
 export type ProjectPack = {
   tracker: "linear" | "github";
   worker: "cursor" | "claude" | "codex" | "copilot" | "http";
   /** owner/repo used when the tracker is GitHub Issues. */
   githubRepo?: string;
+  /**
+   * Documents the install wants in the worker prompt, relative to the
+   * workspace. The package does not name project files itself.
+   */
+  prompts?: { ground?: string[]; build?: string[] };
+  /** Heading files that count as invariant ids, beside `invariantsFile`. */
+  invariantHeadings?: InvariantHeading[];
   /**
    * Cloud agent checkout. Set this when product repos are mounted inside a
    * workspace repo (the agent must start there, not on repos[0]).
@@ -57,6 +70,11 @@ export function loadPack(path: string): ProjectPack {
   raw.qualityWorkflow = raw.qualityWorkflow || "quality";
   raw.connectors = raw.connectors ?? [];
   raw.invariantsFile = raw.invariantsFile || "invariants.md";
+  raw.prompts = {
+    ground: raw.prompts?.ground ?? [],
+    build: raw.prompts?.build ?? [],
+  };
+  raw.invariantHeadings = raw.invariantHeadings ?? [];
   return raw;
 }
 

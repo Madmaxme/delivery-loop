@@ -1,5 +1,7 @@
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+
+import type { InvariantHeading } from "../schema/pack.ts";
 
 export const VERDICTS = [
   "BUILDABLE",
@@ -159,56 +161,36 @@ function headingMatches(markdown: string, id: string): boolean {
   });
 }
 
-const INVARIANT_RULE_GLOBS = [
-  "api/.cursor/rules",
-  "admin-web/.cursor/rules",
-  "operator-app/.cursor/rules",
-  "customer-web/.cursor/rules",
-  "customer-app/.cursor/rules",
-];
-
-function ruleHeadingPrefix(rel: string): string | null {
-  const base = rel.split("/").pop() ?? "";
-  if (base === "business-logic-money.mdc") return "money";
-  if (base === "business-logic-booking.mdc") return "booking";
-  if (base === "business-logic-people.mdc") return "people";
-  if (base === "business-logic.mdc") return "core";
-  return null;
-}
-
-function listMdc(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const abs = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...listMdc(abs));
-    else if (entry.name.endsWith(".mdc")) out.push(abs);
-  }
-  return out;
-}
-
-/** `scope/slug` against business-rule headings. Same ids the old ground prompt required. */
-export function resolveInvariantHeading(id: string, root: string): string | null {
+/** `prefix/slug` against a heading file the install listed. */
+export function resolveInvariantHeading(
+  id: string,
+  root: string,
+  headings: InvariantHeading[] = [],
+): string | null {
   const wanted = id.trim().toLowerCase();
   if (!/^[a-z0-9-]+\/[a-z0-9-]+$/.test(wanted)) return null;
-  for (const dir of INVARIANT_RULE_GLOBS) {
-    const abs = join(root, dir);
-    if (!existsSync(abs)) continue;
-    for (const file of listMdc(abs)) {
-      const rel = file.slice(root.length + 1).replace(/\\/g, "/");
-      const text = readFileSync(file, "utf8");
-      if (text.includes(`{#${wanted}}`)) return rel;
-      const prefix = ruleHeadingPrefix(rel);
-      if (!prefix) continue;
-      for (const heading of text.matchAll(/^#{2,4}\s+(.+)$/gm)) {
-        if (`${prefix}/${headingSlug(heading[1])}` === wanted) return rel;
+  for (const heading of headings) {
+    if (!heading.prefix || !heading.file) continue;
+    const file = join(root, heading.file);
+    if (!existsSync(file)) continue;
+    const text = readFileSync(file, "utf8");
+    if (text.includes(`{#${wanted}}`)) return heading.file;
+    for (const match of text.matchAll(/^#{1,4}\s+(.+)$/gm)) {
+      if (`${heading.prefix}/${headingSlug(match[1])}`.toLowerCase() === wanted) {
+        return heading.file;
       }
     }
   }
   return null;
 }
 
-export function invariantExists(markdown: string, id: string, root?: string): boolean {
+export function invariantExists(
+  markdown: string,
+  id: string,
+  root?: string,
+  headings: InvariantHeading[] = [],
+): boolean {
   if (headingMatches(markdown, id)) return true;
-  if (root && resolveInvariantHeading(id, root)) return true;
+  if (root && resolveInvariantHeading(id, root, headings)) return true;
   return false;
 }

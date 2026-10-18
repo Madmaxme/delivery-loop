@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
@@ -96,6 +99,29 @@ BUILD_PACKET -->
 `;
 
 describe("loop", () => {
+  it("sends the install's prompt files and does not name a project's prefixes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "delivery-loop-"));
+    writeFileSync(join(root, "ground.md"), "INSTALL GROUND DOC");
+    writeFileSync(join(root, "build.md"), "INSTALL BUILD DOC");
+    const env = harness("**Verdict:** NEEDS DIAGNOSIS");
+    env.deps.cwd = root;
+    env.deps.pack = {
+      ...pack,
+      prompts: { ground: ["ground.md"], build: ["build.md"] },
+      invariantHeadings: [],
+    };
+    let prompt = "";
+    env.deps.worker.start = async (input) => {
+      prompt = input.prompt;
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "verdict");
+    assert.match(prompt, /INSTALL GROUND DOC/);
+    assert.doesNotMatch(prompt, /INSTALL BUILD DOC/);
+    assert.doesNotMatch(prompt, /money\//);
+  });
+
   it("lands a buildable ticket after quality is green", async () => {
     const env = harness(BUILDABLE);
     const result = await runTicket(env.deps, ticket());
