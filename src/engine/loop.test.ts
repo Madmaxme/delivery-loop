@@ -177,6 +177,21 @@ describe("loop", () => {
     assert.match(prompt, /\*\*Program graph:\*\*/);
   });
 
+  it("lands a branch the install named when it is already on origin", async () => {
+    const env = harness(BUILDABLE, { branch: "" });
+    env.deps.pack = { ...pack, branchTemplate: "cursor/{issue}-{repo}" };
+    env.deps.lookupHead = (_url, branch) => (branch === "cursor/api-1-api" ? "abc1234" : null);
+    let builds = 0;
+    env.deps.worker.start = async (input) => {
+      if (input.prompt.includes("Push these branches")) builds += 1;
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(builds, 0);
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.merged(), true);
+  });
+
   it("lands a buildable ticket after quality is green", async () => {
     const env = harness(BUILDABLE);
     const result = await runTicket(env.deps, ticket());

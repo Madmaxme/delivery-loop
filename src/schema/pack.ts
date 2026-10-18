@@ -38,6 +38,11 @@ export type ProjectPack = {
   repos: RepoSpec[];
   qualityCommand: string;
   qualityWorkflow: string;
+  /**
+   * Branch the coding agent pushes, with `{issue}` and `{repo}`.
+   * The runner lands that ref only when origin has it.
+   */
+  branchTemplate?: string;
   invariantsFile: string;
   status: { intake: string; dev: string; prod: string };
   connectors: string[];

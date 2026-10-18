@@ -19,6 +19,7 @@ import {
   type CompileProgramResult,
   type DeliveryLeaseStamp,
 } from "./linear-harness-policy.js";
+import { confirmLandBranches, lookupRemoteHead, renderBranch } from "./land-branches.js";
 import { invariantExists, parkStateForVerdict, parseVerdict, parseWorkOrder, type Verdict } from "./packet.js";
 
 export type LoopDeps = {
@@ -37,6 +38,8 @@ export type LoopDeps = {
   program?: CompileProgramResult | null;
   /** Override for tests. Default asks `gh` whether the stamped run is still live. */
   githubRunActive?: (runId: string | null) => boolean | null;
+  /** Override for tests. Default is `git ls-remote` for refs/heads/<branch>. */
+  lookupHead?: (repoUrl: string, branch: string) => string | null;
 };
 
 export type TicketResult = {
@@ -139,15 +142,22 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
   ].join("\n\n");
 }
 
-function buildPrompt(ticket: Ticket, orderText: string, deps: LoopDeps): string {
+function buildPrompt(ticket: Ticket, orderText: string, deps: LoopDeps, repos: string[]): string {
   const cwd = deps.cwd ?? process.cwd();
   const docs = listedDocs(cwd, deps.pack.prompts?.build);
+  const template = deps.pack.branchTemplate;
+  const branches = template
+    ? repos.map((repo) => `${repo}: \`${renderBranch(template, ticket.identifier, repo)}\``)
+    : [];
   return [
     ...docs,
     programBlock(ticket, deps, "build"),
     `Implement only this work order for ${ticket.identifier}.`,
     orderText,
-    "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
+    branches.length
+      ? `Push these branches from each repo trunk: ${branches.join(", ")}. Include repo and branch in the handoff. Do not merge.`
+      : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
+    "Stay inside the allowlist. Run the validation commands.",
   ].join("\n\n");
 }
 
@@ -364,24 +374,50 @@ async function runHeldTicket(
   }
 
   const target = repoByName(deps.pack, order.repos[0])!;
-  let built;
-  try {
-    const started = await deps.worker.start({
-      prompt: buildPrompt(ticket, ground.text, deps),
-      repoUrl: home.url,
-      baseRef: home.trunk,
-    });
-    built = await finishWorker(deps.worker, started.runId);
-  } catch (error) {
-    return {
-      identifier: ticket.identifier,
-      outcome: "worker-failed",
-      detail: error instanceof Error ? error.message : String(error),
-    };
-  }
-  const landings = landingTargets(deps.pack, order.repos, built.branches, built.branch, target);
+  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  let landings: { repo: RepoSpec; branch: string; sha?: string }[] | null = deps.pack.branchTemplate
+    ? confirmLandBranches({
+        issue: ticket.identifier,
+        repos: order.repos,
+        packRepos: deps.pack.repos,
+        template: deps.pack.branchTemplate,
+        text: ground.text,
+        reported: [],
+        lookup,
+      })
+    : null;
   if (!landings) {
-    return { identifier: ticket.identifier, outcome: "worker-failed", detail: "no branch" };
+    let built;
+    try {
+      const started = await deps.worker.start({
+        prompt: buildPrompt(ticket, ground.text, deps, order.repos),
+        repoUrl: home.url,
+        baseRef: home.trunk,
+      });
+      built = await finishWorker(deps.worker, started.runId);
+    } catch (error) {
+      return {
+        identifier: ticket.identifier,
+        outcome: "worker-failed",
+        detail: error instanceof Error ? error.message : String(error),
+      };
+    }
+    const reported = landingTargets(deps.pack, order.repos, built.branches, built.branch, target);
+    landings = reported?.map((row) => ({ repo: row.repo, branch: row.branch })) ?? null;
+    if (!landings) {
+      landings = confirmLandBranches({
+        issue: ticket.identifier,
+        repos: order.repos,
+        packRepos: deps.pack.repos,
+        template: deps.pack.branchTemplate,
+        text: `${ground.text}\n${built.text}`,
+        reported: built.branches ?? [],
+        lookup,
+      });
+    }
+    if (!landings) {
+      return { identifier: ticket.identifier, outcome: "worker-failed", detail: "no branch" };
+    }
   }
 
   const opened: { repo: RepoSpec; number: number; url: string; headSha: string }[] = [];
@@ -397,7 +433,7 @@ async function runHeldTicket(
       repo: landing.repo,
       number: pr.number,
       url: pr.url,
-      headSha: built.head || pr.headSha,
+      headSha: landing.sha || pr.headSha,
     });
   }
   const polls = deps.maxQualityPolls ?? 5;
