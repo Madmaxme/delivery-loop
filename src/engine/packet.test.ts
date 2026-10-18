@@ -30,6 +30,37 @@ describe("work order", () => {
     assert.equal(parseWorkOrder("**Verdict:** BUILDABLE\n**Repos:** `api`"), null);
   });
 
+  it("reads a GROUNDING_HANDOFF packet and ignores a bare mention of BUILDABLE", () => {
+    const handoff = `
+<!-- GROUNDING_HANDOFF
+VERDICT: BUILDABLE
+TIER: B
+COMMENT:
+**Codebase audit:** **BUILDABLE**
+BUILD_PACKET:
+**Repos:** \`api, customer-web\`
+**Invariant:** \`money/commission-resolution\`
+**Decision:** Keep the one commission snapshot (\`money/commission-resolution\`).
+**Symbols:** \`api/src/pay.ts#charge\`
+## Allowlist
+- \`api/src/pay.ts\`
+## Validation
+\`\`\`bash
+npm test
+\`\`\`
+## Stop
+One commission path remains.
+GROUNDING_HANDOFF -->
+The prompt says BUILDABLE, NEEDS DIAGNOSIS.
+`;
+    assert.equal(parseVerdict(handoff), "BUILDABLE");
+    const order = parseWorkOrder(handoff);
+    assert.deepEqual(order?.repos, ["api", "customer-web"]);
+    assert.equal(order?.invariant, "money/commission-resolution");
+    assert.equal(order?.validation[0], "npm test");
+    assert.equal(parseVerdict("The prompt lists BUILDABLE as a choice."), null);
+  });
+
   it("matches an invariant heading", () => {
     const doc = "# Invariants\n\n## charges-are-idempotent\n\nKeep it.\n";
     assert.equal(invariantExists(doc, "charges-are-idempotent"), true);

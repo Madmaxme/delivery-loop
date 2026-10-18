@@ -1,3 +1,6 @@
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+
 export const VERDICTS = [
   "BUILDABLE",
   "NEEDS DIAGNOSIS",
@@ -33,25 +36,67 @@ function words(value: string): string[] {
     .filter(Boolean);
 }
 
+const HANDOFF_RE =
+  /<!--\s*GROUNDING_HANDOFF\s*([\s\S]*?)\s*GROUNDING_HANDOFF\s*-->/i;
+
+/** Verdict only from a labeled line. A mention of the word is not a verdict. */
 export function parseVerdict(text: string): Verdict | null {
-  const labeled = text.match(/\*\*Verdict:\*\*\s*([A-Z][A-Z ]+)/i);
+  const handoff = text.match(HANDOFF_RE)?.[1] ?? text;
+  const labeled = handoff.match(/^(?:\*\*Verdict:\*\*|VERDICT:)\s*([A-Z][A-Z ]+)/im);
   const raw = (labeled?.[1] ?? "").trim().toUpperCase();
   if (raw && (VERDICTS as readonly string[]).includes(raw)) return raw as Verdict;
-  for (const verdict of VERDICTS) {
-    if (text.toUpperCase().includes(verdict)) return verdict;
-  }
   return null;
 }
 
+function packetBody(text: string): string {
+  const handoff = text.match(HANDOFF_RE)?.[1];
+  if (handoff) {
+    const split = handoff.split(/^BUILD_PACKET:\s*\n?/m);
+    if (split[1]?.trim()) return split[1];
+  }
+  const wrapped = text.match(/<!--\s*BUILD_PACKET\s*([\s\S]*?)\s*BUILD_PACKET\s*-->/i)?.[1];
+  return wrapped?.trim() ? wrapped : text;
+}
+
+function section(text: string, name: string): string {
+  const lines = text.split("\n");
+  const start = lines.findIndex((line) => line.trim().toLowerCase() === `## ${name.toLowerCase()}`);
+  if (start < 0) return "";
+  const body: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (/^##\s/.test(line)) break;
+    body.push(line);
+  }
+  return body.join("\n").trim();
+}
+
+function repoNames(value: string): string[] {
+  const tick = value.match(/`([^`]+)`/)?.[1] ?? value;
+  return tick.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+}
+
 export function parseWorkOrder(text: string): WorkOrder | null {
-  const block = text.match(/BUILD_PACKET([\s\S]*?)BUILD_PACKET/i)?.[1] ?? text;
+  const block = packetBody(text);
   const invariant = field(block, "Invariant").replace(/^`|`$/g, "");
   const decision = field(block, "Decision");
-  const stop = field(block, "Stop");
-  const repos = words(field(block, "Repos"));
+  const stop = field(block, "Stop") || section(block, "Stop").split("\n")[0]?.trim() || "";
+  const repos = repoNames(field(block, "Repos"));
   const allowlist = words(field(block, "Allowlist"));
+  if (allowlist.length === 0) {
+    for (const line of section(block, "Allowlist").split("\n")) {
+      const tick = line.match(/`([^`]+)`/)?.[1];
+      if (tick) allowlist.push(tick);
+    }
+  }
   const symbols = words(field(block, "Symbols"));
   const validation = words(field(block, "Validation"));
+  const fence = section(block, "Validation").match(/```(?:bash|sh)?\n([\s\S]*?)```/i)?.[1];
+  if (fence) {
+    for (const line of fence.split("\n")) {
+      const command = line.trim();
+      if (command && !command.startsWith("#")) validation.push(command);
+    }
+  }
   const connector = field(block, "Connector").replace(/^`|`$/g, "") || undefined;
   if (!invariant || !decision || !stop || repos.length === 0) return null;
   return {
@@ -92,10 +137,78 @@ export function parkStateForVerdict(input: {
   return null;
 }
 
-export function invariantExists(markdown: string, id: string): boolean {
+function headingSlug(heading: string): string {
+  return heading
+    .replace(/\{#[^}]+\}/g, "")
+    .replace(/\([^)]*\)/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function headingMatches(markdown: string, id: string): boolean {
   const needle = id.trim().toLowerCase();
   if (!needle) return false;
-  return markdown
-    .split("\n")
-    .some((line) => line.replace(/^#+\s*/, "").trim().toLowerCase() === needle);
+  const slug = headingSlug(id);
+  return markdown.split("\n").some((line) => {
+    const heading = line.replace(/^#+\s*/, "").trim();
+    if (!heading || heading === line.trim()) return false;
+    const text = heading.toLowerCase();
+    return text === needle || headingSlug(heading) === slug;
+  });
+}
+
+const INVARIANT_RULE_GLOBS = [
+  "api/.cursor/rules",
+  "admin-web/.cursor/rules",
+  "operator-app/.cursor/rules",
+  "customer-web/.cursor/rules",
+  "customer-app/.cursor/rules",
+];
+
+function ruleHeadingPrefix(rel: string): string | null {
+  const base = rel.split("/").pop() ?? "";
+  if (base === "business-logic-money.mdc") return "money";
+  if (base === "business-logic-booking.mdc") return "booking";
+  if (base === "business-logic-people.mdc") return "people";
+  if (base === "business-logic.mdc") return "core";
+  return null;
+}
+
+function listMdc(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const abs = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...listMdc(abs));
+    else if (entry.name.endsWith(".mdc")) out.push(abs);
+  }
+  return out;
+}
+
+/** `scope/slug` against business-rule headings. Same ids the old ground prompt required. */
+export function resolveInvariantHeading(id: string, root: string): string | null {
+  const wanted = id.trim().toLowerCase();
+  if (!/^[a-z0-9-]+\/[a-z0-9-]+$/.test(wanted)) return null;
+  for (const dir of INVARIANT_RULE_GLOBS) {
+    const abs = join(root, dir);
+    if (!existsSync(abs)) continue;
+    for (const file of listMdc(abs)) {
+      const rel = file.slice(root.length + 1).replace(/\\/g, "/");
+      const text = readFileSync(file, "utf8");
+      if (text.includes(`{#${wanted}}`)) return rel;
+      const prefix = ruleHeadingPrefix(rel);
+      if (!prefix) continue;
+      for (const heading of text.matchAll(/^#{2,4}\s+(.+)$/gm)) {
+        if (`${prefix}/${headingSlug(heading[1])}` === wanted) return rel;
+      }
+    }
+  }
+  return null;
+}
+
+export function invariantExists(markdown: string, id: string, root?: string): boolean {
+  if (headingMatches(markdown, id)) return true;
+  if (root && resolveInvariantHeading(id, root)) return true;
+  return false;
 }

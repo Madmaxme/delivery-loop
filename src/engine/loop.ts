@@ -84,19 +84,37 @@ function leaseIsHeld(stamp: DeliveryLeaseStamp, nowMs: number, deps: LoopDeps): 
   });
 }
 
-function groundPrompt(ticket: Ticket, pack: ProjectPack): string {
+const GROUND_DOCS = [
+  "docs/automation-prompts/linear-ticket-grounding.md",
+  ".cursor/skills/ground-linear-ticket/SKILL.md",
+  "docs/async-delivery-loop-contract.md",
+];
+
+function readIfPresent(cwd: string, rel: string): string {
+  const abs = join(cwd, rel);
+  return existsSync(abs) ? readFileSync(abs, "utf8") : "";
+}
+
+function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
+  const cwd = deps.cwd ?? process.cwd();
+  const docs = GROUND_DOCS.map((rel) => readIfPresent(cwd, rel)).filter(Boolean);
+  const comments = ticket.comments.slice(-8).join("\n---\n").slice(0, 8000);
   return [
+    ...docs,
     `Ticket ${ticket.identifier}: ${ticket.title}`,
     ticket.body,
     "",
-    "Check this ticket against the code. Do not edit files.",
-    "Cite one invariant that already exists. One code path. No one-off patch.",
-    "If a connector you need is not enabled, set **Connector:** to its name and verdict NEEDS DIAGNOSIS.",
-    "Reply with **Verdict:** one of BUILDABLE, NEEDS DIAGNOSIS, NEEDS RESCOPE, WRONG DIAGNOSIS, ALREADY SHIPPED.",
-    "When BUILDABLE, include a BUILD_PACKET block with **Repos:**, **Allowlist:**, **Invariant:**, **Decision:**, **Symbols:**, **Validation:**, and **Stop:**.",
-    `Enabled connectors: ${pack.connectors.join(", ") || "(none)"}`,
-    `Repos: ${pack.repos.map((r) => r.name).join(", ")}`,
-  ].join("\n");
+    "## Existing comments",
+    comments || "(none)",
+    "",
+    "This send is for this issue only. Do not edit files. Do not call Linear.",
+    "Emit GROUNDING_HANDOFF. VERDICT is one of BUILDABLE, NEEDS DIAGNOSIS, NEEDS RESCOPE, WRONG DIAGNOSIS, ALREADY SHIPPED.",
+    "When BUILDABLE, put the work order under BUILD_PACKET: inside that handoff.",
+    "The invariant id is one existing heading: `scope/slug` (`money/`, `booking/`, `people/`, `core/`) or the exact heading from the invariants file.",
+    "One **Decision:** sentence that cites that id. **Symbols:** `repo/path#symbol`. **Repos:** in backticks.",
+    `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
+    `Repos: ${deps.pack.repos.map((r) => r.name).join(", ")}`,
+  ].join("\n\n");
 }
 
 function buildPrompt(ticket: Ticket, orderText: string): string {
@@ -212,7 +230,7 @@ async function runHeldTicket(
   let ground;
   try {
     const started = await deps.worker.start({
-      prompt: groundPrompt(ticket, deps.pack),
+      prompt: groundPrompt(ticket, deps),
       repoUrl: home.url,
       baseRef: home.trunk,
     });
@@ -253,13 +271,16 @@ async function runHeldTicket(
 
   const order = parseWorkOrder(ground.text);
   if (!order) {
-    await deps.tracker.comment(ticket.identifier, "BUILDABLE without a complete work order.");
+    await deps.tracker.comment(
+      ticket.identifier,
+      `BUILDABLE without a complete work order.\n\n${ground.text.slice(0, 4000)}`,
+    );
     return { identifier: ticket.identifier, outcome: "invalid-packet", detail: "packet" };
   }
   const invariants =
     deps.invariantsMarkdown ??
     readFileSync(deps.pack.invariantsFile, "utf8");
-  if (!invariantExists(invariants, order.invariant)) {
+  if (!invariantExists(invariants, order.invariant, deps.cwd ?? process.cwd())) {
     return {
       identifier: ticket.identifier,
       outcome: "invalid-packet",
