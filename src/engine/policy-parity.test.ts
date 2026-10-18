@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 
 import {
   evaluateGraphReady,
+  formatGroundingCommentSample,
   interpretQualityActions,
   latestDeliveryLeaseStamp,
   shouldStealDeliveryLease,
@@ -89,5 +90,17 @@ describe("ported policy", () => {
       startedAtMs: started,
     });
     assert.equal(shouldStopForPageReserve({ remainingMs: remaining }), true);
+  });
+
+  it("labels comments older than the latest handoff as historical", () => {
+    const sample = formatGroundingCommentSample([
+      { createdAt: "2025-12-01T00:00:00Z", body: "OLD PACKET" },
+      { createdAt: "2026-01-01T00:00:00Z", body: "**Codebase audit:** BUILDABLE" },
+      { createdAt: "2026-02-01T00:00:00Z", body: "A later note" },
+    ]);
+    assert.match(sample, /\[HISTORICAL\] 2025-12-01/);
+    assert.match(sample, /\[CURRENT\] 2026-01-01/);
+    assert.match(sample, /\[CURRENT\] 2026-02-01/);
+    assert.match(sample, /Do not reuse those work orders/);
   });
 });

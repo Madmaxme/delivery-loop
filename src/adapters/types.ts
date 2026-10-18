@@ -1,3 +1,10 @@
+import type { LinearProgramSnapshot } from "../engine/linear-harness-policy.ts";
+
+export type TicketComment = {
+  body: string;
+  createdAt?: string;
+};
+
 export type Ticket = {
   id: string;
   identifier: string;
@@ -5,8 +12,10 @@ export type Ticket = {
   body: string;
   stateName: string;
   labels: string[];
+  /** Set when the tracker groups tickets into a project. */
+  projectName?: string;
   blockedBy: { identifier: string; stateName: string }[];
-  comments: string[];
+  comments: TicketComment[];
 };
 
 export type WorkerStart = {
@@ -38,6 +47,11 @@ export type TrackerAdapter = {
   setState(identifier: string, state: string): Promise<void>;
   addLabel(identifier: string, label: string): Promise<void>;
   removeLabel(identifier: string, label: string): Promise<void>;
+  /**
+   * Milestones, issues, and blockers for a named project.
+   * Trackers without projects return null.
+   */
+  projectSnapshot(name: string): Promise<LinearProgramSnapshot | null>;
 };
 
 export type PullRequest = {

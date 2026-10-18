@@ -1,3 +1,4 @@
+import type { IssueBlocker, LinearProgramSnapshot } from "../engine/linear-harness-policy.js";
 import type { FetchLike, Ticket, TrackerAdapter } from "./types.js";
 
 type LinearIssue = {
@@ -6,6 +7,7 @@ type LinearIssue = {
   title: string;
   description?: string | null;
   state?: { name: string };
+  project?: { name: string } | null;
   labels?: { nodes: { name: string }[] };
   inverseRelations?: {
     nodes: {
@@ -51,6 +53,7 @@ export function linearTracker(opts: {
       body: issue.description ?? "",
       stateName: issue.state?.name ?? "",
       labels: (issue.labels?.nodes ?? []).map((l) => l.name),
+      projectName: issue.project?.name,
       blockedBy: (issue.inverseRelations?.nodes ?? [])
         .filter((rel) => rel.type === "blocks" && rel.issue)
         .map((rel) => ({
@@ -59,13 +62,14 @@ export function linearTracker(opts: {
         })),
       comments: [...(issue.comments?.nodes ?? [])]
         .sort((a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? ""))
-        .map((c) => c.body),
+        .map((c) => ({ body: c.body, createdAt: c.createdAt })),
     };
   }
 
   const issueFields = `
     id identifier title description
     state { name }
+    project { name }
     labels { nodes { name } }
     comments { nodes { body createdAt } }
     inverseRelations { nodes { type issue { identifier state { name } } } }
@@ -129,7 +133,123 @@ export function linearTracker(opts: {
     async removeLabel(identifier, label) {
       await this.comment(identifier, `unlabel:${label}`);
     },
+    projectSnapshot(name) {
+      return linearProjectSnapshot(gql, name);
+    },
   };
+}
+
+async function linearProjectSnapshot(
+  gql: <T>(query: string, variables: Record<string, unknown>) => Promise<T>,
+  name: string,
+): Promise<LinearProgramSnapshot> {
+  const query = name.trim();
+  if (!query) throw new Error("Empty project name");
+  const found = await gql<{ projects: { nodes: { id: string; name: string; url: string }[] } }>(
+    `query ($filter: ProjectFilter) {
+      projects(filter: $filter, first: 25) { nodes { id name url } }
+    }`,
+    { filter: { name: { eqIgnoreCase: query } } },
+  );
+  const exact = found.projects.nodes.filter(
+    (project) => project.name.toLowerCase() === query.toLowerCase(),
+  );
+  const project = exact.length === 1 ? exact[0] : found.projects.nodes.length === 1 ? found.projects.nodes[0] : null;
+  if (!project) {
+    const names = found.projects.nodes.map((item) => item.name).join(", ");
+    throw new Error(names ? `Ambiguous or missing project "${query}": ${names}` : `Linear project not found: "${query}"`);
+  }
+  const meta = await gql<{
+    project: {
+      id: string;
+      name: string;
+      url: string;
+      projectMilestones: { nodes: { id: string; name: string; description: string | null; sortOrder: number }[] };
+    } | null;
+  }>(
+    `query ($id: String!) {
+      project(id: $id) {
+        id name url
+        projectMilestones(first: 50) { nodes { id name description sortOrder } }
+      }
+    }`,
+    { id: project.id },
+  );
+  if (!meta.project) throw new Error(`Linear project disappeared: ${project.id}`);
+
+  type IssueNode = {
+    identifier: string;
+    labels: { nodes: { name: string }[] };
+    state: { name: string } | null;
+    projectMilestone: { id: string } | null;
+    inverseRelations: {
+      nodes: { id?: string; type: string; issue: { identifier: string; state: { name: string } | null } }[];
+    };
+  };
+  const issueNodes: IssueNode[] = [];
+  let after: string | null = null;
+  for (;;) {
+    const page = await gql<{
+      issues: { nodes: IssueNode[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } };
+    }>(
+      `query ($filter: IssueFilter, $after: String) {
+        issues(filter: $filter, first: 100, after: $after) {
+          nodes {
+            identifier
+            labels { nodes { name } }
+            state { name }
+            projectMilestone { id }
+            inverseRelations { nodes { id type issue { identifier state { name } } } }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      { filter: { project: { id: { eq: project.id } } }, after },
+    );
+    issueNodes.push(...page.issues.nodes);
+    if (!page.issues.pageInfo.hasNextPage) break;
+    after = page.issues.pageInfo.endCursor;
+  }
+
+  return {
+    projectId: meta.project.id,
+    projectName: meta.project.name,
+    projectUrl: meta.project.url,
+    milestones: meta.project.projectMilestones.nodes.map((milestone) => ({
+      id: milestone.id,
+      name: milestone.name,
+      description: milestone.description,
+      sortOrder: milestone.sortOrder,
+    })),
+    issues: issueNodes.map((issue) => ({
+      identifier: issue.identifier,
+      stateName: issue.state?.name ?? "",
+      labels: issue.labels.nodes.map((label) => label.name),
+      milestoneId: issue.projectMilestone?.id ?? null,
+      blockedBy: blockersFrom(issue.inverseRelations?.nodes),
+    })),
+  };
+}
+
+function blockersFrom(
+  nodes: { id?: string; type: string; issue: { identifier: string; state: { name: string } | null } }[] | undefined,
+): IssueBlocker[] {
+  const out: IssueBlocker[] = [];
+  const seen = new Set<string>();
+  for (const node of nodes ?? []) {
+    if (node.type.trim().toLowerCase() !== "blocks") continue;
+    const identifier = node.issue?.identifier?.trim();
+    if (!identifier) continue;
+    const key = identifier.toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      identifier,
+      stateName: node.issue.state?.name ?? "",
+      relationId: node.id?.trim() || undefined,
+    });
+  }
+  return out;
 }
 
 export function githubIssuesTracker(opts: {
@@ -181,7 +301,7 @@ export function githubIssuesTracker(opts: {
       blockedBy: blocked.map((identifier) => ({ identifier, stateName: "unknown" })),
       comments: [...comments]
         .sort((a, b) => Date.parse(a.created_at ?? "") - Date.parse(b.created_at ?? ""))
-        .map((c) => c.body),
+        .map((c) => ({ body: c.body, createdAt: c.created_at })),
     };
   }
 
@@ -236,6 +356,9 @@ export function githubIssuesTracker(opts: {
       await api(`/repos/${opts.repo}/issues/${number}/labels/${encodeURIComponent(label)}`, {
         method: "DELETE",
       });
+    },
+    async projectSnapshot() {
+      return null;
     },
   };
 }

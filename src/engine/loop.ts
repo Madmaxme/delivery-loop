@@ -6,12 +6,17 @@ import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../ada
 import { agentHome, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
 import { isGithubActionsRunActive } from "./github-run-status.js";
 import {
+  compileDeliveryProgramFromLinear,
+  currentProgramSlice,
   evaluateGraphReady,
+  formatDeliveryProgramContext,
+  formatGroundingCommentSample,
   latestDeliveryLeaseStamp,
   pageBudgetRemainingMs,
   shouldStealDeliveryLease,
   shouldStopForPageReserve,
   DELIVERY_LEASE_TTL_MS,
+  type CompileProgramResult,
   type DeliveryLeaseStamp,
 } from "./linear-harness-policy.js";
 import { invariantExists, parkStateForVerdict, parseVerdict, parseWorkOrder, type Verdict } from "./packet.js";
@@ -26,8 +31,10 @@ export type LoopDeps = {
   invariantsMarkdown?: string;
   cwd?: string;
   maxQualityPolls?: number;
-  /** Linear project name. Limits intake. GitHub Issues ignores it. */
+  /** Linear project name. Limits intake and loads the sibling snapshot. */
   project?: string | null;
+  /** Compiled once per sweep. Ground and build prompts include it. */
+  program?: CompileProgramResult | null;
   /** Override for tests. Default asks `gh` whether the stamped run is still live. */
   githubRunActive?: (runId: string | null) => boolean | null;
 };
@@ -113,14 +120,14 @@ const GENERIC_GROUND = [
 function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
   const cwd = deps.cwd ?? process.cwd();
   const docs = listedDocs(cwd, deps.pack.prompts?.ground);
-  const comments = ticket.comments.slice(-8).join("\n---\n").slice(0, 8000);
   return [
     ...(docs.length > 0 ? docs : [GENERIC_GROUND]),
+    programBlock(ticket, deps, "ground"),
     `Ticket ${ticket.identifier}: ${ticket.title}`,
     ticket.body,
     "",
     "## Existing comments",
-    comments || "(none)",
+    formatGroundingCommentSample(ticket.comments),
     "",
     "This send is for this issue only. Do not edit files. Do not call the tracker.",
     "Follow the documents above. A verdict is a VERDICT: or **Verdict:** line.",
@@ -137,10 +144,32 @@ function buildPrompt(ticket: Ticket, orderText: string, deps: LoopDeps): string 
   const docs = listedDocs(cwd, deps.pack.prompts?.build);
   return [
     ...docs,
+    programBlock(ticket, deps, "build"),
     `Implement only this work order for ${ticket.identifier}.`,
     orderText,
     "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
   ].join("\n\n");
+}
+
+function commentBodies(ticket: Ticket): string[] {
+  return ticket.comments.map((comment) => comment.body);
+}
+
+function programBlock(ticket: Ticket, deps: LoopDeps, phase: "ground" | "build"): string {
+  const compiled = deps.program;
+  if (!compiled) return "";
+  const slice = currentProgramSlice(compiled.program, compiled.states);
+  const snapshot = formatDeliveryProgramContext({
+    program: compiled.program,
+    states: compiled.states,
+    cursorSliceId: slice?.id ?? null,
+    currentIssueId: ticket.identifier,
+  });
+  const conduct =
+    phase === "ground"
+      ? "When this snapshot is present, include **Program graph:** in the audit (cursor slice, plus the blockers and siblings you relied on). Re-ground unless the latest audit already has **Program graph:** and the ids and states match."
+      : "Extend primitives already delivered on other slices. Do not implement sibling tickets.";
+  return `${snapshot}\n\n${conduct}`;
 }
 
 function githubSlug(url: string): string {
@@ -226,7 +255,7 @@ export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketR
     };
   }
 
-  const lease = latestDeliveryLeaseStamp(ticket.comments);
+  const lease = latestDeliveryLeaseStamp(commentBodies(ticket));
   if (leaseIsHeld(lease, now, deps)) {
     return { identifier: ticket.identifier, outcome: "skipped-lease", detail: "lease held" };
   }
@@ -271,7 +300,7 @@ async function runHeldTicket(
       const parked = parkStateForVerdict({
         verdict,
         text: ground.text,
-        priorComments: ticket.comments,
+        priorComments: commentBodies(ticket),
         devStatus: deps.pack.status.dev,
         trunkCommit:
           verdict === "ALREADY SHIPPED"
@@ -408,10 +437,20 @@ async function runHeldTicket(
   };
 }
 
+async function loadProgram(deps: LoopDeps, projectName?: string | null): Promise<CompileProgramResult | null> {
+  if (deps.program) return deps.program;
+  const name = (projectName ?? deps.project)?.trim();
+  if (!name) return null;
+  const snapshot = await deps.tracker.projectSnapshot(name);
+  if (!snapshot) return null;
+  return compileDeliveryProgramFromLinear(snapshot);
+}
+
 export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
   const tickets = await deps.tracker.listIntake(
     deps.project ? { project: deps.project } : undefined,
   );
+  const programs = new Map<string, CompileProgramResult | null>();
   const results: TicketResult[] = [];
   for (const ticket of tickets) {
     const remaining = pageBudgetRemainingMs({
@@ -422,14 +461,21 @@ export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
       results.push({ identifier: ticket.identifier, outcome: "skipped-page", detail: "page reserve" });
       break;
     }
-    results.push(await runTicket(deps, ticket));
+    const key = (deps.project ?? ticket.projectName ?? "").trim();
+    let program = deps.program ?? null;
+    if (!program && key) {
+      if (!programs.has(key)) programs.set(key, await loadProgram(deps, key));
+      program = programs.get(key) ?? null;
+    }
+    results.push(await runTicket(program ? { ...deps, program } : deps, ticket));
   }
   return results;
 }
 
 export async function deliver(deps: LoopDeps, identifier: string): Promise<TicketResult> {
   const ticket = await deps.tracker.get(identifier);
-  return runTicket(deps, ticket);
+  const program = await loadProgram(deps, deps.project ?? ticket.projectName ?? null);
+  return runTicket(program ? { ...deps, program } : deps, ticket);
 }
 
 export async function ship(deps: LoopDeps, identifier?: string, extraArgs?: string): Promise<void> {

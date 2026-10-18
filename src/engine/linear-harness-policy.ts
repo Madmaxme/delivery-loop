@@ -644,6 +644,52 @@ export function shouldStealShipLease(input: {
   return expired;
 }
 
+export type TimedComment = {
+  body: string;
+  createdAt?: string | null;
+};
+
+function isGroundingGeneration(body: string): boolean {
+  if (/^\s*\[HISTORICAL\]/i.test(body)) return false;
+  return (
+    /<!--\s*GROUNDING_HANDOFF\b/i.test(body) ||
+    /\*\*Codebase audit\b/i.test(body)
+  );
+}
+
+/**
+ * Newest-first sample. Comments older than the latest grounding handoff are
+ * historical: a canceled sweep's work order is not this generation.
+ */
+export function formatGroundingCommentSample(
+  comments: readonly TimedComment[],
+): string {
+  const dated = comments.map((comment, index) => ({
+    body: comment.body,
+    createdAt: comment.createdAt ?? "",
+    index,
+  }));
+  const sorted = [...dated].sort((a, b) => {
+    if (a.createdAt && b.createdAt && a.createdAt !== b.createdAt) {
+      return a.createdAt < b.createdAt ? 1 : -1;
+    }
+    return b.index - a.index;
+  });
+  const floor = sorted.find((comment) => isGroundingGeneration(comment.body))?.createdAt ?? "";
+  const lines = sorted.slice(0, 10).map((comment) => {
+    const historical = Boolean(floor && comment.createdAt && comment.createdAt < floor);
+    const cap = historical ? 220 : 900;
+    const tag = historical ? "HISTORICAL" : "CURRENT";
+    const when = comment.createdAt || "(undated)";
+    const text = comment.body.length > cap ? `${comment.body.slice(0, cap)}…` : comment.body;
+    return `- [${tag}] ${when}\n${text}`;
+  });
+  return [
+    "Comments are newest-first. `[HISTORICAL]` means before the latest grounding handoff. Do not reuse those work orders. Re-read trunk and emit a fresh handoff for this generation.",
+    ...(lines.length ? lines : ["(none)"]),
+  ].join("\n");
+}
+
 /** Last stamp in chronological comment order. A later release supersedes a longer TTL. */
 export function latestDeliveryLeaseStamp(
   commentBodies: readonly string[],
@@ -1242,7 +1288,7 @@ export function formatDeliveryProgramContext(opts: {
     `Project: ${opts.program.projectName ?? opts.program.id}`,
     `Cursor slice: ${opts.cursorSliceId ?? "(none)"}`,
     "This snapshot is **context for every sibling**, including Soon / Shaping / Deployed / held-off. Execute **only this issue**. Do not Todo or implement siblings.",
-    "If a later-stage ticket is already Deployed, extend those primitives — do not fork a parallel money, auth, or ledger path.",
+    "If a later-stage ticket is already delivered, extend those primitives — do not fork a parallel path for the same behavior.",
     "Re-ground when the latest audit lacks **Program graph:** — unchanged description is not a skip.",
     "Linear ticket text is **product intent**, not a closed spec. Engineering owns closed defaults: BUILDABLE the smallest safe change from current code and documented invariants. Write `**Harness packet:**` (one sentence) on the audit. Do not wait for a PM rewrite.",
     "Smallest safe change does not leave other callers of the same primitive on the old behavior. Inventory remaining same-behavior callers (or name a category exclusion with a path). Sweep completes engineering e2e; the only human gate is product using Dev and filing a new ticket. Do not park leftover callers in Recommendations. Do not rely on a second ground after land.",

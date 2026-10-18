@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
+import type { CompileProgramResult } from "./linear-harness-policy.ts";
 import { runTicket, ship, sweep } from "./loop.ts";
 
 const pack: ProjectPack = {
@@ -44,7 +45,7 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
       return [ticket()];
     },
     async get(id) {
-      return ticket({ identifier: id, comments: [...comments] });
+      return ticket({ identifier: id, comments: comments.map((body) => ({ body })) });
     },
     async comment(_id, body) {
       comments.push(body);
@@ -54,6 +55,9 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
     },
     async addLabel() {},
     async removeLabel() {},
+    async projectSnapshot() {
+      return null;
+    },
   };
   const worker: WorkerAdapter = {
     kind: "http",
@@ -122,6 +126,57 @@ describe("loop", () => {
     assert.doesNotMatch(prompt, /money\//);
   });
 
+  it("marks comments before the latest handoff as historical and includes the program", async () => {
+    const env = harness("**Verdict:** NEEDS DIAGNOSIS");
+    const program: CompileProgramResult = {
+      warnings: [],
+      states: { "API-1": "Todo", "API-2": "Dev" },
+      program: {
+        id: "billing",
+        spec: "https://example.test/project",
+        projectName: "Billing",
+        slices: [
+          {
+            id: "stage-1",
+            title: "Stage 1",
+            afkTo: "dev",
+            intake: "auto",
+            park: [],
+            issues: [
+              { id: "API-1", blockedBy: [] },
+              { id: "API-2", blockedBy: ["API-1"] },
+            ],
+          },
+        ],
+      },
+    };
+    env.deps.program = program;
+    let prompt = "";
+    env.deps.worker.start = async (input) => {
+      prompt = input.prompt;
+      return { runId: "run-1" };
+    };
+    await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          { createdAt: "2025-12-01T00:00:00Z", body: "OLD PACKET from a canceled sweep" },
+          {
+            createdAt: "2026-01-01T00:00:00Z",
+            body: "<!-- GROUNDING_HANDOFF\nVERDICT: BUILDABLE\nGROUNDING_HANDOFF -->",
+          },
+          { createdAt: "2026-02-01T00:00:00Z", body: "Please look again." },
+        ],
+      }),
+    );
+    assert.match(prompt, /\[HISTORICAL\] 2025-12-01T00:00:00Z/);
+    assert.match(prompt, /\[CURRENT\] 2026-01-01T00:00:00Z/);
+    assert.match(prompt, /\[CURRENT\] 2026-02-01T00:00:00Z/);
+    assert.match(prompt, /## Delivery program \(full project\)/);
+    assert.match(prompt, /API-2/);
+    assert.match(prompt, /\*\*Program graph:\*\*/);
+  });
+
   it("lands a buildable ticket after quality is green", async () => {
     const env = harness(BUILDABLE);
     const result = await runTicket(env.deps, ticket());
@@ -164,6 +219,40 @@ describe("loop", () => {
     assert.equal(env.state(), "Shaping");
   });
 
+  it("loads each ticket's project into the ground prompt", async () => {
+    const env = harness("**Verdict:** NEEDS DIAGNOSIS");
+    env.deps.tracker.listIntake = async () => [ticket({ projectName: "Billing" })];
+    let saw = "";
+    env.deps.tracker.projectSnapshot = async (name) => {
+      saw = name;
+      return {
+        projectId: "p1",
+        projectName: "Billing",
+        projectUrl: "https://example.test/p",
+        milestones: [{ id: "m1", name: "Stage 1", description: null, sortOrder: 1 }],
+        issues: [
+          {
+            identifier: "API-1",
+            stateName: "Todo",
+            labels: [],
+            milestoneId: "m1",
+            blockedBy: [],
+          },
+        ],
+      };
+    };
+    let prompt = "";
+    env.deps.worker.start = async (input) => {
+      prompt = input.prompt;
+      return { runId: "run-1" };
+    };
+    const results = await sweep(env.deps);
+    assert.equal(results[0]?.outcome, "verdict");
+    assert.equal(saw, "Billing");
+    assert.match(prompt, /## Delivery program \(full project\)/);
+    assert.match(prompt, /API-1 Todo/);
+  });
+
   it("stops one ticket when a connector is missing and continues the sweep", async () => {
     const text = BUILDABLE.replace(
       "**Stop:**",
@@ -192,7 +281,7 @@ describe("loop", () => {
       env.deps,
       ticket({
         comments: [
-          `<!-- DELIVERY_LEASE expires=${future} cursor_run=pending cursor_phase=ground -->`,
+          { body: `<!-- DELIVERY_LEASE expires=${future} cursor_run=pending cursor_phase=ground -->` },
         ],
       }),
     );
@@ -208,7 +297,7 @@ describe("loop", () => {
       env.deps,
       ticket({
         comments: [
-          `<!-- DELIVERY_LEASE expires=${future} gha_run=42 cursor_run=run-9 cursor_phase=ground -->`,
+          { body: `<!-- DELIVERY_LEASE expires=${future} gha_run=42 cursor_run=run-9 cursor_phase=ground -->` },
         ],
       }),
     );

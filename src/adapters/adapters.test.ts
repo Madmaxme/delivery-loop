@@ -119,6 +119,50 @@ describe("adapters", () => {
     const tickets = await linear.listIntake();
     assert.equal(tickets[0]?.identifier, "APP-3");
 
+    const snapshotTracker = linearTracker({
+      apiKey: "k",
+      team: "APP",
+      intakeState: "Todo",
+      fetch: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as { query: string };
+        if (body.query.includes("projects(filter")) {
+          return jsonResponse({ data: { projects: { nodes: [{ id: "p1", name: "Billing", url: "https://linear.app/p1" }] } } });
+        }
+        if (body.query.includes("project(id:")) {
+          return jsonResponse({
+            data: {
+              project: {
+                id: "p1",
+                name: "Billing",
+                url: "https://linear.app/p1",
+                projectMilestones: { nodes: [{ id: "m1", name: "Stage 1", description: null, sortOrder: 1 }] },
+              },
+            },
+          });
+        }
+        return jsonResponse({
+          data: {
+            issues: {
+              nodes: [
+                {
+                  identifier: "APP-3",
+                  labels: { nodes: [] },
+                  state: { name: "Todo" },
+                  projectMilestone: { id: "m1" },
+                  inverseRelations: { nodes: [] },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      },
+    });
+    const snapshot = await snapshotTracker.projectSnapshot("Billing");
+    assert.equal(snapshot?.projectName, "Billing");
+    assert.equal(snapshot?.issues[0]?.identifier, "APP-3");
+    assert.equal(snapshot?.milestones[0]?.name, "Stage 1");
+
     const github = githubIssuesTracker({
       token: "t",
       repo: "acme/api",
