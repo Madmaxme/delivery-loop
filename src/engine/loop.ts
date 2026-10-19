@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { agentHome, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
@@ -107,6 +108,12 @@ function listedDocs(cwd: string, paths: string[] | undefined): string[] {
   return (paths ?? []).map((rel) => readIfPresent(cwd, rel)).filter(Boolean);
 }
 
+/** Package-owned law. Install prompt files come after this and do not replace it. */
+function universalConduct(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  return readFileSync(join(here, "../../conduct/conduct/SKILL.md"), "utf8");
+}
+
 const GENERIC_GROUND = [
   "Check the ticket against the code. Do not edit files. Do not call the tracker.",
   "Reply with one handoff:",
@@ -128,6 +135,7 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
   const cwd = deps.cwd ?? process.cwd();
   const docs = listedDocs(cwd, deps.pack.prompts?.ground);
   return [
+    universalConduct(),
     ...(docs.length > 0 ? docs : [GENERIC_GROUND]),
     programBlock(ticket, deps, "ground"),
     `Ticket ${ticket.identifier}: ${ticket.title}`,
@@ -154,6 +162,7 @@ function buildPrompt(ticket: Ticket, orderText: string, deps: LoopDeps, repos: s
     ? repos.map((repo) => `${repo}: \`${renderBranch(template, ticket.identifier, repo)}\``)
     : [];
   return [
+    universalConduct(),
     ...docs,
     programBlock(ticket, deps, "build"),
     `Implement only this work order for ${ticket.identifier}.`,
