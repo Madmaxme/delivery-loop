@@ -24,6 +24,7 @@ import { githubRepoFromUrl } from "../adapters/types.js";
 import type { ForgeAdapter, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { findConnector } from "../connectors/catalog.js";
 import { deliver, ship, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
+import { shipInvocationDeps } from "./ship-deps.js";
 import { ghaDispatchFields, planDeliveryInvocation } from "../engine/delivery-runtime.js";
 import { defaultStatus, loadPack, type ProjectPack } from "../schema/pack.js";
 
@@ -148,8 +149,12 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     const pack = loadPack(packPath(process.cwd()));
     const issue = argv.find((a) => /^[A-Z][A-Z0-9]*-\d+$/i.test(a));
     const extra = argv.filter((a) => a !== issue).join(" ");
-    ship({ pack, ...adaptersFor(pack), cwd: process.cwd() }, issue?.toUpperCase(), extra).then(() =>
-      console.log("shipped"),
+    ship(shipInvocationDeps(pack, process.cwd()), issue?.toUpperCase(), extra).then(
+      () => console.log("shipped"),
+      (err) => {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      },
     );
     return;
   }
