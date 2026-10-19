@@ -48,6 +48,29 @@ describe("adapters", () => {
       base: "main",
     });
     assert.equal(pr.number, 9);
+    const again = githubForge({
+      token: "t",
+      fetch: async (url, init) => {
+        if (String(url).endsWith("/pulls") && init?.method === "POST") {
+          return jsonResponse({ message: "exists" }, 422);
+        }
+        if (String(url).includes("/pulls?")) {
+          return jsonResponse([
+            { number: 9, html_url: "https://github.com/acme/api/pull/9", head: { sha: "abc", ref: "delivery/api-1" } },
+          ]);
+        }
+        return jsonResponse({});
+      },
+    });
+    const adopted = await again.openPullRequest({
+      repoUrl: "https://github.com/acme/api",
+      title: "API-1",
+      body: "order",
+      head: "delivery/api-1",
+      base: "main",
+    });
+    assert.equal(adopted.number, 9);
+    assert.equal(adopted.headSha, "abc");
     assert.equal(
       await forge.quality({ repoUrl: "https://github.com/acme/api", headSha: "abc", workflow: "quality" }),
       "success",

@@ -7,7 +7,7 @@ import { describe, it } from "node:test";
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
-import { runTicket, ship, sweep } from "./loop.ts";
+import { runTicket, ship, sweep, sweepNeedsAnotherPage } from "./loop.ts";
 
 const pack: ProjectPack = {
   tracker: "github",
@@ -190,6 +190,29 @@ describe("loop", () => {
     assert.equal(builds, 0);
     assert.equal(result.outcome, "landed");
     assert.equal(env.merged(), true);
+  });
+
+  it("waits out a pending quality check and then merges", async () => {
+    const env = harness(BUILDABLE);
+    const seen = ["pending", "success"] as const;
+    let n = 0;
+    env.deps.forge.quality = async () => seen[Math.min(n++, seen.length - 1)];
+    env.deps.maxQualityPolls = 4;
+    env.deps.qualityPollMs = 1;
+    env.deps.sleep = async () => {};
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(n, 2);
+    assert.equal(sweepNeedsAnotherPage([result]), false);
+  });
+
+  it("hands a still-pending quality check to the next page", async () => {
+    const env = harness(BUILDABLE, { quality: "pending" });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "quality-pending");
+    assert.equal(env.comments.some((body) => /still running/.test(body)), true);
+    assert.equal(env.merged(), false);
+    assert.equal(sweepNeedsAnotherPage([result]), true);
   });
 
   it("lands a buildable ticket after quality is green", async () => {

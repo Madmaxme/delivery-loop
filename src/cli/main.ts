@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import {
+  appendFileSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -22,7 +23,7 @@ import {
 import { githubRepoFromUrl } from "../adapters/types.js";
 import type { ForgeAdapter, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { findConnector } from "../connectors/catalog.js";
-import { deliver, ship, sweep } from "../engine/loop.js";
+import { deliver, ship, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
 import { ghaDispatchFields, planDeliveryInvocation } from "../engine/delivery-runtime.js";
 import { defaultStatus, loadPack, type ProjectPack } from "../schema/pack.js";
 
@@ -194,6 +195,10 @@ function dispatchOrRun(mode: string, argv: string[]): void {
   if (mode === "sweep") {
     sweep(deps).then((results) => {
       console.log(JSON.stringify(results, null, 2));
+      const output = process.env.GITHUB_OUTPUT;
+      if (output && sweepNeedsAnotherPage(results)) {
+        appendFileSync(output, "chain=true\n");
+      }
     });
     return;
   }

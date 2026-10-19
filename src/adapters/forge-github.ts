@@ -29,16 +29,41 @@ export function githubForge(opts: {
   return {
     async openPullRequest(input): Promise<PullRequest> {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
-      const response = await api(`/repos/${owner}/${repo}/pulls`, {
-        method: "POST",
-        body: JSON.stringify({
-          title: input.title,
-          body: input.body,
-          head: input.head,
-          base: input.base,
-        }),
+      const body = JSON.stringify({
+        title: input.title,
+        body: input.body,
+        head: input.head,
+        base: input.base,
       });
-      const json = (await response.json()) as {
+      const created = await fetchImpl(`https://api.github.com/repos/${owner}/${repo}/pulls`, {
+        method: "POST",
+        headers,
+        body,
+      });
+      if (created.status === 422) {
+        const listed = await api(
+          `/repos/${owner}/${repo}/pulls?head=${encodeURIComponent(`${owner}:${input.head}`)}&state=open`,
+        );
+        const rows = (await listed.json()) as {
+          number: number;
+          html_url: string;
+          head: { sha: string; ref: string };
+        }[];
+        const existing = rows[0];
+        if (!existing) {
+          throw new Error(`GitHub pulls failed: 422 ${await created.text()}`);
+        }
+        return {
+          number: existing.number,
+          url: existing.html_url,
+          headSha: existing.head.sha,
+          branch: existing.head.ref,
+        };
+      }
+      if (!created.ok) {
+        throw new Error(`GitHub pulls failed: ${created.status} ${await created.text()}`);
+      }
+      const json = (await created.json()) as {
         number: number;
         html_url: string;
         head: { sha: string; ref: string };

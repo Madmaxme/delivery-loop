@@ -40,6 +40,9 @@ export type LoopDeps = {
   githubRunActive?: (runId: string | null) => boolean | null;
   /** Override for tests. Default is `git ls-remote` for refs/heads/<branch>. */
   lookupHead?: (repoUrl: string, branch: string) => string | null;
+  /** Override for tests. Default waits 30s between quality checks. */
+  sleep?: (ms: number) => Promise<void>;
+  qualityPollMs?: number;
 };
 
 export type TicketResult = {
@@ -53,6 +56,7 @@ export type TicketResult = {
     | "invalid-packet"
     | "landed"
     | "quality-failed"
+    | "quality-pending"
     | "worker-failed";
   detail: string;
 };
@@ -436,21 +440,24 @@ async function runHeldTicket(
       headSha: landing.sha || pr.headSha,
     });
   }
-  const polls = deps.maxQualityPolls ?? 5;
-  for (const pr of opened) {
-    let quality: "success" | "failure" | "pending" = "pending";
-    for (let i = 0; i < polls; i++) {
-      quality = await deps.forge.quality({
-        repoUrl: pr.repo.url,
-        headSha: pr.headSha,
-        workflow: deps.pack.qualityWorkflow,
-      });
-      if (quality !== "pending") break;
-    }
-    if (quality !== "success") {
-      await deps.tracker.comment(ticket.identifier, `Quality ${quality} on ${pr.url}`);
-      return { identifier: ticket.identifier, outcome: "quality-failed", detail: pr.url };
-    }
+  const states = await Promise.all(
+    opened.map(async (pr) => ({
+      pr,
+      quality: await waitForQuality(deps, pr),
+    })),
+  );
+  const pending = states.find((row) => row.quality === "pending");
+  if (pending) {
+    await deps.tracker.comment(
+      ticket.identifier,
+      `Quality still running on ${pending.pr.url}. The next page merges it when the check is green.`,
+    );
+    return { identifier: ticket.identifier, outcome: "quality-pending", detail: pending.pr.url };
+  }
+  const failed = states.find((row) => row.quality !== "success");
+  if (failed) {
+    await deps.tracker.comment(ticket.identifier, `Quality ${failed.quality} on ${failed.pr.url}`);
+    return { identifier: ticket.identifier, outcome: "quality-failed", detail: failed.pr.url };
   }
   for (const pr of opened) {
     await deps.forge.squashMerge({ repoUrl: pr.repo.url, number: pr.number });
@@ -471,6 +478,38 @@ async function runHeldTicket(
     outcome: "landed",
     detail: opened.map((pr) => pr.url).join(" "),
   };
+}
+
+const QUALITY_POLL_MS = 30_000;
+
+async function waitForQuality(
+  deps: LoopDeps,
+  pr: { repo: RepoSpec; url: string; headSha: string },
+): Promise<"success" | "failure" | "pending"> {
+  const polls = deps.maxQualityPolls ?? 60;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  for (let i = 0; i < polls; i++) {
+    const quality = await deps.forge.quality({
+      repoUrl: pr.repo.url,
+      headSha: pr.headSha,
+      workflow: deps.pack.qualityWorkflow,
+    });
+    if (quality !== "pending") return quality;
+    const remaining = pageBudgetRemainingMs({
+      nowMs: deps.nowMs ?? Date.now(),
+      startedAtMs: deps.pageStartedAtMs ?? null,
+    });
+    if (shouldStopForPageReserve({ remainingMs: remaining })) return "pending";
+    if (i === polls - 1) return "pending";
+    await sleep(deps.qualityPollMs ?? QUALITY_POLL_MS);
+  }
+  return "pending";
+}
+
+export function sweepNeedsAnotherPage(results: TicketResult[]): boolean {
+  return results.some(
+    (result) => result.outcome === "quality-pending" || result.outcome === "skipped-page",
+  );
 }
 
 async function loadProgram(deps: LoopDeps, projectName?: string | null): Promise<CompileProgramResult | null> {
