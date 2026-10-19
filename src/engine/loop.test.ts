@@ -124,6 +124,29 @@ describe("loop", () => {
     assert.match(prompt, /INSTALL GROUND DOC/);
     assert.doesNotMatch(prompt, /INSTALL BUILD DOC/);
     assert.doesNotMatch(prompt, /money\//);
+    assert.match(prompt, /The install owns the concrete proof/);
+    assert.ok(
+      prompt.indexOf("The install owns the concrete proof") < prompt.indexOf("INSTALL GROUND DOC"),
+    );
+  });
+
+  it("puts universal conduct ahead of the install build doc", async () => {
+    const root = mkdtempSync(join(tmpdir(), "delivery-loop-"));
+    writeFileSync(join(root, "build.md"), "INSTALL BUILD DOC");
+    const env = harness(BUILDABLE);
+    env.deps.cwd = root;
+    env.deps.pack = { ...pack, prompts: { build: ["build.md"] } };
+    const prompts: string[] = [];
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    const build = prompts.find((text) => text.includes("INSTALL BUILD DOC"));
+    assert.ok(build);
+    assert.match(build, /The install owns the concrete proof/);
+    assert.ok(build.indexOf("The install owns the concrete proof") < build.indexOf("INSTALL BUILD DOC"));
   });
 
   it("marks comments before the latest handoff as historical and includes the program", async () => {

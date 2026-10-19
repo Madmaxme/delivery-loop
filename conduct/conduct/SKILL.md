@@ -1,15 +1,17 @@
 ---
 name: conduct
-description: Code conduct for every ticket. One code path, evidence before building, a work order that cites an existing invariant, and no one-off patch.
+description: Universal code conduct for every install. One code path, evidence before building, a work order that cites an existing invariant, and no one-off patch. The install owns type safety and named sources of truth.
 ---
 
 # Conduct
 
-Apply this on every ticket.
+The runner prepends this file to every ground and build prompt. An install does not replace it.
 
 - One code path. Extend the owner of a behavior. Do not add a second implementation that can disagree with it.
 - Evidence before building. A ticket that names a live record or a crash needs that evidence in the audit.
-- The work order cites one invariant that already exists in the invariants file. The change keeps that rule true.
-- Tests named in the work order must pass before merge.
+- The work order cites one invariant that already exists in the install's invariants file. The change keeps that rule true.
+- Tests named in the work order must pass before merge. The install's quality check must be green.
 - A one-off patch that leaves the wrong rule in place is unfinished. Change the owner of the rule.
 - Do not invent a product question. Stop with NEEDS DIAGNOSIS, NEEDS RESCOPE, WRONG DIAGNOSIS, or ALREADY SHIPPED when the ticket is not BUILDABLE.
+
+The install owns the concrete proof: end-to-end type safety, which file is the source of truth, when a module should split, and making a shared primitive safe for every caller before the feature uses it. Those rules live in the install's invariants and prompt files.
