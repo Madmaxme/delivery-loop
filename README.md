@@ -27,7 +27,9 @@ A new tracker or worker is a file in `src/adapters` plus a test. Trackers implem
 
 An install keeps its repos, trunk branches, status names, and promote commands in its own `delivery-loop.yaml`. Those facts do not belong in this repository.
 
-`prompts.ground` and `prompts.build` are workspace-relative files the runner puts in the worker prompt. `invariantHeadings` lists heading files that count as invariant ids beside `invariantsFile`. A heading titled `Commission resolution` in a file with `prefix: billing` is the id `billing/commission-resolution`.
+The runner prepends `conduct/conduct/SKILL.md` to every ground and build prompt. That file is the universal law: one code path, evidence before building, a work order that cites an invariant which already exists, and a green quality check. An install's prompt files and invariants file hold the concrete proof: type safety, which document is the source of truth, when to split a module, and making a shared primitive safe before its callers.
+
+`prompts.ground` and `prompts.build` are workspace-relative files the runner puts in the worker prompt after that law. `invariantHeadings` lists heading files that count as invariant ids beside `invariantsFile`. A heading titled `Commission resolution` in a file with `prefix: billing` is the id `billing/commission-resolution`.
 
 ```yaml
 prompts:
