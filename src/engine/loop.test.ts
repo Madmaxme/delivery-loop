@@ -125,6 +125,7 @@ describe("loop", () => {
     assert.match(prompt, /INSTALL GROUND DOC/);
     assert.doesNotMatch(prompt, /INSTALL BUILD DOC/);
     assert.doesNotMatch(prompt, /money\//);
+    assert.match(prompt, /every caller uses that owner/);
     assert.match(prompt, /The install owns the concrete proof/);
     assert.ok(
       prompt.indexOf("The install owns the concrete proof") < prompt.indexOf("INSTALL GROUND DOC"),

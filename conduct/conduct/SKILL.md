@@ -8,6 +8,9 @@ description: Universal code conduct for every install. One code path, evidence b
 The runner prepends this file to every ground and build prompt. An install does not replace it.
 
 - One code path. Extend the owner of a behavior. Do not add a second implementation that can disagree with it.
+- If a behavior already has an owner, every caller uses that owner. Change that owner first. Repeating the rule in a screen, a default argument, or another constant is unfinished. The subject does not matter.
+- A measure the owner does not claim stays separate. A change that belongs in one place does not get a new shared owner.
+- When extending an owner, include the remaining callers that still do the old behavior, or name a category exclusion.
 - Evidence before building. A ticket that names a live record or a crash needs that evidence in the audit.
 - The work order cites one invariant that already exists in the install's invariants file. The change keeps that rule true.
 - Tests named in the work order must pass before merge. The install's quality check must be green.
