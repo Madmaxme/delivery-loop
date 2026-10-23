@@ -124,6 +124,39 @@ export function parseOutsideGrant(text: string): "none" | "open" | null {
   return null;
 }
 
+export type PriorRequest =
+  | { kind: "none" }
+  | { kind: "kept" }
+  | { kind: "replaced"; identifier: string }
+  | { kind: "ask" };
+
+const PRIOR_REQUEST_RE =
+  /\*\*Prior request:\*\*\s*(none|kept|replaced|ask)\b(?:\s+([A-Za-z][A-Za-z0-9]*-\d+))?/i;
+
+/** The fresh handoff line. A missing line is null. Ticket ids are not project-specific. */
+export function parsePriorRequest(text: string): PriorRequest | null {
+  const match = text.match(PRIOR_REQUEST_RE);
+  if (!match?.[1]) return null;
+  const kind = match[1].toLowerCase();
+  const identifier = match[2]?.toUpperCase() ?? "";
+  if (kind === "replaced") return { kind: "replaced", identifier };
+  if (kind === "none" || kind === "kept" || kind === "ask") return { kind };
+  return null;
+}
+
+/**
+ * Why a BUILDABLE handoff must not build.
+ * `ask`, a missing line, and `replaced` without a ticket id stay in intake.
+ * The verdict stays BUILDABLE. Null means the line allows a build.
+ */
+export function priorRequestBlocksBuild(text: string): "missing" | "ask" | "replaced" | null {
+  const parsed = parsePriorRequest(text);
+  if (!parsed) return "missing";
+  if (parsed.kind === "ask") return "ask";
+  if (parsed.kind === "replaced" && !parsed.identifier) return "replaced";
+  return null;
+}
+
 /** Status to move to after a non-BUILDABLE verdict. Null stays in intake. */
 export function parkStateForVerdict(input: {
   verdict: Verdict;

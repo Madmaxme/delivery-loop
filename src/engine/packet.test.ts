@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { invariantExists, parseVerdict, parseWorkOrder } from "./packet.ts";
+import {
+  invariantExists,
+  parsePriorRequest,
+  parseVerdict,
+  parseWorkOrder,
+  priorRequestBlocksBuild,
+} from "./packet.ts";
 
 const PACKET = `
 **Verdict:** BUILDABLE
@@ -18,6 +24,25 @@ const PACKET = `
 **Stop:** The same handler is the only charge path.
 BUILD_PACKET -->
 `;
+
+describe("prior request", () => {
+  it("allows none, kept, and replaced with any ticket id", () => {
+    assert.deepEqual(parsePriorRequest("**Prior request:** none — cleanup"), { kind: "none" });
+    assert.deepEqual(parsePriorRequest("**Prior request:** kept"), { kind: "kept" });
+    assert.deepEqual(parsePriorRequest("**Prior request:** replaced QUI-100 — undo"), {
+      kind: "replaced",
+      identifier: "QUI-100",
+    });
+    assert.equal(priorRequestBlocksBuild("**Prior request:** none"), null);
+    assert.equal(priorRequestBlocksBuild("**Prior request:** replaced API-9"), null);
+  });
+
+  it("blocks ask, a missing line, and replaced without an id", () => {
+    assert.equal(priorRequestBlocksBuild("**Prior request:** ask — keep the rule"), "ask");
+    assert.equal(priorRequestBlocksBuild("**Prior request:** replaced — no id"), "replaced");
+    assert.equal(priorRequestBlocksBuild("**Verdict:** BUILDABLE"), "missing");
+  });
+});
 
 describe("work order", () => {
   it("parses a buildable packet", () => {

@@ -91,6 +91,7 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
 
 const BUILDABLE = `
 **Verdict:** BUILDABLE
+**Prior request:** none
 **Outside grant:** none
 <!-- BUILD_PACKET
 **Repos:** \`api\`
@@ -126,6 +127,7 @@ describe("loop", () => {
     assert.doesNotMatch(prompt, /INSTALL BUILD DOC/);
     assert.doesNotMatch(prompt, /money\//);
     assert.match(prompt, /every caller uses that owner/);
+    assert.match(prompt, /Prior request/);
     assert.match(prompt, /The install owns the concrete proof/);
     assert.ok(
       prompt.indexOf("The install owns the concrete proof") < prompt.indexOf("INSTALL GROUND DOC"),
@@ -247,6 +249,40 @@ describe("loop", () => {
     assert.equal(result.outcome, "landed");
     assert.equal(env.merged(), true);
     assert.equal(env.state(), "Waiting");
+  });
+
+  it("stays in intake when a buildable handoff says ask", async () => {
+    const env = harness(BUILDABLE.replace("**Prior request:** none", "**Prior request:** ask"));
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "invalid-packet");
+    assert.equal(result.detail, "prior-request-ask");
+    assert.equal(env.merged(), false);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("stays in intake when replaced names no ticket", async () => {
+    const env = harness(BUILDABLE.replace("**Prior request:** none", "**Prior request:** replaced"));
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "invalid-packet");
+    assert.equal(result.detail, "prior-request-replaced");
+    assert.equal(env.merged(), false);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("lands when replaced names a ticket", async () => {
+    const env = harness(BUILDABLE.replace("**Prior request:** none", "**Prior request:** replaced QUI-100"));
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+  });
+
+  it("stays in intake when a buildable handoff omits the prior request line", async () => {
+    const env = harness(BUILDABLE.replace("**Prior request:** none\n", ""));
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "invalid-packet");
+    assert.equal(result.detail, "prior-request-missing");
+    assert.equal(env.merged(), false);
+    assert.equal(env.state(), "Todo");
   });
 
   it("stays in intake when a buildable handoff omits the outside grant line", async () => {
