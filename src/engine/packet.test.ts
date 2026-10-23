@@ -29,9 +29,9 @@ describe("prior request", () => {
   it("allows none, kept, and replaced with any ticket id", () => {
     assert.deepEqual(parsePriorRequest("**Prior request:** none — cleanup"), { kind: "none" });
     assert.deepEqual(parsePriorRequest("**Prior request:** kept"), { kind: "kept" });
-    assert.deepEqual(parsePriorRequest("**Prior request:** replaced QUI-100 — undo"), {
+    assert.deepEqual(parsePriorRequest("**Prior request:** replaced ACME-100 — undo"), {
       kind: "replaced",
-      identifier: "QUI-100",
+      identifier: "ACME-100",
     });
     assert.equal(priorRequestBlocksBuild("**Prior request:** none"), null);
     assert.equal(priorRequestBlocksBuild("**Prior request:** replaced API-9"), null);
