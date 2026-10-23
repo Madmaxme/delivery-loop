@@ -113,23 +113,38 @@ export function parseWorkOrder(text: string): WorkOrder | null {
   };
 }
 
+/**
+ * `none` means the done-state is code this repo can land.
+ * `open` means the done-state is something this repo cannot obtain.
+ * A missing line is null. The runner does not treat that as dev-done.
+ */
+export function parseOutsideGrant(text: string): "none" | "open" | null {
+  const kind = text.match(/\*\*Outside grant:\*\*\s*(none|open)\b/i)?.[1]?.toLowerCase();
+  if (kind === "none" || kind === "open") return kind;
+  return null;
+}
+
 /** Status to move to after a non-BUILDABLE verdict. Null stays in intake. */
 export function parkStateForVerdict(input: {
   verdict: Verdict;
   text: string;
   priorComments: readonly string[];
   devStatus: string;
+  /** Status that does not clear blockers. Defaults to Shaping. */
+  holdStatus?: string;
   /** True when this ticket's commits are already on the named trunks. */
   trunkCommit?: boolean | null;
 }): string | null {
+  const hold = input.holdStatus?.trim() || "Shaping";
   if (input.verdict === "WRONG DIAGNOSIS") return "Canceled";
   if (input.verdict === "NEEDS RESCOPE") {
     const cited =
       /\*\*Harness packet:\*\*/i.test(input.text) ||
       input.priorComments.some((comment) => /\*\*Harness packet:\*\*/i.test(comment));
-    return cited ? "Shaping" : null;
+    return cited ? hold : null;
   }
   if (input.verdict === "ALREADY SHIPPED") {
+    if (parseOutsideGrant(input.text) === "open") return hold;
     const repos = words(field(input.text, "Repos"));
     if (repos.length === 0) return "Canceled";
     if (input.trunkCommit === true) return input.devStatus;

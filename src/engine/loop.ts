@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
-import { agentHome, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
+import { agentHome, holdStatus, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
 import { isGithubActionsRunActive } from "./github-run-status.js";
 import {
   compileDeliveryProgramFromLinear,
@@ -21,7 +21,14 @@ import {
   type DeliveryLeaseStamp,
 } from "./linear-harness-policy.js";
 import { confirmLandBranches, lookupRemoteHead, renderBranch } from "./land-branches.js";
-import { invariantExists, parkStateForVerdict, parseVerdict, parseWorkOrder, type Verdict } from "./packet.js";
+import {
+  invariantExists,
+  parkStateForVerdict,
+  parseOutsideGrant,
+  parseVerdict,
+  parseWorkOrder,
+  type Verdict,
+} from "./packet.js";
 
 export type LoopDeps = {
   pack: ProjectPack;
@@ -149,6 +156,10 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "When the verdict is BUILDABLE, put the work order under BUILD_PACKET: inside the handoff.",
     "The invariant id is a heading in the invariants file, or `prefix/slug` from a heading file the install lists.",
     "One **Decision:** sentence that cites that id. **Symbols:** `repo/path#symbol`. **Repos:** in backticks.",
+    "Every BUILDABLE handoff includes **Outside grant:** none | open.",
+    "none means the done-state is code this repository can land.",
+    "open means the done-state is a vendor approval, an account only a person can create, or an engine this repository does not own. Build the code this repository owns. The runner will not mark that ticket dev-done, so anything blocked by it stays blocked.",
+    "A missing line stays in intake. Reading a vendor's documentation is not the grant.",
     `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
     `Repos: ${deps.pack.repos.map((r) => r.name).join(", ")}`,
   ].join("\n\n");
@@ -325,6 +336,7 @@ async function runHeldTicket(
         text: ground.text,
         priorComments: commentBodies(ticket),
         devStatus: deps.pack.status.dev,
+        holdStatus: holdStatus(deps.pack),
         trunkCommit:
           verdict === "ALREADY SHIPPED"
             ? trunkHasTicketCommit(deps, ticket.identifier, ground.text)
@@ -337,6 +349,15 @@ async function runHeldTicket(
       outcome: "verdict",
       detail: verdict ?? "missing verdict",
     };
+  }
+
+  const grant = parseOutsideGrant(ground.text);
+  if (!grant) {
+    await deps.tracker.comment(
+      ticket.identifier,
+      "BUILDABLE requires **Outside grant:** none | open. The ticket stays in intake.",
+    );
+    return { identifier: ticket.identifier, outcome: "invalid-packet", detail: "outside-grant" };
   }
 
   const order = parseWorkOrder(ground.text);
@@ -481,7 +502,10 @@ async function runHeldTicket(
       };
     }
   }
-  await deps.tracker.setState(ticket.identifier, deps.pack.status.dev);
+  await deps.tracker.setState(
+    ticket.identifier,
+    grant === "open" ? holdStatus(deps.pack) : deps.pack.status.dev,
+  );
   return {
     identifier: ticket.identifier,
     outcome: "landed",
