@@ -91,6 +91,7 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
 
 const BUILDABLE = `
 **Verdict:** BUILDABLE
+**Outside grant:** none
 <!-- BUILD_PACKET
 **Repos:** \`api\`
 **Allowlist:** \`api/src/pay.ts\`
@@ -236,6 +237,33 @@ describe("loop", () => {
     assert.equal(env.comments.some((body) => /still running/.test(body)), true);
     assert.equal(env.merged(), false);
     assert.equal(sweepNeedsAnotherPage([result]), true);
+  });
+
+  it("lands owned code and holds the ticket when the grant is still outside the repo", async () => {
+    const env = harness(BUILDABLE.replace("**Outside grant:** none", "**Outside grant:** open"));
+    env.deps.pack = { ...pack, status: { ...pack.status, hold: "Waiting" } };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.merged(), true);
+    assert.equal(env.state(), "Waiting");
+  });
+
+  it("stays in intake when a buildable handoff omits the outside grant line", async () => {
+    const env = harness(BUILDABLE.replace("**Outside grant:** none\n", ""));
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "invalid-packet");
+    assert.equal(result.detail, "outside-grant");
+    assert.equal(env.merged(), false);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("holds an already-shipped ticket when the grant is still open", async () => {
+    const env = harness(
+      "**Verdict:** ALREADY SHIPPED\n**Repos:** `api`\n**Outside grant:** open\n",
+    );
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "verdict");
+    assert.equal(env.state(), "Shaping");
   });
 
   it("lands a buildable ticket after quality is green", async () => {
