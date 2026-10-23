@@ -7,7 +7,7 @@ import { describe, it } from "node:test";
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
-import { runTicket, ship, sweep, sweepNeedsAnotherPage } from "./loop.ts";
+import { repoCheckoutDir, runTicket, ship, sweep, sweepNeedsAnotherPage } from "./loop.ts";
 
 const pack: ProjectPack = {
   tracker: "github",
@@ -105,6 +105,14 @@ BUILD_PACKET -->
 `;
 
 describe("loop", () => {
+  it("uses the checkout root for the agent repo and a subdirectory for the others", () => {
+    const home = { name: "workspace", url: "https://github.com/acme/workspace", trunk: "main" };
+    const child = { name: "api", url: "https://github.com/acme/api", trunk: "main" };
+    const board = { ...pack, agent: { url: home.url, trunk: "main" }, repos: [home, child] };
+    assert.equal(repoCheckoutDir("/work", home, board), "/work");
+    assert.equal(repoCheckoutDir("/work", child, board), join("/work", "api"));
+  });
+
   it("sends the install's prompt files and does not name a project's prefixes", async () => {
     const root = mkdtempSync(join(tmpdir(), "delivery-loop-"));
     writeFileSync(join(root, "ground.md"), "INSTALL GROUND DOC");
@@ -270,7 +278,7 @@ describe("loop", () => {
   });
 
   it("lands when replaced names a ticket", async () => {
-    const env = harness(BUILDABLE.replace("**Prior request:** none", "**Prior request:** replaced QUI-100"));
+    const env = harness(BUILDABLE.replace("**Prior request:** none", "**Prior request:** replaced ACME-100"));
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
     assert.equal(env.state(), "Dev");
@@ -300,7 +308,7 @@ describe("loop", () => {
     );
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "verdict");
-    assert.equal(env.state(), "Shaping");
+    assert.equal(env.state(), "Hold");
   });
 
   it("lands a buildable ticket after quality is green", async () => {
@@ -342,7 +350,7 @@ describe("loop", () => {
     const env = harness("**Verdict:** NEEDS RESCOPE\n\n**Harness packet:** no safe default remains.");
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "verdict");
-    assert.equal(env.state(), "Shaping");
+    assert.equal(env.state(), "Hold");
   });
 
   it("loads each ticket's project into the ground prompt", async () => {
@@ -377,6 +385,8 @@ describe("loop", () => {
     assert.equal(saw, "Billing");
     assert.match(prompt, /## Delivery program \(full project\)/);
     assert.match(prompt, /API-1 Todo/);
+    assert.match(prompt, /Hold \/ Dev/);
+    assert.doesNotMatch(prompt, /Shaping|Soon|qws-workspace|QuickWash/);
   });
 
   it("stops one ticket when a connector is missing and continues the sweep", async () => {

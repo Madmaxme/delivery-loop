@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 
 import { holdStatus, unblockingStates, type ProjectPack } from "../schema/pack.ts";
 import {
+  parksFromMilestoneCopy,
   evaluateGraphReady,
   formatGroundingCommentSample,
   interpretQualityActions,
@@ -14,6 +15,22 @@ import {
 } from "./linear-harness-policy.ts";
 
 describe("ported policy", () => {
+  it("parks a milestone only when the install named that rule", () => {
+    assert.deepEqual(parksFromMilestoneCopy("Stage 5 — CRM Depth (Later)", ""), []);
+    assert.deepEqual(
+      parksFromMilestoneCopy("Stage 5 — CRM Depth (Later)", "", [
+        { match: "later", kind: "later", where: "name" },
+      ]),
+      [{ kind: "later", before: "intake" }],
+    );
+    assert.deepEqual(
+      parksFromMilestoneCopy("Crew", "design partner trial", [
+        { match: "design-partner", kind: "design-partner", where: "text" },
+      ]),
+      [{ kind: "design-partner", before: "intake" }],
+    );
+  });
+
   it("keeps Todo as the only intake state", () => {
     assert.equal(isSweepIntakeState("Todo"), true);
     assert.equal(isSweepIntakeState("In Progress"), false);

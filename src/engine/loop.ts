@@ -197,18 +197,32 @@ function commentBodies(ticket: Ticket): string[] {
 function programBlock(ticket: Ticket, deps: LoopDeps, phase: "ground" | "build"): string {
   const compiled = deps.program;
   if (!compiled) return "";
-  const slice = currentProgramSlice(compiled.program, compiled.states);
+  const board = {
+    unblocking: unblockingStates(deps.pack),
+    backlog: deps.pack.status.backlog ?? null,
+    hold: holdStatus(deps.pack),
+    dev: deps.pack.status.dev,
+    intake: deps.pack.status.intake,
+  };
+  const slice = currentProgramSlice(compiled.program, compiled.states, new Set(), board);
   const snapshot = formatDeliveryProgramContext({
     program: compiled.program,
     states: compiled.states,
     cursorSliceId: slice?.id ?? null,
     currentIssueId: ticket.identifier,
+    board,
   });
   const conduct =
     phase === "ground"
       ? "When this snapshot is present, include **Program graph:** in the audit (cursor slice, plus the blockers and siblings you relied on). Re-ground unless the latest audit already has **Program graph:** and the ids and states match."
       : "Extend primitives already delivered on other slices. Do not implement sibling tickets.";
   return `${snapshot}\n\n${conduct}`;
+}
+
+/** The agent checkout is the process directory. Every other repo is a subdirectory. */
+export function repoCheckoutDir(cwd: string, spec: RepoSpec, pack: ProjectPack): string {
+  if (pack.agent?.url && githubSlug(pack.agent.url) === githubSlug(spec.url)) return cwd;
+  return join(cwd, spec.name);
 }
 
 function githubSlug(url: string): string {
@@ -248,8 +262,12 @@ function trunkHasTicketCommit(deps: LoopDeps, identifier: string, text: string):
   let unknown = false;
   for (const name of repos) {
     const spec = repoByName(deps.pack, name);
-    const dir = name === "qws-workspace" ? cwd : join(cwd, name);
-    if (!spec || !existsSync(join(dir, ".git"))) {
+    if (!spec) {
+      unknown = true;
+      continue;
+    }
+    const dir = repoCheckoutDir(cwd, spec, deps.pack);
+    if (!existsSync(join(dir, ".git"))) {
       unknown = true;
       continue;
     }
@@ -568,7 +586,7 @@ async function loadProgram(deps: LoopDeps, projectName?: string | null): Promise
   if (!name) return null;
   const snapshot = await deps.tracker.projectSnapshot(name);
   if (!snapshot) return null;
-  return compileDeliveryProgramFromLinear(snapshot);
+  return compileDeliveryProgramFromLinear(snapshot, deps.pack.program?.parkMilestones ?? []);
 }
 
 export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {

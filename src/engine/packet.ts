@@ -163,12 +163,12 @@ export function parkStateForVerdict(input: {
   text: string;
   priorComments: readonly string[];
   devStatus: string;
-  /** Status that does not clear blockers. Defaults to Shaping. */
+  /** Status that does not clear blockers. Defaults to Hold. */
   holdStatus?: string;
   /** True when this ticket's commits are already on the named trunks. */
   trunkCommit?: boolean | null;
 }): string | null {
-  const hold = input.holdStatus?.trim() || "Shaping";
+  const hold = input.holdStatus?.trim() || "Hold";
   if (input.verdict === "WRONG DIAGNOSIS") return "Canceled";
   if (input.verdict === "NEEDS RESCOPE") {
     const cited =

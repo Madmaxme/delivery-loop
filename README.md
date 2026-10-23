@@ -29,7 +29,7 @@ An install keeps its repos, trunk branches, status names, and promote commands i
 
 The runner prepends `conduct/conduct/SKILL.md` to every ground and build prompt. That file is the universal law: one code path, evidence before building, a work order that cites an invariant which already exists, a green quality check, `**Prior request:** none | kept | replaced <id> | ask`, and `**Outside grant:** none | open`. An install's prompt files and invariants file hold the concrete proof: type safety, which document is the source of truth, when to split a module, and making a shared primitive safe before its callers.
 
-A rule about how any ticket moves belongs in this repository. An install's product names, repos, and proof belong in that install. `status.hold` is the install's name for the status that does not clear blockers after owned code lands and the grant is still outside the repo. The default is `Shaping`. `status.dev` and `status.prod` stay the done states.
+A rule about how any ticket moves belongs in this repository. An install's product names, repos, and proof belong in that install. `status.hold` is the install's name for the status that does not clear blockers after owned code lands and the grant is still outside the repo. The default is `Hold`. `status.dev` and `status.prod` stay the done states.
 
 `prompts.ground` and `prompts.build` are workspace-relative files the runner puts in the worker prompt after that law. `invariantHeadings` lists heading files that count as invariant ids beside `invariantsFile`. A heading titled `Commission resolution` in a file with `prefix: billing` is the id `billing/commission-resolution`.
 

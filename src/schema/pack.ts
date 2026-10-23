@@ -47,9 +47,25 @@ export type ProjectPack = {
   /**
    * `hold` is the status after owned code lands when the ticket still needs
    * something this repo cannot obtain. It does not clear blockers.
-   * Installs name it. The default is Shaping.
+   * Installs name it. The default is Hold.
+   * `backlog` is a status that does not count as remaining work.
+   * `closed` clears blockers besides dev and prod. The default is Canceled and Duplicate.
    */
-  status: { intake: string; dev: string; prod: string; hold?: string };
+  status: {
+    intake: string;
+    dev: string;
+    prod: string;
+    hold?: string;
+    backlog?: string;
+    closed?: string[];
+  };
+  /**
+   * Milestone title rules that park a slice before intake.
+   * `where: name` matches the title only. `where: text` matches the title and description.
+   */
+  program?: {
+    parkMilestones?: { match: string; kind: string; where?: "name" | "text" }[];
+  };
   connectors: string[];
   dev?: { steps: string[] };
   /**
@@ -65,14 +81,19 @@ export function defaultStatus(): ProjectPack["status"] {
     intake: "Todo",
     dev: "Dev",
     prod: "Prod",
-    hold: "Shaping",
+    hold: "Hold",
   };
 }
 
 /** Status that keeps a ticket off dev-done. Installs override `status.hold`. */
 export function holdStatus(pack: ProjectPack): string {
   const named = pack.status.hold?.trim();
-  return named || "Shaping";
+  return named || defaultStatus().hold;
+}
+
+export function closedStates(pack: ProjectPack): string[] {
+  const named = (pack.status.closed ?? []).map((s) => s.trim()).filter(Boolean);
+  return named.length > 0 ? named : ["Canceled", "Duplicate"];
 }
 
 export function loadPack(path: string): ProjectPack {
@@ -96,7 +117,7 @@ export function loadPack(path: string): ProjectPack {
 }
 
 export function unblockingStates(pack: ProjectPack): string[] {
-  return [pack.status.dev, pack.status.prod, "Canceled", "Duplicate"];
+  return [pack.status.dev, pack.status.prod, ...closedStates(pack)];
 }
 
 export function repoByName(pack: ProjectPack, name: string): RepoSpec | undefined {

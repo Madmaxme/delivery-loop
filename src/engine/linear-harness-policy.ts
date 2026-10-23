@@ -908,17 +908,39 @@ export function shouldSkipProgramMilestone(name: string): boolean {
   return false;
 }
 
+export type ParkMilestoneRule = {
+  match: string;
+  kind: string;
+  /** `name` matches the milestone title. `text` matches the title and description. */
+  where?: "name" | "text";
+};
+
+function milestoneRuleHits(match: string, hay: string): boolean {
+  const words = match
+    .trim()
+    .split(/[\s-]+/)
+    .filter(Boolean)
+    .map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  if (words.length === 0) return false;
+  return new RegExp(`\\b${words.join("[\\s-]+")}\\b`, "i").test(hay);
+}
+
+/** Parks come from the install's rules. No rules means a milestone title does not park. */
 export function parksFromMilestoneCopy(
   name: string,
   description: string | null | undefined,
+  rules: readonly ParkMilestoneRule[] = [],
 ): ProgramPark[] {
   const parks: ProgramPark[] = [];
-  const blob = `${name}\n${description ?? ""}`;
-  if (/\bdesign[\s-]+partner\b/i.test(blob)) {
-    parks.push({ kind: "design-partner", before: "intake" });
-  }
-  if (/\blater\b/i.test(name)) {
-    parks.push({ kind: "later", before: "intake" });
+  const seen = new Set<string>();
+  for (const rule of rules) {
+    const kind = rule.kind.trim();
+    const match = rule.match.trim();
+    if (!kind || !match || seen.has(kind)) continue;
+    const hay = rule.where === "name" ? name : `${name}\n${description ?? ""}`;
+    if (!milestoneRuleHits(match, hay)) continue;
+    seen.add(kind);
+    parks.push({ kind, before: "intake" });
   }
   return parks;
 }
@@ -971,6 +993,7 @@ function sliceIdFromMilestone(
 
 export function compileDeliveryProgramFromLinear(
   snap: LinearProgramSnapshot,
+  parkRules: readonly ParkMilestoneRule[] = [],
 ): CompileProgramResult {
   const warnings: string[] = [];
   const ordered = [...snap.milestones].sort(compareProgramMilestones);
@@ -1022,7 +1045,7 @@ export function compileDeliveryProgramFromLinear(
         .map((i) => parseParkLabels(i.labels)),
     );
     const park = mergeProgramParks(
-      parksFromMilestoneCopy(m.name, m.description),
+      parksFromMilestoneCopy(m.name, m.description, parkRules),
       issueParks,
     );
     const intakePark = park.some((p) => p.before === "intake");
@@ -1074,23 +1097,38 @@ export function shouldProgramSyncSkipState(
 
 export function isIssueTerminalForProgram(
   stateName: string | null | undefined,
+  board?: ProgramBoard,
 ): boolean {
-  return isGraphUnblockingState(stateName);
+  const names = board?.unblocking?.length ? board.unblocking : GRAPH_UNBLOCKING_STATES;
+  const n = (stateName ?? "").trim().toLowerCase();
+  return names.some((s) => s.trim().toLowerCase() === n);
 }
 
-/** Linear **Soon** is backlog, not AFK. Do not chain or Todo it. */
+/** Installs name their backlog status. An empty name means no status is backlog. */
 export function isProgramBacklogState(
   stateName: string | null | undefined,
+  backlog?: string | null,
 ): boolean {
-  return (stateName ?? "").trim().toLowerCase() === "soon";
+  const name = (backlog ?? "").trim().toLowerCase();
+  if (!name) return false;
+  return (stateName ?? "").trim().toLowerCase() === name;
 }
 
-/** Tickets the factory may sequence: not terminal, not Soon. */
+export type ProgramBoard = {
+  unblocking?: readonly string[];
+  backlog?: string | null;
+  hold?: string | null;
+  dev?: string | null;
+  intake?: string | null;
+};
+
+/** Tickets the factory may sequence: not terminal, and not the install's backlog status. */
 export function isProgramAfkCandidateState(
   stateName: string | null | undefined,
+  board?: ProgramBoard,
 ): boolean {
-  if (isIssueTerminalForProgram(stateName)) return false;
-  if (isProgramBacklogState(stateName)) return false;
+  if (isIssueTerminalForProgram(stateName, board)) return false;
+  if (isProgramBacklogState(stateName, board?.backlog)) return false;
   return true;
 }
 
@@ -1115,6 +1153,7 @@ export function sliceIsComplete(
   slice: ProgramSlice,
   states: Readonly<Record<string, string | undefined>>,
   heldOff: ReadonlySet<string> = new Set(),
+  board?: ProgramBoard,
 ): boolean {
   if (slice.issues.length === 0) return true;
   const s = normalizeProgramStates(states);
@@ -1124,7 +1163,7 @@ export function sliceIsComplete(
   return !slice.issues.some((i) => {
     const id = i.id.toUpperCase();
     if (skip.has(id)) return false;
-    return isProgramAfkCandidateState(s[id]);
+    return isProgramAfkCandidateState(s[id], board);
   });
 }
 
@@ -1132,11 +1171,12 @@ export function currentProgramSlice(
   program: DeliveryProgram,
   states: Readonly<Record<string, string | undefined>>,
   heldOff: ReadonlySet<string> = new Set(),
+  board?: ProgramBoard,
 ): ProgramSlice | null {
   return (
     program.slices.find((s) => {
       if (!programIntakeAllowed(s).ok) return false;
-      return !sliceIsComplete(s, states, heldOff);
+      return !sliceIsComplete(s, states, heldOff, board);
     }) ?? null
   );
 }
@@ -1153,8 +1193,9 @@ export function describeProgramCursor(
   program: DeliveryProgram,
   states: Readonly<Record<string, string | undefined>>,
   heldOff: ReadonlySet<string> = new Set(),
+  board?: ProgramBoard,
 ): ProgramCursorVerdict {
-  const slice = currentProgramSlice(program, states, heldOff);
+  const slice = currentProgramSlice(program, states, heldOff, board);
   if (slice) return { kind: "slice", slice };
   const s = normalizeProgramStates(states);
   for (const sl of program.slices) {
@@ -1254,21 +1295,26 @@ export type StaleGraphPruneEdge = {
 };
 
 /**
- * Later slices stay **Shaping** (visible in the project graph). Never push
- * them to Soon — Soon is skipped as AFK, so a Soon slice looks complete and
- * the cursor walks past it.
+ * Later slices stay on the install's hold status. The backlog status is not
+ * remaining work, so moving a later slice there would make that slice look done.
  */
 export function laterSliceSyncMove(
   stateName: string | null | undefined,
-): "Shaping" | null {
-  return (stateName ?? "").trim().toLowerCase() === "todo" ? "Shaping" : null;
+  hold = "Hold",
+  intake = "Todo",
+): string | null {
+  const n = (stateName ?? "").trim().toLowerCase();
+  if (n !== intake.trim().toLowerCase()) return null;
+  return hold;
 }
 
-/** In-slice WIP overflow: Shaping, not Soon (Soon would complete the slice). */
+/** In-slice overflow uses the same hold status. */
 export function currentSliceOverflowMove(
   stateName: string | null | undefined,
-): "Shaping" | null {
-  return (stateName ?? "").trim().toLowerCase() === "todo" ? "Shaping" : null;
+  hold = "Hold",
+  intake = "Todo",
+): string | null {
+  return laterSliceSyncMove(stateName, hold, intake);
 }
 
 export function formatDeliveryProgramContext(opts: {
@@ -1277,7 +1323,13 @@ export function formatDeliveryProgramContext(opts: {
   heldOff?: ReadonlySet<string>;
   cursorSliceId?: string | null;
   currentIssueId?: string | null;
+  board?: ProgramBoard;
 }): string {
+  const board = opts.board;
+  const hold = board?.hold?.trim() || "Hold";
+  const dev = board?.dev?.trim() || "Dev";
+  const backlog = board?.backlog?.trim() || "";
+  const named = [backlog, hold, dev].filter(Boolean).join(" / ");
   const s = normalizeProgramStates(opts.states);
   const held = new Set(
     [...(opts.heldOff ?? [])].map((id) => id.trim().toUpperCase()).filter(Boolean),
@@ -1287,12 +1339,12 @@ export function formatDeliveryProgramContext(opts: {
     "## Delivery program (full project)",
     `Project: ${opts.program.projectName ?? opts.program.id}`,
     `Cursor slice: ${opts.cursorSliceId ?? "(none)"}`,
-    "This snapshot is **context for every sibling**, including Soon / Shaping / Deployed / held-off. Execute **only this issue**. Do not Todo or implement siblings.",
+    `This snapshot is **context for every sibling**, including ${named} and held-off. Execute **only this issue**. Do not Todo or implement siblings.`,
     "If a later-stage ticket is already delivered, extend those primitives — do not fork a parallel path for the same behavior.",
     "Re-ground when the latest audit lacks **Program graph:** — unchanged description is not a skip.",
     "Linear ticket text is **product intent**, not a closed spec. Engineering owns closed defaults: BUILDABLE the smallest safe change from current code and documented invariants. Write `**Harness packet:**` (one sentence) on the audit. Do not wait for a PM rewrite.",
-    "Smallest safe change does not leave other callers of the same primitive on the old behavior. Inventory remaining same-behavior callers (or name a category exclusion with a path). Sweep completes engineering e2e; the only human gate is product using Dev and filing a new ticket. Do not park leftover callers in Recommendations. Do not rely on a second ground after land.",
-    "NEEDS RESCOPE without that line is a retry, not a park. NEEDS RESCOPE after a cited harness packet means no safe default — Shaping. WRONG DIAGNOSIS parks to Canceled (not a board). Phase parks (Later / design-partner milestones) and real `blockedBy` still bind.",
+    `Smallest safe change does not leave other callers of the same primitive on the old behavior. Inventory remaining same-behavior callers (or name a category exclusion with a path). Sweep completes engineering e2e; the only human gate is product using ${dev} and filing a new ticket. Do not park leftover callers in Recommendations. Do not rely on a second ground after land.`,
+    `NEEDS RESCOPE without that line is a retry, not a park. NEEDS RESCOPE after a cited harness packet means no safe default — ${hold}. WRONG DIAGNOSIS parks to Canceled. Phase parks and real \`blockedBy\` still bind.`,
     "",
   ];
   for (const sl of opts.program.slices) {
@@ -1306,7 +1358,7 @@ export function formatDeliveryProgramContext(opts: {
       const bits = [id, st];
       if (held.has(id)) bits.push("held-off");
       bits.push(
-        isProgramAfkCandidateState(st) && !held.has(id) ? "afk" : "context",
+        isProgramAfkCandidateState(st, board) && !held.has(id) ? "afk" : "context",
       );
       if (i.blockedBy.length) bits.push(`blockedBy=${i.blockedBy.join(",")}`);
       if (current && current === id) bits.push("← this ticket");
@@ -1426,7 +1478,7 @@ function relationIdFor(
 /**
  * Stale identifier-fill noise: same-slice consecutive AFK identifier pairs,
  * same-slice edges whose blocker is held-off, and any edge whose blocker sits
- * on a parked-intake slice (Later / design-partner). Cross-slice waits on
+ * on a parked-intake slice. Cross-slice waits on
  * earlier auto-slice work (e.g. migration blocked by identity) are kept.
  */
 export function planStaleGraphPrune(
