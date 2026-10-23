@@ -27,6 +27,7 @@ import {
   parseOutsideGrant,
   parseVerdict,
   parseWorkOrder,
+  priorRequestBlocksBuild,
   type Verdict,
 } from "./packet.js";
 
@@ -156,6 +157,10 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "When the verdict is BUILDABLE, put the work order under BUILD_PACKET: inside the handoff.",
     "The invariant id is a heading in the invariants file, or `prefix/slug` from a heading file the install lists.",
     "One **Decision:** sentence that cites that id. **Symbols:** `repo/path#symbol`. **Repos:** in backticks.",
+    "Every BUILDABLE handoff includes **Prior request:** none | kept | replaced <id> | ask.",
+    "none means no written rule asked for the current behavior. kept means one did and this ticket keeps it. replaced names the ticket this one undoes. ask means a rule asked for the current behavior and this ticket does not undo it.",
+    "ask, a missing line, or replaced without a ticket id stays in intake. The verdict stays BUILDABLE.",
+    "Look only at the install's invariant and decision documents and at commit subjects that already name a ticket. No sentence means none.",
     "Every BUILDABLE handoff includes **Outside grant:** none | open.",
     "none means the done-state is code this repository can land.",
     "open means the done-state is a vendor approval, an account only a person can create, or an engine this repository does not own. Build the code this repository owns. The runner will not mark that ticket dev-done, so anything blocked by it stays blocked.",
@@ -358,6 +363,18 @@ async function runHeldTicket(
       "BUILDABLE requires **Outside grant:** none | open. The ticket stays in intake.",
     );
     return { identifier: ticket.identifier, outcome: "invalid-packet", detail: "outside-grant" };
+  }
+
+  const prior = priorRequestBlocksBuild(ground.text);
+  if (prior) {
+    const reason =
+      prior === "ask"
+        ? "BUILDABLE **Prior request:** ask does not build. The ticket stays in intake."
+        : prior === "replaced"
+          ? "BUILDABLE **Prior request:** replaced requires a ticket id. The ticket stays in intake."
+          : "BUILDABLE requires **Prior request:** none | kept | replaced <id> | ask. The ticket stays in intake.";
+    await deps.tracker.comment(ticket.identifier, reason);
+    return { identifier: ticket.identifier, outcome: "invalid-packet", detail: `prior-request-${prior}` };
   }
 
   const order = parseWorkOrder(ground.text);
