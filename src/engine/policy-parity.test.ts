@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { holdStatus, unblockingStates, type ProjectPack } from "../schema/pack.ts";
 import {
   evaluateGraphReady,
   formatGroundingCommentSample,
@@ -31,6 +32,9 @@ describe("ported policy", () => {
       ["Shipped", "Live", "Canceled", "Duplicate"],
     );
     assert.equal(waiting.ready, false);
+    const pack = { status: { intake: "Todo", dev: "Dev", prod: "Prod", hold: "Waiting" } } as ProjectPack;
+    assert.equal(holdStatus(pack), "Waiting");
+    assert.equal(unblockingStates(pack).includes("Waiting"), false);
   });
 
   it("counts only the quality workflow", () => {

@@ -44,7 +44,12 @@ export type ProjectPack = {
    */
   branchTemplate?: string;
   invariantsFile: string;
-  status: { intake: string; dev: string; prod: string };
+  /**
+   * `hold` is the status after owned code lands when the ticket still needs
+   * something this repo cannot obtain. It does not clear blockers.
+   * Installs name it. The default is Shaping.
+   */
+  status: { intake: string; dev: string; prod: string; hold?: string };
   connectors: string[];
   dev?: { steps: string[] };
   /**
@@ -60,7 +65,14 @@ export function defaultStatus(): ProjectPack["status"] {
     intake: "Todo",
     dev: "Dev",
     prod: "Prod",
+    hold: "Shaping",
   };
+}
+
+/** Status that keeps a ticket off dev-done. Installs override `status.hold`. */
+export function holdStatus(pack: ProjectPack): string {
+  const named = pack.status.hold?.trim();
+  return named || "Shaping";
 }
 
 export function loadPack(path: string): ProjectPack {
