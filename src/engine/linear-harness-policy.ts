@@ -347,6 +347,38 @@ export function qualityRunUnscheduled(detail: string): boolean {
   return /no Actions runs yet|no quality run/i.test(detail);
 }
 
+/** How long a missing run may stay missing before the lander requests one. */
+export const QUALITY_NO_RUN_MS = 8 * 60 * 1000;
+
+/**
+ * A red quality run needs a new commit from the build worker.
+ * A missing run does not: the commit is already the landing, and polling it
+ * cannot create the workflow. An in-progress or green run is the landing.
+ */
+export function landingShaNeedsRebuild(probe: { state: string }): boolean {
+  return probe.state === "failure";
+}
+
+/**
+ * A missing run is due for a request. A commit that already sat past the
+ * budget is due on the first look. A run we just opened still gets the
+ * budget, because `created` is handled by the caller passing no committedAt.
+ */
+export function unscheduledQualityDue(input: {
+  detail: string;
+  committedAt?: string;
+  observedAtMs: number;
+  nowMs: number;
+  noRunMs: number;
+}): boolean {
+  if (!qualityRunUnscheduled(input.detail)) return false;
+  if (input.committedAt) {
+    const at = Date.parse(input.committedAt);
+    if (Number.isFinite(at) && input.nowMs - at >= input.noRunMs) return true;
+  }
+  return input.nowMs - input.observedAtMs >= input.noRunMs;
+}
+
 export type ProdWorkflowGate = {
   kind: "skip" | "workflows" | "quality-fallback";
   workflows: string[];

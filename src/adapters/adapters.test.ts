@@ -71,11 +71,84 @@ describe("adapters", () => {
     });
     assert.equal(adopted.number, 9);
     assert.equal(adopted.headSha, "abc");
-    assert.equal(
-      await forge.quality({ repoUrl: "https://github.com/acme/api", headSha: "abc", workflow: "quality" }),
-      "success",
-    );
+    assert.equal(adopted.created, false);
+    assert.equal(pr.created, true);
+    const probe = await forge.quality({
+      repoUrl: "https://github.com/acme/api",
+      headSha: "abc",
+      workflow: "quality",
+    });
+    assert.equal(probe.state, "success");
+    assert.match(probe.detail, /quality success/);
     assert.ok(calls.some((c) => c.includes("/pulls")));
+  });
+
+  it("requests one empty commit when quality never started", async () => {
+    const calls: string[] = [];
+    const forge = githubForge({
+      token: "t",
+      fetch: async (url, init) => {
+        const method = init?.method ?? "GET";
+        calls.push(`${method} ${url}`);
+        if (String(url).includes("/actions/runs")) return jsonResponse({ workflow_runs: [] });
+        if (String(url).includes("/commits/abc")) {
+          return jsonResponse({
+            commit: {
+              message: "QUI-1: hide templates",
+              tree: { sha: "tree1" },
+              committer: { date: "2026-10-24T05:02:06Z" },
+            },
+          });
+        }
+        if (String(url).endsWith("/git/commits") && method === "POST") {
+          return jsonResponse({ sha: "def" });
+        }
+        if (String(url).includes("/git/refs/heads/") && method === "PATCH") {
+          return jsonResponse({ ref: "refs/heads/cursor/qui-1-api" });
+        }
+        return jsonResponse({}, 404);
+      },
+    });
+    const probe = await forge.quality({
+      repoUrl: "https://github.com/acme/api",
+      headSha: "abc",
+      workflow: "quality",
+    });
+    assert.equal(probe.state, "pending");
+    assert.match(probe.detail, /no Actions runs yet for abc/);
+    assert.equal(probe.committedAt, "2026-10-24T05:02:06Z");
+    const next = await forge.requestQualityRun({
+      repoUrl: "https://github.com/acme/api",
+      branch: "cursor/qui-1-api",
+      headSha: "abc",
+      message: "rerun quality\n\nThe previous commit had no Actions run.",
+    });
+    assert.equal(next, "def");
+    assert.ok(calls.some((call) => call.startsWith("POST ") && call.endsWith("/git/commits")));
+    const again = githubForge({
+      token: "t",
+      fetch: async (url) => {
+        if (String(url).includes("/commits/def")) {
+          return jsonResponse({
+            commit: {
+              message: "rerun quality\n\nThe previous commit had no Actions run.",
+              tree: { sha: "tree1" },
+              committer: { date: "2026-10-25T17:20:00Z" },
+            },
+          });
+        }
+        return jsonResponse({}, 404);
+      },
+    });
+    assert.equal(
+      await again.requestQualityRun({
+        repoUrl: "https://github.com/acme/api",
+        branch: "cursor/qui-1-api",
+        headSha: "def",
+        message: "rerun quality\n\nThe previous commit had no Actions run.",
+      }),
+      null,
+    );
   });
 
   it("starts and joins a self-hosted worker", async () => {

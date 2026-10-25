@@ -59,6 +59,15 @@ export type PullRequest = {
   url: string;
   headSha: string;
   branch: string;
+  /** False when this call adopted a pull request that was already open. */
+  created: boolean;
+};
+
+export type QualityProbe = {
+  state: "success" | "failure" | "pending";
+  detail: string;
+  /** Present when no quality run exists for the SHA. */
+  committedAt?: string;
 };
 
 export type ForgeAdapter = {
@@ -69,9 +78,17 @@ export type ForgeAdapter = {
     head: string;
     base: string;
   }): Promise<PullRequest>;
-  quality(input: { repoUrl: string; headSha: string; workflow: string }): Promise<
-    "success" | "failure" | "pending"
-  >;
+  quality(input: { repoUrl: string; headSha: string; workflow: string }): Promise<QualityProbe>;
+  /**
+   * One empty commit on an existing head so a pull_request workflow can start.
+   * Returns the new SHA, or null when this head already requested that run.
+   */
+  requestQualityRun(input: {
+    repoUrl: string;
+    branch: string;
+    headSha: string;
+    message: string;
+  }): Promise<string | null>;
   squashMerge(input: { repoUrl: string; number: number }): Promise<void>;
   dispatch(input: { workflow: string; ref: string; inputs: Record<string, string> }): Promise<void>;
 };
