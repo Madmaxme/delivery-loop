@@ -1,6 +1,34 @@
 import type { FetchLike, ForgeAdapter, PullRequest } from "./types.js";
 import { githubRepoFromUrl } from "./types.js";
-import { interpretQualityActions, type QualityRunLite } from "../engine/linear-harness-policy.js";
+
+async function readCommit(
+  fetchImpl: FetchLike,
+  headers: Record<string, string>,
+  owner: string,
+  repo: string,
+  sha: string,
+): Promise<{ message: string; tree: string; committedAt: string } | null> {
+  const response = await fetchImpl(
+    `https://api.github.com/repos/${owner}/${repo}/commits/${sha}`,
+    { headers },
+  );
+  if (!response.ok) return null;
+  const json = (await response.json()) as {
+    commit?: { message?: string; tree?: { sha?: string }; committer?: { date?: string } };
+  };
+  const tree = json.commit?.tree?.sha ?? "";
+  if (!tree) return null;
+  return {
+    message: json.commit?.message ?? "",
+    tree,
+    committedAt: json.commit?.committer?.date ?? "",
+  };
+}
+import {
+  interpretQualityActions,
+  qualityRunUnscheduled,
+  type QualityRunLite,
+} from "../engine/linear-harness-policy.js";
 
 export function githubForge(opts: {
   token: string;
@@ -58,6 +86,7 @@ export function githubForge(opts: {
           url: existing.html_url,
           headSha: existing.head.sha,
           branch: existing.head.ref,
+          created: false,
         };
       }
       if (!created.ok) {
@@ -73,6 +102,7 @@ export function githubForge(opts: {
         url: json.html_url,
         headSha: json.head.sha,
         branch: json.head.ref,
+        created: true,
       };
     },
     async quality(input) {
@@ -102,9 +132,34 @@ export function githubForge(opts: {
         run.name === input.workflow ? { ...run, name: "quality" } : run,
       );
       const interpreted = interpretQualityActions(named, input.headSha);
-      if (interpreted.state === "success") return "success";
-      if (interpreted.state === "failure") return "failure";
-      return "pending";
+      if (!qualityRunUnscheduled(interpreted.detail)) return interpreted;
+      const commit = await readCommit(fetchImpl, headers, owner, repo, input.headSha);
+      return commit?.committedAt
+        ? { ...interpreted, committedAt: commit.committedAt }
+        : interpreted;
+    },
+    async requestQualityRun(input) {
+      const { owner, repo } = githubRepoFromUrl(input.repoUrl);
+      const commit = await readCommit(fetchImpl, headers, owner, repo, input.headSha);
+      const requested = input.message.split("\n")[0]?.trim();
+      const current = commit?.message.split("\n")[0]?.trim();
+      if (!commit?.tree || !requested || current === requested) return null;
+      const created = await api(`/repos/${owner}/${repo}/git/commits`, {
+        method: "POST",
+        body: JSON.stringify({
+          message: input.message,
+          tree: commit.tree,
+          parents: [input.headSha],
+        }),
+      });
+      const json = (await created.json()) as { sha?: string };
+      if (!json.sha) return null;
+      const branch = input.branch.replace(/^\/+/, "");
+      await api(`/repos/${owner}/${repo}/git/refs/heads/${branch}`, {
+        method: "PATCH",
+        body: JSON.stringify({ sha: json.sha }),
+      });
+      return json.sha;
     },
     async squashMerge(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);

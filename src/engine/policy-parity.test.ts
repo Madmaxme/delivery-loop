@@ -7,7 +7,9 @@ import {
   evaluateGraphReady,
   formatGroundingCommentSample,
   interpretQualityActions,
+  landingShaNeedsRebuild,
   latestDeliveryLeaseStamp,
+  unscheduledQualityDue,
   shouldStealDeliveryLease,
   shouldStopForPageReserve,
   pageBudgetRemainingMs,
@@ -69,6 +71,31 @@ describe("ported policy", () => {
       "abc",
     );
     assert.equal(result.state, "pending");
+    assert.match(result.detail, /no quality run/);
+  });
+
+  it("rebuilds a red landing and requests a stale missing run", () => {
+    assert.equal(landingShaNeedsRebuild({ state: "failure" }), true);
+    assert.equal(landingShaNeedsRebuild({ state: "pending" }), false);
+    assert.equal(
+      unscheduledQualityDue({
+        detail: "no Actions runs yet for abc1234",
+        committedAt: "2020-01-01T00:00:00.000Z",
+        observedAtMs: Date.parse("2026-10-25T17:09:00.000Z"),
+        nowMs: Date.parse("2026-10-25T17:09:00.000Z"),
+        noRunMs: 8 * 60 * 1000,
+      }),
+      true,
+    );
+    assert.equal(
+      unscheduledQualityDue({
+        detail: "quality in_progress https://example.test/run",
+        observedAtMs: Date.parse("2026-10-25T17:09:00.000Z"),
+        nowMs: Date.parse("2026-10-25T17:09:00.000Z"),
+        noRunMs: 8 * 60 * 1000,
+      }),
+      false,
+    );
   });
 
   it("steals an expired lease and keeps a live one", () => {

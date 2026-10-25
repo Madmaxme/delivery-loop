@@ -13,9 +13,13 @@ import {
   formatDeliveryProgramContext,
   formatGroundingCommentSample,
   latestDeliveryLeaseStamp,
+  landingShaNeedsRebuild,
   pageBudgetRemainingMs,
+  qualityRunUnscheduled,
+  QUALITY_NO_RUN_MS,
   shouldStealDeliveryLease,
   shouldStopForPageReserve,
+  unscheduledQualityDue,
   DELIVERY_LEASE_TTL_MS,
   type CompileProgramResult,
   type DeliveryLeaseStamp,
@@ -52,6 +56,8 @@ export type LoopDeps = {
   /** Override for tests. Default waits 30s between quality checks. */
   sleep?: (ms: number) => Promise<void>;
   qualityPollMs?: number;
+  /** How long a missing Actions run stays missing before the lander requests one. */
+  qualityNoRunMs?: number;
 };
 
 export type TicketResult = {
@@ -66,6 +72,7 @@ export type TicketResult = {
     | "landed"
     | "quality-failed"
     | "quality-pending"
+    | "quality-unscheduled"
     | "worker-failed";
   detail: string;
 };
@@ -170,7 +177,13 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
   ].join("\n\n");
 }
 
-function buildPrompt(ticket: Ticket, orderText: string, deps: LoopDeps, repos: string[]): string {
+function buildPrompt(
+  ticket: Ticket,
+  orderText: string,
+  deps: LoopDeps,
+  repos: string[],
+  retry: string,
+): string {
   const cwd = deps.cwd ?? process.cwd();
   const docs = listedDocs(cwd, deps.pack.prompts?.build);
   const template = deps.pack.branchTemplate;
@@ -187,7 +200,8 @@ function buildPrompt(ticket: Ticket, orderText: string, deps: LoopDeps, repos: s
       ? `Push these branches from each repo trunk: ${branches.join(", ")}. Include repo and branch in the handoff. Do not merge.`
       : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
     "Stay inside the allowlist. Run the validation commands.",
-  ].join("\n\n");
+    retry,
+  ].filter((part) => part.length > 0).join("\n\n");
 }
 
 function commentBodies(ticket: Ticket): string[] {
@@ -455,11 +469,36 @@ async function runHeldTicket(
         lookup,
       })
     : null;
+  let retry = "";
+  if (landings) {
+    const probes = await Promise.all(
+      landings.map(async (landing) => ({
+        landing,
+        probe: landing.sha
+          ? await deps.forge.quality({
+              repoUrl: landing.repo.url,
+              headSha: landing.sha,
+              workflow: deps.pack.qualityWorkflow,
+            })
+          : { state: "failure" as const, detail: "no sha" },
+      })),
+    );
+    const failed = probes.filter((row) => landingShaNeedsRebuild(row.probe));
+    if (failed.length > 0) {
+      landings = null;
+      retry = failed
+        .map(
+          (row) =>
+            `Quality failed on \`${row.landing.repo.name}\` branch \`${row.landing.branch}\` at \`${row.landing.sha ?? ""}\`. Push a new commit on that branch. A no-op leaves the red check in place.`,
+        )
+        .join("\n");
+    }
+  }
   if (!landings) {
     let built;
     try {
       const started = await deps.worker.start({
-        prompt: buildPrompt(ticket, ground.text, deps, order.repos),
+        prompt: buildPrompt(ticket, ground.text, deps, order.repos, retry),
         repoUrl: home.url,
         baseRef: home.trunk,
       });
@@ -489,7 +528,14 @@ async function runHeldTicket(
     }
   }
 
-  const opened: { repo: RepoSpec; number: number; url: string; headSha: string }[] = [];
+  const opened: {
+    repo: RepoSpec;
+    number: number;
+    url: string;
+    headSha: string;
+    branch: string;
+    created: boolean;
+  }[] = [];
   for (const landing of landings) {
     const pr = await deps.forge.openPullRequest({
       repoUrl: landing.repo.url,
@@ -503,6 +549,8 @@ async function runHeldTicket(
       number: pr.number,
       url: pr.url,
       headSha: landing.sha || pr.headSha,
+      branch: landing.branch,
+      created: pr.created,
     });
   }
   const states = await Promise.all(
@@ -511,17 +559,31 @@ async function runHeldTicket(
       quality: await waitForQuality(deps, pr),
     })),
   );
-  const pending = states.find((row) => row.quality === "pending");
+  const pending = states.find((row) => row.quality.state === "pending");
   if (pending) {
-    await deps.tracker.comment(
-      ticket.identifier,
-      `Quality still running on ${pending.pr.url}. The next page merges it when the check is green.`,
-    );
+    const body = qualityRunUnscheduled(pending.quality.detail)
+      ? `Quality did not start on ${pending.pr.url}. ${pending.quality.detail} The next page requests the workflow run.`
+      : `Quality still running on ${pending.pr.url}. The next page merges it when the check is green.`;
+    await deps.tracker.comment(ticket.identifier, body);
     return { identifier: ticket.identifier, outcome: "quality-pending", detail: pending.pr.url };
   }
-  const failed = states.find((row) => row.quality !== "success");
+  const failed = states.find((row) => row.quality.state !== "success");
   if (failed) {
-    await deps.tracker.comment(ticket.identifier, `Quality ${failed.quality} on ${failed.pr.url}`);
+    if (failed.quality.state === "unscheduled") {
+      await deps.tracker.comment(
+        ticket.identifier,
+        `Quality did not start on ${failed.pr.url}. ${failed.quality.detail} Polling this commit cannot create the workflow run.`,
+      );
+      return {
+        identifier: ticket.identifier,
+        outcome: "quality-unscheduled",
+        detail: failed.pr.url,
+      };
+    }
+    await deps.tracker.comment(
+      ticket.identifier,
+      `Quality ${failed.quality.state} on ${failed.pr.url}`,
+    );
     return { identifier: ticket.identifier, outcome: "quality-failed", detail: failed.pr.url };
   }
   for (const pr of opened) {
@@ -550,28 +612,77 @@ async function runHeldTicket(
 
 const QUALITY_POLL_MS = 30_000;
 
+const RERUN_QUALITY_MESSAGE = [
+  "rerun quality",
+  "",
+  "The previous commit had no Actions run. This empty commit requests the pull request workflow.",
+].join("\n");
+
+type QualityWait = {
+  state: "success" | "failure" | "pending" | "unscheduled";
+  detail: string;
+};
+
 async function waitForQuality(
   deps: LoopDeps,
-  pr: { repo: RepoSpec; url: string; headSha: string },
-): Promise<"success" | "failure" | "pending"> {
+  pr: { repo: RepoSpec; url: string; headSha: string; branch: string; created: boolean },
+): Promise<QualityWait> {
   const polls = deps.maxQualityPolls ?? 60;
+  const noRunMs = deps.qualityNoRunMs ?? QUALITY_NO_RUN_MS;
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  let sha = pr.headSha;
+  let nudged = false;
+  let noRunSince: number | null = null;
   for (let i = 0; i < polls; i++) {
-    const quality = await deps.forge.quality({
+    const probe = await deps.forge.quality({
       repoUrl: pr.repo.url,
-      headSha: pr.headSha,
+      headSha: sha,
       workflow: deps.pack.qualityWorkflow,
     });
-    if (quality !== "pending") return quality;
+    if (probe.state === "success" || probe.state === "failure") {
+      return { state: probe.state, detail: probe.detail };
+    }
+    const now = deps.nowMs ?? Date.now();
+    if (qualityRunUnscheduled(probe.detail)) {
+      if (noRunSince === null) noRunSince = now;
+      const due = unscheduledQualityDue({
+        detail: probe.detail,
+        committedAt: pr.created ? undefined : probe.committedAt,
+        observedAtMs: noRunSince,
+        nowMs: now,
+        noRunMs,
+      });
+      if (due) {
+        if (!nudged) {
+          const next = await deps.forge.requestQualityRun({
+            repoUrl: pr.repo.url,
+            branch: pr.branch,
+            headSha: sha,
+            message: RERUN_QUALITY_MESSAGE,
+          });
+          nudged = true;
+          if (next && next !== sha) {
+            sha = next;
+            noRunSince = null;
+            continue;
+          }
+        }
+        return { state: "unscheduled", detail: probe.detail };
+      }
+    } else {
+      noRunSince = null;
+    }
     const remaining = pageBudgetRemainingMs({
-      nowMs: deps.nowMs ?? Date.now(),
+      nowMs: now,
       startedAtMs: deps.pageStartedAtMs ?? null,
     });
-    if (shouldStopForPageReserve({ remainingMs: remaining })) return "pending";
-    if (i === polls - 1) return "pending";
+    if (shouldStopForPageReserve({ remainingMs: remaining })) {
+      return { state: "pending", detail: probe.detail };
+    }
+    if (i === polls - 1) return { state: "pending", detail: probe.detail };
     await sleep(deps.qualityPollMs ?? QUALITY_POLL_MS);
   }
-  return "pending";
+  return { state: "pending", detail: "" };
 }
 
 export function sweepNeedsAnotherPage(results: TicketResult[]): boolean {

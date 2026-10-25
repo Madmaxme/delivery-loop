@@ -54,6 +54,9 @@ function idleForge(): ForgeAdapter {
     quality: async () => {
       throw new Error("ship does not open pull requests");
     },
+    requestQualityRun: async () => {
+      throw new Error("ship does not open pull requests");
+    },
     squashMerge: async () => {
       throw new Error("ship does not open pull requests");
     },

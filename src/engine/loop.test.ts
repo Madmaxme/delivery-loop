@@ -71,10 +71,26 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
   let merged = false;
   const forge: ForgeAdapter = {
     async openPullRequest() {
-      return { number: 4, url: "https://github.com/acme/api/pull/4", headSha: "abc", branch: "delivery/api-1" };
+      return {
+        number: 4,
+        url: "https://github.com/acme/api/pull/4",
+        headSha: "abc",
+        branch: "delivery/api-1",
+        created: true,
+      };
     },
     async quality() {
-      return opts?.quality ?? "success";
+      const state = opts?.quality ?? "success";
+      return {
+        state,
+        detail:
+          state === "pending"
+            ? "quality in_progress https://example.test/run"
+            : `quality ${state}`,
+      };
+    },
+    async requestQualityRun() {
+      return null;
     },
     async squashMerge() {
       merged = true;
@@ -231,7 +247,16 @@ describe("loop", () => {
     const env = harness(BUILDABLE);
     const seen = ["pending", "success"] as const;
     let n = 0;
-    env.deps.forge.quality = async () => seen[Math.min(n++, seen.length - 1)];
+    env.deps.forge.quality = async () => {
+      const state = seen[Math.min(n++, seen.length - 1)];
+      return {
+        state,
+        detail:
+          state === "pending"
+            ? "quality in_progress https://example.test/run"
+            : "quality success",
+      };
+    };
     env.deps.maxQualityPolls = 4;
     env.deps.qualityPollMs = 1;
     env.deps.sleep = async () => {};
@@ -248,6 +273,96 @@ describe("loop", () => {
     assert.equal(env.comments.some((body) => /still running/.test(body)), true);
     assert.equal(env.merged(), false);
     assert.equal(sweepNeedsAnotherPage([result]), true);
+  });
+
+  it("rebuilds when the install branch already failed quality", async () => {
+    const env = harness(BUILDABLE, { quality: "failure" });
+    env.deps.pack = { ...pack, branchTemplate: "cursor/{issue}-{repo}" };
+    env.deps.lookupHead = (_url, branch) => (branch === "cursor/api-1-api" ? "abc1234" : null);
+    let prompt = "";
+    env.deps.worker.start = async (input) => {
+      prompt = input.prompt;
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.match(prompt, /Quality failed on `api` branch `cursor\/api-1-api`/);
+    assert.equal(result.outcome, "quality-failed");
+    assert.equal(env.merged(), false);
+  });
+
+  it("keeps a running check on the install branch for the next page", async () => {
+    const env = harness(BUILDABLE, { quality: "pending" });
+    env.deps.pack = { ...pack, branchTemplate: "cursor/{issue}-{repo}" };
+    env.deps.lookupHead = (_url, branch) => (branch === "cursor/api-1-api" ? "abc1234" : null);
+    let builds = 0;
+    env.deps.worker.start = async (input) => {
+      if (input.prompt.includes("Push these branches")) builds += 1;
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(builds, 0);
+    assert.equal(result.outcome, "quality-pending");
+    assert.equal(env.comments.some((body) => /still running/.test(body)), true);
+  });
+
+  it("requests a workflow run when an existing branch never started quality", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = { ...pack, branchTemplate: "cursor/{issue}-{repo}" };
+    env.deps.lookupHead = (_url, branch) => (branch === "cursor/api-1-api" ? "abc1234" : null);
+    env.deps.qualityNoRunMs = 0;
+    env.deps.maxQualityPolls = 4;
+    env.deps.qualityPollMs = 1;
+    env.deps.sleep = async () => {};
+    let builds = 0;
+    env.deps.worker.start = async (input) => {
+      if (input.prompt.includes("Push these branches")) builds += 1;
+      return { runId: "run-1" };
+    };
+    env.deps.forge.openPullRequest = async () => ({
+      number: 4,
+      url: "https://github.com/acme/api/pull/4",
+      headSha: "abc1234",
+      branch: "cursor/api-1-api",
+      created: false,
+    });
+    env.deps.forge.quality = async ({ headSha }) =>
+      headSha === "abc1234"
+        ? {
+            state: "pending",
+            detail: "no Actions runs yet for abc1234",
+            committedAt: "2020-01-01T00:00:00.000Z",
+          }
+        : { state: "success", detail: "quality success" };
+    env.deps.forge.requestQualityRun = async () => "def5678";
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(builds, 0);
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.merged(), true);
+  });
+
+  it("stops when a missing quality run was already requested", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = { ...pack, branchTemplate: "cursor/{issue}-{repo}" };
+    env.deps.lookupHead = (_url, branch) => (branch === "cursor/api-1-api" ? "abc1234" : null);
+    env.deps.qualityNoRunMs = 0;
+    env.deps.forge.openPullRequest = async () => ({
+      number: 4,
+      url: "https://github.com/acme/api/pull/4",
+      headSha: "abc1234",
+      branch: "cursor/api-1-api",
+      created: false,
+    });
+    env.deps.forge.quality = async () => ({
+      state: "pending",
+      detail: "no Actions runs yet for abc1234",
+      committedAt: "2020-01-01T00:00:00.000Z",
+    });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "quality-unscheduled");
+    assert.equal(env.comments.some((body) => /did not start/.test(body)), true);
+    assert.equal(env.comments.some((body) => /still running/.test(body)), false);
+    assert.equal(sweepNeedsAnotherPage([result]), false);
+    assert.equal(env.merged(), false);
   });
 
   it("lands owned code and holds the ticket when the grant is still outside the repo", async () => {
