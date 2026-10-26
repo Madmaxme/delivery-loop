@@ -158,6 +158,36 @@ describe("loop", () => {
     );
   });
 
+  it("runs the quality command in the checkout instead of a workflow", async () => {
+    const env = harness(BUILDABLE);
+    let workflow = false;
+    env.deps.forge.quality = async () => {
+      workflow = true;
+      return { state: "failure", detail: "workflow should not be polled" };
+    };
+    env.deps.pack = { ...pack, check: "command", runner: "local", forge: "git" };
+    let ran = "";
+    env.deps.runCommand = (command) => {
+      ran = command;
+      return { status: 0 };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(ran, "npm test");
+    assert.equal(workflow, false);
+    assert.equal(env.merged(), true);
+  });
+
+  it("stops the land when the quality command fails", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = { ...pack, check: "command", runner: "local" };
+    env.deps.runCommand = () => ({ status: 1 });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "quality-failed");
+    assert.match(result.detail, /pull\/4/);
+    assert.equal(env.merged(), false);
+  });
+
   it("puts universal conduct ahead of the install build doc", async () => {
     const root = mkdtempSync(join(tmpdir(), "delivery-loop-"));
     writeFileSync(join(root, "build.md"), "INSTALL BUILD DOC");
