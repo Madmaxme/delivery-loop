@@ -58,6 +58,8 @@ export type LoopDeps = {
   qualityPollMs?: number;
   /** How long a missing Actions run stays missing before the lander requests one. */
   qualityNoRunMs?: number;
+  /** Fix attempts after a red quality check. Default is `DELIVERY_LOOP_CI_FIX_MAX`, then `QWS_CI_FIX_MAX`, then 5. */
+  ciFixMax?: number;
   /** Runs `qualityCommand` when `check` is `command`. Default runs it in the checkout. */
   runCommand?: (command: string, cwd: string) => { status: number | null };
 };
@@ -204,6 +206,38 @@ function buildPrompt(
       : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
     "Stay inside the allowlist. Run the validation commands.",
     retry,
+  ].filter((part) => part.length > 0).join("\n\n");
+}
+
+function ciFixLimit(deps: LoopDeps): number {
+  if (deps.ciFixMax != null) return deps.ciFixMax;
+  const raw = process.env.DELIVERY_LOOP_CI_FIX_MAX ?? process.env.QWS_CI_FIX_MAX ?? "5";
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 5;
+}
+
+function fixPrompt(
+  ticket: Ticket,
+  orderText: string,
+  deps: LoopDeps,
+  pr: OpenPull,
+  attempt: number,
+  max: number,
+  detail: string,
+): string {
+  const cwd = deps.cwd ?? process.cwd();
+  const docs = listedDocs(cwd, deps.pack.prompts?.build);
+  return [
+    universalConduct(),
+    ...docs,
+    `Fix the failing quality check on \`${pr.repo.name}\` branch \`${pr.branch}\` for ${ticket.identifier}.`,
+    `Attempt ${attempt} of ${max}.`,
+    `The check said: ${detail}`,
+    orderText,
+    `Checkout \`${pr.branch}\` in \`${pr.repo.name}\`. Fix the failure. Commit and push that same branch.`,
+    `Do not open a pull request. Do not merge. Do not push \`${pr.repo.trunk}\`.`,
+    "Stay inside the work order allowlist.",
+    "If this branch is ahead of trunk, do not replace it with the older trunk copy. Push the fix forward on this branch.",
   ].filter((part) => part.length > 0).join("\n\n");
 }
 
@@ -558,7 +592,7 @@ async function runHeldTicket(
   }
   for (const pr of opened) {
     try {
-      const paused = await landPull(deps, ticket, pr);
+      const paused = await landPull(deps, ticket, pr, ground.text);
       if (paused) return paused;
     } catch (error) {
       const paused = pauseLand(
@@ -649,13 +683,52 @@ async function landPull(
   deps: LoopDeps,
   ticket: Ticket,
   pr: OpenPull,
+  orderText: string,
 ): Promise<TicketResult | null> {
   let current = pr;
   let updates = 0;
   let unknown = 0;
+  let fixes = 0;
+  const fixMax = ciFixLimit(deps);
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
-  for (let step = 0; step < 8; step++) {
+  for (let step = 0; step < 8 + fixMax; step++) {
     const quality = await waitForQuality(deps, current);
+    if (quality.state === "failure") {
+      if (fixes >= fixMax) {
+        const paused = pauseLand(
+          ticket.identifier,
+          current.url,
+          `Quality is still red after ${fixMax} fix attempts. Resume land on the next sweep. Do not rebuild this branch.`,
+        );
+        await deps.tracker.comment(ticket.identifier, paused.detail);
+        return paused;
+      }
+      fixes += 1;
+      const home = agentHome(deps.pack);
+      try {
+        const started = await deps.worker.start({
+          prompt: fixPrompt(ticket, orderText, deps, current, fixes, fixMax, quality.detail),
+          repoUrl: home.url,
+          baseRef: home.trunk,
+        });
+        await finishWorker(deps.worker, started.runId);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        const paused = pauseLand(
+          ticket.identifier,
+          current.url,
+          `Quality fix did not finish. ${reason} Resume land on the next sweep.`,
+        );
+        await deps.tracker.comment(ticket.identifier, paused.detail);
+        return paused;
+      }
+      const lookup = deps.lookupHead ?? lookupRemoteHead;
+      const next = lookup(current.repo.url, current.branch);
+      if (next && next !== current.headSha) {
+        current = { ...current, headSha: next, created: false };
+      }
+      continue;
+    }
     const early = await explainQuality(deps, ticket, current, quality);
     if (early) return early;
     const merge = await deps.forge.mergeability({

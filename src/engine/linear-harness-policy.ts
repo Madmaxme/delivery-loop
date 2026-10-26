@@ -351,12 +351,12 @@ export function qualityRunUnscheduled(detail: string): boolean {
 export const QUALITY_NO_RUN_MS = 8 * 60 * 1000;
 
 /**
- * A red quality run needs a new commit from the build worker.
- * A missing run does not: the commit is already the landing, and polling it
- * cannot create the workflow. An in-progress or green run is the landing.
+ * A red quality run stays on its branch. Land starts a fix on that branch.
+ * Rebuilding from trunk replaces the landing. A missing or in-progress run
+ * is also the landing.
  */
-export function landingShaNeedsRebuild(probe: { state: string }): boolean {
-  return probe.state === "failure";
+export function landingShaNeedsRebuild(_probe: { state: string }): boolean {
+  return false;
 }
 
 /**

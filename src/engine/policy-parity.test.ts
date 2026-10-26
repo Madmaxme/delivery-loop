@@ -74,8 +74,8 @@ describe("ported policy", () => {
     assert.match(result.detail, /no quality run/);
   });
 
-  it("rebuilds a red landing and requests a stale missing run", () => {
-    assert.equal(landingShaNeedsRebuild({ state: "failure" }), true);
+  it("keeps a red landing for the fix loop and requests a stale missing run", () => {
+    assert.equal(landingShaNeedsRebuild({ state: "failure" }), false);
     assert.equal(landingShaNeedsRebuild({ state: "pending" }), false);
     assert.equal(
       unscheduledQualityDue({

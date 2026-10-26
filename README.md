@@ -9,7 +9,7 @@ Versioned autonomous delivery loop. Four things are required. The vendor behind 
 
 `check: workflow` polls the named quality workflow on GitHub. `check: command` runs `qualityCommand` in the checkout. A workflow check requires `forge: github`.
 
-Land merges one pull request at a time. A branch that is only behind trunk is updated, then quality runs again on the new head. A conflict or a refused merge pauses that ticket. The sweep continues with the next ticket.
+Land merges one pull request at a time. A branch that is only behind trunk is updated, then quality runs again on the new head. A red quality check starts the coding worker on that same branch, up to the fix budget, and the next sweep resumes land. A conflict or a refused merge pauses that ticket. The sweep continues with the next ticket.
 
 An install keeps its own `delivery-loop.yaml` and invariants file. This repository does not name those projects.
 

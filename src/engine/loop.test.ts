@@ -184,11 +184,13 @@ describe("loop", () => {
 
   it("stops the land when the quality command fails", async () => {
     const env = harness(BUILDABLE);
+    env.deps.ciFixMax = 1;
+    env.deps.lookupHead = () => null;
     env.deps.pack = { ...pack, check: "command", runner: "local" };
     env.deps.runCommand = () => ({ status: 1 });
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "quality-failed");
-    assert.match(result.detail, /pull\/4/);
+    assert.equal(result.outcome, "land-blocked");
+    assert.match(result.detail, /still red after 1 fix/);
     assert.equal(env.merged(), false);
   });
 
@@ -389,19 +391,45 @@ describe("loop", () => {
     assert.equal(sweepNeedsAnotherPage([result]), true);
   });
 
-  it("rebuilds when the install branch already failed quality", async () => {
+  it("fixes a red landing on the same branch and does not rebuild from trunk", async () => {
     const env = harness(BUILDABLE, { quality: "failure" });
+    env.deps.ciFixMax = 1;
     env.deps.pack = { ...pack, branchTemplate: "cursor/{issue}-{repo}" };
     env.deps.lookupHead = (_url, branch) => (branch === "cursor/api-1-api" ? "abc1234" : null);
-    let prompt = "";
+    const prompts: string[] = [];
     env.deps.worker.start = async (input) => {
-      prompt = input.prompt;
+      prompts.push(input.prompt);
       return { runId: "run-1" };
     };
     const result = await runTicket(env.deps, ticket());
-    assert.match(prompt, /Quality failed on `api` branch `cursor\/api-1-api`/);
-    assert.equal(result.outcome, "quality-failed");
+    const fix = prompts.find((text) => text.includes("Fix the failing quality check"));
+    assert.ok(fix);
+    assert.match(fix ?? "", /cursor\/api-1-api/);
+    assert.match(fix ?? "", /do not replace it with the older trunk copy/);
+    assert.equal(prompts.some((text) => text.includes("Push these branches")), false);
+    assert.equal(result.outcome, "land-blocked");
+    assert.match(result.detail, /Resume land on the next sweep/);
     assert.equal(env.merged(), false);
+  });
+
+  it("merges after a quality fix pushes a new head", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.ciFixMax = 2;
+    let head = "abc";
+    env.deps.lookupHead = () => head;
+    env.deps.forge.mergeability = async () => ({ state: "clean", headSha: "" });
+    env.deps.forge.quality = async (input) => {
+      const state = input.headSha === "def" ? "success" : "failure";
+      return { state, detail: `quality ${state}` };
+    };
+    env.deps.worker.start = async (input) => {
+      if (input.prompt.includes("Fix the failing quality check")) head = "def";
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.merged(), true);
+    assert.equal(env.state(), "Dev");
   });
 
   it("keeps a running check on the install branch for the next page", async () => {
