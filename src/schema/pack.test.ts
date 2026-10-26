@@ -44,6 +44,14 @@ describe("pack requirements", () => {
     assert.throws(() => loadPack(write(`${base}\nforge: git\ncheck: workflow\n`)), /forge github/);
   });
 
+  it("keeps a scoped promote command on the dev block", () => {
+    const pack = loadPack(
+      write(`${base}\ndev:\n  promote:\n    command: ./scripts/promote.sh dev --repo {repo}\n    repos:\n      - customer-app\n`),
+    );
+    assert.equal(pack.dev?.promote?.command, "./scripts/promote.sh dev --repo {repo}");
+    assert.deepEqual(pack.dev?.promote?.repos, ["customer-app"]);
+  });
+
   it("refuses a tracker that is not a real queue", () => {
     assert.throws(() => loadPack(write(base.replace("tracker: linear", "tracker: files"))), /tracker/);
   });

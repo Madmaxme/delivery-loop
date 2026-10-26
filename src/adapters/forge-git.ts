@@ -2,12 +2,21 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import type { ForgeAdapter } from "./types.js";
+import type { CompareStatus, ForgeAdapter } from "./types.js";
 
-export type GitRun = (args: string[], cwd: string) => { status: number | null };
+export type GitRun = (args: string[], cwd: string) => { status: number | null; stdout?: string };
 
-function defaultGit(args: string[], cwd: string): { status: number | null } {
-  return spawnSync("git", args, { cwd, stdio: "inherit" });
+function defaultGit(args: string[], cwd: string): { status: number | null; stdout: string } {
+  const capture = args[0] === "rev-parse" || args[0] === "merge-base";
+  const result = spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
+  });
+  return {
+    status: result.status,
+    stdout: typeof result.stdout === "string" ? result.stdout : "",
+  };
 }
 
 /** Checkout for a repo URL. A nested clone wins. Otherwise the workspace root. */
@@ -51,6 +60,20 @@ export function gitForge(opts: {
       return { state: "clean", headSha: "" };
     },
     async updateBranch() {},
+    async compare(input): Promise<CompareStatus> {
+      const cwd = dirFor(input.repoUrl);
+      const base = run(["rev-parse", input.base], cwd);
+      const head = run(["rev-parse", input.head], cwd);
+      const baseSha = base.stdout?.trim() ?? "";
+      const headSha = head.stdout?.trim() ?? "";
+      if (base.status !== 0 || head.status !== 0 || !baseSha || !headSha) return "unknown";
+      if (baseSha === headSha) return "identical";
+      const headContainsBase = run(["merge-base", "--is-ancestor", baseSha, headSha], cwd);
+      if (headContainsBase.status === 0) return "ahead";
+      const baseContainsHead = run(["merge-base", "--is-ancestor", headSha, baseSha], cwd);
+      if (baseContainsHead.status === 0) return "behind";
+      return "diverged";
+    },
     async squashMerge(input) {
       const branch = input.branch?.trim();
       const base = input.base?.trim();
@@ -62,6 +85,10 @@ export function gitForge(opts: {
       if (checkout.status !== 0) throw new Error(`git checkout failed for ${base}`);
       const merge = run(["merge", "--no-ff", branch], cwd);
       if (merge.status !== 0) throw new Error(`git merge failed for ${branch}`);
+      const rev = run(["rev-parse", "HEAD"], cwd);
+      const sha = rev.stdout?.trim() ?? "";
+      if (rev.status !== 0 || !sha) throw new Error("git rev-parse failed after merge");
+      return sha;
     },
     async dispatch() {
       throw new Error("git forge has no workflow to dispatch; the runner executes commands");

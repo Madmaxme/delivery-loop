@@ -9,7 +9,7 @@ Versioned autonomous delivery loop. Four things are required. The vendor behind 
 
 `check: workflow` polls the named quality workflow on GitHub. `check: command` runs `qualityCommand` in the checkout. A workflow check requires `forge: github`.
 
-Land merges one pull request at a time. A branch that is only behind trunk is updated, then quality runs again on the new head. A red quality check starts the coding worker on that same branch, up to the fix budget, and the next sweep resumes land. A conflict or a refused merge pauses that ticket. The sweep continues with the next ticket.
+Land merges one pull request at a time, in `repos` order from the install pack. A branch that is only behind an open pull request is updated, then quality runs again on the new head. A branch that is identical to trunk, or has no commits of its own, is not opened. The next sweep leaves that ticket alone while that commit is still the branch tip. A red quality check on the pull request starts the coding worker on that same branch, up to the fix budget, and the next sweep resumes land. After the squash, quality runs on the merge commit. Until that check is green the ticket stays in intake, and the next sweep only reads that commit. When the install sets `dev.promote`, the runner executes that command for each landed repo named in `dev.promote.repos`, and only after the trunk check is green. A conflict or a refused merge pauses that ticket. The sweep continues with the next ticket.
 
 An install keeps its own `delivery-loop.yaml` and invariants file. This repository does not name those projects.
 
@@ -32,7 +32,7 @@ The product remote is https://github.com/Madmaxme/delivery-loop. `bash scripts/b
 
 Clone this repo, branch from `main`, and open a pull request. The `quality` workflow runs the tests.
 
-A new tracker, forge, or worker is a file in `src/adapters` plus a test. Trackers implement `listIntake`, `get`, `comment`, and `setState`. Workers implement `start` and `join`. Forges implement `openPullRequest`, `quality`, `mergeability`, `updateBranch`, and `squashMerge`.
+A new tracker, forge, or worker is a file in `src/adapters` plus a test. Trackers implement `listIntake`, `get`, `comment`, and `setState`. Workers implement `start` and `join`. Forges implement `openPullRequest`, `quality`, `mergeability`, `compare`, `updateBranch`, and `squashMerge`. `squashMerge` returns the merge commit.
 
 An install keeps its repos, trunk branches, status names, and promote commands in its own `delivery-loop.yaml`. Those facts do not belong in this repository.
 

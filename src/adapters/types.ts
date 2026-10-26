@@ -73,6 +73,13 @@ export type QualityProbe = {
 /** What the forge knows before a merge. `unknown` means the host has not computed it yet. */
 export type Mergeability = "clean" | "behind" | "conflict" | "blocked" | "unknown";
 
+/**
+ * `base...head` from the forge.
+ * `identical` and `behind` have nothing of their own to merge.
+ * `unknown` means the host did not answer; the lander still tries.
+ */
+export type CompareStatus = "ahead" | "behind" | "identical" | "diverged" | "unknown";
+
 export type PullMerge = {
   state: Mergeability;
   headSha: string;
@@ -99,6 +106,8 @@ export type ForgeAdapter = {
   }): Promise<string | null>;
   /** Read whether this pull request can merge. A git forge with no pull request reports `clean`. */
   mergeability(input: { repoUrl: string; number: number }): Promise<PullMerge>;
+  /** Compare trunk (`base`) to the branch or commit (`head`). */
+  compare(input: { repoUrl: string; base: string; head: string }): Promise<CompareStatus>;
   /**
    * Put the trunk commits onto the branch. A git forge has nothing to update
    * until `squashMerge`. An already up-to-date branch resolves.
@@ -110,7 +119,7 @@ export type ForgeAdapter = {
     /** Set for a git merge. GitHub squash uses `number`. */
     branch?: string;
     base?: string;
-  }): Promise<void>;
+  }): Promise<string>;
   dispatch(input: { workflow: string; ref: string; inputs: Record<string, string> }): Promise<void>;
 };
 

@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
+import type { CompareStatus, ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { agentHome, holdStatus, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
 import { isGithubActionsRunActive } from "./github-run-status.js";
 import {
@@ -78,6 +78,8 @@ export type TicketResult = {
     | "quality-pending"
     | "quality-unscheduled"
     | "land-blocked"
+    | "land-empty"
+    | "trunk-waiting"
     | "worker-failed";
   detail: string;
 };
@@ -382,6 +384,8 @@ async function runHeldTicket(
   ticket: Ticket,
   home: { url: string; trunk: string },
 ): Promise<TicketResult> {
+  const resumed = await resumeMarkedLand(deps, ticket);
+  if (resumed) return resumed;
   let ground;
   try {
     const started = await deps.worker.start({
@@ -565,15 +569,26 @@ async function runHeldTicket(
     }
   }
 
-  const opened: {
-    repo: RepoSpec;
-    number: number;
-    url: string;
-    headSha: string;
-    branch: string;
-    created: boolean;
-  }[] = [];
-  for (const landing of landings) {
+  const opened: OpenPull[] = [];
+  const empty: { repo: string; sha: string }[] = [];
+  for (const landing of sortByPack(deps.pack, landings, (row) => row.repo.name)) {
+    const head = landing.sha || landing.branch;
+    let compared: CompareStatus = "unknown";
+    try {
+      compared = await deps.forge.compare({
+        repoUrl: landing.repo.url,
+        base: landing.repo.trunk,
+        head,
+      });
+    } catch {
+      compared = "unknown";
+    }
+    if (compared === "identical" || compared === "behind") {
+      const lookup = deps.lookupHead ?? lookupRemoteHead;
+      const sha = landing.sha || lookup(landing.repo.url, landing.branch) || head;
+      empty.push({ repo: landing.repo.name, sha });
+      continue;
+    }
     const pr = await deps.forge.openPullRequest({
       repoUrl: landing.repo.url,
       title: `${ticket.identifier}: ${order.decision}`,
@@ -590,10 +605,20 @@ async function runHeldTicket(
       created: pr.created,
     });
   }
+  if (opened.length === 0) {
+    await deps.tracker.comment(ticket.identifier, landEmptyMarker(empty));
+    return {
+      identifier: ticket.identifier,
+      outcome: "land-empty",
+      detail: empty.map((row) => `${row.repo} ${row.sha}`).join(" "),
+    };
+  }
+  const merged: MergedHead[] = [];
   for (const pr of opened) {
     try {
-      const paused = await landPull(deps, ticket, pr, ground.text);
-      if (paused) return paused;
+      const landed = await landPull(deps, ticket, pr, ground.text);
+      if ("outcome" in landed) return landed;
+      merged.push({ repo: pr.repo, sha: landed.mergedSha, url: pr.url });
     } catch (error) {
       const paused = pauseLand(
         ticket.identifier,
@@ -604,25 +629,7 @@ async function runHeldTicket(
       return paused;
     }
   }
-  for (const step of deps.pack.dev?.steps ?? []) {
-    const result = spawnSync(step, { shell: true, cwd: deps.cwd ?? process.cwd(), stdio: "inherit" });
-    if (result.status !== 0) {
-      return {
-        identifier: ticket.identifier,
-        outcome: "quality-failed",
-        detail: `dev step failed: ${step}`,
-      };
-    }
-  }
-  await deps.tracker.setState(
-    ticket.identifier,
-    grant === "open" ? holdStatus(deps.pack) : deps.pack.status.dev,
-  );
-  return {
-    identifier: ticket.identifier,
-    outcome: "landed",
-    detail: opened.map((pr) => pr.url).join(" "),
-  };
+  return finishMerged(deps, ticket, grant === "open", merged);
 }
 
 const QUALITY_POLL_MS = 30_000;
@@ -637,6 +644,211 @@ type OpenPull = {
   branch: string;
   created: boolean;
 };
+
+type MergedHead = { repo: RepoSpec; sha: string; url: string };
+
+type LandPullResult = TicketResult | { mergedSha: string };
+
+/** Pack order. Names the pack does not list sort last. Work-order order does not win. */
+export function sortByPack<T>(pack: ProjectPack, rows: readonly T[], name: (row: T) => string): T[] {
+  const rank = new Map(pack.repos.map((repo, index) => [repo.name, index]));
+  return [...rows].sort((a, b) => {
+    const left = rank.get(name(a)) ?? Number.MAX_SAFE_INTEGER;
+    const right = rank.get(name(b)) ?? Number.MAX_SAFE_INTEGER;
+    return left - right;
+  });
+}
+
+function devCommands(pack: ProjectPack, landed: string[]): string[] {
+  const promote = pack.dev?.promote;
+  if (promote?.command) {
+    const allowed = new Set(promote.repos ?? []);
+    const seen = new Set<string>();
+    const commands: string[] = [];
+    for (const repo of landed) {
+      if (!allowed.has(repo) || seen.has(repo)) continue;
+      seen.add(repo);
+      commands.push(promote.command.replaceAll("{repo}", repo));
+    }
+    return commands;
+  }
+  return pack.dev?.steps ?? [];
+}
+
+function landWaitMarker(hold: boolean, rows: { repo: string; sha: string }[]): string {
+  const lines = ["<!-- LAND_WAIT", `hold=${hold ? "1" : "0"}`];
+  for (const row of rows) lines.push(`${row.repo} ${row.sha}`);
+  lines.push("-->");
+  return lines.join("\n");
+}
+
+function landEmptyMarker(rows: { repo: string; sha: string }[]): string {
+  const lines = ["<!-- LAND_EMPTY"];
+  for (const row of rows) lines.push(`${row.repo} ${row.sha}`);
+  lines.push("-->");
+  return lines.join("\n");
+}
+
+type LandMarker =
+  | { kind: "wait"; hold: boolean; rows: { repo: string; sha: string }[] }
+  | { kind: "empty"; rows: { repo: string; sha: string }[] };
+
+function markerRows(body: string): { hold: boolean; rows: { repo: string; sha: string }[] } {
+  let hold = false;
+  const rows: { repo: string; sha: string }[] = [];
+  for (const line of body.split("\n").slice(1)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("-->") || trimmed.startsWith("<!--")) break;
+    const holdLine = /^hold=([01])$/.exec(trimmed);
+    if (holdLine) {
+      hold = holdLine[1] === "1";
+      continue;
+    }
+    const [repo, sha] = trimmed.split(/\s+/);
+    if (repo && sha) rows.push({ repo, sha });
+  }
+  return { hold, rows };
+}
+
+/** Latest machine marker wins. Comments are oldest first. */
+export function latestLandMarker(comments: { body: string }[]): LandMarker | null {
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const body = comments[i]?.body ?? "";
+    const waitAt = body.lastIndexOf("LAND_WAIT");
+    const emptyAt = body.lastIndexOf("LAND_EMPTY");
+    if (waitAt < 0 && emptyAt < 0) continue;
+    if (waitAt > emptyAt) {
+      const parsed = markerRows(body.slice(waitAt));
+      return { kind: "wait", hold: parsed.hold, rows: parsed.rows };
+    }
+    return { kind: "empty", rows: markerRows(body.slice(emptyAt)).rows };
+  }
+  return null;
+}
+
+function runDevCommands(deps: LoopDeps, commands: string[]): string | null {
+  const cwd = deps.cwd ?? process.cwd();
+  const run = deps.runCommand ?? defaultRunCommand;
+  for (const command of commands) {
+    const result = run(command, cwd);
+    if (result.status !== 0) return command;
+  }
+  return null;
+}
+
+async function trunkQuality(
+  deps: LoopDeps,
+  row: { repo: RepoSpec; sha: string },
+): Promise<QualityWait> {
+  return waitForQuality(
+    deps,
+    {
+      repo: row.repo,
+      url: row.repo.url,
+      headSha: row.sha,
+      branch: row.repo.trunk,
+      created: false,
+    },
+    { requestRun: false },
+  );
+}
+
+async function finishMerged(
+  deps: LoopDeps,
+  ticket: Ticket,
+  hold: boolean,
+  merged: MergedHead[],
+): Promise<TicketResult> {
+  let green = true;
+  for (const row of merged) {
+    const quality = await trunkQuality(deps, row);
+    if (quality.state !== "success") green = false;
+  }
+  if (!green) {
+    await deps.tracker.comment(
+      ticket.identifier,
+      landWaitMarker(hold, merged.map((row) => ({ repo: row.repo.name, sha: row.sha }))),
+    );
+    return {
+      identifier: ticket.identifier,
+      outcome: "trunk-waiting",
+      detail: merged.map((row) => row.url).join(" "),
+    };
+  }
+  const failed = runDevCommands(
+    deps,
+    devCommands(deps.pack, merged.map((row) => row.repo.name)),
+  );
+  if (failed) {
+    await deps.tracker.comment(
+      ticket.identifier,
+      landWaitMarker(hold, merged.map((row) => ({ repo: row.repo.name, sha: row.sha }))),
+    );
+    return {
+      identifier: ticket.identifier,
+      outcome: "quality-failed",
+      detail: `dev step failed: ${failed}`,
+    };
+  }
+  await deps.tracker.setState(ticket.identifier, hold ? holdStatus(deps.pack) : deps.pack.status.dev);
+  return {
+    identifier: ticket.identifier,
+    outcome: "landed",
+    detail: merged.map((row) => row.url).join(" "),
+  };
+}
+
+/**
+ * A previous land already merged, or already saw there was nothing to merge.
+ * Re-check that fact. Do not start a worker while the recorded commit is unchanged.
+ */
+async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketResult | null> {
+  const marker = latestLandMarker(ticket.comments);
+  if (!marker) return null;
+  if (marker.kind === "empty") {
+    const template = deps.pack.branchTemplate;
+    if (!template || marker.rows.length === 0) return null;
+    const lookup = deps.lookupHead ?? lookupRemoteHead;
+    for (const row of marker.rows) {
+      const spec = repoByName(deps.pack, row.repo);
+      if (!spec) return null;
+      const sha = lookup(spec.url, renderBranch(template, ticket.identifier, row.repo));
+      if (!sha || sha !== row.sha) return null;
+    }
+    return { identifier: ticket.identifier, outcome: "land-empty", detail: "branch unchanged" };
+  }
+  if (marker.rows.length === 0) return null;
+  let green = true;
+  for (const row of marker.rows) {
+    const spec = repoByName(deps.pack, row.repo);
+    if (!spec) return null;
+    const quality = await trunkQuality(deps, { repo: spec, sha: row.sha });
+    if (quality.state !== "success") green = false;
+  }
+  if (!green) {
+    return {
+      identifier: ticket.identifier,
+      outcome: "trunk-waiting",
+      detail: "trunk quality",
+    };
+  }
+  const failed = runDevCommands(
+    deps,
+    devCommands(deps.pack, marker.rows.map((row) => row.repo)),
+  );
+  if (failed) {
+    return {
+      identifier: ticket.identifier,
+      outcome: "quality-failed",
+      detail: `dev step failed: ${failed}`,
+    };
+  }
+  await deps.tracker.setState(
+    ticket.identifier,
+    marker.hold ? holdStatus(deps.pack) : deps.pack.status.dev,
+  );
+  return { identifier: ticket.identifier, outcome: "landed", detail: "trunk green" };
+}
 
 function pauseLand(identifier: string, url: string, reason: string): TicketResult {
   return {
@@ -677,14 +889,14 @@ async function explainQuality(
  * Merge one pull request. A behind branch is updated onto trunk and quality
  * runs again on the new head. A conflict or a refused merge pauses this
  * ticket. The caller keeps the rest of the sweep moving.
- * Returns null when this pull request merged.
+ * Returns the merge commit when this pull request merged.
  */
 async function landPull(
   deps: LoopDeps,
   ticket: Ticket,
   pr: OpenPull,
   orderText: string,
-): Promise<TicketResult | null> {
+): Promise<LandPullResult> {
   let current = pr;
   let updates = 0;
   let unknown = 0;
@@ -775,13 +987,14 @@ async function landPull(
     }
     break;
   }
-  await deps.forge.squashMerge({
+  const mergedSha = await deps.forge.squashMerge({
     repoUrl: current.repo.url,
     number: current.number,
     branch: current.branch,
     base: current.repo.trunk,
   });
-  return null;
+  if (!mergedSha?.trim()) throw new Error("merge did not return a commit");
+  return { mergedSha };
 }
 
 const RERUN_QUALITY_MESSAGE = [
@@ -802,6 +1015,7 @@ function defaultRunCommand(command: string, cwd: string): { status: number | nul
 async function waitForQuality(
   deps: LoopDeps,
   pr: { repo: RepoSpec; url: string; headSha: string; branch: string; created: boolean },
+  opts?: { requestRun?: boolean },
 ): Promise<QualityWait> {
   if (deps.pack.check === "command") {
     const cwd = repoCheckoutDir(deps.cwd ?? process.cwd(), pr.repo, deps.pack);
@@ -837,6 +1051,9 @@ async function waitForQuality(
         noRunMs,
       });
       if (due) {
+        if (opts?.requestRun === false) {
+          return { state: "pending", detail: probe.detail };
+        }
         if (!nudged) {
           const next = await deps.forge.requestQualityRun({
             repoUrl: pr.repo.url,

@@ -63,6 +63,9 @@ function idleForge(): ForgeAdapter {
     updateBranch: async () => {
       throw new Error("ship does not open pull requests");
     },
+    compare: async () => {
+      throw new Error("ship does not open pull requests");
+    },
     squashMerge: async () => {
       throw new Error("ship does not open pull requests");
     },
