@@ -9,6 +9,8 @@ Versioned autonomous delivery loop. Four things are required. The vendor behind 
 
 `check: workflow` polls the named quality workflow on GitHub. `check: command` runs `qualityCommand` in the checkout. A workflow check requires `forge: github`.
 
+Land merges one pull request at a time. A branch that is only behind trunk is updated, then quality runs again on the new head. A conflict or a refused merge pauses that ticket. The sweep continues with the next ticket.
+
 An install keeps its own `delivery-loop.yaml` and invariants file. This repository does not name those projects.
 
 Licensed under Apache-2.0. See `LICENSE`. The repository is public.
@@ -30,7 +32,7 @@ The product remote is https://github.com/Madmaxme/delivery-loop. `bash scripts/b
 
 Clone this repo, branch from `main`, and open a pull request. The `quality` workflow runs the tests.
 
-A new tracker, forge, or worker is a file in `src/adapters` plus a test. Trackers implement `listIntake`, `get`, `comment`, and `setState`. Workers implement `start` and `join`. Forges implement `openPullRequest`, `quality`, and `squashMerge`.
+A new tracker, forge, or worker is a file in `src/adapters` plus a test. Trackers implement `listIntake`, `get`, `comment`, and `setState`. Workers implement `start` and `join`. Forges implement `openPullRequest`, `quality`, `mergeability`, `updateBranch`, and `squashMerge`.
 
 An install keeps its repos, trunk branches, status names, and promote commands in its own `delivery-loop.yaml`. Those facts do not belong in this repository.
 

@@ -75,6 +75,7 @@ export type TicketResult = {
     | "quality-failed"
     | "quality-pending"
     | "quality-unscheduled"
+    | "land-blocked"
     | "worker-failed";
   detail: string;
 };
@@ -555,46 +556,19 @@ async function runHeldTicket(
       created: pr.created,
     });
   }
-  const states = await Promise.all(
-    opened.map(async (pr) => ({
-      pr,
-      quality: await waitForQuality(deps, pr),
-    })),
-  );
-  const pending = states.find((row) => row.quality.state === "pending");
-  if (pending) {
-    const body = qualityRunUnscheduled(pending.quality.detail)
-      ? `Quality did not start on ${pending.pr.url}. ${pending.quality.detail} The next page requests the workflow run.`
-      : `Quality still running on ${pending.pr.url}. The next page merges it when the check is green.`;
-    await deps.tracker.comment(ticket.identifier, body);
-    return { identifier: ticket.identifier, outcome: "quality-pending", detail: pending.pr.url };
-  }
-  const failed = states.find((row) => row.quality.state !== "success");
-  if (failed) {
-    if (failed.quality.state === "unscheduled") {
-      await deps.tracker.comment(
-        ticket.identifier,
-        `Quality did not start on ${failed.pr.url}. ${failed.quality.detail} Polling this commit cannot create the workflow run.`,
-      );
-      return {
-        identifier: ticket.identifier,
-        outcome: "quality-unscheduled",
-        detail: failed.pr.url,
-      };
-    }
-    await deps.tracker.comment(
-      ticket.identifier,
-      `Quality ${failed.quality.state} on ${failed.pr.url}`,
-    );
-    return { identifier: ticket.identifier, outcome: "quality-failed", detail: failed.pr.url };
-  }
   for (const pr of opened) {
-    await deps.forge.squashMerge({
-      repoUrl: pr.repo.url,
-      number: pr.number,
-      branch: pr.branch,
-      base: pr.repo.trunk,
-    });
+    try {
+      const paused = await landPull(deps, ticket, pr);
+      if (paused) return paused;
+    } catch (error) {
+      const paused = pauseLand(
+        ticket.identifier,
+        pr.url,
+        error instanceof Error ? error.message : String(error),
+      );
+      await deps.tracker.comment(ticket.identifier, paused.detail);
+      return paused;
+    }
   }
   for (const step of deps.pack.dev?.steps ?? []) {
     const result = spawnSync(step, { shell: true, cwd: deps.cwd ?? process.cwd(), stdio: "inherit" });
@@ -618,6 +592,124 @@ async function runHeldTicket(
 }
 
 const QUALITY_POLL_MS = 30_000;
+const MERGE_SETTLE_MS = 2_000;
+const MAX_BRANCH_UPDATES = 2;
+
+type OpenPull = {
+  repo: RepoSpec;
+  number: number;
+  url: string;
+  headSha: string;
+  branch: string;
+  created: boolean;
+};
+
+function pauseLand(identifier: string, url: string, reason: string): TicketResult {
+  return {
+    identifier,
+    outcome: "land-blocked",
+    detail: `Land paused on ${url}. ${reason} The sweep continues with the next ticket.`,
+  };
+}
+
+async function explainQuality(
+  deps: LoopDeps,
+  ticket: Ticket,
+  pr: OpenPull,
+  quality: QualityWait,
+): Promise<TicketResult | null> {
+  if (quality.state === "pending") {
+    const body = qualityRunUnscheduled(quality.detail)
+      ? `Quality did not start on ${pr.url}. ${quality.detail} The next page requests the workflow run.`
+      : `Quality still running on ${pr.url}. The next page merges it when the check is green.`;
+    await deps.tracker.comment(ticket.identifier, body);
+    return { identifier: ticket.identifier, outcome: "quality-pending", detail: pr.url };
+  }
+  if (quality.state === "unscheduled") {
+    await deps.tracker.comment(
+      ticket.identifier,
+      `Quality did not start on ${pr.url}. ${quality.detail} Polling this commit cannot create the workflow run.`,
+    );
+    return { identifier: ticket.identifier, outcome: "quality-unscheduled", detail: pr.url };
+  }
+  if (quality.state !== "success") {
+    await deps.tracker.comment(ticket.identifier, `Quality ${quality.state} on ${pr.url}`);
+    return { identifier: ticket.identifier, outcome: "quality-failed", detail: pr.url };
+  }
+  return null;
+}
+
+/**
+ * Merge one pull request. A behind branch is updated onto trunk and quality
+ * runs again on the new head. A conflict or a refused merge pauses this
+ * ticket. The caller keeps the rest of the sweep moving.
+ * Returns null when this pull request merged.
+ */
+async function landPull(
+  deps: LoopDeps,
+  ticket: Ticket,
+  pr: OpenPull,
+): Promise<TicketResult | null> {
+  let current = pr;
+  let updates = 0;
+  let unknown = 0;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  for (let step = 0; step < 8; step++) {
+    const quality = await waitForQuality(deps, current);
+    const early = await explainQuality(deps, ticket, current, quality);
+    if (early) return early;
+    const merge = await deps.forge.mergeability({
+      repoUrl: current.repo.url,
+      number: current.number,
+    });
+    const head = merge.headSha || current.headSha;
+    if (head !== current.headSha) {
+      current = { ...current, headSha: head };
+      continue;
+    }
+    if (merge.state === "conflict") {
+      const paused = pauseLand(
+        ticket.identifier,
+        current.url,
+        `The branch conflicts with \`${current.repo.trunk}\`.`,
+      );
+      await deps.tracker.comment(ticket.identifier, paused.detail);
+      return paused;
+    }
+    if (merge.state === "behind") {
+      if (updates >= MAX_BRANCH_UPDATES) {
+        const paused = pauseLand(
+          ticket.identifier,
+          current.url,
+          `The branch is still behind \`${current.repo.trunk}\` after update-branch.`,
+        );
+        await deps.tracker.comment(ticket.identifier, paused.detail);
+        return paused;
+      }
+      await deps.forge.updateBranch({
+        repoUrl: current.repo.url,
+        number: current.number,
+        expectedHeadSha: head,
+      });
+      updates += 1;
+      await sleep(MERGE_SETTLE_MS);
+      continue;
+    }
+    if (merge.state === "unknown" && unknown < 4) {
+      unknown += 1;
+      await sleep(MERGE_SETTLE_MS);
+      continue;
+    }
+    break;
+  }
+  await deps.forge.squashMerge({
+    repoUrl: current.repo.url,
+    number: current.number,
+    branch: current.branch,
+    base: current.repo.trunk,
+  });
+  return null;
+}
 
 const RERUN_QUALITY_MESSAGE = [
   "rerun quality",
@@ -740,7 +832,15 @@ export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
       if (!programs.has(key)) programs.set(key, await loadProgram(deps, key));
       program = programs.get(key) ?? null;
     }
-    results.push(await runTicket(program ? { ...deps, program } : deps, ticket));
+    try {
+      results.push(await runTicket(program ? { ...deps, program } : deps, ticket));
+    } catch (error) {
+      results.push({
+        identifier: ticket.identifier,
+        outcome: "worker-failed",
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
   return results;
 }
