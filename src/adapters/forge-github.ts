@@ -4,7 +4,7 @@ import {
   githubUserLogin,
   type CommitActor,
 } from "./github-actor.js";
-import type { FetchLike, ForgeAdapter, PullMerge, PullRequest } from "./types.js";
+import type { CompareStatus, FetchLike, ForgeAdapter, PullMerge, PullRequest } from "./types.js";
 import { githubRepoFromUrl } from "./types.js";
 
 async function readCommit(
@@ -51,6 +51,12 @@ export function interpretMergeability(body: {
     return { state: "conflict", headSha };
   }
   return { state: "unknown", headSha };
+}
+
+export function interpretCompare(status: string | null | undefined): CompareStatus {
+  const raw = (status ?? "").toLowerCase();
+  if (raw === "ahead" || raw === "behind" || raw === "identical" || raw === "diverged") return raw;
+  return "unknown";
 }
 
 export function githubForge(opts: {
@@ -207,6 +213,17 @@ export function githubForge(opts: {
         },
       );
     },
+    async compare(input) {
+      const { owner, repo } = githubRepoFromUrl(input.repoUrl);
+      const spec = `${encodeURIComponent(input.base)}...${encodeURIComponent(input.head)}`;
+      const response = await fetchImpl(
+        `https://api.github.com/repos/${owner}/${repo}/compare/${spec}`,
+        { headers },
+      );
+      if (!response.ok) return "unknown";
+      const json = (await response.json()) as { status?: string };
+      return interpretCompare(json.status);
+    },
     async updateBranch(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
       await requireActor(`https://github.com/${owner}/${repo}`);
@@ -234,10 +251,14 @@ export function githubForge(opts: {
     async squashMerge(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
       await requireActor(`https://github.com/${owner}/${repo}`);
-      await api(`/repos/${owner}/${repo}/pulls/${input.number}/merge`, {
+      const response = await api(`/repos/${owner}/${repo}/pulls/${input.number}/merge`, {
         method: "PUT",
         body: JSON.stringify({ merge_method: "squash" }),
       });
+      const json = (await response.json()) as { sha?: string };
+      const sha = json.sha?.trim() ?? "";
+      if (!sha) throw new Error("GitHub merge did not return a commit");
+      return sha;
     },
     async dispatch(input) {
       if (!opts.repo) throw new Error("Forge dispatch needs owner/repo");

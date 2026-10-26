@@ -114,7 +114,15 @@ export type ProjectPack = {
     parkMilestones?: { match: string; kind: string; where?: "name" | "text" }[];
   };
   connectors: string[];
-  dev?: { steps: string[] };
+  /**
+   * After trunk quality is green. `promote` runs `command` once per landed
+   * repo that is also listed in `repos`, with `{repo}` replaced.
+   * When `promote` is set, `steps` are not run.
+   */
+  dev?: {
+    steps?: string[];
+    promote?: { command: string; repos: string[] };
+  };
   /**
    * Pack-owned production steps. `markStatus` defaults to true.
    * Set it false when a step already moves the ticket to the prod state

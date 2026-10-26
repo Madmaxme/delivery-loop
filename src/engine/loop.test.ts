@@ -7,7 +7,7 @@ import { describe, it } from "node:test";
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
-import { repoCheckoutDir, runTicket, ship, sweep, sweepNeedsAnotherPage } from "./loop.ts";
+import { latestLandMarker, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage } from "./loop.ts";
 
 const pack: ProjectPack = {
   tracker: "github",
@@ -96,8 +96,12 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
       return { state: "clean", headSha: "abc" };
     },
     async updateBranch() {},
+    async compare() {
+      return "ahead";
+    },
     async squashMerge() {
       merged = true;
+      return "trunk";
     },
     async dispatch() {},
   };
@@ -265,6 +269,7 @@ describe("loop", () => {
         throw new Error("405 Pull Request has merge conflicts");
       }
       merged += 1;
+      return "trunk";
     };
     const results = await sweep(env.deps);
     assert.deepEqual(
@@ -378,7 +383,7 @@ describe("loop", () => {
     env.deps.sleep = async () => {};
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
-    assert.equal(n, 2);
+    assert.equal(n, 3);
     assert.equal(sweepNeedsAnotherPage([result]), false);
   });
 
@@ -419,7 +424,7 @@ describe("loop", () => {
     env.deps.lookupHead = () => head;
     env.deps.forge.mergeability = async () => ({ state: "clean", headSha: "" });
     env.deps.forge.quality = async (input) => {
-      const state = input.headSha === "def" ? "success" : "failure";
+      const state = input.headSha === "def" || input.headSha === "trunk" ? "success" : "failure";
       return { state, detail: `quality ${state}` };
     };
     env.deps.worker.start = async (input) => {
@@ -696,6 +701,207 @@ describe("loop", () => {
     );
     assert.equal(result.outcome, "skipped-lease");
     assert.equal(env.comments.length, 0);
+  });
+
+  it("sorts landings by pack repo order", () => {
+    const board: ProjectPack = {
+      ...pack,
+      repos: [
+        { name: "api", url: "https://github.com/acme/api", trunk: "development" },
+        { name: "customer-app", url: "https://github.com/acme/customer-app", trunk: "main" },
+        { name: "infra", url: "https://github.com/acme/infra", trunk: "main" },
+      ],
+    };
+    const sorted = sortByPack(
+      board,
+      [{ name: "customer-app" }, { name: "other" }, { name: "api" }],
+      (row) => row.name,
+    );
+    assert.deepEqual(
+      sorted.map((row) => row.name),
+      ["api", "customer-app", "other"],
+    );
+  });
+
+  it("merges api before a client that the work order listed first", async () => {
+    const env = harness(
+      BUILDABLE.replace("**Repos:** `api`", "**Repos:** `customer-app, api`"),
+    );
+    const api = { name: "api", url: "https://github.com/acme/api", trunk: "development" };
+    const client = { name: "customer-app", url: "https://github.com/acme/customer-app", trunk: "main" };
+    env.deps.pack = { ...pack, repos: [api, client], branchTemplate: "cursor/{issue}-{repo}" };
+    env.deps.lookupHead = () => "abc1234";
+    const opened: string[] = [];
+    env.deps.forge.openPullRequest = async (input) => {
+      opened.push(input.repoUrl);
+      return {
+        number: opened.length,
+        url: `${input.repoUrl}/pull/${opened.length}`,
+        headSha: "abc1234",
+        branch: input.head,
+        created: true,
+      };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.deepEqual(opened, [api.url, client.url]);
+  });
+
+  it("does not open a pull request when the branch is already on trunk", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = { ...pack, branchTemplate: "cursor/{issue}-{repo}" };
+    env.deps.lookupHead = () => "abc1234";
+    env.deps.forge.compare = async () => "identical";
+    let opened = 0;
+    env.deps.forge.openPullRequest = async () => {
+      opened += 1;
+      return {
+        number: 1,
+        url: "https://github.com/acme/api/pull/1",
+        headSha: "abc1234",
+        branch: "cursor/api-1-api",
+        created: true,
+      };
+    };
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
+    const first = await runTicket(env.deps, ticket());
+    assert.equal(first.outcome, "land-empty");
+    assert.equal(opened, 0);
+    assert.equal(starts, 1);
+    assert.equal(env.state(), "Todo");
+    assert.equal(sweepNeedsAnotherPage([first]), false);
+    const marker = env.comments.find((body) => body.includes("LAND_EMPTY")) ?? "";
+    assert.match(marker, /api abc1234/);
+    starts = 0;
+    const second = await runTicket(
+      env.deps,
+      ticket({ comments: [{ body: marker }] }),
+    );
+    assert.equal(second.outcome, "land-empty");
+    assert.equal(starts, 0);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("waits for trunk quality before marking dev", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.forge.quality = async (input) =>
+      input.headSha === "trunk"
+        ? { state: "failure", detail: "trunk red" }
+        : { state: "success", detail: "quality success" };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "trunk-waiting");
+    assert.equal(env.state(), "Todo");
+    assert.equal(env.merged(), true);
+    assert.match(env.comments.join("\n"), /LAND_WAIT/);
+    assert.match(env.comments.join("\n"), /hold=0/);
+    assert.match(env.comments.join("\n"), /api trunk/);
+    assert.equal(sweepNeedsAnotherPage([result]), false);
+  });
+
+  it("marks dev on the next sweep when the recorded trunk commit is green", async () => {
+    const env = harness(BUILDABLE);
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
+    const waiting = await runTicket(
+      env.deps,
+      ticket({ comments: [{ body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" }] }),
+    );
+    assert.equal(waiting.outcome, "landed");
+    assert.equal(starts, 0);
+    assert.equal(env.state(), "Dev");
+    assert.equal(env.comments.some((body) => body.includes("LAND_WAIT")), false);
+  });
+
+  it("leaves the trunk marker in place while quality is still red", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.forge.quality = async () => ({ state: "pending", detail: "quality in_progress" });
+    const result = await runTicket(
+      env.deps,
+      ticket({ comments: [{ body: "<!-- LAND_WAIT\nhold=1\napi trunk\n-->" }] }),
+    );
+    assert.equal(result.outcome, "trunk-waiting");
+    assert.equal(env.state(), "Todo");
+    assert.equal(env.comments.some((body) => body.includes("LAND_WAIT")), false);
+    assert.equal(sweepNeedsAnotherPage([result]), false);
+  });
+
+  it("promotes only the mobile repos this ticket landed", async () => {
+    const env = harness(
+      BUILDABLE.replace("**Repos:** `api`", "**Repos:** `customer-app, api`"),
+    );
+    const api = { name: "api", url: "https://github.com/acme/api", trunk: "development" };
+    const client = { name: "customer-app", url: "https://github.com/acme/customer-app", trunk: "main" };
+    const commands: string[] = [];
+    env.deps.pack = {
+      ...pack,
+      repos: [api, client],
+      branchTemplate: "cursor/{issue}-{repo}",
+      dev: {
+        promote: {
+          command: "./scripts/promote.sh dev --repo {repo}",
+          repos: ["customer-app", "operator-app"],
+        },
+      },
+    };
+    env.deps.lookupHead = () => "abc1234";
+    env.deps.runCommand = (command) => {
+      commands.push(command);
+      return { status: 0 };
+    };
+    env.deps.forge.openPullRequest = async (input) => ({
+      number: commands.length + 1,
+      url: `${input.repoUrl}/pull/1`,
+      headSha: "abc1234",
+      branch: input.head,
+      created: true,
+    });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.deepEqual(commands, ["./scripts/promote.sh dev --repo customer-app"]);
+    assert.equal(env.state(), "Dev");
+  });
+
+  it("retries promote on the next sweep without grounding again", async () => {
+    const env = harness(BUILDABLE);
+    let fail = true;
+    const commands: string[] = [];
+    env.deps.pack = {
+      ...pack,
+      dev: {
+        promote: {
+          command: "./scripts/promote.sh dev --repo {repo}",
+          repos: ["api"],
+        },
+      },
+    };
+    env.deps.runCommand = (command) => {
+      commands.push(command);
+      return { status: fail ? 1 : 0 };
+    };
+    const first = await runTicket(env.deps, ticket());
+    assert.equal(first.outcome, "quality-failed");
+    assert.equal(env.state(), "Todo");
+    const marker = env.comments.find((body) => body.includes("LAND_WAIT")) ?? "";
+    assert.equal(latestLandMarker([{ body: marker }])?.kind, "wait");
+    fail = false;
+    commands.length = 0;
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
+    const second = await runTicket(env.deps, ticket({ comments: [{ body: marker }] }));
+    assert.equal(second.outcome, "landed");
+    assert.equal(starts, 0);
+    assert.deepEqual(commands, ["./scripts/promote.sh dev --repo api"]);
+    assert.equal(env.state(), "Dev");
   });
 
   it("leaves prod status to the pack when markStatus is false", async () => {
