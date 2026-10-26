@@ -1,3 +1,9 @@
+import {
+  assertCommitActor,
+  commitActorLogin,
+  githubUserLogin,
+  type CommitActor,
+} from "./github-actor.js";
 import type { FetchLike, ForgeAdapter, PullRequest } from "./types.js";
 import { githubRepoFromUrl } from "./types.js";
 
@@ -34,6 +40,8 @@ export function githubForge(opts: {
   token: string;
   fetch?: FetchLike;
   repo?: string;
+  /** Writes to a listed repo require `GET /user` to be that login. */
+  commitActors?: CommitActor[];
 }): ForgeAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
@@ -42,6 +50,14 @@ export function githubForge(opts: {
     "X-GitHub-Api-Version": "2022-11-28",
     "Content-Type": "application/json",
   };
+  let loginPromise: Promise<string | null> | null = null;
+
+  async function requireActor(repoUrl: string): Promise<void> {
+    const expected = commitActorLogin(opts.commitActors, repoUrl);
+    if (!expected) return;
+    loginPromise ??= githubUserLogin(fetchImpl, opts.token);
+    assertCommitActor(repoUrl, await loginPromise, expected);
+  }
 
   async function api(path: string, init?: RequestInit): Promise<Response> {
     const response = await fetchImpl(`https://api.github.com${path}`, {
@@ -56,6 +72,7 @@ export function githubForge(opts: {
 
   return {
     async openPullRequest(input): Promise<PullRequest> {
+      await requireActor(input.repoUrl);
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
       const body = JSON.stringify({
         title: input.title,
@@ -144,6 +161,7 @@ export function githubForge(opts: {
       const requested = input.message.split("\n")[0]?.trim();
       const current = commit?.message.split("\n")[0]?.trim();
       if (!commit?.tree || !requested || current === requested) return null;
+      await requireActor(input.repoUrl);
       const created = await api(`/repos/${owner}/${repo}/git/commits`, {
         method: "POST",
         body: JSON.stringify({
@@ -163,6 +181,7 @@ export function githubForge(opts: {
     },
     async squashMerge(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
+      await requireActor(`https://github.com/${owner}/${repo}`);
       await api(`/repos/${owner}/${repo}/pulls/${input.number}/merge`, {
         method: "PUT",
         body: JSON.stringify({ merge_method: "squash" }),

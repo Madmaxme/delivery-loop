@@ -10,6 +10,57 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("adapters", () => {
+  it("refuses a pull request when the token is not the commit actor", async () => {
+    const calls: string[] = [];
+    const forge = githubForge({
+      token: "app",
+      commitActors: [{ login: "Madmaxme", repos: ["https://github.com/Madmaxme/delivery-loop"] }],
+      fetch: async (url, init) => {
+        calls.push(`${init?.method ?? "GET"} ${url}`);
+        if (String(url).endsWith("/user")) return jsonResponse({ message: "forbidden" }, 403);
+        return jsonResponse({});
+      },
+    });
+    await assert.rejects(
+      () =>
+        forge.openPullRequest({
+          repoUrl: "https://github.com/Madmaxme/delivery-loop",
+          title: "t",
+          body: "b",
+          head: "feature",
+          base: "main",
+        }),
+      /commit actor is Madmaxme/,
+    );
+    assert.equal(calls.some((call) => call.includes("/pulls")), false);
+  });
+
+  it("opens a pull request when the token login is the commit actor", async () => {
+    const forge = githubForge({
+      token: "user",
+      commitActors: [{ login: "Madmaxme", repos: ["Madmaxme/delivery-loop"] }],
+      fetch: async (url, init) => {
+        if (String(url).endsWith("/user")) return jsonResponse({ login: "Madmaxme" });
+        if (String(url).endsWith("/pulls") && init?.method === "POST") {
+          return jsonResponse({
+            number: 4,
+            html_url: "https://github.com/Madmaxme/delivery-loop/pull/4",
+            head: { sha: "abc", ref: "feature" },
+          });
+        }
+        return jsonResponse({});
+      },
+    });
+    const pr = await forge.openPullRequest({
+      repoUrl: "https://github.com/Madmaxme/delivery-loop.git",
+      title: "t",
+      body: "b",
+      head: "feature",
+      base: "main",
+    });
+    assert.equal(pr.number, 4);
+  });
+
   it("opens a pull request and reads a green quality run", async () => {
     const calls: string[] = [];
     const forge = githubForge({

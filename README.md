@@ -17,7 +17,7 @@ delivery-loop update
 
 The runner clones https://github.com/Madmaxme/delivery-loop over HTTPS. It installs dependencies in that checkout before the global install, because `npm install -g <dir>` only symlinks the directory.
 
-The product remote is https://github.com/Madmaxme/delivery-loop. `bash scripts/bootstrap-remote.sh` pushes `main` there.
+The product remote is https://github.com/Madmaxme/delivery-loop. `bash scripts/bootstrap-remote.sh` pushes `main` there only when `GET /user` on the token is that remote's owner. An install names the same rule with `commitActors`: a write to one of those repos is refused unless the token's login is the actor. Other repos keep whatever account the token already is.
 
 ## Contribute
 

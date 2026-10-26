@@ -100,6 +100,7 @@ export function adaptersFor(pack: ProjectPack): {
   const forge = githubForge({
     token,
     repo: pack.githubRepo ?? githubRepoFromUrl(pack.repos[0].url).owner + "/" + githubRepoFromUrl(pack.repos[0].url).repo,
+    commitActors: pack.commitActors,
   });
   const tracker =
     pack.tracker === "linear"

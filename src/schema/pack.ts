@@ -1,6 +1,12 @@
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 
+/** Writes to `repos` are refused unless the token's GitHub login is `login`. */
+export type CommitActor = {
+  login: string;
+  repos: string[];
+};
+
 export type RepoSpec = {
   name: string;
   url: string;
@@ -36,6 +42,11 @@ export type ProjectPack = {
   linearTeam?: string;
   workerHttp?: { startUrl: string; statusUrl: string };
   repos: RepoSpec[];
+  /**
+   * Repos whose commits must show a person. Absent repos keep the token's
+   * own account, including a GitHub App.
+   */
+  commitActors?: CommitActor[];
   qualityCommand: string;
   qualityWorkflow: string;
   /**
@@ -107,6 +118,7 @@ export function loadPack(path: string): ProjectPack {
   raw.status = { ...defaultStatus(), ...raw.status };
   raw.qualityWorkflow = raw.qualityWorkflow || "quality";
   raw.connectors = raw.connectors ?? [];
+  raw.commitActors = raw.commitActors ?? [];
   raw.invariantsFile = raw.invariantsFile || "invariants.md";
   raw.prompts = {
     ground: raw.prompts?.ground ?? [],
