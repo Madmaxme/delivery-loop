@@ -21,9 +21,45 @@ export type InvariantHeading = {
   file: string;
 };
 
+/** A real shared list of next, blocked, and done. Not files dropped in the repo. */
+export type TrackerKind = "linear" | "github";
+
+/** Who edits the code. The runner starts this and waits. */
+export type WorkerKind = "cursor" | "claude" | "codex" | "copilot" | "http";
+
+/**
+ * Where the branch is published and merged.
+ * `github` uses pull requests. `git` merges with git on any remote.
+ */
+export type ForgeKind = "github" | "git";
+
+/**
+ * How a commit is allowed to merge.
+ * `workflow` polls a forge workflow. `command` runs `qualityCommand` in the checkout.
+ */
+export type CheckKind = "workflow" | "command";
+
+/**
+ * The process that stays awake and runs commands.
+ * `gha` is GitHub Actions. `local` is this process. One of them is required.
+ */
+export type RunnerKind = "gha" | "local";
+
+const TRACKERS: readonly TrackerKind[] = ["linear", "github"];
+const WORKERS: readonly WorkerKind[] = ["cursor", "claude", "codex", "copilot", "http"];
+const FORGES: readonly ForgeKind[] = ["github", "git"];
+const CHECKS: readonly CheckKind[] = ["workflow", "command"];
+const RUNNERS: readonly RunnerKind[] = ["gha", "local"];
+
 export type ProjectPack = {
-  tracker: "linear" | "github";
-  worker: "cursor" | "claude" | "codex" | "copilot" | "http";
+  tracker: TrackerKind;
+  worker: WorkerKind;
+  /** `github` opens pull requests. `git` merges the branch with git. */
+  forge?: ForgeKind;
+  /** `workflow` polls the quality workflow. `command` runs `qualityCommand`. */
+  check?: CheckKind;
+  /** What executes the loop. `gha` dispatches GitHub Actions. `local` runs here. */
+  runner?: RunnerKind;
   /** owner/repo used when the tracker is GitHub Issues. */
   githubRepo?: string;
   /**
@@ -112,9 +148,22 @@ export function loadPack(path: string): ProjectPack {
   if (!raw || !Array.isArray(raw.repos) || raw.repos.length === 0) {
     throw new Error(`${path} needs at least one repo`);
   }
-  if (raw.tracker !== "linear" && raw.tracker !== "github") {
+  if (!TRACKERS.includes(raw.tracker)) {
     throw new Error(`${path} tracker must be linear or github`);
   }
+  if (!WORKERS.includes(raw.worker)) {
+    throw new Error(`${path} worker must be cursor, claude, codex, copilot, or http`);
+  }
+  raw.forge = raw.forge ?? "github";
+  raw.check = raw.check ?? "workflow";
+  raw.runner = raw.runner ?? "gha";
+  if (!FORGES.includes(raw.forge)) throw new Error(`${path} forge must be github or git`);
+  if (!CHECKS.includes(raw.check)) throw new Error(`${path} check must be workflow or command`);
+  if (!RUNNERS.includes(raw.runner)) throw new Error(`${path} runner must be gha or local`);
+  if (raw.check === "workflow" && raw.forge !== "github") {
+    throw new Error(`${path} check workflow needs forge github`);
+  }
+  if (!raw.qualityCommand?.trim()) throw new Error(`${path} needs qualityCommand`);
   raw.status = { ...defaultStatus(), ...raw.status };
   raw.qualityWorkflow = raw.qualityWorkflow || "quality";
   raw.connectors = raw.connectors ?? [];

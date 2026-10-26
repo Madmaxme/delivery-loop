@@ -58,6 +58,8 @@ export type LoopDeps = {
   qualityPollMs?: number;
   /** How long a missing Actions run stays missing before the lander requests one. */
   qualityNoRunMs?: number;
+  /** Runs `qualityCommand` when `check` is `command`. Default runs it in the checkout. */
+  runCommand?: (command: string, cwd: string) => { status: number | null };
 };
 
 export type TicketResult = {
@@ -587,7 +589,12 @@ async function runHeldTicket(
     return { identifier: ticket.identifier, outcome: "quality-failed", detail: failed.pr.url };
   }
   for (const pr of opened) {
-    await deps.forge.squashMerge({ repoUrl: pr.repo.url, number: pr.number });
+    await deps.forge.squashMerge({
+      repoUrl: pr.repo.url,
+      number: pr.number,
+      branch: pr.branch,
+      base: pr.repo.trunk,
+    });
   }
   for (const step of deps.pack.dev?.steps ?? []) {
     const result = spawnSync(step, { shell: true, cwd: deps.cwd ?? process.cwd(), stdio: "inherit" });
@@ -623,10 +630,22 @@ type QualityWait = {
   detail: string;
 };
 
+function defaultRunCommand(command: string, cwd: string): { status: number | null } {
+  return spawnSync(command, { shell: true, cwd, stdio: "inherit" });
+}
+
 async function waitForQuality(
   deps: LoopDeps,
   pr: { repo: RepoSpec; url: string; headSha: string; branch: string; created: boolean },
 ): Promise<QualityWait> {
+  if (deps.pack.check === "command") {
+    const cwd = repoCheckoutDir(deps.cwd ?? process.cwd(), pr.repo, deps.pack);
+    const run = deps.runCommand ?? defaultRunCommand;
+    const result = run(deps.pack.qualityCommand, cwd);
+    return result.status === 0
+      ? { state: "success", detail: deps.pack.qualityCommand }
+      : { state: "failure", detail: `${deps.pack.qualityCommand} exited ${result.status ?? "null"}` };
+  }
   const polls = deps.maxQualityPolls ?? 60;
   const noRunMs = deps.qualityNoRunMs ?? QUALITY_NO_RUN_MS;
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));

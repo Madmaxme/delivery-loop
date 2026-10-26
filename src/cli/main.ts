@@ -11,6 +11,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse, stringify } from "yaml";
 
+import { gitForge } from "../adapters/forge-git.js";
 import { githubForge } from "../adapters/forge-github.js";
 import { githubIssuesTracker, linearTracker } from "../adapters/trackers.js";
 import {
@@ -96,12 +97,17 @@ export function adaptersFor(pack: ProjectPack): {
   worker: WorkerAdapter;
   forge: ForgeAdapter;
 } {
-  const token = requireEnv("GH_TOKEN");
-  const forge = githubForge({
-    token,
-    repo: pack.githubRepo ?? githubRepoFromUrl(pack.repos[0].url).owner + "/" + githubRepoFromUrl(pack.repos[0].url).repo,
-    commitActors: pack.commitActors,
-  });
+  const githubToken = () => requireEnv("GH_TOKEN");
+  const forge =
+    pack.forge === "git"
+      ? gitForge({ cwd: process.cwd() })
+      : githubForge({
+          token: githubToken(),
+          repo:
+            pack.githubRepo ??
+            githubRepoFromUrl(pack.repos[0].url).owner + "/" + githubRepoFromUrl(pack.repos[0].url).repo,
+          commitActors: pack.commitActors,
+        });
   const tracker =
     pack.tracker === "linear"
       ? linearTracker({
@@ -110,7 +116,7 @@ export function adaptersFor(pack: ProjectPack): {
           intakeState: pack.status.intake,
         })
       : githubIssuesTracker({
-          token,
+          token: githubToken(),
           repo: pack.githubRepo ?? "",
           intakeLabel: pack.status.intake,
         });
@@ -136,7 +142,13 @@ function workerFor(pack: ProjectPack): WorkerAdapter {
 
 function dispatchOrRun(mode: string, argv: string[]): void {
   if (mode === "ship") {
-    const local = process.env.GITHUB_ACTIONS === "true" || process.env.DELIVERY_LOOP_RUNTIME === "local";
+    const packRunner = existsSync(packPath(process.cwd()))
+      ? loadPack(packPath(process.cwd())).runner
+      : undefined;
+    const local =
+      packRunner === "local" ||
+      process.env.GITHUB_ACTIONS === "true" ||
+      process.env.DELIVERY_LOOP_RUNTIME === "local";
     if (!local) {
       const repo = process.env.GITHUB_REPOSITORY;
       if (!repo) throw new Error("GITHUB_REPOSITORY is required to dispatch the runner");
@@ -159,9 +171,12 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     );
     return;
   }
+  const packRunner = existsSync(packPath(process.cwd()))
+    ? loadPack(packPath(process.cwd())).runner
+    : undefined;
   const plan = planDeliveryInvocation({
     githubActions: process.env.GITHUB_ACTIONS === "true",
-    envRuntime: process.env.DELIVERY_LOOP_RUNTIME,
+    envRuntime: packRunner === "local" ? "local" : process.env.DELIVERY_LOOP_RUNTIME,
     mode,
     argv,
   });
@@ -232,6 +247,9 @@ function init(argv: string[]): void {
     githubRepo: repo,
     linearTeam: arg("--linear-team", argv),
     repos: [{ name, url, trunk, packages: arg("--packages", argv)?.split(",") }],
+    forge: "github",
+    check: "workflow",
+    runner: "gha",
     qualityCommand: arg("--quality", argv) ?? "npm test",
     qualityWorkflow: arg("--quality-workflow", argv) ?? "quality",
     invariantsFile: "invariants.md",

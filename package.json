@@ -12,7 +12,7 @@
     "./schema/pack": "./src/schema/pack.ts"
   },
   "scripts": {
-    "test": "tsx --test src/engine/*.test.ts src/cli/*.test.ts src/adapters/*.test.ts src/connectors/*.test.ts"
+    "test": "tsx --test src/engine/*.test.ts src/cli/*.test.ts src/adapters/*.test.ts src/schema/*.test.ts src/connectors/*.test.ts"
   },
   "dependencies": {
     "@cursor/sdk": "^1.0.26",

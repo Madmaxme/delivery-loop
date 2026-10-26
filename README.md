@@ -1,6 +1,13 @@
 # delivery-loop
 
-Versioned autonomous delivery loop. Conduct rules, a GitHub Actions runner, and a swappable coding agent.
+Versioned autonomous delivery loop. Four things are required. The vendor behind each one is an adapter.
+
+1. **Git** holds the code, the branch, and the merge. `forge: github` opens a pull request. `forge: git` merges with git on any remote.
+2. **A work queue** is a real shared list of what is next, what is blocked, and what is done. `tracker: linear` or `tracker: github`. Files in the repo are not a queue.
+3. **A runner** executes commands with nobody sitting there. `runner: gha` is GitHub Actions. `runner: local` is this process. One of them is required.
+4. **A coding worker** edits the code. The runner starts it and waits. `worker` is `cursor`, `claude`, `codex`, `copilot`, or `http`.
+
+`check: workflow` polls the named quality workflow on GitHub. `check: command` runs `qualityCommand` in the checkout. A workflow check requires `forge: github`.
 
 An install keeps its own `delivery-loop.yaml` and invariants file. This repository does not name those projects.
 
@@ -23,7 +30,7 @@ The product remote is https://github.com/Madmaxme/delivery-loop. `bash scripts/b
 
 Clone this repo, branch from `main`, and open a pull request. The `quality` workflow runs the tests.
 
-A new tracker or worker is a file in `src/adapters` plus a test. Trackers implement `listIntake`, `get`, `comment`, and `setState`. Workers implement `start` and `join`.
+A new tracker, forge, or worker is a file in `src/adapters` plus a test. Trackers implement `listIntake`, `get`, `comment`, and `setState`. Workers implement `start` and `join`. Forges implement `openPullRequest`, `quality`, and `squashMerge`.
 
 An install keeps its repos, trunk branches, status names, and promote commands in its own `delivery-loop.yaml`. Those facts do not belong in this repository.
 

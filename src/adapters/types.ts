@@ -89,7 +89,13 @@ export type ForgeAdapter = {
     headSha: string;
     message: string;
   }): Promise<string | null>;
-  squashMerge(input: { repoUrl: string; number: number }): Promise<void>;
+  squashMerge(input: {
+    repoUrl: string;
+    number: number;
+    /** Set for a git merge. GitHub squash uses `number`. */
+    branch?: string;
+    base?: string;
+  }): Promise<void>;
   dispatch(input: { workflow: string; ref: string; inputs: Record<string, string> }): Promise<void>;
 };
 
