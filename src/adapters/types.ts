@@ -70,6 +70,14 @@ export type QualityProbe = {
   committedAt?: string;
 };
 
+/** What the forge knows before a merge. `unknown` means the host has not computed it yet. */
+export type Mergeability = "clean" | "behind" | "conflict" | "blocked" | "unknown";
+
+export type PullMerge = {
+  state: Mergeability;
+  headSha: string;
+};
+
 export type ForgeAdapter = {
   openPullRequest(input: {
     repoUrl: string;
@@ -89,6 +97,13 @@ export type ForgeAdapter = {
     headSha: string;
     message: string;
   }): Promise<string | null>;
+  /** Read whether this pull request can merge. A git forge with no pull request reports `clean`. */
+  mergeability(input: { repoUrl: string; number: number }): Promise<PullMerge>;
+  /**
+   * Put the trunk commits onto the branch. A git forge has nothing to update
+   * until `squashMerge`. An already up-to-date branch resolves.
+   */
+  updateBranch(input: { repoUrl: string; number: number; expectedHeadSha?: string }): Promise<void>;
   squashMerge(input: {
     repoUrl: string;
     number: number;

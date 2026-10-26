@@ -92,6 +92,10 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
     async requestQualityRun() {
       return null;
     },
+    async mergeability() {
+      return { state: "clean", headSha: "abc" };
+    },
+    async updateBranch() {},
     async squashMerge() {
       merged = true;
     },
@@ -186,6 +190,86 @@ describe("loop", () => {
     assert.equal(result.outcome, "quality-failed");
     assert.match(result.detail, /pull\/4/);
     assert.equal(env.merged(), false);
+  });
+
+  it("pauses the ticket when the branch conflicts and does not merge", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.sleep = async () => {};
+    env.deps.forge.mergeability = async () => ({ state: "conflict", headSha: "abc" });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "land-blocked");
+    assert.match(result.detail, /conflicts with `main`/);
+    assert.match(env.comments.join("\n"), /sweep continues/);
+    assert.equal(env.merged(), false);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("updates a behind branch and waits for quality on the new head", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.sleep = async () => {};
+    let reads = 0;
+    env.deps.forge.mergeability = async () => {
+      reads += 1;
+      if (reads === 1) return { state: "behind", headSha: "abc" };
+      return { state: "clean", headSha: "def" };
+    };
+    let updated = false;
+    env.deps.forge.updateBranch = async () => {
+      updated = true;
+    };
+    const shas: string[] = [];
+    env.deps.forge.quality = async (input) => {
+      shas.push(input.headSha);
+      return { state: "success", detail: "quality success" };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(updated, true);
+    assert.ok(shas.includes("def"));
+    assert.equal(env.merged(), true);
+  });
+
+  it("pauses the ticket when the merge is refused", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.forge.squashMerge = async () => {
+      throw new Error(
+        'GitHub /repos/acme/api/pulls/4/merge failed: 405 {"message":"Pull Request has merge conflicts"}',
+      );
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "land-blocked");
+    assert.match(result.detail, /405/);
+    assert.equal(env.merged(), false);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("continues the sweep after one ticket cannot merge", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.tracker.listIntake = async () => [ticket(), ticket({ identifier: "API-2", id: "2" })];
+    let opened = 0;
+    env.deps.forge.openPullRequest = async (input) => {
+      opened += 1;
+      return {
+        number: opened,
+        url: `https://github.com/acme/api/pull/${opened}`,
+        headSha: "abc",
+        branch: input.head,
+        created: true,
+      };
+    };
+    let merged = 0;
+    env.deps.forge.squashMerge = async (input) => {
+      if (input.number === 1) {
+        throw new Error("405 Pull Request has merge conflicts");
+      }
+      merged += 1;
+    };
+    const results = await sweep(env.deps);
+    assert.deepEqual(
+      results.map((row) => row.outcome),
+      ["land-blocked", "landed"],
+    );
+    assert.equal(merged, 1);
   });
 
   it("puts universal conduct ahead of the install build doc", async () => {

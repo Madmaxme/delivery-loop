@@ -214,13 +214,18 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     pageStartedAtMs: Number.isFinite(started) && started > 0 ? started : null,
   };
   if (mode === "sweep") {
-    sweep(deps).then((results) => {
-      console.log(JSON.stringify(results, null, 2));
-      const output = process.env.GITHUB_OUTPUT;
-      if (output && sweepNeedsAnotherPage(results)) {
-        appendFileSync(output, "chain=true\n");
-      }
-    });
+    sweep(deps)
+      .then((results) => {
+        console.log(JSON.stringify(results, null, 2));
+        const output = process.env.GITHUB_OUTPUT;
+        if (output && sweepNeedsAnotherPage(results)) {
+          appendFileSync(output, "chain=true\n");
+        }
+      })
+      .catch((error: unknown) => {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exit(1);
+      });
     return;
   }
   if (mode === "ship") {

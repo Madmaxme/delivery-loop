@@ -4,7 +4,7 @@ import {
   githubUserLogin,
   type CommitActor,
 } from "./github-actor.js";
-import type { FetchLike, ForgeAdapter, PullRequest } from "./types.js";
+import type { FetchLike, ForgeAdapter, PullMerge, PullRequest } from "./types.js";
 import { githubRepoFromUrl } from "./types.js";
 
 async function readCommit(
@@ -35,6 +35,23 @@ import {
   qualityRunUnscheduled,
   type QualityRunLite,
 } from "../engine/linear-harness-policy.js";
+
+export function interpretMergeability(body: {
+  mergeable?: boolean | null;
+  mergeable_state?: string | null;
+  head?: { sha?: string | null };
+}): PullMerge {
+  const headSha = body.head?.sha ?? "";
+  const raw = (body.mergeable_state ?? "").toLowerCase();
+  if (raw === "dirty") return { state: "conflict", headSha };
+  if (raw === "behind") return { state: "behind", headSha };
+  if (raw === "blocked" || raw === "draft") return { state: "blocked", headSha };
+  if (raw === "clean" || raw === "unstable" || raw === "has_hooks") return { state: "clean", headSha };
+  if (body.mergeable === false && raw !== "unknown" && raw !== "") {
+    return { state: "conflict", headSha };
+  }
+  return { state: "unknown", headSha };
+}
 
 export function githubForge(opts: {
   token: string;
@@ -178,6 +195,41 @@ export function githubForge(opts: {
         body: JSON.stringify({ sha: json.sha }),
       });
       return json.sha;
+    },
+    async mergeability(input) {
+      const { owner, repo } = githubRepoFromUrl(input.repoUrl);
+      const response = await api(`/repos/${owner}/${repo}/pulls/${input.number}`);
+      return interpretMergeability(
+        (await response.json()) as {
+          mergeable?: boolean | null;
+          mergeable_state?: string | null;
+          head?: { sha?: string | null };
+        },
+      );
+    },
+    async updateBranch(input) {
+      const { owner, repo } = githubRepoFromUrl(input.repoUrl);
+      await requireActor(`https://github.com/${owner}/${repo}`);
+      const response = await fetchImpl(
+        `https://api.github.com/repos/${owner}/${repo}/pulls/${input.number}/update-branch`,
+        {
+          method: "PUT",
+          headers,
+          body: JSON.stringify(
+            input.expectedHeadSha ? { expected_head_sha: input.expectedHeadSha } : {},
+          ),
+        },
+      );
+      if (response.status === 422) {
+        const text = await response.text();
+        if (/no new commits|already up.to.date|not behind/i.test(text)) return;
+        throw new Error(`GitHub update-branch failed: 422 ${text}`);
+      }
+      if (!response.ok) {
+        throw new Error(
+          `GitHub update-branch failed: ${response.status} ${await response.text()}`,
+        );
+      }
     },
     async squashMerge(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);

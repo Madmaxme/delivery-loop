@@ -47,6 +47,10 @@ export function gitForge(opts: {
     async requestQualityRun() {
       return null;
     },
+    async mergeability() {
+      return { state: "clean", headSha: "" };
+    },
+    async updateBranch() {},
     async squashMerge(input) {
       const branch = input.branch?.trim();
       const base = input.base?.trim();
