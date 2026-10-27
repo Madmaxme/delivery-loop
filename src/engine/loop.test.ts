@@ -279,6 +279,27 @@ describe("loop", () => {
     assert.equal(merged, 1);
   });
 
+  it("runs a dependent in the same sweep after its blocker lands", async () => {
+    const env = harness(BUILDABLE);
+    let reads = 0;
+    env.deps.tracker.listIntake = async () => {
+      reads += 1;
+      const blocker = ticket({ identifier: "API-1" });
+      const waiting = ticket({
+        identifier: "API-2",
+        id: "2",
+        blockedBy: [{ identifier: "API-1", stateName: reads === 1 ? "Todo" : "Dev" }],
+      });
+      return reads === 1 ? [waiting, blocker] : [waiting];
+    };
+    const results = await sweep(env.deps);
+    assert.deepEqual(
+      results.map((row) => `${row.identifier}:${row.outcome}`),
+      ["API-2:skipped-graph", "API-1:landed", "API-2:landed"],
+    );
+    assert.ok(reads >= 2);
+  });
+
   it("puts universal conduct ahead of the install build doc", async () => {
     const root = mkdtempSync(join(tmpdir(), "delivery-loop-"));
     writeFileSync(join(root, "build.md"), "INSTALL BUILD DOC");
