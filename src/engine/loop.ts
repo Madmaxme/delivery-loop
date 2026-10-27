@@ -1101,36 +1101,65 @@ async function loadProgram(deps: LoopDeps, projectName?: string | null): Promise
   return compileDeliveryProgramFromLinear(snapshot, deps.pack.program?.parkMilestones ?? []);
 }
 
+const MAX_SWEEP_PASSES = 50;
+
+/**
+ * Read the queue, run what is ready, and read it again when a ticket lands
+ * or a verdict moves it. A ticket that was waiting on that one can run in
+ * this same page. A pass that only skips blocked tickets stops.
+ */
 export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
-  const tickets = await deps.tracker.listIntake(
-    deps.project ? { project: deps.project } : undefined,
-  );
+  const settled = new Set<string>();
+  const blocked = new Set<string>();
   const programs = new Map<string, CompileProgramResult | null>();
   const results: TicketResult[] = [];
-  for (const ticket of tickets) {
-    const remaining = pageBudgetRemainingMs({
-      nowMs: deps.nowMs ?? Date.now(),
-      startedAtMs: deps.pageStartedAtMs ?? null,
-    });
-    if (shouldStopForPageReserve({ remainingMs: remaining })) {
-      results.push({ identifier: ticket.identifier, outcome: "skipped-page", detail: "page reserve" });
-      break;
-    }
-    const key = (deps.project ?? ticket.projectName ?? "").trim();
-    let program = deps.program ?? null;
-    if (!program && key) {
-      if (!programs.has(key)) programs.set(key, await loadProgram(deps, key));
-      program = programs.get(key) ?? null;
-    }
-    try {
-      results.push(await runTicket(program ? { ...deps, program } : deps, ticket));
-    } catch (error) {
-      results.push({
-        identifier: ticket.identifier,
-        outcome: "worker-failed",
-        detail: error instanceof Error ? error.message : String(error),
+  for (let pass = 0; pass < MAX_SWEEP_PASSES; pass++) {
+    const tickets = await deps.tracker.listIntake(
+      deps.project ? { project: deps.project } : undefined,
+    );
+    const pending = tickets.filter(
+      (ticket) => !settled.has(ticket.identifier) && !blocked.has(ticket.identifier),
+    );
+    if (pending.length === 0) break;
+    let moved = false;
+    for (const ticket of pending) {
+      const remaining = pageBudgetRemainingMs({
+        nowMs: deps.nowMs ?? Date.now(),
+        startedAtMs: deps.pageStartedAtMs ?? null,
       });
+      if (shouldStopForPageReserve({ remainingMs: remaining })) {
+        results.push({ identifier: ticket.identifier, outcome: "skipped-page", detail: "page reserve" });
+        return results;
+      }
+      const key = (deps.project ?? ticket.projectName ?? "").trim();
+      let program = deps.program ?? null;
+      if (!program && key) {
+        if (!programs.has(key)) programs.set(key, await loadProgram(deps, key));
+        program = programs.get(key) ?? null;
+      }
+      let result: TicketResult;
+      try {
+        result = await runTicket(program ? { ...deps, program } : deps, ticket);
+      } catch (error) {
+        result = {
+          identifier: ticket.identifier,
+          outcome: "worker-failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
+      results.push(result);
+      if (result.outcome === "skipped-graph") {
+        blocked.add(ticket.identifier);
+        continue;
+      }
+      settled.add(ticket.identifier);
+      if (result.outcome === "landed" || result.outcome === "verdict") {
+        blocked.clear();
+        moved = true;
+        break;
+      }
     }
+    if (!moved) break;
   }
   return results;
 }
