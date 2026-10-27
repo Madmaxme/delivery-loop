@@ -848,12 +848,17 @@ describe("loop", () => {
 
   it("waits for trunk quality before marking dev", async () => {
     const env = harness(BUILDABLE);
-    env.deps.ciFixMax = 1;
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
     env.deps.forge.quality = async (input) =>
       input.headSha === "trunk"
         ? { state: "failure", detail: "trunk red" }
         : { state: "success", detail: "quality success" };
     const result = await runTicket(env.deps, ticket());
+    assert.equal(starts, 2);
     assert.equal(result.outcome, "trunk-waiting");
     assert.equal(env.state(), "Todo");
     assert.equal(env.merged(), true);
@@ -904,6 +909,11 @@ describe("loop", () => {
 
   it("leaves the trunk marker in place while quality is still red", async () => {
     const env = harness(BUILDABLE);
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
     const lines: string[] = [];
     env.deps.report = (event) => {
       lines.push(formatTicketProgress(event));
@@ -913,6 +923,7 @@ describe("loop", () => {
       env.deps,
       ticket({ comments: [{ body: "<!-- LAND_WAIT\nhold=1\napi trunk\n-->" }] }),
     );
+    assert.equal(starts, 0);
     assert.equal(result.outcome, "trunk-waiting");
     assert.deepEqual(lines, ["API-1 land", "API-1 trunk-waiting api trunk"]);
     assert.equal(env.state(), "Todo");
