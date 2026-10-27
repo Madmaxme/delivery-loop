@@ -62,7 +62,22 @@ export type LoopDeps = {
   ciFixMax?: number;
   /** Runs `qualityCommand` when `check` is `command`. Default runs it in the checkout. */
   runCommand?: (command: string, cwd: string) => { status: number | null };
+  /**
+   * Receives one event when a ticket enters ground, build, or land, and one
+   * when that ticket finishes. Default writes a single line to stdout.
+   */
+  report?: (event: TicketProgress) => void;
 };
+
+/** ground, build, and land are in progress. done is the ticket result. */
+export type TicketProgress =
+  | { identifier: string; phase: "ground" | "build" | "land" }
+  | {
+      identifier: string;
+      phase: "done";
+      outcome: TicketResult["outcome"];
+      detail: string;
+    };
 
 export type TicketResult = {
   identifier: string;
@@ -83,6 +98,34 @@ export type TicketResult = {
     | "worker-failed";
   detail: string;
 };
+
+const PROGRESS_DETAIL_MAX = 200;
+
+/** One log line. Phase lines name the wait. The done line names the result. */
+export function formatTicketProgress(event: TicketProgress): string {
+  if (event.phase !== "done") return `${event.identifier} ${event.phase}`;
+  const detail = event.detail.replace(/\s+/g, " ").trim();
+  if (!detail) return `${event.identifier} ${event.outcome}`;
+  const short = detail.length > PROGRESS_DETAIL_MAX ? `${detail.slice(0, PROGRESS_DETAIL_MAX - 3)}...` : detail;
+  return `${event.identifier} ${event.outcome} ${short}`;
+}
+
+function noteTicket(deps: LoopDeps, event: TicketProgress): void {
+  if (deps.report) {
+    deps.report(event);
+    return;
+  }
+  process.stdout.write(`${formatTicketProgress(event)}\n`);
+}
+
+function noteDone(deps: LoopDeps, result: TicketResult): void {
+  noteTicket(deps, {
+    identifier: result.identifier,
+    phase: "done",
+    outcome: result.outcome,
+    detail: result.detail,
+  });
+}
 
 function leaseComment(nowMs: number, phase: string, runId: string): string {
   const expires = new Date(nowMs + DELIVERY_LEASE_TTL_MS).toISOString();
@@ -343,6 +386,12 @@ async function finishWorker(worker: WorkerAdapter, runId: string) {
 }
 
 export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResult> {
+  const result = await executeTicket(deps, ticket);
+  noteDone(deps, result);
+  return result;
+}
+
+async function executeTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResult> {
   const now = deps.nowMs ?? Date.now();
   const remaining = pageBudgetRemainingMs({
     nowMs: now,
@@ -387,6 +436,7 @@ async function runHeldTicket(
   const resumed = await resumeMarkedLand(deps, ticket);
   if (resumed) return resumed;
   let ground;
+  noteTicket(deps, { identifier: ticket.identifier, phase: "ground" });
   try {
     const started = await deps.worker.start({
       prompt: groundPrompt(ticket, deps),
@@ -537,6 +587,7 @@ async function runHeldTicket(
   }
   if (!landings) {
     let built;
+    noteTicket(deps, { identifier: ticket.identifier, phase: "build" });
     try {
       const started = await deps.worker.start({
         prompt: buildPrompt(ticket, ground.text, deps, order.repos, retry),
@@ -613,6 +664,7 @@ async function runHeldTicket(
       detail: empty.map((row) => `${row.repo} ${row.sha}`).join(" "),
     };
   }
+  noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
   const merged: MergedHead[] = [];
   for (const pr of opened) {
     try {
@@ -818,6 +870,7 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
     return { identifier: ticket.identifier, outcome: "land-empty", detail: "branch unchanged" };
   }
   if (marker.rows.length === 0) return null;
+  noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
   let green = true;
   for (const row of marker.rows) {
     const spec = repoByName(deps.pack, row.repo);
@@ -1128,7 +1181,13 @@ export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
         startedAtMs: deps.pageStartedAtMs ?? null,
       });
       if (shouldStopForPageReserve({ remainingMs: remaining })) {
-        results.push({ identifier: ticket.identifier, outcome: "skipped-page", detail: "page reserve" });
+        const result: TicketResult = {
+          identifier: ticket.identifier,
+          outcome: "skipped-page",
+          detail: "page reserve",
+        };
+        noteDone(deps, result);
+        results.push(result);
         return results;
       }
       const key = (deps.project ?? ticket.projectName ?? "").trim();
@@ -1146,6 +1205,7 @@ export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
           outcome: "worker-failed",
           detail: error instanceof Error ? error.message : String(error),
         };
+        noteDone(deps, result);
       }
       results.push(result);
       if (result.outcome === "skipped-graph") {

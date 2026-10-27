@@ -7,7 +7,7 @@ import { describe, it } from "node:test";
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
-import { latestLandMarker, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage } from "./loop.ts";
+import { formatTicketProgress, latestLandMarker, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage } from "./loop.ts";
 
 const pack: ProjectPack = {
   tracker: "github",
@@ -109,7 +109,15 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
     comments,
     merged: () => merged,
     state: () => state,
-    deps: { pack, tracker, worker, forge, invariantsMarkdown: invariants, maxQualityPolls: 1 },
+    deps: {
+      pack,
+      tracker,
+      worker,
+      forge,
+      invariantsMarkdown: invariants,
+      maxQualityPolls: 1,
+      report() {},
+    },
   };
 }
 
@@ -842,12 +850,17 @@ describe("loop", () => {
 
   it("leaves the trunk marker in place while quality is still red", async () => {
     const env = harness(BUILDABLE);
+    const lines: string[] = [];
+    env.deps.report = (event) => {
+      lines.push(formatTicketProgress(event));
+    };
     env.deps.forge.quality = async () => ({ state: "pending", detail: "quality in_progress" });
     const result = await runTicket(
       env.deps,
       ticket({ comments: [{ body: "<!-- LAND_WAIT\nhold=1\napi trunk\n-->" }] }),
     );
     assert.equal(result.outcome, "trunk-waiting");
+    assert.deepEqual(lines, ["API-1 land", "API-1 trunk-waiting trunk quality"]);
     assert.equal(env.state(), "Todo");
     assert.equal(env.comments.some((body) => body.includes("LAND_WAIT")), false);
     assert.equal(sweepNeedsAnotherPage([result]), false);
@@ -923,6 +936,63 @@ describe("loop", () => {
     assert.equal(starts, 0);
     assert.deepEqual(commands, ["./scripts/promote.sh dev --repo api"]);
     assert.equal(env.state(), "Dev");
+  });
+
+  it("reports each phase before the wait and the result when the ticket finishes", async () => {
+    const env = harness(BUILDABLE);
+    const lines: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      lines.push(input.prompt.includes("Implement only this work order") ? "worker-build" : "worker-ground");
+      return start(input);
+    };
+    env.deps.report = (event) => {
+      lines.push(formatTicketProgress(event));
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.deepEqual(lines, [
+      "API-1 ground",
+      "worker-ground",
+      "API-1 build",
+      "worker-build",
+      "API-1 land",
+      "API-1 landed https://github.com/acme/api/pull/4",
+    ]);
+  });
+
+  it("reports a blocked ticket without starting a phase", async () => {
+    const env = harness(BUILDABLE);
+    const lines: string[] = [];
+    env.deps.report = (event) => {
+      lines.push(formatTicketProgress(event));
+    };
+    const result = await runTicket(
+      env.deps,
+      ticket({ blockedBy: [{ identifier: "API-2", stateName: "Todo" }] }),
+    );
+    assert.equal(result.outcome, "skipped-graph");
+    assert.deepEqual(lines, ["API-1 skipped-graph blocked by API-2 (Todo)"]);
+  });
+
+  it("keeps a progress line on one line", () => {
+    assert.equal(formatTicketProgress({ identifier: "API-1", phase: "ground" }), "API-1 ground");
+    assert.equal(
+      formatTicketProgress({
+        identifier: "API-1",
+        phase: "done",
+        outcome: "worker-failed",
+        detail: "boom\nnext",
+      }),
+      "API-1 worker-failed boom next",
+    );
+    const line = formatTicketProgress({
+      identifier: "API-1",
+      phase: "done",
+      outcome: "worker-failed",
+      detail: "x".repeat(250),
+    });
+    assert.equal(line, `API-1 worker-failed ${"x".repeat(197)}...`);
   });
 
   it("leaves prod status to the pack when markStatus is false", async () => {
