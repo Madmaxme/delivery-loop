@@ -202,18 +202,46 @@ describe("loop", () => {
     env.deps.runCommand = () => ({ status: 1 });
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
-    assert.match(result.detail, /still red after 1 fix/);
+    assert.match(result.detail, /next page resumes/);
+    assert.equal(sweepNeedsAnotherPage([result]), true);
     assert.equal(env.merged(), false);
   });
 
-  it("pauses the ticket when the branch conflicts and does not merge", async () => {
+  it("resolves a conflict on the same branch and merges", async () => {
     const env = harness(BUILDABLE);
+    env.deps.sleep = async () => {};
+    let moved = false;
+    env.deps.lookupHead = () => (moved ? "def" : "abc");
+    let reads = 0;
+    env.deps.forge.mergeability = async () => {
+      reads += 1;
+      if (reads === 1) return { state: "conflict", headSha: "abc" };
+      return { state: "clean", headSha: "def" };
+    };
+    let conflicts = 0;
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      if (input.prompt.includes("Resolve the merge conflict")) {
+        conflicts += 1;
+        moved = true;
+      }
+      return start(input);
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(conflicts, 1);
+    assert.equal(env.merged(), true);
+  });
+
+  it("resumes a conflict on the next page when this page's budget is spent", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.ciFixMax = 1;
     env.deps.sleep = async () => {};
     env.deps.forge.mergeability = async () => ({ state: "conflict", headSha: "abc" });
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
-    assert.match(result.detail, /conflicts with `main`/);
-    assert.match(env.comments.join("\n"), /sweep continues/);
+    assert.match(result.detail, /next page resumes/);
+    assert.equal(sweepNeedsAnotherPage([result]), true);
     assert.equal(env.merged(), false);
     assert.equal(env.state(), "Todo");
   });
@@ -245,6 +273,7 @@ describe("loop", () => {
 
   it("pauses the ticket when the merge is refused", async () => {
     const env = harness(BUILDABLE);
+    env.deps.ciFixMax = 1;
     env.deps.forge.squashMerge = async () => {
       throw new Error(
         'GitHub /repos/acme/api/pulls/4/merge failed: 405 {"message":"Pull Request has merge conflicts"}',
@@ -252,13 +281,15 @@ describe("loop", () => {
     };
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
-    assert.match(result.detail, /405/);
+    assert.match(result.detail, /next page resumes/);
+    assert.equal(sweepNeedsAnotherPage([result]), true);
     assert.equal(env.merged(), false);
     assert.equal(env.state(), "Todo");
   });
 
   it("continues the sweep after one ticket cannot merge", async () => {
     const env = harness(BUILDABLE);
+    env.deps.ciFixMax = 1;
     env.deps.tracker.listIntake = async () => [ticket(), ticket({ identifier: "API-2", id: "2" })];
     let opened = 0;
     env.deps.forge.openPullRequest = async (input) => {
@@ -442,7 +473,7 @@ describe("loop", () => {
     assert.match(fix ?? "", /do not replace it with the older trunk copy/);
     assert.equal(prompts.some((text) => text.includes("Push these branches")), false);
     assert.equal(result.outcome, "land-blocked");
-    assert.match(result.detail, /Resume land on the next sweep/);
+    assert.match(result.detail, /next page resumes/);
     assert.equal(env.merged(), false);
   });
 
@@ -537,7 +568,7 @@ describe("loop", () => {
     assert.equal(result.outcome, "quality-unscheduled");
     assert.equal(env.comments.some((body) => /did not start/.test(body)), true);
     assert.equal(env.comments.some((body) => /still running/.test(body)), false);
-    assert.equal(sweepNeedsAnotherPage([result]), false);
+    assert.equal(sweepNeedsAnotherPage([result]), true);
     assert.equal(env.merged(), false);
   });
 
@@ -817,6 +848,7 @@ describe("loop", () => {
 
   it("waits for trunk quality before marking dev", async () => {
     const env = harness(BUILDABLE);
+    env.deps.ciFixMax = 1;
     env.deps.forge.quality = async (input) =>
       input.headSha === "trunk"
         ? { state: "failure", detail: "trunk red" }
@@ -828,7 +860,29 @@ describe("loop", () => {
     assert.match(env.comments.join("\n"), /LAND_WAIT/);
     assert.match(env.comments.join("\n"), /hold=0/);
     assert.match(env.comments.join("\n"), /api trunk/);
-    assert.equal(sweepNeedsAnotherPage([result]), false);
+    assert.equal(sweepNeedsAnotherPage([result]), true);
+  });
+
+  it("accepts a green trunk tip that contains the merge", async () => {
+    const env = harness(BUILDABLE);
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
+    env.deps.lookupHead = () => "green";
+    env.deps.forge.compare = async () => "ahead";
+    env.deps.forge.quality = async (input) =>
+      input.headSha === "green"
+        ? { state: "success", detail: "quality success" }
+        : { state: "failure", detail: "old red" };
+    const result = await runTicket(
+      env.deps,
+      ticket({ comments: [{ body: "<!-- LAND_WAIT\nhold=0\napi oldred\n-->" }] }),
+    );
+    assert.equal(result.outcome, "landed");
+    assert.equal(starts, 0);
+    assert.equal(env.state(), "Dev");
   });
 
   it("marks dev on the next sweep when the recorded trunk commit is green", async () => {
@@ -860,10 +914,9 @@ describe("loop", () => {
       ticket({ comments: [{ body: "<!-- LAND_WAIT\nhold=1\napi trunk\n-->" }] }),
     );
     assert.equal(result.outcome, "trunk-waiting");
-    assert.deepEqual(lines, ["API-1 land", "API-1 trunk-waiting trunk quality"]);
+    assert.deepEqual(lines, ["API-1 land", "API-1 trunk-waiting api trunk"]);
     assert.equal(env.state(), "Todo");
-    assert.equal(env.comments.some((body) => body.includes("LAND_WAIT")), false);
-    assert.equal(sweepNeedsAnotherPage([result]), false);
+    assert.equal(sweepNeedsAnotherPage([result]), true);
   });
 
   it("promotes only the mobile repos this ticket landed", async () => {

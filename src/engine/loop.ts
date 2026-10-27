@@ -286,6 +286,52 @@ function fixPrompt(
   ].filter((part) => part.length > 0).join("\n\n");
 }
 
+function conflictPrompt(
+  ticket: Ticket,
+  orderText: string,
+  deps: LoopDeps,
+  pr: OpenPull,
+  attempt: number,
+  max: number,
+  reason: string,
+): string {
+  const cwd = deps.cwd ?? process.cwd();
+  const docs = listedDocs(cwd, deps.pack.prompts?.build);
+  return [
+    universalConduct(),
+    ...docs,
+    `Resolve the merge conflict on \`${pr.repo.name}\` branch \`${pr.branch}\` for ${ticket.identifier}.`,
+    `Attempt ${attempt} of ${max}.`,
+    reason,
+    orderText,
+    `Checkout \`${pr.branch}\` in \`${pr.repo.name}\`. Rebase it onto \`${pr.repo.trunk}\` and resolve every conflict.`,
+    `Commit and push that same branch. Do not open a pull request. Do not merge. Do not push \`${pr.repo.trunk}\`.`,
+    "Keep the branch's own commits. Do not replace the branch with a copy of trunk.",
+  ].filter((part) => part.length > 0).join("\n\n");
+}
+
+function trunkFixPrompt(
+  ticket: Ticket,
+  deps: LoopDeps,
+  repo: RepoSpec,
+  sha: string,
+  attempt: number,
+  max: number,
+  detail: string,
+): string {
+  const cwd = deps.cwd ?? process.cwd();
+  const docs = listedDocs(cwd, deps.pack.prompts?.build);
+  return [
+    universalConduct(),
+    ...docs,
+    `Trunk quality is red on \`${repo.name}\` \`${repo.trunk}\` at \`${sha}\` for ${ticket.identifier}.`,
+    `Attempt ${attempt} of ${max}.`,
+    `The check said: ${detail}`,
+    `Branch from \`${repo.trunk}\` in \`${repo.name}\`. Fix the failure. Push that branch.`,
+    "Do not open a pull request. Do not merge. Report the branch name and commit.",
+  ].filter((part) => part.length > 0).join("\n\n");
+}
+
 function commentBodies(ticket: Ticket): string[] {
   return ticket.comments.map((comment) => comment.body);
 }
@@ -805,36 +851,116 @@ async function trunkQuality(
   );
 }
 
-async function finishMerged(
+async function trunkTip(
+  deps: LoopDeps,
+  repo: RepoSpec,
+  mergeSha: string,
+): Promise<string> {
+  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const tip = lookup(repo.url, repo.trunk) || mergeSha;
+  if (tip === mergeSha) return tip;
+  try {
+    const status = await deps.forge.compare({
+      repoUrl: repo.url,
+      base: mergeSha,
+      head: repo.trunk,
+    });
+    if (status === "ahead" || status === "identical") return tip;
+  } catch {
+    return mergeSha;
+  }
+  return mergeSha;
+}
+
+/**
+ * Red trunk starts the same coding worker, on a branch from trunk.
+ * A green tip that contains the merge is done. The remembered commit is not
+ * the tip once a later commit landed.
+ */
+async function repairTrunk(
+  deps: LoopDeps,
+  ticket: Ticket,
+  repo: RepoSpec,
+  sha: string,
+  attempt: number,
+  max: number,
+  detail: string,
+): Promise<void> {
+  const home = agentHome(deps.pack);
+  const started = await deps.worker.start({
+    prompt: trunkFixPrompt(ticket, deps, repo, sha, attempt, max, detail),
+    repoUrl: home.url,
+    baseRef: home.trunk,
+  });
+  const built = await finishWorker(deps.worker, started.runId);
+  const reported = landingTargets(deps.pack, [repo.name], built.branches, built.branch, repo);
+  const branch = reported?.[0]?.branch;
+  if (!branch) return;
+  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const head = lookup(repo.url, branch) || built.head || branch;
+  const pr = await deps.forge.openPullRequest({
+    repoUrl: repo.url,
+    title: `${ticket.identifier}: trunk quality`,
+    body: detail,
+    head: branch,
+    base: repo.trunk,
+  });
+  await landPull(
+    deps,
+    ticket,
+    {
+      repo,
+      number: pr.number,
+      url: pr.url,
+      headSha: pr.headSha || head,
+      branch,
+      created: pr.created,
+    },
+    detail,
+  );
+}
+
+async function settleTrunk(
   deps: LoopDeps,
   ticket: Ticket,
   hold: boolean,
-  merged: MergedHead[],
+  rows: { repo: RepoSpec; sha: string }[],
+  doneDetail: string,
 ): Promise<TicketResult> {
-  let green = true;
-  for (const row of merged) {
-    const quality = await trunkQuality(deps, row);
-    if (quality.state !== "success") green = false;
+  const waiting: { repo: string; sha: string }[] = [];
+  const fixMax = ciFixLimit(deps);
+  for (const row of rows) {
+    let tip = await trunkTip(deps, row.repo, row.sha);
+    let quality = await trunkQuality(deps, { repo: row.repo, sha: tip });
+    let attempt = 0;
+    while (quality.state === "failure" && attempt < fixMax) {
+      attempt += 1;
+      try {
+        await repairTrunk(deps, ticket, row.repo, tip, attempt, fixMax, quality.detail);
+      } catch {
+        break;
+      }
+      tip = await trunkTip(deps, row.repo, row.sha);
+      quality = await trunkQuality(deps, { repo: row.repo, sha: tip });
+    }
+    if (quality.state !== "success") waiting.push({ repo: row.repo.name, sha: tip });
   }
-  if (!green) {
-    await deps.tracker.comment(
-      ticket.identifier,
-      landWaitMarker(hold, merged.map((row) => ({ repo: row.repo.name, sha: row.sha }))),
-    );
+  if (waiting.length > 0) {
+    await deps.tracker.comment(ticket.identifier, landWaitMarker(hold, waiting));
     return {
       identifier: ticket.identifier,
       outcome: "trunk-waiting",
-      detail: merged.map((row) => row.url).join(" "),
+      detail: waiting.map((row) => `${row.repo} ${row.sha}`).join(" "),
     };
   }
   const failed = runDevCommands(
     deps,
-    devCommands(deps.pack, merged.map((row) => row.repo.name)),
+    devCommands(deps.pack, rows.map((row) => row.repo.name)),
   );
   if (failed) {
     await deps.tracker.comment(
       ticket.identifier,
-      landWaitMarker(hold, merged.map((row) => ({ repo: row.repo.name, sha: row.sha }))),
+      landWaitMarker(hold, rows.map((row) => ({ repo: row.repo.name, sha: row.sha }))),
     );
     return {
       identifier: ticket.identifier,
@@ -846,8 +972,23 @@ async function finishMerged(
   return {
     identifier: ticket.identifier,
     outcome: "landed",
-    detail: merged.map((row) => row.url).join(" "),
+    detail: doneDetail,
   };
+}
+
+async function finishMerged(
+  deps: LoopDeps,
+  ticket: Ticket,
+  hold: boolean,
+  merged: MergedHead[],
+): Promise<TicketResult> {
+  return settleTrunk(
+    deps,
+    ticket,
+    hold,
+    merged.map((row) => ({ repo: row.repo, sha: row.sha })),
+    merged.map((row) => row.url).join(" "),
+  );
 }
 
 /**
@@ -870,37 +1011,14 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
     return { identifier: ticket.identifier, outcome: "land-empty", detail: "branch unchanged" };
   }
   if (marker.rows.length === 0) return null;
-  noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
-  let green = true;
+  const rows: { repo: RepoSpec; sha: string }[] = [];
   for (const row of marker.rows) {
     const spec = repoByName(deps.pack, row.repo);
     if (!spec) return null;
-    const quality = await trunkQuality(deps, { repo: spec, sha: row.sha });
-    if (quality.state !== "success") green = false;
+    rows.push({ repo: spec, sha: row.sha });
   }
-  if (!green) {
-    return {
-      identifier: ticket.identifier,
-      outcome: "trunk-waiting",
-      detail: "trunk quality",
-    };
-  }
-  const failed = runDevCommands(
-    deps,
-    devCommands(deps.pack, marker.rows.map((row) => row.repo)),
-  );
-  if (failed) {
-    return {
-      identifier: ticket.identifier,
-      outcome: "quality-failed",
-      detail: `dev step failed: ${failed}`,
-    };
-  }
-  await deps.tracker.setState(
-    ticket.identifier,
-    marker.hold ? holdStatus(deps.pack) : deps.pack.status.dev,
-  );
-  return { identifier: ticket.identifier, outcome: "landed", detail: "trunk green" };
+  noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
+  return settleTrunk(deps, ticket, marker.hold, rows, "trunk green");
 }
 
 function pauseLand(identifier: string, url: string, reason: string): TicketResult {
@@ -939,9 +1057,56 @@ async function explainQuality(
 }
 
 /**
+ * One coding-worker attempt on the open branch. The next page resumes the
+ * same branch when this page's budget is spent.
+ */
+async function spendFix(
+  deps: LoopDeps,
+  ticket: Ticket,
+  current: OpenPull,
+  fixes: number,
+  fixMax: number,
+  prompt: string,
+): Promise<{ fixes: number; headSha: string } | TicketResult> {
+  if (fixes >= fixMax) {
+    const paused = pauseLand(
+      ticket.identifier,
+      current.url,
+      `Still blocked after ${fixMax} attempts on \`${current.branch}\`. The next page resumes this branch.`,
+    );
+    await deps.tracker.comment(ticket.identifier, paused.detail);
+    return paused;
+  }
+  const home = agentHome(deps.pack);
+  try {
+    const started = await deps.worker.start({
+      prompt,
+      repoUrl: home.url,
+      baseRef: home.trunk,
+    });
+    await finishWorker(deps.worker, started.runId);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    const paused = pauseLand(
+      ticket.identifier,
+      current.url,
+      `Fix did not finish. ${reason} The next page resumes this branch.`,
+    );
+    await deps.tracker.comment(ticket.identifier, paused.detail);
+    return paused;
+  }
+  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const next = lookup(current.repo.url, current.branch);
+  return {
+    fixes: fixes + 1,
+    headSha: next && next !== current.headSha ? next : current.headSha,
+  };
+}
+
+/**
  * Merge one pull request. A behind branch is updated onto trunk and quality
- * runs again on the new head. A conflict or a refused merge pauses this
- * ticket. The caller keeps the rest of the sweep moving.
+ * runs again on the new head. A conflict or a refused merge starts the coding
+ * worker on that same branch. The caller keeps the rest of the sweep moving.
  * Returns the merge commit when this pull request merged.
  */
 async function landPull(
@@ -959,39 +1124,17 @@ async function landPull(
   for (let step = 0; step < 8 + fixMax; step++) {
     const quality = await waitForQuality(deps, current);
     if (quality.state === "failure") {
-      if (fixes >= fixMax) {
-        const paused = pauseLand(
-          ticket.identifier,
-          current.url,
-          `Quality is still red after ${fixMax} fix attempts. Resume land on the next sweep. Do not rebuild this branch.`,
-        );
-        await deps.tracker.comment(ticket.identifier, paused.detail);
-        return paused;
-      }
-      fixes += 1;
-      const home = agentHome(deps.pack);
-      try {
-        const started = await deps.worker.start({
-          prompt: fixPrompt(ticket, orderText, deps, current, fixes, fixMax, quality.detail),
-          repoUrl: home.url,
-          baseRef: home.trunk,
-        });
-        await finishWorker(deps.worker, started.runId);
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        const paused = pauseLand(
-          ticket.identifier,
-          current.url,
-          `Quality fix did not finish. ${reason} Resume land on the next sweep.`,
-        );
-        await deps.tracker.comment(ticket.identifier, paused.detail);
-        return paused;
-      }
-      const lookup = deps.lookupHead ?? lookupRemoteHead;
-      const next = lookup(current.repo.url, current.branch);
-      if (next && next !== current.headSha) {
-        current = { ...current, headSha: next, created: false };
-      }
+      const spent = await spendFix(
+        deps,
+        ticket,
+        current,
+        fixes,
+        fixMax,
+        fixPrompt(ticket, orderText, deps, current, fixes + 1, fixMax, quality.detail),
+      );
+      if ("outcome" in spent) return spent;
+      fixes = spent.fixes;
+      current = { ...current, headSha: spent.headSha, created: false };
       continue;
     }
     const early = await explainQuality(deps, ticket, current, quality);
@@ -1005,25 +1148,29 @@ async function landPull(
       current = { ...current, headSha: head };
       continue;
     }
-    if (merge.state === "conflict") {
-      const paused = pauseLand(
-        ticket.identifier,
-        current.url,
-        `The branch conflicts with \`${current.repo.trunk}\`.`,
+    if (merge.state === "conflict" || (merge.state === "behind" && updates >= MAX_BRANCH_UPDATES)) {
+      const spent = await spendFix(
+        deps,
+        ticket,
+        current,
+        fixes,
+        fixMax,
+        conflictPrompt(
+          ticket,
+          orderText,
+          deps,
+          current,
+          fixes + 1,
+          fixMax,
+          `The branch ${merge.state === "conflict" ? "conflicts with" : "is still behind"} \`${current.repo.trunk}\`.`,
+        ),
       );
-      await deps.tracker.comment(ticket.identifier, paused.detail);
-      return paused;
+      if ("outcome" in spent) return spent;
+      fixes = spent.fixes;
+      current = { ...current, headSha: spent.headSha, created: false };
+      continue;
     }
     if (merge.state === "behind") {
-      if (updates >= MAX_BRANCH_UPDATES) {
-        const paused = pauseLand(
-          ticket.identifier,
-          current.url,
-          `The branch is still behind \`${current.repo.trunk}\` after update-branch.`,
-        );
-        await deps.tracker.comment(ticket.identifier, paused.detail);
-        return paused;
-      }
       await deps.forge.updateBranch({
         repoUrl: current.repo.url,
         number: current.number,
@@ -1038,16 +1185,37 @@ async function landPull(
       await sleep(MERGE_SETTLE_MS);
       continue;
     }
-    break;
+    try {
+      const mergedSha = await deps.forge.squashMerge({
+        repoUrl: current.repo.url,
+        number: current.number,
+        branch: current.branch,
+        base: current.repo.trunk,
+      });
+      if (!mergedSha?.trim()) throw new Error("merge did not return a commit");
+      return { mergedSha };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const spent = await spendFix(
+        deps,
+        ticket,
+        current,
+        fixes,
+        fixMax,
+        conflictPrompt(ticket, orderText, deps, current, fixes + 1, fixMax, reason),
+      );
+      if ("outcome" in spent) return spent;
+      fixes = spent.fixes;
+      current = { ...current, headSha: spent.headSha, created: false };
+    }
   }
-  const mergedSha = await deps.forge.squashMerge({
-    repoUrl: current.repo.url,
-    number: current.number,
-    branch: current.branch,
-    base: current.repo.trunk,
-  });
-  if (!mergedSha?.trim()) throw new Error("merge did not return a commit");
-  return { mergedSha };
+  const paused = pauseLand(
+    ticket.identifier,
+    current.url,
+    `Land did not finish on \`${current.branch}\`. The next page resumes this branch.`,
+  );
+  await deps.tracker.comment(ticket.identifier, paused.detail);
+  return paused;
 }
 
 const RERUN_QUALITY_MESSAGE = [
@@ -1141,7 +1309,13 @@ async function waitForQuality(
 
 export function sweepNeedsAnotherPage(results: TicketResult[]): boolean {
   return results.some(
-    (result) => result.outcome === "quality-pending" || result.outcome === "skipped-page",
+    (result) =>
+      result.outcome === "quality-pending" ||
+      result.outcome === "quality-unscheduled" ||
+      result.outcome === "quality-failed" ||
+      result.outcome === "trunk-waiting" ||
+      result.outcome === "land-blocked" ||
+      result.outcome === "skipped-page",
   );
 }
 
