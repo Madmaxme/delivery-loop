@@ -310,28 +310,6 @@ function conflictPrompt(
   ].filter((part) => part.length > 0).join("\n\n");
 }
 
-function trunkFixPrompt(
-  ticket: Ticket,
-  deps: LoopDeps,
-  repo: RepoSpec,
-  sha: string,
-  attempt: number,
-  max: number,
-  detail: string,
-): string {
-  const cwd = deps.cwd ?? process.cwd();
-  const docs = listedDocs(cwd, deps.pack.prompts?.build);
-  return [
-    universalConduct(),
-    ...docs,
-    `Trunk quality is red on \`${repo.name}\` \`${repo.trunk}\` at \`${sha}\` for ${ticket.identifier}.`,
-    `Attempt ${attempt} of ${max}.`,
-    `The check said: ${detail}`,
-    `Branch from \`${repo.trunk}\` in \`${repo.name}\`. Fix the failure. Push that branch.`,
-    "Do not open a pull request. Do not merge. Report the branch name and commit.",
-  ].filter((part) => part.length > 0).join("\n\n");
-}
-
 function commentBodies(ticket: Ticket): string[] {
   return ticket.comments.map((comment) => comment.body);
 }
@@ -872,54 +850,6 @@ async function trunkTip(
   return mergeSha;
 }
 
-/**
- * Red trunk starts the same coding worker, on a branch from trunk.
- * A green tip that contains the merge is done. The remembered commit is not
- * the tip once a later commit landed.
- */
-async function repairTrunk(
-  deps: LoopDeps,
-  ticket: Ticket,
-  repo: RepoSpec,
-  sha: string,
-  attempt: number,
-  max: number,
-  detail: string,
-): Promise<void> {
-  const home = agentHome(deps.pack);
-  const started = await deps.worker.start({
-    prompt: trunkFixPrompt(ticket, deps, repo, sha, attempt, max, detail),
-    repoUrl: home.url,
-    baseRef: home.trunk,
-  });
-  const built = await finishWorker(deps.worker, started.runId);
-  const reported = landingTargets(deps.pack, [repo.name], built.branches, built.branch, repo);
-  const branch = reported?.[0]?.branch;
-  if (!branch) return;
-  const lookup = deps.lookupHead ?? lookupRemoteHead;
-  const head = lookup(repo.url, branch) || built.head || branch;
-  const pr = await deps.forge.openPullRequest({
-    repoUrl: repo.url,
-    title: `${ticket.identifier}: trunk quality`,
-    body: detail,
-    head: branch,
-    base: repo.trunk,
-  });
-  await landPull(
-    deps,
-    ticket,
-    {
-      repo,
-      number: pr.number,
-      url: pr.url,
-      headSha: pr.headSha || head,
-      branch,
-      created: pr.created,
-    },
-    detail,
-  );
-}
-
 async function settleTrunk(
   deps: LoopDeps,
   ticket: Ticket,
@@ -928,21 +858,9 @@ async function settleTrunk(
   doneDetail: string,
 ): Promise<TicketResult> {
   const waiting: { repo: string; sha: string }[] = [];
-  const fixMax = ciFixLimit(deps);
   for (const row of rows) {
-    let tip = await trunkTip(deps, row.repo, row.sha);
-    let quality = await trunkQuality(deps, { repo: row.repo, sha: tip });
-    let attempt = 0;
-    while (quality.state === "failure" && attempt < fixMax) {
-      attempt += 1;
-      try {
-        await repairTrunk(deps, ticket, row.repo, tip, attempt, fixMax, quality.detail);
-      } catch {
-        break;
-      }
-      tip = await trunkTip(deps, row.repo, row.sha);
-      quality = await trunkQuality(deps, { repo: row.repo, sha: tip });
-    }
+    const tip = await trunkTip(deps, row.repo, row.sha);
+    const quality = await trunkQuality(deps, { repo: row.repo, sha: tip });
     if (quality.state !== "success") waiting.push({ repo: row.repo.name, sha: tip });
   }
   if (waiting.length > 0) {
