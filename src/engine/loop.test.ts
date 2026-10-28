@@ -170,6 +170,8 @@ describe("loop", () => {
     assert.match(prompt, /every caller uses that owner/);
     assert.match(prompt, /Prior request/);
     assert.match(prompt, /Journey evidence/);
+    assert.match(prompt, /Land repos: api/);
+    assert.match(prompt, /directory the agent was started in is not a land repo/);
     assert.match(prompt, /The install owns the concrete proof/);
     assert.ok(
       prompt.indexOf("The install owns the concrete proof") < prompt.indexOf("INSTALL GROUND DOC"),
@@ -581,6 +583,37 @@ describe("loop", () => {
     assert.equal(result.outcome, "landed");
     assert.equal(env.merged(), true);
     assert.equal(env.state(), "Waiting");
+  });
+
+  it("stays in intake and names the land repos when the handoff names the checkout", async () => {
+    const env = harness(BUILDABLE.replace("**Repos:** `api`", "**Repos:** `workspace`"));
+    env.deps.pack = {
+      ...pack,
+      agent: { url: "https://github.com/acme/workspace", trunk: "main" },
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "invalid-packet");
+    assert.equal(result.detail, "repo workspace is not in the pack");
+    assert.equal(env.state(), "Todo");
+    assert.equal(env.merged(), false);
+    assert.match(env.comments.join("\n"), /`workspace`/);
+    assert.match(env.comments.join("\n"), /Land repos are `api`/);
+  });
+
+  it("tells ground that the checkout is not a land repo", async () => {
+    const env = harness("**Verdict:** NEEDS DIAGNOSIS");
+    env.deps.pack = {
+      ...pack,
+      agent: { url: "https://github.com/acme/workspace", trunk: "main" },
+    };
+    let prompt = "";
+    env.deps.worker.start = async (input) => {
+      prompt = input.prompt;
+      return { runId: "run-1" };
+    };
+    await runTicket(env.deps, ticket());
+    assert.match(prompt, /The checkout `workspace` is where this agent starts/);
+    assert.match(prompt, /Land repos: api/);
   });
 
   it("stays in intake when a buildable handoff says ask", async () => {

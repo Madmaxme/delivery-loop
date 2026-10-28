@@ -141,6 +141,8 @@ The prompt says BUILDABLE, NEEDS DIAGNOSIS.
     assert.equal(parseVerdict(handoff), "BUILDABLE");
     const order = parseWorkOrder(handoff);
     assert.deepEqual(order?.repos, ["api", "customer-web"]);
+    const separate = handoff.replace("**Repos:** `api, customer-web`", "**Repos:** `api` `customer-web`");
+    assert.deepEqual(parseWorkOrder(separate)?.repos, ["api", "customer-web"]);
     assert.equal(order?.invariant, "billing/commission-resolution");
     assert.equal(order?.validation[0], "npm test");
     assert.equal(parseVerdict("The prompt lists BUILDABLE as a choice."), null);
