@@ -72,9 +72,17 @@ function section(text: string, name: string): string {
   return body.join("\n").trim();
 }
 
-function repoNames(value: string): string[] {
-  const tick = value.match(/`([^`]+)`/)?.[1] ?? value;
-  return tick.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+/** Every name in a Repos field. Separate backticks and a comma-separated tick are the same list. */
+export function repoNames(value: string): string[] {
+  const ticks = [...value.matchAll(/`([^`]+)`/g)].map((match) => match[1].trim()).filter(Boolean);
+  const parts = ticks.length > 0 ? ticks : [value];
+  const names: string[] = [];
+  for (const part of parts) {
+    for (const name of part.split(/[,\s]+/).map((item) => item.trim()).filter(Boolean)) {
+      if (!names.includes(name)) names.push(name);
+    }
+  }
+  return names;
 }
 
 export function parseWorkOrder(text: string): WorkOrder | null {

@@ -35,6 +35,7 @@ import {
   parseVerdict,
   parseWorkOrder,
   priorRequestBlocksBuild,
+  repoNames,
   type Verdict,
 } from "./packet.js";
 
@@ -222,7 +223,7 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "Follow the documents above. A verdict is a VERDICT: or **Verdict:** line.",
     "When the verdict is BUILDABLE, put the work order under BUILD_PACKET: inside the handoff.",
     "The invariant id is a heading in the invariants file, or `prefix/slug` from a heading file the install lists.",
-    "One **Decision:** sentence that cites that id. **Symbols:** `repo/path#symbol`. **Repos:** in backticks.",
+    "One **Decision:** sentence that cites that id. **Symbols:** `repo/path#symbol`. **Repos:** in backticks, and only names from the land-repo list.",
     "Every BUILDABLE handoff includes **Prior request:** none | kept | replaced <id> | ask.",
     "none means no written rule asked for the current behavior. kept means one did and this ticket keeps it. replaced names the ticket this one undoes. ask means a rule asked for the current behavior and this ticket does not undo it.",
     "ask, a missing line, or replaced without a ticket id stays in intake. The verdict stays BUILDABLE.",
@@ -236,7 +237,7 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "recorded means it is. Web proof is **Journey proof:** an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. Mobile proof is **Journey proof:** a route test on the merged commit, `repo/path_test.dart` or `repo/path.test.ts`. A sentence that names no token is not proof.",
     "blocked means that proof cannot be produced in this run. A missing line or blocked stays in intake and does not mark dev-done.",
     `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
-    `Repos: ${deps.pack.repos.map((r) => r.name).join(", ")}`,
+    landRepoLine(deps.pack),
   ].join("\n\n");
 }
 
@@ -359,6 +360,22 @@ export function repoCheckoutDir(cwd: string, spec: RepoSpec, pack: ProjectPack):
   return join(cwd, spec.name);
 }
 
+function landRepoLine(pack: ProjectPack): string {
+  const land = pack.repos.map((repo) => repo.name).join(", ");
+  const checkout = agentCheckoutName(pack);
+  const checkoutIsLand = pack.repos.some((repo) => repo.name === checkout);
+  const extra =
+    checkout && !checkoutIsLand
+      ? ` The checkout \`${checkout}\` is where this agent starts. It is not a land repo. **Repos:** must not name it.`
+      : "";
+  return `Land repos: ${land}. **Repos:** names only these.${extra}`;
+}
+
+function agentCheckoutName(pack: ProjectPack): string {
+  const match = (pack.agent?.url ?? "").match(/github\.com[:/][^/]+\/([^/.]+)/i);
+  return match?.[1] ?? "";
+}
+
 function githubSlug(url: string): string {
   const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/i);
   return match ? `${match[1]}/${match[2]}`.toLowerCase() : url.toLowerCase();
@@ -387,9 +404,7 @@ function landingTargets(
 }
 
 function trunkHasTicketCommit(deps: LoopDeps, identifier: string, text: string): boolean | null {
-  const named = [...text.matchAll(/\*\*Repos:\*\*\s*(.+)/gi)].flatMap((match) =>
-    [...match[1].matchAll(/`([^`]+)`/g)].map((item) => item[1].trim()),
-  );
+  const named = [...text.matchAll(/\*\*Repos:\*\*\s*(.+)/gi)].flatMap((match) => repoNames(match[1]));
   const repos = named.length ? named : [];
   if (repos.length === 0) return false;
   const cwd = deps.cwd ?? process.cwd();
@@ -579,14 +594,19 @@ async function runHeldTicket(
       detail: `unknown invariant ${order.invariant}`,
     };
   }
-  for (const name of order.repos) {
-    if (!repoByName(deps.pack, name)) {
-      return {
-        identifier: ticket.identifier,
-        outcome: "invalid-packet",
-        detail: `repo ${name} is not in the pack`,
-      };
-    }
+  const unknownRepos = order.repos.filter((name) => !repoByName(deps.pack, name));
+  if (unknownRepos.length > 0) {
+    const land = deps.pack.repos.map((repo) => `\`${repo.name}\``).join(", ");
+    const named = unknownRepos.map((name) => `\`${name}\``).join(", ");
+    await deps.tracker.comment(
+      ticket.identifier,
+      `**Repos:** names ${named}, which is not a land repo. Land repos are ${land}. The ticket stays in intake.`,
+    );
+    return {
+      identifier: ticket.identifier,
+      outcome: "invalid-packet",
+      detail: `repo ${unknownRepos.join(", ")} is not in the pack`,
+    };
   }
   if (order.connector && !deps.pack.connectors.includes(order.connector)) {
     const command = `npx @delivery-loop/cli connector add ${order.connector}`;
