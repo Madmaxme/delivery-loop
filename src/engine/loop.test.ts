@@ -196,6 +196,7 @@ describe("loop", () => {
     assert.equal(ran, "npm test");
     assert.equal(workflow, false);
     assert.equal(env.merged(), true);
+    assert.equal(env.comments.some((body) => body.includes("Extend the charge handler.")), true);
   });
 
   it("stops the land when the quality command fails", async () => {
