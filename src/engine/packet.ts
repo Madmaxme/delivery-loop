@@ -157,6 +157,78 @@ export function priorRequestBlocksBuild(text: string): "missing" | "ask" | "repl
   return null;
 }
 
+export type JourneyEvidence = "recorded" | "not-applicable" | "blocked";
+
+const JOURNEY_EVIDENCE_RE =
+  /\*\*Journey evidence:\*\*\s*(recorded|not-applicable|blocked)\b/i;
+
+/**
+ * `not-applicable` means the done-state is not a journey a person walks.
+ * `recorded` means it is, and dev-done waits on a proof token.
+ * `blocked` means that proof cannot be produced in this run.
+ * A missing line is null. The runner does not build and does not mark dev-done.
+ */
+export function parseJourneyEvidence(text: string): JourneyEvidence | null {
+  const kind = text.match(JOURNEY_EVIDENCE_RE)?.[1]?.toLowerCase();
+  if (kind === "recorded" || kind === "not-applicable" || kind === "blocked") return kind;
+  return null;
+}
+
+/** Why a BUILDABLE handoff must not build. Null means the line allows a build. */
+export function journeyEvidenceBlocksBuild(text: string): "missing" | "blocked" | null {
+  const parsed = parseJourneyEvidence(text);
+  if (!parsed) return "missing";
+  if (parsed === "blocked") return "blocked";
+  return null;
+}
+
+const RECORDING_PROOF_RE = /^https:\/\/\S+$/i;
+const RECORDING_SHAPE_RE = /\.(?:png|jpe?g|webp|gif|mp4|webm|mov)(?:[?#]\S*)?$|\/artifacts\//i;
+const ROUTE_TEST_PROOF_RE =
+  /^([^/\s]+)\/(\S*(?:_test\.dart|\.test\.tsx?|\.spec\.tsx?|\.test\.js|\.spec\.js))$/;
+
+export type JourneyProof =
+  | { kind: "recording"; url: string }
+  | { kind: "route-test"; repo: string; path: string };
+
+/** Proof tokens from every `**Journey proof:**` line. A sentence without a token is empty. */
+export function parseJourneyProofs(text: string): JourneyProof[] {
+  const proofs: JourneyProof[] = [];
+  for (const match of text.matchAll(/\*\*Journey proof:\*\*\s*(.+)/gi)) {
+    const tokens = [...match[1].matchAll(/`([^`]+)`/g)].map((item) => item[1].trim());
+    for (const token of tokens) {
+      if (RECORDING_PROOF_RE.test(token) && RECORDING_SHAPE_RE.test(token)) {
+        proofs.push({ kind: "recording", url: token });
+        continue;
+      }
+      const route = token.match(ROUTE_TEST_PROOF_RE);
+      if (route) proofs.push({ kind: "route-test", repo: route[1], path: route[2] });
+    }
+  }
+  return proofs;
+}
+
+/**
+ * `recorded` is proven only when every cited proof is real.
+ * A recording URL has to be in the build receipt. A route test has to be on the commit.
+ * `not-applicable` is proven. Anything else is not.
+ */
+export function journeyEvidenceProven(
+  declared: string,
+  receipt: string,
+  fileOnCommit: (repo: string, path: string) => boolean,
+): boolean {
+  const evidence = parseJourneyEvidence(declared);
+  if (evidence === "not-applicable") return true;
+  if (evidence !== "recorded") return false;
+  const proofs = parseJourneyProofs(`${declared}\n${receipt}`);
+  if (proofs.length === 0) return false;
+  return proofs.every((proof) => {
+    if (proof.kind === "recording") return receipt.includes(proof.url);
+    return fileOnCommit(proof.repo, proof.path);
+  });
+}
+
 /** Status to move to after a non-BUILDABLE verdict. Null stays in intake. */
 export function parkStateForVerdict(input: {
   verdict: Verdict;
@@ -167,6 +239,8 @@ export function parkStateForVerdict(input: {
   holdStatus?: string;
   /** True when this ticket's commits are already on the named trunks. */
   trunkCommit?: boolean | null;
+  /** True when recorded journey proof is already on the trunk or in the audit receipt. */
+  journeyProven?: boolean | null;
 }): string | null {
   const hold = input.holdStatus?.trim() || "Hold";
   if (input.verdict === "WRONG DIAGNOSIS") return "Canceled";
@@ -178,6 +252,9 @@ export function parkStateForVerdict(input: {
   }
   if (input.verdict === "ALREADY SHIPPED") {
     if (parseOutsideGrant(input.text) === "open") return hold;
+    const journey = parseJourneyEvidence(input.text);
+    if (journey !== "not-applicable" && journey !== "recorded") return null;
+    if (journey === "recorded" && input.journeyProven !== true) return null;
     const repos = words(field(input.text, "Repos"));
     if (repos.length === 0) return "Canceled";
     if (input.trunkCommit === true) return input.devStatus;

@@ -125,6 +125,7 @@ const BUILDABLE = `
 **Verdict:** BUILDABLE
 **Prior request:** none
 **Outside grant:** none
+**Journey evidence:** not-applicable
 <!-- BUILD_PACKET
 **Repos:** \`api\`
 **Allowlist:** \`api/src/pay.ts\`
@@ -168,6 +169,7 @@ describe("loop", () => {
     assert.doesNotMatch(prompt, /money\//);
     assert.match(prompt, /every caller uses that owner/);
     assert.match(prompt, /Prior request/);
+    assert.match(prompt, /Journey evidence/);
     assert.match(prompt, /The install owns the concrete proof/);
     assert.ok(
       prompt.indexOf("The install owns the concrete proof") < prompt.indexOf("INSTALL GROUND DOC"),
@@ -612,6 +614,89 @@ describe("loop", () => {
     assert.equal(result.outcome, "invalid-packet");
     assert.equal(result.detail, "prior-request-missing");
     assert.equal(env.merged(), false);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("stays in intake when a buildable handoff omits the journey line", async () => {
+    const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable\n", ""));
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "invalid-packet");
+    assert.equal(result.detail, "journey-missing");
+    assert.equal(env.merged(), false);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("stays in intake when journey evidence is blocked", async () => {
+    const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** blocked"));
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "invalid-packet");
+    assert.equal(result.detail, "journey-blocked");
+    assert.equal(env.merged(), false);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("marks dev-done when the recording URL is in the build receipt", async () => {
+    const url = "https://example.test/artifacts/signup.mp4";
+    const ground = BUILDABLE.replace(
+      "**Journey evidence:** not-applicable",
+      `**Journey evidence:** recorded\n**Journey proof:** \`${url}\``,
+    );
+    const env = harness(ground);
+    let joins = 0;
+    env.deps.worker.join = async () => {
+      joins += 1;
+      const text = joins === 1 ? ground : `**Journey evidence:** recorded\n**Journey proof:** \`${url}\``;
+      return { status: "finished", branch: "delivery/api-1", head: "abc", text };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.merged(), true);
+    assert.equal(env.state(), "Dev");
+  });
+
+  it("leaves the ticket in intake when the recording URL never reaches the build receipt", async () => {
+    const url = "https://example.test/artifacts/signup.mp4";
+    const ground = BUILDABLE.replace(
+      "**Journey evidence:** not-applicable",
+      `**Journey evidence:** recorded\n**Journey proof:** \`${url}\``,
+    );
+    const env = harness(ground);
+    let joins = 0;
+    env.deps.worker.join = async () => {
+      joins += 1;
+      const text = joins === 1 ? ground : "**Journey evidence:** recorded\nThe journey was walked.";
+      return { status: "finished", branch: "delivery/api-1", head: "abc", text };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(env.merged(), true);
+    assert.equal(env.state(), "Todo");
+    assert.equal(env.comments.some((body) => /LAND_WAIT/.test(body)), false);
+  });
+
+  it("marks dev-done when the route test is on the merge commit", async () => {
+    const ground = BUILDABLE.replace(
+      "**Journey evidence:** not-applicable",
+      "**Journey evidence:** recorded\n**Journey proof:** `api/test/signup_route_test.dart`",
+    );
+    const env = harness(ground);
+    env.deps.journeyFileAt = ({ repo, ref, path }) =>
+      repo === "api" && ref === "trunk" && path === "test/signup_route_test.dart";
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+  });
+
+  it("leaves the ticket in intake when the route test is not on the merge commit", async () => {
+    const ground = BUILDABLE.replace(
+      "**Journey evidence:** not-applicable",
+      "**Journey evidence:** recorded\n**Journey proof:** `api/test/signup_route_test.dart`",
+    );
+    const env = harness(ground);
+    env.deps.journeyFileAt = () => false;
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(env.merged(), true);
     assert.equal(env.state(), "Todo");
   });
 

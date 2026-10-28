@@ -27,7 +27,10 @@ import {
 import { confirmLandBranches, lookupRemoteHead, renderBranch } from "./land-branches.js";
 import {
   invariantExists,
+  journeyEvidenceBlocksBuild,
+  journeyEvidenceProven,
   parkStateForVerdict,
+  parseJourneyEvidence,
   parseOutsideGrant,
   parseVerdict,
   parseWorkOrder,
@@ -63,6 +66,11 @@ export type LoopDeps = {
   /** Runs `qualityCommand` when `check` is `command`. Default runs it in the checkout. */
   runCommand?: (command: string, cwd: string) => { status: number | null };
   /**
+   * True when a route-test proof is on `ref`. Default reads the checkout with git.
+   * A recording URL is not a file.
+   */
+  journeyFileAt?: (input: { repo: string; ref: string; path: string }) => boolean;
+  /**
    * Receives one event when a ticket enters ground, build, or land, and one
    * when that ticket finishes. Default writes a single line to stdout.
    */
@@ -95,6 +103,7 @@ export type TicketResult = {
     | "land-blocked"
     | "land-empty"
     | "trunk-waiting"
+    | "journey-missing"
     | "worker-failed";
   detail: string;
 };
@@ -222,6 +231,10 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "none means the done-state is code this repository can land.",
     "open means the done-state is a vendor approval, an account only a person can create, or an engine this repository does not own. Build the code this repository owns. The runner will not mark that ticket dev-done, so anything blocked by it stays blocked.",
     "A missing line stays in intake. Reading a vendor's documentation is not the grant.",
+    "Every BUILDABLE handoff includes **Journey evidence:** recorded | not-applicable | blocked.",
+    "not-applicable means the done-state is not a journey a person walks.",
+    "recorded means it is. Web proof is **Journey proof:** an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. Mobile proof is **Journey proof:** a route test on the merged commit, `repo/path_test.dart` or `repo/path.test.ts`. A sentence that names no token is not proof.",
+    "blocked means that proof cannot be produced in this run. A missing line or blocked stays in intake and does not mark dev-done.",
     `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
     `Repos: ${deps.pack.repos.map((r) => r.name).join(", ")}`,
   ].join("\n\n");
@@ -250,6 +263,7 @@ function buildPrompt(
       ? `Push these branches from each repo trunk: ${branches.join(", ")}. Include repo and branch in the handoff. Do not merge.`
       : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
     "Stay inside the allowlist. Run the validation commands.",
+    "When the handoff says **Journey evidence:** recorded, the build receipt includes **Journey proof:**. A web journey cites one https recording or screenshot URL. A mobile journey commits the route test the proof names. The runner does not mark dev-done without that proof.",
     retry,
   ].filter((part) => part.length > 0).join("\n\n");
 }
@@ -493,6 +507,12 @@ async function runHeldTicket(
           verdict === "ALREADY SHIPPED"
             ? trunkHasTicketCommit(deps, ticket.identifier, ground.text)
             : null,
+        journeyProven:
+          verdict === "ALREADY SHIPPED"
+            ? journeyEvidenceProven(ground.text, ground.text, (repo, path) =>
+                journeyFileInCheckout(deps, repo, repoByName(deps.pack, repo)?.trunk ?? "", path),
+              )
+            : null,
       });
       if (parked) await deps.tracker.setState(ticket.identifier, parked);
     }
@@ -510,6 +530,16 @@ async function runHeldTicket(
       "BUILDABLE requires **Outside grant:** none | open. The ticket stays in intake.",
     );
     return { identifier: ticket.identifier, outcome: "invalid-packet", detail: "outside-grant" };
+  }
+
+  const journey = journeyEvidenceBlocksBuild(ground.text);
+  if (journey) {
+    const reason =
+      journey === "blocked"
+        ? "BUILDABLE **Journey evidence:** blocked does not build. The ticket stays in intake."
+        : "BUILDABLE requires **Journey evidence:** recorded | not-applicable | blocked. The ticket stays in intake.";
+    await deps.tracker.comment(ticket.identifier, reason);
+    return { identifier: ticket.identifier, outcome: "invalid-packet", detail: `journey-${journey}` };
   }
 
   const prior = priorRequestBlocksBuild(ground.text);
@@ -585,6 +615,7 @@ async function runHeldTicket(
       })
     : null;
   let retry = "";
+  let builtReceipt = "";
   if (landings) {
     const probes = await Promise.all(
       landings.map(async (landing) => ({
@@ -619,6 +650,7 @@ async function runHeldTicket(
         baseRef: home.trunk,
       });
       built = await finishWorker(deps.worker, started.runId);
+      builtReceipt = built.text;
     } catch (error) {
       return {
         identifier: ticket.identifier,
@@ -705,7 +737,7 @@ async function runHeldTicket(
       return paused;
     }
   }
-  return finishMerged(deps, ticket, grant === "open", merged);
+  return finishMerged(deps, ticket, grant === "open", merged, ground.text, builtReceipt);
 }
 
 const QUALITY_POLL_MS = 30_000;
@@ -850,12 +882,29 @@ async function trunkTip(
   return mergeSha;
 }
 
+function journeyFileInCheckout(deps: LoopDeps, repo: string, ref: string, path: string): boolean {
+  if (deps.journeyFileAt) return deps.journeyFileAt({ repo, ref, path });
+  const spec = repoByName(deps.pack, repo);
+  if (!spec || !ref) return false;
+  const dir = repoCheckoutDir(deps.cwd ?? process.cwd(), spec, deps.pack);
+  if (!existsSync(join(dir, ".git")) || !ref) return false;
+  const present = (at: string) =>
+    spawnSync("git", ["-C", dir, "cat-file", "-e", `${at}:${path}`], { encoding: "utf8" }).status === 0;
+  if (present(ref)) return true;
+  spawnSync("git", ["-C", dir, "fetch", "--depth=1", "origin", ref], { encoding: "utf8" });
+  if (present(ref)) return true;
+  spawnSync("git", ["-C", dir, "fetch", "origin", spec.trunk], { encoding: "utf8" });
+  return present(ref);
+}
+
 async function settleTrunk(
   deps: LoopDeps,
   ticket: Ticket,
   hold: boolean,
   rows: { repo: RepoSpec; sha: string }[],
   doneDetail: string,
+  declared = "",
+  receipt = "",
 ): Promise<TicketResult> {
   const waiting: { repo: string; sha: string }[] = [];
   for (const row of rows) {
@@ -886,6 +935,24 @@ async function settleTrunk(
       detail: `dev step failed: ${failed}`,
     };
   }
+  if (parseJourneyEvidence(declared) === "recorded" || parseJourneyEvidence(receipt) === "recorded") {
+    const proven = journeyEvidenceProven(`${declared}\n${receipt}`, receipt, (repo, path) => {
+      const row = rows.find((item) => item.repo.name === repo);
+      const ref = row?.sha || repoByName(deps.pack, repo)?.trunk || "";
+      return journeyFileInCheckout(deps, repo, ref, path);
+    });
+    if (!proven) {
+      await deps.tracker.comment(
+        ticket.identifier,
+        "Journey evidence is recorded, and the proof is not on this merge. A web journey needs the recording URL in the build receipt. A mobile journey needs the route test on the commit. The ticket stays in intake.",
+      );
+      return {
+        identifier: ticket.identifier,
+        outcome: "journey-missing",
+        detail: "recorded proof missing",
+      };
+    }
+  }
   await deps.tracker.setState(ticket.identifier, hold ? holdStatus(deps.pack) : deps.pack.status.dev);
   return {
     identifier: ticket.identifier,
@@ -899,6 +966,8 @@ async function finishMerged(
   ticket: Ticket,
   hold: boolean,
   merged: MergedHead[],
+  declared: string,
+  receipt: string,
 ): Promise<TicketResult> {
   return settleTrunk(
     deps,
@@ -906,6 +975,8 @@ async function finishMerged(
     hold,
     merged.map((row) => ({ repo: row.repo, sha: row.sha })),
     merged.map((row) => row.url).join(" "),
+    declared,
+    receipt,
   );
 }
 
