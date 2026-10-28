@@ -621,6 +621,8 @@ async function runHeldTicket(
     };
   }
 
+  await deps.tracker.comment(ticket.identifier, ground.text);
+
   const target = repoByName(deps.pack, order.repos[0])!;
   const lookup = deps.lookupHead ?? lookupRemoteHead;
   let landings: { repo: RepoSpec; branch: string; sha?: string }[] | null = deps.pack.branchTemplate
