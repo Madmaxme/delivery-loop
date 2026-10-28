@@ -6,10 +6,15 @@ import { describe, it } from "node:test";
 
 import {
   invariantExists,
+  journeyEvidenceBlocksBuild,
+  journeyEvidenceProven,
+  parseJourneyEvidence,
+  parseJourneyProofs,
   parsePriorRequest,
   parseVerdict,
   parseWorkOrder,
   priorRequestBlocksBuild,
+  parkStateForVerdict,
 } from "./packet.ts";
 
 const PACKET = `
@@ -41,6 +46,58 @@ describe("prior request", () => {
     assert.equal(priorRequestBlocksBuild("**Prior request:** ask — keep the rule"), "ask");
     assert.equal(priorRequestBlocksBuild("**Prior request:** replaced — no id"), "replaced");
     assert.equal(priorRequestBlocksBuild("**Verdict:** BUILDABLE"), "missing");
+  });
+});
+
+describe("journey evidence", () => {
+  it("blocks a missing line and a blocked line", () => {
+    assert.equal(parseJourneyEvidence("**Journey evidence:** recorded"), "recorded");
+    assert.equal(parseJourneyEvidence("**Journey evidence:** not-applicable"), "not-applicable");
+    assert.equal(journeyEvidenceBlocksBuild("**Journey evidence:** not-applicable"), null);
+    assert.equal(journeyEvidenceBlocksBuild("**Journey evidence:** blocked"), "blocked");
+    assert.equal(journeyEvidenceBlocksBuild("**Verdict:** BUILDABLE"), "missing");
+  });
+
+  it("reads a recording URL and a route-test path, and ignores a sentence", () => {
+    const text = [
+      "**Journey proof:** `https://example.test/artifacts/signup.mp4`",
+      "**Journey proof:** `api/test/signup_route_test.dart`",
+      "**Journey proof:** the journey was walked",
+    ].join("\n");
+    assert.deepEqual(parseJourneyProofs(text), [
+      { kind: "recording", url: "https://example.test/artifacts/signup.mp4" },
+      { kind: "route-test", repo: "api", path: "test/signup_route_test.dart" },
+    ]);
+  });
+
+  it("accepts not-applicable and a receipt that contains the recording", () => {
+    const declared = "**Journey evidence:** recorded\n**Journey proof:** `https://example.test/walk.png`";
+    assert.equal(journeyEvidenceProven("**Journey evidence:** not-applicable", "", () => false), true);
+    assert.equal(journeyEvidenceProven(declared, declared, () => false), true);
+    assert.equal(journeyEvidenceProven(declared, "walked the journey", () => false), false);
+  });
+
+  it("accepts a route test only when the file is on the commit", () => {
+    const declared = "**Journey evidence:** recorded\n**Journey proof:** `api/test/signup_route_test.dart`";
+    assert.equal(
+      journeyEvidenceProven(declared, "", (repo, path) => repo === "api" && path === "test/signup_route_test.dart"),
+      true,
+    );
+    assert.equal(journeyEvidenceProven(declared, declared, () => false), false);
+  });
+
+  it("keeps an already-shipped journey in intake until the proof is real", () => {
+    const text = "**Verdict:** ALREADY SHIPPED\n**Repos:** `api`\n**Journey evidence:** recorded\n";
+    const input = { verdict: "ALREADY SHIPPED" as const, text, priorComments: [], devStatus: "Dev", trunkCommit: true };
+    assert.equal(parkStateForVerdict(input), null);
+    assert.equal(parkStateForVerdict({ ...input, journeyProven: true }), "Dev");
+    assert.equal(
+      parkStateForVerdict({
+        ...input,
+        text: text.replace("recorded", "not-applicable"),
+      }),
+      "Dev",
+    );
   });
 });
 
