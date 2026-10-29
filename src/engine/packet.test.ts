@@ -42,8 +42,9 @@ describe("prior request", () => {
     assert.equal(priorRequestBlocksBuild("**Prior request:** replaced API-9"), null);
   });
 
-  it("blocks ask, a missing line, and replaced without an id", () => {
-    assert.equal(priorRequestBlocksBuild("**Prior request:** ask — keep the rule"), "ask");
+  it("records ask as allowed, and still blocks a missing line and replaced without an id", () => {
+    assert.equal(priorRequestBlocksBuild("**Prior request:** ask — keep the rule"), null);
+    assert.equal(priorRequestBlocksBuild("**Prior request:** kept"), null);
     assert.equal(priorRequestBlocksBuild("**Prior request:** replaced — no id"), "replaced");
     assert.equal(priorRequestBlocksBuild("**Verdict:** BUILDABLE"), "missing");
   });

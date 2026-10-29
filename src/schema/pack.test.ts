@@ -44,6 +44,25 @@ describe("pack requirements", () => {
     assert.throws(() => loadPack(write(`${base}\nforge: git\ncheck: workflow\n`)), /forge github/);
   });
 
+  it("keeps optional symbol, journey, and ship-after-dev commands", () => {
+    const pack = loadPack(
+      write(`${base}
+symbolsCommand: node scripts/code-graph.mjs --check
+journeyCommand: node scripts/journey-proof.mjs
+ship:
+  markStatus: false
+  afterDev: true
+  steps:
+    - ./scripts/ship.sh
+`),
+    );
+    assert.equal(pack.symbolsCommand, "node scripts/code-graph.mjs --check");
+    assert.equal(pack.journeyCommand, "node scripts/journey-proof.mjs");
+    assert.equal(pack.ship?.afterDev, true);
+    assert.equal(pack.ship?.markStatus, false);
+    assert.deepEqual(pack.ship?.steps, ["./scripts/ship.sh"]);
+  });
+
   it("keeps a scoped promote command on the dev block", () => {
     const pack = loadPack(
       write(`${base}\ndev:\n  promote:\n    command: ./scripts/promote.sh dev --repo {repo}\n    repos:\n      - customer-app\n`),
