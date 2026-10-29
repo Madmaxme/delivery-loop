@@ -1309,8 +1309,10 @@ describe("loop", () => {
       ...pack,
       ship: { steps: ["ship"], markStatus: false, afterDev: true },
     };
+    let shipArgs = "";
     env.deps.runCommand = () => {
       runs += 1;
+      shipArgs = process.env.DELIVERY_LOOP_SHIP_ARGS ?? "";
       return { status: runs === 1 ? 1 : 0 };
     };
     const first = await runTicket(env.deps, ticket());
@@ -1324,6 +1326,7 @@ describe("loop", () => {
     assert.equal(again.outcome, "landed");
     assert.equal(again.detail, "ship resumed");
     assert.equal(env.state(), "Dev");
+    assert.equal(shipArgs, "--issue API-1");
   });
 
   it("leaves prod status to the pack when markStatus is false", async () => {

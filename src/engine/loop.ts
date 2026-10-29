@@ -951,6 +951,22 @@ function runDevCommands(deps: LoopDeps, commands: string[]): string | null {
   return null;
 }
 
+/** Ship this ticket only. An empty arg list is a bulk ship. */
+function runShipSteps(deps: LoopDeps, identifier: string): string | null {
+  const previousIssue = process.env.DELIVERY_LOOP_ISSUE;
+  const previousArgs = process.env.DELIVERY_LOOP_SHIP_ARGS;
+  process.env.DELIVERY_LOOP_ISSUE = identifier;
+  process.env.DELIVERY_LOOP_SHIP_ARGS = `--issue ${identifier}`;
+  try {
+    return runDevCommands(deps, deps.pack.ship?.steps ?? []);
+  } finally {
+    if (previousIssue === undefined) delete process.env.DELIVERY_LOOP_ISSUE;
+    else process.env.DELIVERY_LOOP_ISSUE = previousIssue;
+    if (previousArgs === undefined) delete process.env.DELIVERY_LOOP_SHIP_ARGS;
+    else process.env.DELIVERY_LOOP_SHIP_ARGS = previousArgs;
+  }
+}
+
 function defaultRunPackCommand(
   command: string,
   cwd: string,
@@ -1109,7 +1125,7 @@ async function settleTrunk(
   const devState = hold ? holdStatus(deps.pack) : deps.pack.status.dev;
   if (deps.pack.ship?.afterDev) {
     await deps.tracker.setState(ticket.identifier, devState);
-    const failed = runDevCommands(deps, deps.pack.ship.steps ?? []);
+    const failed = runShipSteps(deps, ticket.identifier);
     if (failed) {
       await deps.tracker.setState(ticket.identifier, deps.pack.status.intake);
       await deps.tracker.comment(
@@ -1176,7 +1192,7 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
   }
   if (marker.kind === "ship") {
     noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
-    const failed = runDevCommands(deps, deps.pack.ship?.steps ?? []);
+    const failed = runShipSteps(deps, ticket.identifier);
     if (failed) {
       return {
         identifier: ticket.identifier,
