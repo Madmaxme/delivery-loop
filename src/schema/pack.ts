@@ -124,11 +124,23 @@ export type ProjectPack = {
     promote?: { command: string; repos: string[] };
   };
   /**
+   * Resolves `**Symbols:**` lines. The engine passes one `repo/path#symbol`
+   * per line on stdin. A non-zero exit is an incomplete packet.
+   */
+  symbolsCommand?: string;
+  /**
+   * Prints `**Journey proof:**` tokens on stdout. The engine appends that
+   * stdout to the build receipt. The author does not write the token.
+   */
+  journeyCommand?: string;
+  /**
    * Pack-owned production steps. `markStatus` defaults to true.
    * Set it false when a step already moves the ticket to the prod state
    * (for example a store park that must not be marked shipped early).
+   * `afterDev` runs `steps` once the dev gate has passed. A failed step
+   * returns the ticket to intake so the next page runs the steps again.
    */
-  ship?: { steps: string[]; markStatus?: boolean };
+  ship?: { steps: string[]; markStatus?: boolean; afterDev?: boolean };
 };
 
 export function defaultStatus(): ProjectPack["status"] {

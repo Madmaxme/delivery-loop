@@ -25,8 +25,9 @@ export type WorkOrder = {
 };
 
 function field(text: string, name: string): string {
-  const re = new RegExp(`\\*\\*${name}:\\*\\*\\s*(.+)`, "i");
-  return text.match(re)?.[1]?.trim() ?? "";
+  const re = new RegExp(`\\*\\*${name}:\\*\\*[ \\t]*(.*)`, "i");
+  const line = text.match(re)?.[1] ?? "";
+  return line.trim();
 }
 
 function words(value: string): string[] {
@@ -154,13 +155,14 @@ export function parsePriorRequest(text: string): PriorRequest | null {
 
 /**
  * Why a BUILDABLE handoff must not build.
- * `ask`, a missing line, and `replaced` without a ticket id stay in intake.
- * The verdict stays BUILDABLE. Null means the line allows a build.
+ * A missing line, and `replaced` without a ticket id, stay in intake.
+ * `ask` does not block: the runner records `kept`. With no symbols, the
+ * ticket is already done. With symbols, the same land path continues.
+ * Null means the line allows a build.
  */
-export function priorRequestBlocksBuild(text: string): "missing" | "ask" | "replaced" | null {
+export function priorRequestBlocksBuild(text: string): "missing" | "replaced" | null {
   const parsed = parsePriorRequest(text);
   if (!parsed) return "missing";
-  if (parsed.kind === "ask") return "ask";
   if (parsed.kind === "replaced" && !parsed.identifier) return "replaced";
   return null;
 }

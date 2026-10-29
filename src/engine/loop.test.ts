@@ -8,6 +8,7 @@ import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../ada
 import type { ProjectPack } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
 import { formatTicketProgress, latestLandMarker, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage } from "./loop.ts";
+import { classifyQualityCause } from "./quality-cause.ts";
 
 const pack: ProjectPack = {
   tracker: "github",
@@ -617,13 +618,26 @@ describe("loop", () => {
     assert.match(prompt, /Land repos: api/);
   });
 
-  it("stays in intake when a buildable handoff says ask", async () => {
+  it("lands when ask names symbols and records the request as kept", async () => {
     const env = harness(BUILDABLE.replace("**Prior request:** none", "**Prior request:** ask"));
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "invalid-packet");
-    assert.equal(result.detail, "prior-request-ask");
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.merged(), true);
+    assert.match(env.comments.join("\n"), /\*\*Prior request:\*\* kept/);
+  });
+
+  it("closes an ask with no symbols as already done", async () => {
+    const env = harness(
+      BUILDABLE.replace("**Prior request:** none", "**Prior request:** ask").replace(
+        "**Symbols:** `api/src/pay.ts#charge`",
+        "**Symbols:**",
+      ),
+    );
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "verdict");
+    assert.equal(result.detail, "prior-request-kept");
     assert.equal(env.merged(), false);
-    assert.equal(env.state(), "Todo");
+    assert.equal(env.state(), "Canceled");
   });
 
   it("stays in intake when replaced names no ticket", async () => {
@@ -1176,6 +1190,143 @@ describe("loop", () => {
       detail: "x".repeat(250),
     });
     assert.equal(line, `API-1 worker-failed ${"x".repeat(197)}...`);
+  });
+
+  it("classifies a red quality run before another product edit", () => {
+    const rows: {
+      cause: ReturnType<typeof classifyQualityCause>;
+      detail: string;
+      rerun: "success" | "failure" | null;
+      trunk: "success" | "failure" | null;
+      commandMatchesWorkflow: boolean | null;
+    }[] = [
+      { cause: "flake", detail: "quality failure", rerun: "success", trunk: "success", commandMatchesWorkflow: true },
+      { cause: "trunk", detail: "quality failure", rerun: "failure", trunk: "failure", commandMatchesWorkflow: true },
+      { cause: "environment", detail: "quality failure", rerun: "failure", trunk: "success", commandMatchesWorkflow: false },
+      { cause: "contract", detail: "api-types drift", rerun: null, trunk: null, commandMatchesWorkflow: null },
+      { cause: "change", detail: "npm test exited 1", rerun: null, trunk: "success", commandMatchesWorkflow: true },
+    ];
+    for (const row of rows) {
+      assert.equal(
+        classifyQualityCause({
+          detail: row.detail,
+          rerun: row.rerun ? { state: row.rerun, detail: row.detail } : null,
+          trunk: row.trunk ? { state: row.trunk, detail: row.detail } : null,
+          commandMatchesWorkflow: row.commandMatchesWorkflow,
+        }),
+        row.cause,
+      );
+    }
+  });
+
+  it("does not patch the product branch when trunk is already red", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.ciFixMax = 5;
+    let starts = 0;
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      starts += 1;
+      return start(input);
+    };
+    env.deps.qualityContext = async () => ({
+      rerun: { state: "failure", detail: "quality failure" },
+      trunk: { state: "failure", detail: "quality failure" },
+      commandMatchesWorkflow: true,
+    });
+    env.deps.forge.quality = async () => ({ state: "failure", detail: "quality failure" });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "land-blocked");
+    assert.match(result.detail, /next page resumes/);
+    assert.match(env.comments.join("\n"), /already red/);
+    assert.equal(starts, 2);
+    assert.equal(env.merged(), false);
+  });
+
+  it("does not adopt a commit that repeats the previous hypothesis", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.ciFixMax = 3;
+    env.deps.sleep = async () => {};
+    let reads = 0;
+    env.deps.forge.quality = async (input) => {
+      reads += 1;
+      if (reads > 3) return { state: "success", detail: "quality success" };
+      return { state: "failure", detail: `quality failure ${input.headSha}` };
+    };
+    let lookups = 0;
+    env.deps.lookupHead = (_url, branch) => {
+      if (branch === "main") return "trunk";
+      lookups += 1;
+      return `sha-${lookups}`;
+    };
+    let joins = 0;
+    env.deps.worker.join = async () => {
+      joins += 1;
+      return {
+        status: "finished",
+        branch: "delivery/api-1",
+        head: "abc",
+        text: joins <= 2 ? BUILDABLE : "**Hypothesis:** retry the suite",
+      };
+    };
+    const heads: string[] = [];
+    const quality = env.deps.forge.quality.bind(env.deps.forge);
+    env.deps.forge.quality = async (input) => {
+      if (input.headSha.startsWith("sha-")) heads.push(`${input.headSha}`);
+      return quality(input);
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.match(env.comments.join("\n"), /Repeated hypothesis is not a fix/);
+    assert.deepEqual(heads.filter((sha) => sha === "sha-1").length > 0, true);
+    assert.equal(heads.includes("sha-2"), false);
+    assert.equal(result.outcome, "landed");
+  });
+
+  it("refuses a packet whose symbols do not resolve", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = { ...pack, symbolsCommand: "node scripts/code-graph.mjs --check" };
+    env.deps.runPackCommand = () => ({ status: 1, stdout: "" });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "invalid-packet");
+    assert.equal(result.detail, "symbols");
+    assert.equal(env.merged(), false);
+    assert.equal(env.comments.some((body) => body.includes("BUILD_PACKET")), false);
+  });
+
+  it("appends the journey command token and does not require the author to write it", async () => {
+    const url = "https://example.test/artifacts/signup.mp4";
+    const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded"));
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => ({ status: 0, stdout: `**Journey proof:** \`${url}\`` });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+  });
+
+  it("resumes a failed ship step on the next page without a new worker", async () => {
+    const env = harness(BUILDABLE);
+    let runs = 0;
+    env.deps.pack = {
+      ...pack,
+      ship: { steps: ["ship"], markStatus: false, afterDev: true },
+    };
+    let shipArgs = "";
+    env.deps.runCommand = () => {
+      runs += 1;
+      shipArgs = process.env.DELIVERY_LOOP_SHIP_ARGS ?? "";
+      return { status: runs === 1 ? 1 : 0 };
+    };
+    const first = await runTicket(env.deps, ticket());
+    assert.equal(first.outcome, "ship-blocked");
+    assert.equal(env.state(), "Todo");
+    assert.equal(sweepNeedsAnotherPage([first]), true);
+    const again = await runTicket(
+      env.deps,
+      ticket({ comments: env.comments.map((body) => ({ body })) }),
+    );
+    assert.equal(again.outcome, "landed");
+    assert.equal(again.detail, "ship resumed");
+    assert.equal(env.state(), "Dev");
+    assert.equal(shipArgs, "--issue API-1");
   });
 
   it("leaves prod status to the pack when markStatus is false", async () => {

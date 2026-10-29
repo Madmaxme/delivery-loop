@@ -31,13 +31,22 @@ import {
   journeyEvidenceProven,
   parkStateForVerdict,
   parseJourneyEvidence,
+  parseJourneyProofs,
   parseOutsideGrant,
+  parsePriorRequest,
   parseVerdict,
   parseWorkOrder,
   priorRequestBlocksBuild,
   repoNames,
   type Verdict,
 } from "./packet.js";
+import {
+  classifyQualityCause,
+  parseHypothesis,
+  sameHypothesis,
+  type QualityCause,
+  type QualitySample,
+} from "./quality-cause.js";
 
 export type LoopDeps = {
   pack: ProjectPack;
@@ -66,6 +75,29 @@ export type LoopDeps = {
   ciFixMax?: number;
   /** Runs `qualityCommand` when `check` is `command`. Default runs it in the checkout. */
   runCommand?: (command: string, cwd: string) => { status: number | null };
+  /**
+   * Runs a pack command with stdin. Default is a shell in the checkout.
+   * Symbol and journey commands use this.
+   */
+  runPackCommand?: (
+    command: string,
+    cwd: string,
+    stdin: string,
+  ) => { status: number | null; stdout: string };
+  /**
+   * Second read of a red SHA, the trunk tip, and whether the worker image
+   * matches the workflow. Null fields mean this install did not measure them.
+   * Default is all null, so the cause is read from the log text.
+   */
+  qualityContext?: (input: {
+    repoUrl: string;
+    headSha: string;
+    detail: string;
+  }) => Promise<{
+    rerun: QualitySample | null;
+    trunk: QualitySample | null;
+    commandMatchesWorkflow: boolean | null;
+  }>;
   /**
    * True when a route-test proof is on `ref`. Default reads the checkout with git.
    * A recording URL is not a file.
@@ -104,6 +136,7 @@ export type TicketResult = {
     | "land-blocked"
     | "land-empty"
     | "trunk-waiting"
+    | "ship-blocked"
     | "journey-missing"
     | "worker-failed";
   detail: string;
@@ -225,8 +258,8 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "The invariant id is a heading in the invariants file, or `prefix/slug` from a heading file the install lists.",
     "One **Decision:** sentence that cites that id. **Symbols:** `repo/path#symbol`. **Repos:** in backticks, and only names from the land-repo list.",
     "Every BUILDABLE handoff includes **Prior request:** none | kept | replaced <id> | ask.",
-    "none means no written rule asked for the current behavior. kept means one did and this ticket keeps it. replaced names the ticket this one undoes. ask means a rule asked for the current behavior and this ticket does not undo it.",
-    "ask, a missing line, or replaced without a ticket id stays in intake. The verdict stays BUILDABLE.",
+    "none means no written rule asked for the current behavior. kept means one did and this ticket keeps it. replaced names the ticket this one undoes. ask means a rule asked for the current behavior and this ticket does not undo it. The runner records ask as kept.",
+    "A missing line, or replaced without a ticket id, stays in intake. ask does not. With no symbols, ask closes the ticket as already done. With symbols, the same land path continues. The verdict stays BUILDABLE.",
     "Look only at the install's invariant and decision documents and at commit subjects that already name a ticket. No sentence means none.",
     "Every BUILDABLE handoff includes **Outside grant:** none | open.",
     "none means the done-state is code this repository can land.",
@@ -264,7 +297,7 @@ function buildPrompt(
       ? `Push these branches from each repo trunk: ${branches.join(", ")}. Include repo and branch in the handoff. Do not merge.`
       : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
     "Stay inside the allowlist. Run the validation commands.",
-    "When the handoff says **Journey evidence:** recorded, the build receipt includes **Journey proof:**. A web journey cites one https recording or screenshot URL. A mobile journey commits the route test the proof names. The runner does not mark dev-done without that proof.",
+    "When the handoff says **Journey evidence:** recorded, the pack journey command prints **Journey proof:**. A web token is an https recording or screenshot URL. A mobile token is the route test on the commit. The author does not write that token. The runner does not mark dev-done without it.",
     retry,
   ].filter((part) => part.length > 0).join("\n\n");
 }
@@ -276,6 +309,19 @@ function ciFixLimit(deps: LoopDeps): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 5;
 }
 
+function causeInstruction(cause: QualityCause): string {
+  if (cause === "flake") {
+    return "This SHA went green on rerun. The check is a flake. Fix that check. A product patch is not the fix. The land continues after two green runs.";
+  }
+  if (cause === "environment") {
+    return "The worker command or image differs from the workflow. The next edit is the environment. A product patch is rejected until the failure reproduces in the CI image.";
+  }
+  if (cause === "contract") {
+    return "The log is generated-client drift. The next edit is the regen in the repo the log names.";
+  }
+  return "This failure reproduces on this SHA and is green on trunk. State a new **Hypothesis:** line. A repeat of the previous hypothesis is not a fix.";
+}
+
 function fixPrompt(
   ticket: Ticket,
   orderText: string,
@@ -284,6 +330,8 @@ function fixPrompt(
   attempt: number,
   max: number,
   detail: string,
+  cause: QualityCause,
+  previousHypothesis: string | null,
 ): string {
   const cwd = deps.cwd ?? process.cwd();
   const docs = listedDocs(cwd, deps.pack.prompts?.build);
@@ -292,6 +340,11 @@ function fixPrompt(
     ...docs,
     `Fix the failing quality check on \`${pr.repo.name}\` branch \`${pr.branch}\` for ${ticket.identifier}.`,
     `Attempt ${attempt} of ${max}.`,
+    `**Cause:** ${cause}`,
+    causeInstruction(cause),
+    previousHypothesis
+      ? `The previous hypothesis was: ${previousHypothesis}. A repeat of that hypothesis is not pushed.`
+      : "State a **Hypothesis:** line that names the layer this edit changes.",
     `The check said: ${detail}`,
     orderText,
     `Checkout \`${pr.branch}\` in \`${pr.repo.name}\`. Fix the failure. Commit and push that same branch.`,
@@ -560,13 +613,24 @@ async function runHeldTicket(
   const prior = priorRequestBlocksBuild(ground.text);
   if (prior) {
     const reason =
-      prior === "ask"
-        ? "BUILDABLE **Prior request:** ask does not build. The ticket stays in intake."
-        : prior === "replaced"
-          ? "BUILDABLE **Prior request:** replaced requires a ticket id. The ticket stays in intake."
-          : "BUILDABLE requires **Prior request:** none | kept | replaced <id> | ask. The ticket stays in intake.";
+      prior === "replaced"
+        ? "BUILDABLE **Prior request:** replaced requires a ticket id. The ticket stays in intake."
+        : "BUILDABLE requires **Prior request:** none | kept | replaced <id> | ask. The ticket stays in intake.";
     await deps.tracker.comment(ticket.identifier, reason);
     return { identifier: ticket.identifier, outcome: "invalid-packet", detail: `prior-request-${prior}` };
+  }
+  if (parsePriorRequest(ground.text)?.kind === "ask") {
+    const preview = parseWorkOrder(ground.text);
+    await deps.tracker.comment(
+      ticket.identifier,
+      "**Prior request:** kept. A written rule already asked for the current behavior.",
+    );
+    if (!preview || preview.symbols.length === 0) {
+      const onTrunk = trunkHasTicketCommit(deps, ticket.identifier, ground.text);
+      const done = onTrunk === true ? deps.pack.status.dev : "Canceled";
+      await deps.tracker.setState(ticket.identifier, done);
+      return { identifier: ticket.identifier, outcome: "verdict", detail: "prior-request-kept" };
+    }
   }
 
   const order = parseWorkOrder(ground.text);
@@ -593,6 +657,13 @@ async function runHeldTicket(
       outcome: "invalid-packet",
       detail: `unknown invariant ${order.invariant}`,
     };
+  }
+  if (!(await symbolsResolve(deps, order.symbols))) {
+    await deps.tracker.comment(
+      ticket.identifier,
+      "A **Symbols:** line did not resolve. The packet is incomplete. The next page re-grounds. This comment is not a buildable stamp.",
+    );
+    return { identifier: ticket.identifier, outcome: "invalid-packet", detail: "symbols" };
   }
   const unknownRepos = order.repos.filter((name) => !repoByName(deps.pack, name));
   if (unknownRepos.length > 0) {
@@ -819,9 +890,17 @@ function landEmptyMarker(rows: { repo: string; sha: string }[]): string {
   return lines.join("\n");
 }
 
+function shipWaitMarker(hold: boolean, rows: { repo: string; sha: string }[]): string {
+  const lines = ["<!-- SHIP_WAIT", `hold=${hold ? "1" : "0"}`];
+  for (const row of rows) lines.push(`${row.repo} ${row.sha}`);
+  lines.push("-->");
+  return lines.join("\n");
+}
+
 type LandMarker =
   | { kind: "wait"; hold: boolean; rows: { repo: string; sha: string }[] }
-  | { kind: "empty"; rows: { repo: string; sha: string }[] };
+  | { kind: "empty"; rows: { repo: string; sha: string }[] }
+  | { kind: "ship"; hold: boolean; rows: { repo: string; sha: string }[] };
 
 function markerRows(body: string): { hold: boolean; rows: { repo: string; sha: string }[] } {
   let hold = false;
@@ -844,10 +923,16 @@ function markerRows(body: string): { hold: boolean; rows: { repo: string; sha: s
 export function latestLandMarker(comments: { body: string }[]): LandMarker | null {
   for (let i = comments.length - 1; i >= 0; i--) {
     const body = comments[i]?.body ?? "";
+    const shipAt = body.lastIndexOf("SHIP_WAIT");
     const waitAt = body.lastIndexOf("LAND_WAIT");
     const emptyAt = body.lastIndexOf("LAND_EMPTY");
-    if (waitAt < 0 && emptyAt < 0) continue;
-    if (waitAt > emptyAt) {
+    const latest = Math.max(shipAt, waitAt, emptyAt);
+    if (latest < 0) continue;
+    if (latest === shipAt) {
+      const parsed = markerRows(body.slice(shipAt));
+      return { kind: "ship", hold: parsed.hold, rows: parsed.rows };
+    }
+    if (latest === waitAt) {
       const parsed = markerRows(body.slice(waitAt));
       return { kind: "wait", hold: parsed.hold, rows: parsed.rows };
     }
@@ -864,6 +949,54 @@ function runDevCommands(deps: LoopDeps, commands: string[]): string | null {
     if (result.status !== 0) return command;
   }
   return null;
+}
+
+/** Ship this ticket only. An empty arg list is a bulk ship. */
+function runShipSteps(deps: LoopDeps, identifier: string): string | null {
+  const previousIssue = process.env.DELIVERY_LOOP_ISSUE;
+  const previousArgs = process.env.DELIVERY_LOOP_SHIP_ARGS;
+  process.env.DELIVERY_LOOP_ISSUE = identifier;
+  process.env.DELIVERY_LOOP_SHIP_ARGS = `--issue ${identifier}`;
+  try {
+    return runDevCommands(deps, deps.pack.ship?.steps ?? []);
+  } finally {
+    if (previousIssue === undefined) delete process.env.DELIVERY_LOOP_ISSUE;
+    else process.env.DELIVERY_LOOP_ISSUE = previousIssue;
+    if (previousArgs === undefined) delete process.env.DELIVERY_LOOP_SHIP_ARGS;
+    else process.env.DELIVERY_LOOP_SHIP_ARGS = previousArgs;
+  }
+}
+
+function defaultRunPackCommand(
+  command: string,
+  cwd: string,
+  stdin: string,
+): { status: number | null; stdout: string } {
+  const result = spawnSync(command, { shell: true, cwd, input: stdin, encoding: "utf8" });
+  return { status: result.status, stdout: result.stdout ?? "" };
+}
+
+/** A symbol command that is unset accepts every line. A failing command does not. */
+async function symbolsResolve(deps: LoopDeps, symbols: string[]): Promise<boolean> {
+  const command = deps.pack.symbolsCommand?.trim();
+  if (!command || symbols.length === 0) return true;
+  const run = deps.runPackCommand ?? defaultRunPackCommand;
+  const result = run(command, deps.cwd ?? process.cwd(), `${symbols.join("\n")}\n`);
+  return result.status === 0;
+}
+
+/**
+ * The pack command prints the proof token. Empty or unparsed stdout is not proof.
+ * Returns the stdout to append, or null when the command failed.
+ */
+function journeyCommandProof(deps: LoopDeps, stdin: string): string | null {
+  const command = deps.pack.journeyCommand?.trim();
+  if (!command) return "";
+  const run = deps.runPackCommand ?? defaultRunPackCommand;
+  const result = run(command, deps.cwd ?? process.cwd(), stdin);
+  if (result.status !== 0) return null;
+  if (parseJourneyProofs(result.stdout).length === 0) return null;
+  return result.stdout;
 }
 
 async function trunkQuality(
@@ -957,8 +1090,22 @@ async function settleTrunk(
       detail: `dev step failed: ${failed}`,
     };
   }
+  let proofReceipt = receipt;
   if (parseJourneyEvidence(declared) === "recorded" || parseJourneyEvidence(receipt) === "recorded") {
-    const proven = journeyEvidenceProven(`${declared}\n${receipt}`, receipt, (repo, path) => {
+    const printed = journeyCommandProof(deps, `${declared}\n${receipt}`);
+    if (printed === null) {
+      await deps.tracker.comment(
+        ticket.identifier,
+        "The journey command did not print a **Journey proof:** token. The ticket stays in intake.",
+      );
+      return {
+        identifier: ticket.identifier,
+        outcome: "journey-missing",
+        detail: "journey command",
+      };
+    }
+    proofReceipt = `${receipt}\n${printed}`;
+    const proven = journeyEvidenceProven(`${declared}\n${proofReceipt}`, proofReceipt, (repo, path) => {
       const row = rows.find((item) => item.repo.name === repo);
       const ref = row?.sha || repoByName(deps.pack, repo)?.trunk || "";
       return journeyFileInCheckout(deps, repo, ref, path);
@@ -975,7 +1122,29 @@ async function settleTrunk(
       };
     }
   }
-  await deps.tracker.setState(ticket.identifier, hold ? holdStatus(deps.pack) : deps.pack.status.dev);
+  const devState = hold ? holdStatus(deps.pack) : deps.pack.status.dev;
+  if (deps.pack.ship?.afterDev) {
+    await deps.tracker.setState(ticket.identifier, devState);
+    const failed = runShipSteps(deps, ticket.identifier);
+    if (failed) {
+      await deps.tracker.setState(ticket.identifier, deps.pack.status.intake);
+      await deps.tracker.comment(
+        ticket.identifier,
+        shipWaitMarker(hold, rows.map((row) => ({ repo: row.repo.name, sha: row.sha }))),
+      );
+      return {
+        identifier: ticket.identifier,
+        outcome: "ship-blocked",
+        detail: `ship step failed: ${failed}. The next page resumes this branch.`,
+      };
+    }
+    if (deps.pack.ship.markStatus === false) {
+      return { identifier: ticket.identifier, outcome: "landed", detail: doneDetail };
+    }
+    await deps.tracker.setState(ticket.identifier, deps.pack.status.prod);
+    return { identifier: ticket.identifier, outcome: "landed", detail: doneDetail };
+  }
+  await deps.tracker.setState(ticket.identifier, devState);
   return {
     identifier: ticket.identifier,
     outcome: "landed",
@@ -1020,6 +1189,24 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
       if (!sha || sha !== row.sha) return null;
     }
     return { identifier: ticket.identifier, outcome: "land-empty", detail: "branch unchanged" };
+  }
+  if (marker.kind === "ship") {
+    noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
+    const failed = runShipSteps(deps, ticket.identifier);
+    if (failed) {
+      return {
+        identifier: ticket.identifier,
+        outcome: "ship-blocked",
+        detail: `ship step failed: ${failed}. The next page resumes this branch.`,
+      };
+    }
+    const devState = marker.hold ? holdStatus(deps.pack) : deps.pack.status.dev;
+    if (deps.pack.ship?.markStatus !== false) {
+      await deps.tracker.setState(ticket.identifier, deps.pack.status.prod);
+    } else {
+      await deps.tracker.setState(ticket.identifier, devState);
+    }
+    return { identifier: ticket.identifier, outcome: "landed", detail: "ship resumed" };
   }
   if (marker.rows.length === 0) return null;
   const rows: { repo: RepoSpec; sha: string }[] = [];
@@ -1078,7 +1265,8 @@ async function spendFix(
   fixes: number,
   fixMax: number,
   prompt: string,
-): Promise<{ fixes: number; headSha: string } | TicketResult> {
+  previousHypothesis: string | null,
+): Promise<{ fixes: number; headSha: string; hypothesis: string | null } | TicketResult> {
   if (fixes >= fixMax) {
     const paused = pauseLand(
       ticket.identifier,
@@ -1089,13 +1277,14 @@ async function spendFix(
     return paused;
   }
   const home = agentHome(deps.pack);
+  let text = "";
   try {
     const started = await deps.worker.start({
       prompt,
       repoUrl: home.url,
       baseRef: home.trunk,
     });
-    await finishWorker(deps.worker, started.runId);
+    text = (await finishWorker(deps.worker, started.runId)).text;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const paused = pauseLand(
@@ -1106,11 +1295,20 @@ async function spendFix(
     await deps.tracker.comment(ticket.identifier, paused.detail);
     return paused;
   }
+  const hypothesis = parseHypothesis(text) ?? previousHypothesis;
+  if (sameHypothesis(previousHypothesis, parseHypothesis(text))) {
+    await deps.tracker.comment(
+      ticket.identifier,
+      `Repeated hypothesis is not a fix: ${hypothesis}. The previous commit stays.`,
+    );
+    return { fixes: fixes + 1, headSha: current.headSha, hypothesis: previousHypothesis };
+  }
   const lookup = deps.lookupHead ?? lookupRemoteHead;
   const next = lookup(current.repo.url, current.branch);
   return {
     fixes: fixes + 1,
     headSha: next && next !== current.headSha ? next : current.headSha,
+    hypothesis,
   };
 }
 
@@ -1130,21 +1328,49 @@ async function landPull(
   let updates = 0;
   let unknown = 0;
   let fixes = 0;
+  let hypothesis: string | null = null;
+  let requireTwoGreens = false;
+  let greens = 0;
   const fixMax = ciFixLimit(deps);
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
   for (let step = 0; step < 8 + fixMax; step++) {
     const quality = await waitForQuality(deps, current);
+    if (quality.state === "success" && requireTwoGreens) {
+      greens += 1;
+      if (greens < 2) continue;
+    }
     if (quality.state === "failure") {
+      greens = 0;
+      const context = deps.qualityContext
+        ? await deps.qualityContext({
+            repoUrl: current.repo.url,
+            headSha: current.headSha,
+            detail: quality.detail,
+          })
+        : { rerun: null, trunk: null, commandMatchesWorkflow: null };
+      const cause = classifyQualityCause({ detail: quality.detail, ...context });
+      if (cause === "trunk") {
+        const paused = pauseLand(
+          ticket.identifier,
+          current.url,
+          `Quality is already red on \`${current.repo.trunk}\`. This branch stays. The next page resumes this branch when that tip is green.`,
+        );
+        await deps.tracker.comment(ticket.identifier, paused.detail);
+        return paused;
+      }
+      if (cause === "flake") requireTwoGreens = true;
       const spent = await spendFix(
         deps,
         ticket,
         current,
         fixes,
         fixMax,
-        fixPrompt(ticket, orderText, deps, current, fixes + 1, fixMax, quality.detail),
+        fixPrompt(ticket, orderText, deps, current, fixes + 1, fixMax, quality.detail, cause, hypothesis),
+        hypothesis,
       );
       if ("outcome" in spent) return spent;
       fixes = spent.fixes;
+      hypothesis = spent.hypothesis;
       current = { ...current, headSha: spent.headSha, created: false };
       continue;
     }
@@ -1175,9 +1401,11 @@ async function landPull(
           fixMax,
           `The branch ${merge.state === "conflict" ? "conflicts with" : "is still behind"} \`${current.repo.trunk}\`.`,
         ),
+        hypothesis,
       );
       if ("outcome" in spent) return spent;
       fixes = spent.fixes;
+      hypothesis = spent.hypothesis;
       current = { ...current, headSha: spent.headSha, created: false };
       continue;
     }
@@ -1214,9 +1442,11 @@ async function landPull(
         fixes,
         fixMax,
         conflictPrompt(ticket, orderText, deps, current, fixes + 1, fixMax, reason),
+        hypothesis,
       );
       if ("outcome" in spent) return spent;
       fixes = spent.fixes;
+      hypothesis = spent.hypothesis;
       current = { ...current, headSha: spent.headSha, created: false };
     }
   }
@@ -1326,6 +1556,7 @@ export function sweepNeedsAnotherPage(results: TicketResult[]): boolean {
       result.outcome === "quality-failed" ||
       result.outcome === "trunk-waiting" ||
       result.outcome === "land-blocked" ||
+      result.outcome === "ship-blocked" ||
       result.outcome === "skipped-page",
   );
 }
