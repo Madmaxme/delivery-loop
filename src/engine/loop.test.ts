@@ -1302,7 +1302,7 @@ describe("loop", () => {
     assert.equal(env.state(), "Dev");
   });
 
-  it("resumes a failed ship step on the next page without a new worker", async () => {
+  it("keeps dev when ship fails and resumes that ship step without a new worker", async () => {
     const env = harness(BUILDABLE);
     let runs = 0;
     env.deps.pack = {
@@ -1317,7 +1317,7 @@ describe("loop", () => {
     };
     const first = await runTicket(env.deps, ticket());
     assert.equal(first.outcome, "ship-blocked");
-    assert.equal(env.state(), "Todo");
+    assert.equal(env.state(), "Dev");
     assert.equal(sweepNeedsAnotherPage([first]), true);
     const again = await runTicket(
       env.deps,

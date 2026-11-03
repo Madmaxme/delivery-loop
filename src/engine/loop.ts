@@ -1127,7 +1127,6 @@ async function settleTrunk(
     await deps.tracker.setState(ticket.identifier, devState);
     const failed = runShipSteps(deps, ticket.identifier);
     if (failed) {
-      await deps.tracker.setState(ticket.identifier, deps.pack.status.intake);
       await deps.tracker.comment(
         ticket.identifier,
         shipWaitMarker(hold, rows.map((row) => ({ repo: row.repo.name, sha: row.sha }))),
@@ -1135,7 +1134,7 @@ async function settleTrunk(
       return {
         identifier: ticket.identifier,
         outcome: "ship-blocked",
-        detail: `ship step failed: ${failed}. The next page resumes this branch.`,
+        detail: `ship step failed: ${failed}. Dev status stays. Ship retries from dev.`,
       };
     }
     if (deps.pack.ship.markStatus === false) {
@@ -1192,15 +1191,16 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
   }
   if (marker.kind === "ship") {
     noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
+    const devState = marker.hold ? holdStatus(deps.pack) : deps.pack.status.dev;
+    await deps.tracker.setState(ticket.identifier, devState);
     const failed = runShipSteps(deps, ticket.identifier);
     if (failed) {
       return {
         identifier: ticket.identifier,
         outcome: "ship-blocked",
-        detail: `ship step failed: ${failed}. The next page resumes this branch.`,
+        detail: `ship step failed: ${failed}. Dev status stays. Ship retries from dev.`,
       };
     }
-    const devState = marker.hold ? holdStatus(deps.pack) : deps.pack.status.dev;
     if (deps.pack.ship?.markStatus !== false) {
       await deps.tracker.setState(ticket.identifier, deps.pack.status.prod);
     } else {
