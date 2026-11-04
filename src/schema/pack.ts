@@ -137,8 +137,10 @@ export type ProjectPack = {
    * Pack-owned production steps. `markStatus` defaults to true.
    * Set it false when a step already moves the ticket to the prod state
    * (for example a store park that must not be marked shipped early).
-   * `afterDev` runs `steps` once the dev gate has passed. A failed step
-   * returns the ticket to intake so the next page runs the steps again.
+   * `afterDev` runs `steps` once the dev gate has passed. When it is
+   * absent, sweep stops at the dev state and does not run `steps`,
+   * including a later page that still has a ship marker. A failed step
+   * leaves the dev state. The ship command retries it.
    */
   ship?: { steps: string[]; markStatus?: boolean; afterDev?: boolean };
 };

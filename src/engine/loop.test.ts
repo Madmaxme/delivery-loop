@@ -1329,6 +1329,33 @@ describe("loop", () => {
     assert.equal(shipArgs, "--issue API-1");
   });
 
+  it("stops at dev and does not resume ship when afterDev is off", async () => {
+    const env = harness(BUILDABLE);
+    let runs = 0;
+    env.deps.pack = {
+      ...pack,
+      ship: { steps: ["ship"], markStatus: false },
+    };
+    env.deps.runCommand = () => {
+      runs += 1;
+      return { status: 0 };
+    };
+    const first = await runTicket(env.deps, ticket());
+    assert.equal(first.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+    assert.equal(runs, 0);
+    const again = await runTicket(
+      env.deps,
+      ticket({
+        comments: [{ body: "<!-- SHIP_WAIT\nhold=0\napi abc\n-->" }],
+      }),
+    );
+    assert.equal(again.outcome, "landed");
+    assert.equal(again.detail, "dev only");
+    assert.equal(env.state(), "Dev");
+    assert.equal(runs, 0);
+  });
+
   it("leaves prod status to the pack when markStatus is false", async () => {
     const env = harness(BUILDABLE);
     let state = "Dev";
