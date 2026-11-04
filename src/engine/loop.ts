@@ -1193,6 +1193,13 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
     noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
     const devState = marker.hold ? holdStatus(deps.pack) : deps.pack.status.dev;
     await deps.tracker.setState(ticket.identifier, devState);
+    if (!deps.pack.ship?.afterDev) {
+      return {
+        identifier: ticket.identifier,
+        outcome: "landed",
+        detail: "dev only",
+      };
+    }
     const failed = runShipSteps(deps, ticket.identifier);
     if (failed) {
       return {
