@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,7 +47,7 @@ import {
   type QualityCause,
   type QualitySample,
 } from "./quality-cause.js";
-import { ownerHealMarker, ownerHealPrompt, stallOwner } from "./stall.js";
+import { ownerHealMarker, ownerHealPrompt, shipNoSignature, stallOwner } from "./stall.js";
 
 export type LoopDeps = {
   pack: ProjectPack;
@@ -969,11 +969,38 @@ async function healShipStep(
   ticket: Ticket,
   step: string,
   mode: "steps" | "continue",
+  tail = "",
 ): Promise<void> {
-  const key = `install:${mode}:${step}`;
+  const signature = shipNoSignature(tail);
+  const key = signature ? `install:${mode}:${step}:${signature}` : `install:${mode}:${step}`;
   const owner = stallOwner({ kind: "ship", healsAlready: healAlready(deps, ticket, key) ? 1 : 0 });
   if (owner !== "install") return;
-  await applyOwnerHeal(deps, ticket, key, `Ship step returned no: ${step}`, "install");
+  const reason = signature ? `Ship step returned no: ${step}\n${signature}` : `Ship step returned no: ${step}`;
+  await applyOwnerHeal(deps, ticket, key, reason, "install");
+}
+
+function runShipStep(
+  step: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+): Promise<{ status: number | null; tail: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(step, { shell: true, cwd, env, stdio: ["inherit", "pipe", "pipe"] });
+    const lines: string[] = [];
+    const take = (chunk: Buffer, dest: NodeJS.WriteStream) => {
+      dest.write(chunk);
+      for (const piece of chunk.toString("utf8").split(/\n/)) {
+        const trimmed = piece.trim();
+        if (!trimmed) continue;
+        lines.push(trimmed);
+        if (lines.length > 30) lines.shift();
+      }
+    };
+    child.stdout?.on("data", (chunk: Buffer) => take(chunk, process.stdout));
+    child.stderr?.on("data", (chunk: Buffer) => take(chunk, process.stderr));
+    child.on("error", () => resolve({ status: 1, tail: lines.slice(-8).join("\n") }));
+    child.on("close", (code) => resolve({ status: code, tail: lines.slice(-8).join("\n") }));
+  });
 }
 
 /** Ship this ticket only. An empty arg list is a bulk ship. */
@@ -1827,13 +1854,9 @@ export async function ship(
     }
   }
   let current = await loadTicket();
+  const cwd = deps.cwd ?? process.cwd();
   for (const step of steps) {
-    const result = spawnSync(step, {
-      shell: true,
-      cwd: deps.cwd ?? process.cwd(),
-      stdio: "inherit",
-      env,
-    });
+    const result = await runShipStep(step, cwd, env);
     if (result.status === 0) continue;
     if (!current && deps.tracker.kind === "ship-idle" && deps.openTracker) {
       deps.tracker = deps.openTracker();
@@ -1849,13 +1872,8 @@ export async function ship(
       blockedBy: [],
       comments: [],
     };
-    await healShipStep(deps, standIn, step, mode === "continue" ? "continue" : "steps");
-    const retry = spawnSync(step, {
-      shell: true,
-      cwd: deps.cwd ?? process.cwd(),
-      stdio: "inherit",
-      env,
-    });
+    await healShipStep(deps, standIn, step, mode === "continue" ? "continue" : "steps", result.tail);
+    const retry = await runShipStep(step, cwd, env);
     if (retry.status !== 0) throw new Error(`ship step failed: ${step}`);
   }
   if (identifier && deps.pack.ship?.markStatus !== false) {

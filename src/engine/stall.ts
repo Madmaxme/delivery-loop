@@ -24,6 +24,17 @@ export function stallOwner(input: {
   return "person";
 }
 
+/**
+ * The last distinctive line of a step that returned no.
+ * The same command can fail for a new reason. That is a new no.
+ * A long token is not part of the reason.
+ */
+export function shipNoSignature(tail: string): string {
+  const lines = tail.split(/\n/).map((line) => line.trim()).filter(Boolean);
+  const picked = [...lines].reverse().find((line) => /error|fail|missing|required|denied|attribute/i.test(line)) ?? "";
+  return picked.replace(/[A-Za-z0-9_-]{24,}/g, "").replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
 /** One owner edit per key. The marker lives on the ticket so the next page sees it. */
 export function ownerHealMarker(key: string): string {
   return `<!-- OWNER_HEAL ${key} -->`;
@@ -44,7 +55,7 @@ export function ownerHealPrompt(input: {
             ? `Push with the token in \`${token}\`. An installation token must not merge that package.`
             : "Push with the commit-actor token. An installation token must not merge that package.",
         ].join(" ")
-      : "Edit the install that owns the command that returned no. That includes production promote and store continue. Land it on the install trunk. A clean store wait is not a no. A production check that restores the previous tip and exits clean is not a no.";
+      : "Edit the owner of the behavior that returned no. That owner may be this checkout, or a repo the command ships, including production promote and store continue. Land that owner's trunk before you finish. This step runs again when you return. An open pull request is not landed. A clean store wait is not a no. A production check that restores the previous tip and exits clean is not a no.";
   return [
     "A required step returned no. Fix that owner so this no cannot happen again.",
     input.reason,
