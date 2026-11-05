@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { ownerHealMarker, stallOwner } from "./stall.ts";
+import { ownerHealMarker, shipNoSignature, stallOwner } from "./stall.ts";
 
 describe("stall", () => {
   it("sorts a no with the existing causes", () => {
@@ -23,5 +23,15 @@ describe("stall", () => {
 
   it("names the heal in a marker the next page can read", () => {
     assert.equal(ownerHealMarker("install:steps:ship"), "<!-- OWNER_HEAL install:steps:ship -->");
+  });
+
+  it("treats a different failure of the same command as a new no", () => {
+    const social = shipNoSignature("waiting for build\nmissing required attribute socialMedia");
+    const other = shipNoSignature("missing required attribute exportCompliance");
+    assert.match(social, /socialMedia/);
+    assert.match(other, /exportCompliance/);
+    assert.notEqual(social, other);
+    assert.equal(shipNoSignature("ok"), "");
+    assert.equal(shipNoSignature("error token abcdefghijklmnopqrstuvwxyz123456"), "error token");
   });
 });

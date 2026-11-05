@@ -1386,7 +1386,7 @@ describe("loop", () => {
     assert.equal(env.deps.pageControl?.stop, true);
     const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
     assert.equal(heals.length, 1);
-    assert.match(heals[0], /install that owns the command/);
+    assert.match(heals[0], /owner of the behavior/);
     assert.equal(prompts.some((prompt) => prompt.includes("Checkout")), false);
     assert.equal(env.merged(), false);
   });
@@ -1430,10 +1430,33 @@ describe("loop", () => {
     const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
     assert.equal(heals.length, 2);
     assert.match(heals[0], /Ship step returned no: false/);
-    assert.match(heals[0], /store continue/);
+    assert.match(heals[0], /repo the command ships/);
+    assert.match(heals[0], /An open pull request is not landed/);
     assert.match(env.comments.join("\n"), /OWNER_HEAL install:steps:false/);
     assert.match(env.comments.join("\n"), /OWNER_HEAL install:continue:false/);
     assert.match(ownerHealPrompt({ reason: "no", owner: "runner", tokenEnv: "COMMIT_ACTOR_TOKEN" }), /COMMIT_ACTOR_TOKEN/);
+  });
+
+  it("edits the owner again when the same ship command returns a different no", async () => {
+    const env = harness(BUILDABLE);
+    const prompts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return start(input);
+    };
+    const note = join(mkdtempSync(join(tmpdir(), "ship-no-")), "no.txt");
+    writeFileSync(note, "missing required attribute socialMedia\n");
+    const step = `cat ${note} >&2; exit 1`;
+    env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
+    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed/);
+    writeFileSync(note, "missing required attribute exportCompliance\n");
+    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed/);
+    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed/);
+    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
+    assert.equal(heals.length, 2);
+    assert.match(heals[0], /socialMedia/);
+    assert.match(heals[1], /exportCompliance/);
   });
 
   it("leaves prod status to the pack when markStatus is false", async () => {
