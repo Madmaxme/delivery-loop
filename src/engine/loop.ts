@@ -47,6 +47,7 @@ import {
   type QualityCause,
   type QualitySample,
 } from "./quality-cause.js";
+import { ownerHealMarker, ownerHealPrompt, stallOwner } from "./stall.js";
 
 export type LoopDeps = {
   pack: ProjectPack;
@@ -73,6 +74,18 @@ export type LoopDeps = {
   qualityNoRunMs?: number;
   /** Fix attempts after a red quality check. Default is `DELIVERY_LOOP_CI_FIX_MAX`, then `QWS_CI_FIX_MAX`, then 5. */
   ciFixMax?: number;
+  /**
+   * Shared with every ticket on this page. An owner edit sets `stop` so the
+   * page ends and the next page loads the edited trunk.
+   */
+  pageControl?: { stop: boolean; healed: string[] };
+  /**
+   * Starts the owner edit. Ship sets this so a successful ship does not
+   * construct a coding worker. Sweep uses `worker` when this is absent.
+   */
+  ownerHeal?: (input: { prompt: string; repoUrl: string; baseRef: string }) => Promise<void>;
+  /** Builds the real tracker after a ship step returns no. Success does not call it. */
+  openTracker?: () => TrackerAdapter;
   /** Runs `qualityCommand` when `check` is `command`. Default runs it in the checkout. */
   runCommand?: (command: string, cwd: string) => { status: number | null };
   /**
@@ -951,6 +964,18 @@ function runDevCommands(deps: LoopDeps, commands: string[]): string | null {
   return null;
 }
 
+async function healShipStep(
+  deps: LoopDeps,
+  ticket: Ticket,
+  step: string,
+  mode: "steps" | "continue",
+): Promise<void> {
+  const key = `install:${mode}:${step}`;
+  const owner = stallOwner({ kind: "ship", healsAlready: healAlready(deps, ticket, key) ? 1 : 0 });
+  if (owner !== "install") return;
+  await applyOwnerHeal(deps, ticket, key, `Ship step returned no: ${step}`, "install");
+}
+
 /** Ship this ticket only. An empty arg list is a bulk ship. */
 function runShipSteps(deps: LoopDeps, identifier: string): string | null {
   const previousIssue = process.env.DELIVERY_LOOP_ISSUE;
@@ -1127,6 +1152,7 @@ async function settleTrunk(
     await deps.tracker.setState(ticket.identifier, devState);
     const failed = runShipSteps(deps, ticket.identifier);
     if (failed) {
+      await healShipStep(deps, ticket, failed, "steps");
       await deps.tracker.comment(
         ticket.identifier,
         shipWaitMarker(hold, rows.map((row) => ({ repo: row.repo.name, sha: row.sha }))),
@@ -1202,6 +1228,7 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
     }
     const failed = runShipSteps(deps, ticket.identifier);
     if (failed) {
+      await healShipStep(deps, ticket, failed, "steps");
       return {
         identifier: ticket.identifier,
         outcome: "ship-blocked",
@@ -1226,11 +1253,67 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
   return settleTrunk(deps, ticket, marker.hold, rows, "trunk green");
 }
 
-function pauseLand(identifier: string, url: string, reason: string): TicketResult {
+function healAlready(deps: LoopDeps, ticket: Ticket, key: string): boolean {
+  if (deps.pageControl?.healed.includes(key)) return true;
+  const marker = ownerHealMarker(key);
+  return ticket.comments.some((comment) => comment.body.includes(marker));
+}
+
+/**
+ * One edit of the owner of a step that returned no.
+ * A second call for the same key does not start a worker.
+ * The page stops so the next page checks out the edited trunk.
+ */
+async function applyOwnerHeal(
+  deps: LoopDeps,
+  ticket: Ticket,
+  key: string,
+  reason: string,
+  owner: "install" | "runner",
+): Promise<boolean> {
+  const decision = stallOwner({
+    kind: key.startsWith("install:")
+      ? "ship"
+      : key.startsWith("runner:conflict")
+        ? "conflict"
+        : key.startsWith("runner:unscheduled")
+          ? "unscheduled"
+          : "quality",
+    cause: key.startsWith("install:environment") ? "environment" : undefined,
+    healsAlready: healAlready(deps, ticket, key) ? 1 : 0,
+  });
+  if (decision === "person" || decision === "wait" || decision === "change") return false;
+  const body = `${ownerHealMarker(key)}\n${reason}`;
+  ticket.comments = [...ticket.comments, { body }];
+  try {
+    await deps.tracker.comment(ticket.identifier, body);
+  } catch {
+    // The marker is already on this ticket object and on pageControl.
+  }
+  const home = agentHome(deps.pack);
+  const prompt = ownerHealPrompt({
+    reason,
+    owner,
+    tokenEnv: deps.pack.commitActorTokenEnv,
+  });
+  if (deps.ownerHeal) {
+    await deps.ownerHeal({ prompt, repoUrl: home.url, baseRef: home.trunk });
+  } else {
+    const started = await deps.worker.start({ prompt, repoUrl: home.url, baseRef: home.trunk });
+    await finishWorker(deps.worker, started.runId);
+  }
+  if (!deps.pageControl) deps.pageControl = { stop: false, healed: [] };
+  deps.pageControl.healed.push(key);
+  deps.pageControl.stop = true;
+  return true;
+}
+
+function pauseLand(identifier: string, url: string, reason: string, tail = "The sweep continues with the next ticket."): TicketResult {
+  const detail = tail ? `Land paused on ${url}. ${reason} ${tail}` : `Land paused on ${url}. ${reason}`;
   return {
     identifier,
     outcome: "land-blocked",
-    detail: `Land paused on ${url}. ${reason} The sweep continues with the next ticket.`,
+    detail,
   };
 }
 
@@ -1248,6 +1331,19 @@ async function explainQuality(
     return { identifier: ticket.identifier, outcome: "quality-pending", detail: pr.url };
   }
   if (quality.state === "unscheduled") {
+    const owner = stallOwner({
+      kind: "unscheduled",
+      healsAlready: healAlready(deps, ticket, "runner:unscheduled") ? 1 : 0,
+    });
+    if (owner === "runner") {
+      await applyOwnerHeal(
+        deps,
+        ticket,
+        "runner:unscheduled",
+        `Quality did not start on ${pr.url}. ${quality.detail} The request for a run already happened.`,
+        "runner",
+      );
+    }
     await deps.tracker.comment(
       ticket.identifier,
       `Quality did not start on ${pr.url}. ${quality.detail} Polling this commit cannot create the workflow run.`,
@@ -1273,8 +1369,34 @@ async function spendFix(
   fixMax: number,
   prompt: string,
   previousHypothesis: string | null,
+  budget: "pause" | "runner" = "pause",
 ): Promise<{ fixes: number; headSha: string; hypothesis: string | null } | TicketResult> {
   if (fixes >= fixMax) {
+    if (budget === "runner") {
+      const owner = stallOwner({
+        kind: "conflict",
+        healsAlready: healAlready(deps, ticket, "runner:conflict") ? 1 : 0,
+      });
+      const healed = owner === "runner"
+        ? await applyOwnerHeal(
+            deps,
+            ticket,
+            "runner:conflict",
+            `Still blocked after ${fixMax} attempts on \`${current.branch}\`.`,
+            "runner",
+          )
+        : false;
+      const paused = pauseLand(
+        ticket.identifier,
+        current.url,
+        healed
+          ? "The procedure owner was edited. The next page resumes this branch."
+          : "The same procedure no already had one owner edit. A person decides.",
+        "",
+      );
+      await deps.tracker.comment(ticket.identifier, paused.detail);
+      return paused;
+    }
     const paused = pauseLand(
       ticket.identifier,
       current.url,
@@ -1366,6 +1488,32 @@ async function landPull(
         return paused;
       }
       if (cause === "flake") requireTwoGreens = true;
+      if (cause === "environment") {
+        const owner = stallOwner({
+          kind: "quality",
+          cause,
+          healsAlready: healAlready(deps, ticket, "install:environment") ? 1 : 0,
+        });
+        const healed = owner === "install"
+          ? await applyOwnerHeal(
+              deps,
+              ticket,
+              "install:environment",
+              `Quality did not run the same check as the workflow. ${quality.detail}`,
+              "install",
+            )
+          : false;
+        const paused = pauseLand(
+          ticket.identifier,
+          current.url,
+          healed
+            ? "The procedure owner was edited. The next page resumes this branch."
+            : "The same procedure no already had one owner edit. A person decides.",
+          "",
+        );
+        await deps.tracker.comment(ticket.identifier, paused.detail);
+        return paused;
+      }
       const spent = await spendFix(
         deps,
         ticket,
@@ -1409,6 +1557,7 @@ async function landPull(
           `The branch ${merge.state === "conflict" ? "conflicts with" : "is still behind"} \`${current.repo.trunk}\`.`,
         ),
         hypothesis,
+        "runner",
       );
       if ("outcome" in spent) return spent;
       fixes = spent.fixes;
@@ -1450,6 +1599,7 @@ async function landPull(
         fixMax,
         conflictPrompt(ticket, orderText, deps, current, fixes + 1, fixMax, reason),
         hypothesis,
+        "runner",
       );
       if ("outcome" in spent) return spent;
       fixes = spent.fixes;
@@ -1585,6 +1735,7 @@ const MAX_SWEEP_PASSES = 50;
  * this same page. A pass that only skips blocked tickets stops.
  */
 export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
+  if (!deps.pageControl) deps.pageControl = { stop: false, healed: [] };
   const settled = new Set<string>();
   const blocked = new Set<string>();
   const programs = new Map<string, CompileProgramResult | null>();
@@ -1631,6 +1782,7 @@ export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
         noteDone(deps, result);
       }
       results.push(result);
+      if (deps.pageControl?.stop) return results;
       if (result.outcome === "skipped-graph") {
         blocked.add(ticket.identifier);
         continue;
@@ -1653,20 +1805,58 @@ export async function deliver(deps: LoopDeps, identifier: string): Promise<Ticke
   return runTicket(program ? { ...deps, program } : deps, ticket);
 }
 
-export async function ship(deps: LoopDeps, identifier?: string, extraArgs?: string): Promise<void> {
+export async function ship(
+  deps: LoopDeps,
+  identifier?: string,
+  extraArgs?: string,
+  mode: "ship" | "continue" = "ship",
+): Promise<void> {
+  const steps = mode === "continue" ? (deps.pack.ship?.continue ?? []) : (deps.pack.ship?.steps ?? []);
+  if (mode === "continue" && steps.length === 0) throw new Error("ship continue has no steps");
   const env = {
     ...process.env,
     DELIVERY_LOOP_ISSUE: identifier ?? "",
     DELIVERY_LOOP_SHIP_ARGS: extraArgs ?? "",
   };
-  for (const step of deps.pack.ship?.steps ?? []) {
+  async function loadTicket(): Promise<Ticket | null> {
+    if (!identifier) return null;
+    try {
+      return await deps.tracker.get(identifier);
+    } catch {
+      return null;
+    }
+  }
+  let current = await loadTicket();
+  for (const step of steps) {
     const result = spawnSync(step, {
       shell: true,
       cwd: deps.cwd ?? process.cwd(),
       stdio: "inherit",
       env,
     });
-    if (result.status !== 0) throw new Error(`ship step failed: ${step}`);
+    if (result.status === 0) continue;
+    if (!current && deps.tracker.kind === "ship-idle" && deps.openTracker) {
+      deps.tracker = deps.openTracker();
+      current = await loadTicket();
+    }
+    const standIn: Ticket = current ?? {
+      id: identifier ?? "ship",
+      identifier: identifier ?? "ship",
+      title: "",
+      body: "",
+      stateName: "",
+      labels: [],
+      blockedBy: [],
+      comments: [],
+    };
+    await healShipStep(deps, standIn, step, mode === "continue" ? "continue" : "steps");
+    const retry = spawnSync(step, {
+      shell: true,
+      cwd: deps.cwd ?? process.cwd(),
+      stdio: "inherit",
+      env,
+    });
+    if (retry.status !== 0) throw new Error(`ship step failed: ${step}`);
   }
   if (identifier && deps.pack.ship?.markStatus !== false) {
     await deps.tracker.setState(identifier, deps.pack.status.prod);

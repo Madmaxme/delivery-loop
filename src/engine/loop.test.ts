@@ -9,6 +9,7 @@ import type { ProjectPack } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
 import { formatTicketProgress, latestLandMarker, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage } from "./loop.ts";
 import { classifyQualityCause } from "./quality-cause.ts";
+import { ownerHealPrompt } from "./stall.ts";
 
 const pack: ProjectPack = {
   tracker: "github",
@@ -293,7 +294,7 @@ describe("loop", () => {
     assert.equal(env.state(), "Todo");
   });
 
-  it("continues the sweep after one ticket cannot merge", async () => {
+  it("stops the page after a refused merge edits the runner", async () => {
     const env = harness(BUILDABLE);
     env.deps.ciFixMax = 1;
     env.deps.tracker.listIntake = async () => [ticket(), ticket({ identifier: "API-2", id: "2" })];
@@ -319,9 +320,11 @@ describe("loop", () => {
     const results = await sweep(env.deps);
     assert.deepEqual(
       results.map((row) => row.outcome),
-      ["land-blocked", "landed"],
+      ["land-blocked"],
     );
-    assert.equal(merged, 1);
+    assert.equal(env.deps.pageControl?.stop, true);
+    assert.equal(merged, 0);
+    assert.equal(sweepNeedsAnotherPage(results), true);
   });
 
   it("runs a dependent in the same sweep after its blocker lands", async () => {
@@ -1302,9 +1305,15 @@ describe("loop", () => {
     assert.equal(env.state(), "Dev");
   });
 
-  it("keeps dev when ship fails and resumes that ship step without a new worker", async () => {
+  it("keeps dev when ship fails, edits that owner once, and resumes the step", async () => {
     const env = harness(BUILDABLE);
     let runs = 0;
+    let heals = 0;
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      if (input.prompt.includes("Fix that owner")) heals += 1;
+      return start(input);
+    };
     env.deps.pack = {
       ...pack,
       ship: { steps: ["ship"], markStatus: false, afterDev: true },
@@ -1327,6 +1336,7 @@ describe("loop", () => {
     assert.equal(again.detail, "ship resumed");
     assert.equal(env.state(), "Dev");
     assert.equal(shipArgs, "--issue API-1");
+    assert.equal(heals, 1);
   });
 
   it("stops at dev and does not resume ship when afterDev is off", async () => {
@@ -1354,6 +1364,76 @@ describe("loop", () => {
     assert.equal(again.detail, "dev only");
     assert.equal(env.state(), "Dev");
     assert.equal(runs, 0);
+  });
+
+  it("edits the install once when the quality check does not match the workflow", async () => {
+    const env = harness(BUILDABLE);
+    const prompts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return start(input);
+    };
+    env.deps.qualityContext = async () => ({
+      rerun: { state: "failure", detail: "quality failure" },
+      trunk: { state: "success", detail: "quality success" },
+      commandMatchesWorkflow: false,
+    });
+    env.deps.forge.quality = async () => ({ state: "failure", detail: "quality failure" });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "land-blocked");
+    assert.match(result.detail, /procedure owner was edited/);
+    assert.equal(env.deps.pageControl?.stop, true);
+    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
+    assert.equal(heals.length, 1);
+    assert.match(heals[0], /install that owns the command/);
+    assert.equal(prompts.some((prompt) => prompt.includes("Checkout")), false);
+    assert.equal(env.merged(), false);
+  });
+
+  it("edits the runner once when a conflict is still stuck after the fix budget", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.ciFixMax = 0;
+    const prompts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return start(input);
+    };
+    env.deps.forge.mergeability = async () => ({ state: "conflict", headSha: "abc" });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "land-blocked");
+    assert.equal(env.deps.pageControl?.stop, true);
+    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
+    assert.equal(heals.length, 1);
+    assert.match(heals[0], /package that executes this loop/);
+    assert.equal(env.merged(), false);
+  });
+
+  it("edits the install once when a ship step returns no, including continue", async () => {
+    const env = harness(BUILDABLE);
+    const prompts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return start(input);
+    };
+    env.deps.pack = {
+      ...pack,
+      commitActorTokenEnv: "COMMIT_ACTOR_TOKEN",
+      ship: { steps: ["false"], continue: ["false"], markStatus: false },
+    };
+    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed: false/);
+    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed: false/);
+    await assert.rejects(() => ship(env.deps, "API-1", "", "continue"), /ship step failed: false/);
+    await assert.rejects(() => ship(env.deps, "API-1", "", "continue"), /ship step failed: false/);
+    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
+    assert.equal(heals.length, 2);
+    assert.match(heals[0], /Ship step returned no: false/);
+    assert.match(heals[0], /store continue/);
+    assert.match(env.comments.join("\n"), /OWNER_HEAL install:steps:false/);
+    assert.match(env.comments.join("\n"), /OWNER_HEAL install:continue:false/);
+    assert.match(ownerHealPrompt({ reason: "no", owner: "runner", tokenEnv: "COMMIT_ACTOR_TOKEN" }), /COMMIT_ACTOR_TOKEN/);
   });
 
   it("leaves prod status to the pack when markStatus is false", async () => {

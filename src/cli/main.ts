@@ -160,9 +160,18 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       return;
     }
     const pack = loadPack(packPath(process.cwd()));
-    const issue = argv.find((a) => /^[A-Z][A-Z0-9]*-\d+$/i.test(a));
-    const extra = argv.filter((a) => a !== issue).join(" ");
-    ship(shipInvocationDeps(pack, process.cwd()), issue?.toUpperCase(), extra).then(
+    const continueMode = argv.includes("continue");
+    const rest = argv.filter((item) => item !== "continue");
+    const issue = rest.find((a) => /^[A-Z][A-Z0-9]*-\d+$/i.test(a));
+    const extra = rest.filter((a) => a !== issue).join(" ");
+    const deps = shipInvocationDeps(pack, process.cwd());
+    deps.ownerHeal = async (input) => {
+      const worker = workerFor(pack);
+      const started = await worker.start(input);
+      const joined = await worker.join(started.runId);
+      if (joined.status === "failed") throw new Error(joined.text || "owner edit failed");
+    };
+    ship(deps, issue?.toUpperCase(), extra, continueMode ? "continue" : "ship").then(
       () => console.log("shipped"),
       (err) => {
         console.error(err instanceof Error ? err.message : String(err));
@@ -310,7 +319,7 @@ if (isCli) {
   } else if (command === "sweep" || command === "deliver" || command === "ship") {
     dispatchOrRun(command === "deliver" ? "pipeline" : command, argv.slice(1));
   } else {
-    console.error("Usage: delivery-loop init|update|connector add <name>|sweep|deliver <id>|ship [id]");
+    console.error("Usage: delivery-loop init|update|connector add <name>|sweep|deliver <id>|ship [continue] [id]");
     process.exit(command ? 1 : 0);
   }
 }

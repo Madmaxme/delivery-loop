@@ -92,9 +92,10 @@ function trackerFor(pack: ProjectPack): TrackerAdapter {
 }
 
 /**
- * Ship runs pack steps. It never starts the coding worker, so Cursor /
- * Claude / Codex keys are not required. Tracker credentials are required
- * only when the pack still asks the CLI to set the prod status.
+ * Ship runs pack steps. A successful run does not start the coding worker
+ * and does not need tracker credentials when the pack owns prod status.
+ * A failed step opens the tracker to record one owner edit, then starts
+ * the worker.
  */
 export function shipInvocationDeps(pack: ProjectPack, cwd: string): LoopDeps {
   const needsTracker = pack.ship?.markStatus !== false;
@@ -104,5 +105,6 @@ export function shipInvocationDeps(pack: ProjectPack, cwd: string): LoopDeps {
     worker: idleWorker(),
     forge: idleForge(),
     tracker: needsTracker ? trackerFor(pack) : idleTracker(),
+    openTracker: () => trackerFor(pack),
   };
 }
