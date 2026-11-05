@@ -83,6 +83,11 @@ export type ProjectPack = {
    * own account, including a GitHub App.
    */
   commitActors?: CommitActor[];
+  /**
+   * Env var holding the token that may push the runner package.
+   * An installation token must not merge that package.
+   */
+  commitActorTokenEnv?: string;
   qualityCommand: string;
   qualityWorkflow: string;
   /**
@@ -140,9 +145,11 @@ export type ProjectPack = {
    * `afterDev` runs `steps` once the dev gate has passed. When it is
    * absent, sweep stops at the dev state and does not run `steps`,
    * including a later page that still has a ship marker. A failed step
-   * leaves the dev state. The ship command retries it.
+   * leaves the dev state. The ship command edits that step's owner once,
+   * then the next run retries it. `continue` is the store-continue command.
+   * A clean exit, including a store wait, is not a failure.
    */
-  ship?: { steps: string[]; markStatus?: boolean; afterDev?: boolean };
+  ship?: { steps: string[]; continue?: string[]; markStatus?: boolean; afterDev?: boolean };
 };
 
 export function defaultStatus(): ProjectPack["status"] {
