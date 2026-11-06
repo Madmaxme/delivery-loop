@@ -6,7 +6,8 @@ import type { QualityCause } from "./quality-cause.js";
  * `change` is the ticket branch. `install` is the checkout that owns the
  * command, including production promote and store continue.
  * `runner` is the package that executes the loop.
- * `wait` is an existing path. `person` is a second edit of the same no.
+ * `wait` is an existing path. `person` is a cause this table cannot name.
+ * A repeated no keeps the owner from the first time. The next page edits it again.
  */
 export type StallOwner = "change" | "install" | "runner" | "wait" | "person";
 
@@ -15,7 +16,7 @@ export function stallOwner(input: {
   cause?: QualityCause;
   healsAlready: number;
 }): StallOwner {
-  if (input.healsAlready >= 1) return "person";
+  void input.healsAlready;
   if (input.kind === "ship") return "install";
   if (input.kind === "unscheduled" || input.kind === "conflict") return "runner";
   if (input.cause === "flake" || input.cause === "trunk") return "wait";
@@ -40,7 +41,7 @@ export function shipNoIsWait(tail: string): boolean {
   return /GH006|quality is in progress|required status check[^\n]*in progress/i.test(tail);
 }
 
-/** One owner edit per key. The marker lives on the ticket so the next page sees it. */
+/** One owner edit per key on this page. The marker is a record. It does not retire the owner. */
 export function ownerHealMarker(key: string): string {
   return `<!-- OWNER_HEAL ${key} -->`;
 }

@@ -15,10 +15,10 @@ describe("stall", () => {
     assert.equal(stallOwner({ kind: "ship", healsAlready: 0 }), "install");
   });
 
-  it("leaves a second edit of the same no to a person", () => {
-    assert.equal(stallOwner({ kind: "ship", healsAlready: 1 }), "person");
-    assert.equal(stallOwner({ kind: "conflict", healsAlready: 1 }), "person");
-    assert.equal(stallOwner({ kind: "quality", cause: "environment", healsAlready: 1 }), "person");
+  it("keeps the same owner when the no happens again", () => {
+    assert.equal(stallOwner({ kind: "ship", healsAlready: 1 }), "install");
+    assert.equal(stallOwner({ kind: "conflict", healsAlready: 1 }), "runner");
+    assert.equal(stallOwner({ kind: "quality", cause: "environment", healsAlready: 1 }), "install");
   });
 
   it("names the heal in a marker the next page can read", () => {
