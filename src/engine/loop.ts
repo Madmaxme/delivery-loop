@@ -47,7 +47,7 @@ import {
   type QualityCause,
   type QualitySample,
 } from "./quality-cause.js";
-import { ownerHealMarker, ownerHealPrompt, shipNoSignature, stallOwner } from "./stall.js";
+import { ownerHealMarker, ownerHealPrompt, shipNoIsWait, shipNoSignature, stallOwner } from "./stall.js";
 
 export type LoopDeps = {
   pack: ProjectPack;
@@ -1855,26 +1855,44 @@ export async function ship(
   }
   let current = await loadTicket();
   const cwd = deps.cwd ?? process.cwd();
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
   for (const step of steps) {
-    const result = await runShipStep(step, cwd, env);
-    if (result.status === 0) continue;
-    if (!current && deps.tracker.kind === "ship-idle" && deps.openTracker) {
-      deps.tracker = deps.openTracker();
-      current = await loadTicket();
+    let result = await runShipStep(step, cwd, env);
+    let waits = 0;
+    while (result.status !== 0) {
+      if (shipNoIsWait(result.tail) && waits < 40) {
+        waits += 1;
+        await sleep(30_000);
+        result = await runShipStep(step, cwd, env);
+        continue;
+      }
+      waits = 0;
+      if (!current && deps.tracker.kind === "ship-idle" && deps.openTracker) {
+        deps.tracker = deps.openTracker();
+        current = await loadTicket();
+      }
+      const standIn: Ticket = current ?? {
+        id: identifier ?? "ship",
+        identifier: identifier ?? "ship",
+        title: "",
+        body: "",
+        stateName: "",
+        labels: [],
+        blockedBy: [],
+        comments: [],
+      };
+      current = standIn;
+      const signature = shipNoSignature(result.tail);
+      const modeName = mode === "continue" ? "continue" : "steps";
+      const key = signature
+        ? `install:${modeName}:${step}:${signature}`
+        : `install:${modeName}:${step}`;
+      if (healAlready(deps, standIn, key)) {
+        throw new Error(`ship step failed: ${step}`);
+      }
+      await healShipStep(deps, standIn, step, modeName, result.tail);
+      result = await runShipStep(step, cwd, env);
     }
-    const standIn: Ticket = current ?? {
-      id: identifier ?? "ship",
-      identifier: identifier ?? "ship",
-      title: "",
-      body: "",
-      stateName: "",
-      labels: [],
-      blockedBy: [],
-      comments: [],
-    };
-    await healShipStep(deps, standIn, step, mode === "continue" ? "continue" : "steps", result.tail);
-    const retry = await runShipStep(step, cwd, env);
-    if (retry.status !== 0) throw new Error(`ship step failed: ${step}`);
   }
   if (identifier && deps.pack.ship?.markStatus !== false) {
     await deps.tracker.setState(identifier, deps.pack.status.prod);

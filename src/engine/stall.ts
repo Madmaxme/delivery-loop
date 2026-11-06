@@ -35,6 +35,11 @@ export function shipNoSignature(tail: string): string {
   return picked.replace(/[A-Za-z0-9_-]{24,}/g, "").replace(/\s+/g, " ").trim().slice(0, 120);
 }
 
+/** A required check that has not finished is a wait, not an owner edit. */
+export function shipNoIsWait(tail: string): boolean {
+  return /GH006|quality is in progress|required status check[^\n]*in progress/i.test(tail);
+}
+
 /** One owner edit per key. The marker lives on the ticket so the next page sees it. */
 export function ownerHealMarker(key: string): string {
   return `<!-- OWNER_HEAL ${key} -->`;

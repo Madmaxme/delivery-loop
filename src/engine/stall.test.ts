@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { ownerHealMarker, shipNoSignature, stallOwner } from "./stall.ts";
+import { ownerHealMarker, shipNoIsWait, shipNoSignature, stallOwner } from "./stall.ts";
 
 describe("stall", () => {
   it("sorts a no with the existing causes", () => {
@@ -31,6 +31,8 @@ describe("stall", () => {
     assert.match(social, /socialMedia/);
     assert.match(other, /exportCompliance/);
     assert.notEqual(social, other);
+    assert.equal(shipNoIsWait('GH006: Required status check "quality" is in progress.'), true);
+    assert.equal(shipNoIsWait("missing required attribute socialMedia"), false);
     assert.equal(shipNoSignature("ok"), "");
     assert.equal(shipNoSignature("error token abcdefghijklmnopqrstuvwxyz123456"), "error token");
   });
