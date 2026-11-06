@@ -1281,9 +1281,8 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
 }
 
 function healAlready(deps: LoopDeps, ticket: Ticket, key: string): boolean {
-  if (deps.pageControl?.healed.includes(key)) return true;
-  const marker = ownerHealMarker(key);
-  return ticket.comments.some((comment) => comment.body.includes(marker));
+  void ticket;
+  return deps.pageControl?.healed.includes(key) ?? false;
 }
 
 /**
@@ -1298,6 +1297,7 @@ async function applyOwnerHeal(
   reason: string,
   owner: "install" | "runner",
 ): Promise<boolean> {
+  if (healAlready(deps, ticket, key)) return false;
   const decision = stallOwner({
     kind: key.startsWith("install:")
       ? "ship"
@@ -1418,7 +1418,7 @@ async function spendFix(
         current.url,
         healed
           ? "The procedure owner was edited. The next page resumes this branch."
-          : "The same procedure no already had one owner edit. A person decides.",
+          : "This page already edited that owner. The next page edits it again.",
         "",
       );
       await deps.tracker.comment(ticket.identifier, paused.detail);
@@ -1535,7 +1535,7 @@ async function landPull(
           current.url,
           healed
             ? "The procedure owner was edited. The next page resumes this branch."
-            : "The same procedure no already had one owner edit. A person decides.",
+            : "This page already edited that owner. The next page edits it again.",
           "",
         );
         await deps.tracker.comment(ticket.identifier, paused.detail);

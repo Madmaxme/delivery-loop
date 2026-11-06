@@ -1459,6 +1459,23 @@ describe("loop", () => {
     assert.match(heals[1], /exportCompliance/);
   });
 
+  it("edits the same ship no again on the next page", async () => {
+    const env = harness(BUILDABLE);
+    const prompts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return start(input);
+    };
+    env.deps.pack = { ...pack, ship: { steps: ["false"], markStatus: false } };
+    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed: false/);
+    env.deps.pageControl = { stop: false, healed: [] };
+    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed: false/);
+    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
+    assert.equal(heals.length, 2);
+    assert.match(env.comments.join("\n"), /OWNER_HEAL install:steps:false/);
+  });
+
   it("waits out a ship check that is still running and does not edit an owner", async () => {
     const env = harness(BUILDABLE);
     const prompts: string[] = [];
