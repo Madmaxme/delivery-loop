@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -1474,6 +1474,50 @@ describe("loop", () => {
     env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
     await ship(env.deps, "API-1");
     assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 0);
+  });
+
+  it("heals a ship no and continues when the retry is a check still running", async () => {
+    const env = harness(BUILDABLE);
+    const prompts: string[] = [];
+    const dir = mkdtempSync(join(tmpdir(), "ship-continue-"));
+    const note = join(dir, "note");
+    const count = join(dir, "n");
+    writeFileSync(note, "missing required attribute socialMedia\n");
+    writeFileSync(count, "0\n");
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      writeFileSync(note, "fixed\n");
+      return start(input);
+    };
+    env.deps.sleep = async () => {};
+    const step = `if grep -q socialMedia ${note}; then echo 'missing required attribute socialMedia' >&2; exit 1; fi; n=$(cat ${count}); echo $((n+1)) > ${count}; if [ "$n" -lt 1 ]; then echo 'Required status check "quality" is in progress.' >&2; exit 1; fi`;
+    env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
+    await ship(env.deps, "API-1");
+    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
+    assert.equal(heals.length, 1);
+    assert.match(heals[0], /socialMedia/);
+  });
+
+  it("heals the next ship no in the same run and continues", async () => {
+    const env = harness(BUILDABLE);
+    const prompts: string[] = [];
+    const phase = join(mkdtempSync(join(tmpdir(), "ship-next-no-")), "phase");
+    writeFileSync(phase, "0\n");
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      const next = readFileSync(phase, "utf8").trim() === "0" ? "1\n" : "2\n";
+      writeFileSync(phase, next);
+      return start(input);
+    };
+    const step = `p=$(cat ${phase}); if [ "$p" = 0 ]; then echo 'missing required attribute socialMedia' >&2; exit 1; fi; if [ "$p" = 1 ]; then echo 'missing required attribute exportCompliance' >&2; exit 1; fi`;
+    env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
+    await ship(env.deps, "API-1");
+    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
+    assert.equal(heals.length, 2);
+    assert.match(heals[0], /socialMedia/);
+    assert.match(heals[1], /exportCompliance/);
   });
 
   it("leaves prod status to the pack when markStatus is false", async () => {
