@@ -228,16 +228,17 @@ describe("loop", () => {
     let conflicts = 0;
     const start = env.deps.worker.start.bind(env.deps.worker);
     env.deps.worker.start = async (input) => {
-      if (input.prompt.includes("Resolve the merge conflict")) {
+      if (input.prompt.includes("Fix that owner") && input.prompt.includes("conflicts with")) {
         conflicts += 1;
         moved = true;
       }
       return start(input);
     };
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "landed");
+    assert.equal(result.outcome, "land-blocked");
     assert.equal(conflicts, 1);
-    assert.equal(env.merged(), true);
+    assert.equal(env.deps.pageControl?.stop, true);
+    assert.equal(env.merged(), false);
   });
 
   it("resumes a conflict on the next page when this page's budget is spent", async () => {
@@ -458,6 +459,18 @@ describe("loop", () => {
 
   it("hands a still-pending quality check to the next page", async () => {
     const env = harness(BUILDABLE, { quality: "pending" });
+    let healing = false;
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      healing = input.prompt.includes("Fix that owner");
+      return start(input);
+    };
+    env.deps.worker.join = async () => ({
+      status: "finished",
+      branch: "delivery/api-1",
+      head: "abc",
+      text: healing ? "**Heal:** wait" : BUILDABLE,
+    });
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "quality-pending");
     assert.equal(env.comments.some((body) => /still running/.test(body)), true);
@@ -476,10 +489,9 @@ describe("loop", () => {
       return { runId: "run-1" };
     };
     const result = await runTicket(env.deps, ticket());
-    const fix = prompts.find((text) => text.includes("Fix the failing quality check"));
+    const fix = prompts.find((text) => text.includes("Fix that owner"));
     assert.ok(fix);
     assert.match(fix ?? "", /cursor\/api-1-api/);
-    assert.match(fix ?? "", /do not replace it with the older trunk copy/);
     assert.equal(prompts.some((text) => text.includes("Push these branches")), false);
     assert.equal(result.outcome, "land-blocked");
     assert.match(result.detail, /next page resumes/);
@@ -497,13 +509,13 @@ describe("loop", () => {
       return { state, detail: `quality ${state}` };
     };
     env.deps.worker.start = async (input) => {
-      if (input.prompt.includes("Fix the failing quality check")) head = "def";
+      if (input.prompt.includes("Fix that owner")) head = "def";
       return { runId: "run-1" };
     };
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "landed");
-    assert.equal(env.merged(), true);
-    assert.equal(env.state(), "Dev");
+    assert.equal(result.outcome, "land-blocked");
+    assert.equal(env.deps.pageControl?.stop, true);
+    assert.equal(env.merged(), false);
   });
 
   it("keeps a running check on the install branch for the next page", async () => {
@@ -511,10 +523,19 @@ describe("loop", () => {
     env.deps.pack = { ...pack, branchTemplate: "cursor/{issue}-{repo}" };
     env.deps.lookupHead = (_url, branch) => (branch === "cursor/api-1-api" ? "abc1234" : null);
     let builds = 0;
+    let healing = false;
+    const start = env.deps.worker.start.bind(env.deps.worker);
     env.deps.worker.start = async (input) => {
+      healing = input.prompt.includes("Fix that owner");
       if (input.prompt.includes("Push these branches")) builds += 1;
-      return { runId: "run-1" };
+      return start(input);
     };
+    env.deps.worker.join = async () => ({
+      status: "finished",
+      branch: "delivery/api-1",
+      head: "abc",
+      text: healing ? "**Heal:** wait" : BUILDABLE,
+    });
     const result = await runTicket(env.deps, ticket());
     assert.equal(builds, 0);
     assert.equal(result.outcome, "quality-pending");
@@ -574,9 +595,9 @@ describe("loop", () => {
       committedAt: "2020-01-01T00:00:00.000Z",
     });
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "quality-unscheduled");
-    assert.equal(env.comments.some((body) => /did not start/.test(body)), true);
-    assert.equal(env.comments.some((body) => /still running/.test(body)), false);
+    assert.equal(result.outcome, "land-blocked");
+    assert.match(env.comments.join("\n"), /no Actions runs yet/);
+    assert.equal(env.deps.pageControl?.stop, true);
     assert.equal(sweepNeedsAnotherPage([result]), true);
     assert.equal(env.merged(), false);
   });
@@ -1240,8 +1261,8 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
     assert.match(result.detail, /next page resumes/);
-    assert.match(env.comments.join("\n"), /already red/);
-    assert.equal(starts, 2);
+    assert.match(env.comments.join("\n"), /OWNER_HEAL/);
+    assert.equal(starts, 3);
     assert.equal(env.merged(), false);
   });
 
@@ -1278,10 +1299,10 @@ describe("loop", () => {
       return quality(input);
     };
     const result = await runTicket(env.deps, ticket());
-    assert.match(env.comments.join("\n"), /Repeated hypothesis is not a fix/);
-    assert.deepEqual(heads.filter((sha) => sha === "sha-1").length > 0, true);
-    assert.equal(heads.includes("sha-2"), false);
-    assert.equal(result.outcome, "landed");
+    assert.equal(result.outcome, "land-blocked");
+    assert.equal(env.deps.pageControl?.stop, true);
+    assert.equal(joins, 3);
+    assert.equal(env.merged(), false);
   });
 
   it("refuses a packet whose symbols do not resolve", async () => {
@@ -1434,7 +1455,7 @@ describe("loop", () => {
     assert.match(heals[0], /An open pull request is not landed/);
     assert.match(env.comments.join("\n"), /OWNER_HEAL install:steps:false/);
     assert.match(env.comments.join("\n"), /OWNER_HEAL install:continue:false/);
-    assert.match(ownerHealPrompt({ reason: "no", owner: "runner", tokenEnv: "COMMIT_ACTOR_TOKEN" }), /COMMIT_ACTOR_TOKEN/);
+    assert.match(ownerHealPrompt({ reason: "no", tokenEnv: "COMMIT_ACTOR_TOKEN" }), /COMMIT_ACTOR_TOKEN/);
   });
 
   it("edits the owner again when the same ship command returns a different no", async () => {

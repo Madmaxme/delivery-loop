@@ -53,20 +53,19 @@ export function ownerHealMarker(key: string): string {
 
 export function ownerHealPrompt(input: {
   reason: string;
-  owner: "install" | "runner";
   tokenEnv?: string;
 }): string {
   const token = input.tokenEnv?.trim();
-  const where =
-    input.owner === "runner"
-      ? [
-          "Edit the package that executes this loop.",
-          "Land it on that package's trunk.",
-          token
-            ? `Push with the token in \`${token}\`. An installation token must not merge that package.`
-            : "Push with the commit-actor token. An installation token must not merge that package.",
-        ].join(" ")
-      : "Edit the owner of the behavior that returned no. That owner may be this checkout, or a repo the command ships, including production promote and store continue. Land that owner's trunk before you finish. This step runs again when you return. An open pull request is not landed. A clean store wait is not a no. A production check that restores the previous tip and exits clean is not a no.";
+  const where = [
+    "Edit the owner of the behavior that returned no.",
+    "That owner may be the ticket branch, this checkout, a repo the command ships, or the package that executes this loop.",
+    "Land that owner's trunk before you finish.",
+    "This step runs again when you return.",
+    "An open pull request is not landed.",
+    token
+      ? `Push the runner package with the token in \`${token}\`. An installation token must not merge that package.`
+      : "Push the runner package with the commit-actor token. An installation token must not merge that package.",
+  ].join(" ");
   const decide = [
     "Answer with one line: **Heal:** edit, **Heal:** wait, or **Heal:** login.",
     "edit changes the owner above and lands that trunk.",

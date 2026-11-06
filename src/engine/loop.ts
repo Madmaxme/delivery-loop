@@ -41,13 +41,12 @@ import {
   type Verdict,
 } from "./packet.js";
 import {
-  classifyQualityCause,
   parseHypothesis,
   sameHypothesis,
   type QualityCause,
   type QualitySample,
 } from "./quality-cause.js";
-import { healVerdict, ownerHealMarker, ownerHealPrompt, shipNoSignature, stallOwner, type HealVerdict } from "./stall.js";
+import { healVerdict, ownerHealMarker, ownerHealPrompt, shipNoSignature, type HealVerdict } from "./stall.js";
 
 export type LoopDeps = {
   pack: ProjectPack;
@@ -964,10 +963,6 @@ function runDevCommands(deps: LoopDeps, commands: string[]): string | null {
   return null;
 }
 
-function isShipStepKey(key: string): boolean {
-  return key.startsWith("install:steps:") || key.startsWith("install:continue:");
-}
-
 function rememberedVerdict(deps: LoopDeps, key: string): HealVerdict | undefined {
   return deps.pageControl?.verdicts?.[key];
 }
@@ -987,10 +982,8 @@ async function healShipStep(
 ): Promise<HealVerdict> {
   const signature = shipNoSignature(tail);
   const key = signature ? `install:${mode}:${step}:${signature}` : `install:${mode}:${step}`;
-  const owner = stallOwner({ kind: "ship", healsAlready: healAlready(deps, ticket, key) ? 1 : 0 });
-  if (owner !== "install") return "edit";
   const reason = signature ? `Ship step returned no: ${step}\n${signature}` : `Ship step returned no: ${step}`;
-  return applyOwnerHeal(deps, ticket, key, reason, "install");
+  return applyOwnerHeal(deps, ticket, key, reason);
 }
 
 function refreshShipGithubToken(env: NodeJS.ProcessEnv): boolean {
@@ -1159,6 +1152,8 @@ async function settleTrunk(
     devCommands(deps.pack, rows.map((row) => row.repo.name)),
   );
   if (failed) {
+    const signature = shipNoSignature(failed) || failed;
+    await applyOwnerHeal(deps, ticket, `heal:dev:${signature}`, `Dev step returned no: ${failed}`);
     await deps.tracker.comment(
       ticket.identifier,
       landWaitMarker(hold, rows.map((row) => ({ repo: row.repo.name, sha: row.sha }))),
@@ -1322,25 +1317,11 @@ async function applyOwnerHeal(
   ticket: Ticket,
   key: string,
   reason: string,
-  owner: "install" | "runner",
 ): Promise<HealVerdict> {
   if (healAlready(deps, ticket, key)) return "wait";
-  const decision = stallOwner({
-    kind: key.startsWith("install:")
-      ? "ship"
-      : key.startsWith("runner:conflict")
-        ? "conflict"
-        : key.startsWith("runner:unscheduled")
-          ? "unscheduled"
-          : "quality",
-    cause: key.startsWith("install:environment") ? "environment" : undefined,
-    healsAlready: healAlready(deps, ticket, key) ? 1 : 0,
-  });
-  if (decision === "person" || decision === "wait" || decision === "change") return "wait";
   const home = agentHome(deps.pack);
   const prompt = ownerHealPrompt({
     reason,
-    owner,
     tokenEnv: deps.pack.commitActorTokenEnv,
   });
   let text = "";
@@ -1350,7 +1331,7 @@ async function applyOwnerHeal(
     const started = await deps.worker.start({ prompt, repoUrl: home.url, baseRef: home.trunk });
     text = (await finishWorker(deps.worker, started.runId)).text;
   }
-  const verdict = isShipStepKey(key) ? healVerdict(text) : "edit";
+  const verdict = healVerdict(text);
   rememberVerdict(deps, key, verdict);
   if (verdict !== "edit") return verdict;
   const body = `${ownerHealMarker(key)}\n${reason}`;
@@ -1381,32 +1362,30 @@ async function explainQuality(
   pr: OpenPull,
   quality: QualityWait,
 ): Promise<TicketResult | null> {
-  if (quality.state === "pending") {
+  if (quality.state === "pending" || quality.state === "unscheduled") {
+    const signature = shipNoSignature(quality.detail) || quality.state;
+    const key = `heal:${quality.state}:${signature}`;
+    const reason = `Quality returned no on ${pr.url}. ${quality.detail}`;
+    const verdict = rememberedVerdict(deps, key) ?? (await applyOwnerHeal(deps, ticket, key, reason));
+    if (verdict === "edit") {
+      const paused = pauseLand(
+        ticket.identifier,
+        pr.url,
+        "The procedure owner was edited. The next page resumes this branch.",
+        "",
+      );
+      await deps.tracker.comment(ticket.identifier, paused.detail);
+      return paused;
+    }
     const body = qualityRunUnscheduled(quality.detail)
       ? `Quality did not start on ${pr.url}. ${quality.detail} The next page requests the workflow run.`
       : `Quality still running on ${pr.url}. The next page merges it when the check is green.`;
     await deps.tracker.comment(ticket.identifier, body);
-    return { identifier: ticket.identifier, outcome: "quality-pending", detail: pr.url };
-  }
-  if (quality.state === "unscheduled") {
-    const owner = stallOwner({
-      kind: "unscheduled",
-      healsAlready: healAlready(deps, ticket, "runner:unscheduled") ? 1 : 0,
-    });
-    if (owner === "runner") {
-      await applyOwnerHeal(
-        deps,
-        ticket,
-        "runner:unscheduled",
-        `Quality did not start on ${pr.url}. ${quality.detail} The request for a run already happened.`,
-        "runner",
-      );
-    }
-    await deps.tracker.comment(
-      ticket.identifier,
-      `Quality did not start on ${pr.url}. ${quality.detail} Polling this commit cannot create the workflow run.`,
-    );
-    return { identifier: ticket.identifier, outcome: "quality-unscheduled", detail: pr.url };
+    return {
+      identifier: ticket.identifier,
+      outcome: quality.state === "unscheduled" ? "quality-unscheduled" : "quality-pending",
+      detail: pr.url,
+    };
   }
   if (quality.state !== "success") {
     await deps.tracker.comment(ticket.identifier, `Quality ${quality.state} on ${pr.url}`);
@@ -1431,19 +1410,12 @@ async function spendFix(
 ): Promise<{ fixes: number; headSha: string; hypothesis: string | null } | TicketResult> {
   if (fixes >= fixMax) {
     if (budget === "runner") {
-      const owner = stallOwner({
-        kind: "conflict",
-        healsAlready: healAlready(deps, ticket, "runner:conflict") ? 1 : 0,
-      });
-      const healed = owner === "runner"
-        ? await applyOwnerHeal(
-            deps,
-            ticket,
-            "runner:conflict",
-            `Still blocked after ${fixMax} attempts on \`${current.branch}\`.`,
-            "runner",
-          )
-        : "wait";
+      const healed = await applyOwnerHeal(
+        deps,
+        ticket,
+        "runner:conflict",
+        `Still blocked after ${fixMax} attempts on \`${current.branch}\`.`,
+      );
       const paused = pauseLand(
         ticket.identifier,
         current.url,
@@ -1505,86 +1477,86 @@ async function spendFix(
  * worker on that same branch. The caller keeps the rest of the sweep moving.
  * Returns the merge commit when this pull request merged.
  */
+async function healNo(
+  deps: LoopDeps,
+  ticket: Ticket,
+  current: OpenPull,
+  key: string,
+  reason: string,
+  sleep: (ms: number) => Promise<void>,
+  tries: { waits: number; login: boolean },
+): Promise<TicketResult | null> {
+  let verdict = rememberedVerdict(deps, key);
+  if (!(verdict === "edit" && healAlready(deps, ticket, key))) {
+    if (!verdict) verdict = await applyOwnerHeal(deps, ticket, key, reason);
+  }
+  if (verdict === "edit") {
+    const paused = pauseLand(
+      ticket.identifier,
+      current.url,
+      healAlready(deps, ticket, key)
+        ? "The procedure owner was edited. The next page resumes this branch."
+        : "This page already edited that owner. The next page edits it again.",
+      "",
+    );
+    await deps.tracker.comment(ticket.identifier, paused.detail);
+    return paused;
+  }
+  if (verdict === "login") {
+    if (tries.login || !refreshShipGithubToken(process.env)) {
+      const paused = pauseLand(
+        ticket.identifier,
+        current.url,
+        "The step still returned no after the login was replaced. The next page heals again.",
+        "",
+      );
+      await deps.tracker.comment(ticket.identifier, paused.detail);
+      return paused;
+    }
+    tries.login = true;
+    return null;
+  }
+  if (tries.waits >= 40) {
+    const paused = pauseLand(
+      ticket.identifier,
+      current.url,
+      "The step is still returning no. The next page heals again.",
+      "",
+    );
+    await deps.tracker.comment(ticket.identifier, paused.detail);
+    return paused;
+  }
+  tries.waits += 1;
+  await sleep(30_000);
+  return null;
+}
+
 async function landPull(
   deps: LoopDeps,
   ticket: Ticket,
   pr: OpenPull,
   orderText: string,
 ): Promise<LandPullResult> {
+  void orderText;
   let current = pr;
   let updates = 0;
   let unknown = 0;
-  let fixes = 0;
-  let hypothesis: string | null = null;
-  let requireTwoGreens = false;
-  let greens = 0;
-  const fixMax = ciFixLimit(deps);
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
-  for (let step = 0; step < 8 + fixMax; step++) {
+  const tries = { waits: 0, login: false };
+  for (let step = 0; step < 48; step++) {
     const quality = await waitForQuality(deps, current);
-    if (quality.state === "success" && requireTwoGreens) {
-      greens += 1;
-      if (greens < 2) continue;
-    }
     if (quality.state === "failure") {
-      greens = 0;
-      const context = deps.qualityContext
-        ? await deps.qualityContext({
-            repoUrl: current.repo.url,
-            headSha: current.headSha,
-            detail: quality.detail,
-          })
-        : { rerun: null, trunk: null, commandMatchesWorkflow: null };
-      const cause = classifyQualityCause({ detail: quality.detail, ...context });
-      if (cause === "trunk") {
-        const paused = pauseLand(
-          ticket.identifier,
-          current.url,
-          `Quality is already red on \`${current.repo.trunk}\`. This branch stays. The next page resumes this branch when that tip is green.`,
-        );
-        await deps.tracker.comment(ticket.identifier, paused.detail);
-        return paused;
-      }
-      if (cause === "flake") requireTwoGreens = true;
-      if (cause === "environment") {
-        const owner = stallOwner({
-          kind: "quality",
-          cause,
-          healsAlready: healAlready(deps, ticket, "install:environment") ? 1 : 0,
-        });
-        const healed = owner === "install"
-          ? await applyOwnerHeal(
-              deps,
-              ticket,
-              "install:environment",
-              `Quality did not run the same check as the workflow. ${quality.detail}`,
-              "install",
-            )
-          : "wait";
-        const paused = pauseLand(
-          ticket.identifier,
-          current.url,
-          healed === "edit"
-            ? "The procedure owner was edited. The next page resumes this branch."
-            : "This page already edited that owner. The next page edits it again.",
-          "",
-        );
-        await deps.tracker.comment(ticket.identifier, paused.detail);
-        return paused;
-      }
-      const spent = await spendFix(
+      const signature = shipNoSignature(quality.detail) || "quality";
+      const paused = await healNo(
         deps,
         ticket,
         current,
-        fixes,
-        fixMax,
-        fixPrompt(ticket, orderText, deps, current, fixes + 1, fixMax, quality.detail, cause, hypothesis),
-        hypothesis,
+        `heal:quality:${current.repo.name}:${signature}`,
+        `Quality returned no on \`${current.repo.name}\` branch \`${current.branch}\`.\n${quality.detail}`,
+        sleep,
+        tries,
       );
-      if ("outcome" in spent) return spent;
-      fixes = spent.fixes;
-      hypothesis = spent.hypothesis;
-      current = { ...current, headSha: spent.headSha, created: false };
+      if (paused) return paused;
       continue;
     }
     const early = await explainQuality(deps, ticket, current, quality);
@@ -1599,28 +1571,17 @@ async function landPull(
       continue;
     }
     if (merge.state === "conflict" || (merge.state === "behind" && updates >= MAX_BRANCH_UPDATES)) {
-      const spent = await spendFix(
+      const why = `The branch ${merge.state === "conflict" ? "conflicts with" : "is still behind"} \`${current.repo.trunk}\`.`;
+      const paused = await healNo(
         deps,
         ticket,
         current,
-        fixes,
-        fixMax,
-        conflictPrompt(
-          ticket,
-          orderText,
-          deps,
-          current,
-          fixes + 1,
-          fixMax,
-          `The branch ${merge.state === "conflict" ? "conflicts with" : "is still behind"} \`${current.repo.trunk}\`.`,
-        ),
-        hypothesis,
-        "runner",
+        `heal:merge:${shipNoSignature(why) || merge.state}`,
+        why,
+        sleep,
+        tries,
       );
-      if ("outcome" in spent) return spent;
-      fixes = spent.fixes;
-      hypothesis = spent.hypothesis;
-      current = { ...current, headSha: spent.headSha, created: false };
+      if (paused) return paused;
       continue;
     }
     if (merge.state === "behind") {
@@ -1649,20 +1610,16 @@ async function landPull(
       return { mergedSha };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      const spent = await spendFix(
+      const paused = await healNo(
         deps,
         ticket,
         current,
-        fixes,
-        fixMax,
-        conflictPrompt(ticket, orderText, deps, current, fixes + 1, fixMax, reason),
-        hypothesis,
-        "runner",
+        `heal:merge:${shipNoSignature(reason) || "merge"}`,
+        reason,
+        sleep,
+        tries,
       );
-      if ("outcome" in spent) return spent;
-      fixes = spent.fixes;
-      hypothesis = spent.hypothesis;
-      current = { ...current, headSha: spent.headSha, created: false };
+      if (paused) return paused;
     }
   }
   const paused = pauseLand(
