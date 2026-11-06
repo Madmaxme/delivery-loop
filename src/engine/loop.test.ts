@@ -1459,6 +1459,23 @@ describe("loop", () => {
     assert.match(heals[1], /exportCompliance/);
   });
 
+  it("waits out a ship check that is still running and does not edit an owner", async () => {
+    const env = harness(BUILDABLE);
+    const prompts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return start(input);
+    };
+    env.deps.sleep = async () => {};
+    const count = join(mkdtempSync(join(tmpdir(), "ship-wait-")), "n");
+    writeFileSync(count, "0\n");
+    const step = `n=$(cat ${count}); echo $((n+1)) > ${count}; if [ "$n" -lt 2 ]; then echo 'Required status check "quality" is in progress.' >&2; exit 1; fi`;
+    env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
+    await ship(env.deps, "API-1");
+    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 0);
+  });
+
   it("leaves prod status to the pack when markStatus is false", async () => {
     const env = harness(BUILDABLE);
     let state = "Dev";

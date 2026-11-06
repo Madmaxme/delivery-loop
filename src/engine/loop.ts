@@ -47,7 +47,7 @@ import {
   type QualityCause,
   type QualitySample,
 } from "./quality-cause.js";
-import { ownerHealMarker, ownerHealPrompt, shipNoSignature, stallOwner } from "./stall.js";
+import { ownerHealMarker, ownerHealPrompt, shipNoIsWait, shipNoSignature, stallOwner } from "./stall.js";
 
 export type LoopDeps = {
   pack: ProjectPack;
@@ -1856,7 +1856,12 @@ export async function ship(
   let current = await loadTicket();
   const cwd = deps.cwd ?? process.cwd();
   for (const step of steps) {
-    const result = await runShipStep(step, cwd, env);
+    let result = await runShipStep(step, cwd, env);
+    const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+    for (let waited = 0; result.status !== 0 && shipNoIsWait(result.tail) && waited < 40; waited++) {
+      await sleep(30_000);
+      result = await runShipStep(step, cwd, env);
+    }
     if (result.status === 0) continue;
     if (!current && deps.tracker.kind === "ship-idle" && deps.openTracker) {
       deps.tracker = deps.openTracker();
