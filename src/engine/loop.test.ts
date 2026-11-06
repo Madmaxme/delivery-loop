@@ -1459,6 +1459,28 @@ describe("loop", () => {
     assert.match(heals[1], /exportCompliance/);
   });
 
+  it("mints a new login after a rejected one and runs the step again", async () => {
+    const env = harness(BUILDABLE);
+    const prompts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return start(input);
+    };
+    const marker = join(mkdtempSync(join(tmpdir(), "ship-login-")), "minted");
+    const previous = process.env.DELIVERY_LOOP_GITHUB_MINT;
+    process.env.DELIVERY_LOOP_GITHUB_MINT = `echo minted > ${marker}; echo replacement-token`;
+    const step = `if [ ! -s ${marker} ]; then echo 'HTTP 401: Bad credentials' >&2; exit 1; fi`;
+    env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
+    try {
+      await ship(env.deps, "API-1");
+    } finally {
+      if (previous === undefined) delete process.env.DELIVERY_LOOP_GITHUB_MINT;
+      else process.env.DELIVERY_LOOP_GITHUB_MINT = previous;
+    }
+    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 0);
+  });
+
   it("edits the same ship no again on the next page", async () => {
     const env = harness(BUILDABLE);
     const prompts: string[] = [];

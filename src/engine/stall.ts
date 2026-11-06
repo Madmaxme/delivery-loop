@@ -41,6 +41,11 @@ export function shipNoIsWait(tail: string): boolean {
   return /GH006|quality is in progress|required status check[^\n]*in progress/i.test(tail);
 }
 
+/** A rejected login is a fresh login, then the same step. It is not a code edit. */
+export function shipNoIsCredentialRejection(tail: string): boolean {
+  return /HTTP 401|HTTP 403|Bad credentials|rejected the login/i.test(tail);
+}
+
 /** One owner edit per key on this page. The marker is a record. It does not retire the owner. */
 export function ownerHealMarker(key: string): string {
   return `<!-- OWNER_HEAL ${key} -->`;
