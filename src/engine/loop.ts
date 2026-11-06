@@ -47,7 +47,7 @@ import {
   type QualityCause,
   type QualitySample,
 } from "./quality-cause.js";
-import { ownerHealMarker, ownerHealPrompt, shipNoIsWait, shipNoSignature, stallOwner } from "./stall.js";
+import { ownerHealMarker, ownerHealPrompt, shipNoIsCredentialRejection, shipNoIsWait, shipNoSignature, stallOwner } from "./stall.js";
 
 export type LoopDeps = {
   pack: ProjectPack;
@@ -979,6 +979,19 @@ async function healShipStep(
   await applyOwnerHeal(deps, ticket, key, reason, "install");
 }
 
+function refreshShipGithubToken(env: NodeJS.ProcessEnv): boolean {
+  const command = env.DELIVERY_LOOP_GITHUB_MINT?.trim();
+  if (!command) return false;
+  const result = spawnSync(command, { shell: true, encoding: "utf8" });
+  const token = (result.stdout ?? "").trim().split(/\n/).at(-1)?.trim() ?? "";
+  if (result.status !== 0 || !token) return false;
+  env.GH_TOKEN = token;
+  env.GITHUB_TOKEN = token;
+  process.env.GH_TOKEN = token;
+  process.env.GITHUB_TOKEN = token;
+  return true;
+}
+
 function runShipStep(
   step: string,
   cwd: string,
@@ -1859,7 +1872,13 @@ export async function ship(
   for (const step of steps) {
     let result = await runShipStep(step, cwd, env);
     let waits = 0;
+    let refreshedLogin = false;
     while (result.status !== 0) {
+      if (!refreshedLogin && shipNoIsCredentialRejection(result.tail) && refreshShipGithubToken(env)) {
+        refreshedLogin = true;
+        result = await runShipStep(step, cwd, env);
+        continue;
+      }
       if (shipNoIsWait(result.tail) && waits < 40) {
         waits += 1;
         await sleep(30_000);
