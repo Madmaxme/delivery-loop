@@ -1467,6 +1467,7 @@ describe("loop", () => {
       prompts.push(input.prompt);
       return start(input);
     };
+    env.deps.worker.join = async () => ({ status: "finished", branch: "delivery/api-1", head: "abc", text: "**Heal:** login" });
     const marker = join(mkdtempSync(join(tmpdir(), "ship-login-")), "minted");
     const previous = process.env.DELIVERY_LOOP_GITHUB_MINT;
     process.env.DELIVERY_LOOP_GITHUB_MINT = `echo minted > ${marker}; echo replacement-token`;
@@ -1478,7 +1479,8 @@ describe("loop", () => {
       if (previous === undefined) delete process.env.DELIVERY_LOOP_GITHUB_MINT;
       else process.env.DELIVERY_LOOP_GITHUB_MINT = previous;
     }
-    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 0);
+    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 1);
+    assert.equal(env.comments.some((body) => body.includes("OWNER_HEAL")), false);
   });
 
   it("edits the same ship no again on the next page", async () => {
@@ -1506,13 +1508,15 @@ describe("loop", () => {
       prompts.push(input.prompt);
       return start(input);
     };
+    env.deps.worker.join = async () => ({ status: "finished", branch: "delivery/api-1", head: "abc", text: "**Heal:** wait" });
     env.deps.sleep = async () => {};
     const count = join(mkdtempSync(join(tmpdir(), "ship-wait-")), "n");
     writeFileSync(count, "0\n");
     const step = `n=$(cat ${count}); echo $((n+1)) > ${count}; if [ "$n" -lt 2 ]; then echo 'Required status check "quality" is in progress.' >&2; exit 1; fi`;
     env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
     await ship(env.deps, "API-1");
-    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 0);
+    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 1);
+    assert.equal(env.comments.some((body) => body.includes("OWNER_HEAL")), false);
   });
 
   it("heals a ship no and continues when the retry is a check still running", async () => {
@@ -1529,13 +1533,25 @@ describe("loop", () => {
       writeFileSync(note, "fixed\n");
       return start(input);
     };
+    env.deps.worker.join = async () => {
+      const reason = prompts.at(-1)?.split("\n\n")[1] ?? "";
+      const signature = reason.trim().split("\n").at(-1) ?? "";
+      return {
+        status: "finished" as const,
+        branch: "delivery/api-1",
+        head: "abc",
+        text: signature.includes("in progress") ? "**Heal:** wait" : BUILDABLE,
+      };
+    };
     env.deps.sleep = async () => {};
     const step = `if grep -q socialMedia ${note}; then echo 'missing required attribute socialMedia' >&2; exit 1; fi; n=$(cat ${count}); echo $((n+1)) > ${count}; if [ "$n" -lt 1 ]; then echo 'Required status check "quality" is in progress.' >&2; exit 1; fi`;
     env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
     await ship(env.deps, "API-1");
     const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
-    assert.equal(heals.length, 1);
+    assert.equal(heals.length, 2);
     assert.match(heals[0], /socialMedia/);
+    assert.match(heals[1], /in progress/);
+    assert.equal(env.comments.filter((body) => body.includes("OWNER_HEAL")).length, 1);
   });
 
   it("heals the next ship no in the same run and continues", async () => {

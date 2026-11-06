@@ -26,24 +26,24 @@ export function stallOwner(input: {
 }
 
 /**
- * The last distinctive line of a step that returned no.
+ * The last line of a step that returned no.
  * The same command can fail for a new reason. That is a new no.
  * A long token is not part of the reason.
+ * The line is not classified. The heal names what to do.
  */
 export function shipNoSignature(tail: string): string {
   const lines = tail.split(/\n/).map((line) => line.trim()).filter(Boolean);
-  const picked = [...lines].reverse().find((line) => /error|fail|missing|required|denied|attribute/i.test(line)) ?? "";
+  const picked = lines.at(-1) ?? "";
   return picked.replace(/[A-Za-z0-9_-]{24,}/g, "").replace(/\s+/g, " ").trim().slice(0, 120);
 }
 
-/** A required check that has not finished is a wait, not an owner edit. */
-export function shipNoIsWait(tail: string): boolean {
-  return /GH006|quality is in progress|required status check[^\n]*in progress/i.test(tail);
-}
+/** What the heal decided. The runner does not keep its own list of failures. */
+export type HealVerdict = "edit" | "wait" | "login";
 
-/** A rejected login is a fresh login, then the same step. It is not a code edit. */
-export function shipNoIsCredentialRejection(tail: string): boolean {
-  return /HTTP 401|HTTP 403|Bad credentials|rejected the login/i.test(tail);
+export function healVerdict(text: string): HealVerdict {
+  const named = text.match(/\*\*Heal:\*\*\s*(edit|wait|login)\b/i)?.[1]?.toLowerCase();
+  if (named === "wait" || named === "login" || named === "edit") return named;
+  return "edit";
 }
 
 /** One owner edit per key on this page. The marker is a record. It does not retire the owner. */
@@ -67,10 +67,17 @@ export function ownerHealPrompt(input: {
             : "Push with the commit-actor token. An installation token must not merge that package.",
         ].join(" ")
       : "Edit the owner of the behavior that returned no. That owner may be this checkout, or a repo the command ships, including production promote and store continue. Land that owner's trunk before you finish. This step runs again when you return. An open pull request is not landed. A clean store wait is not a no. A production check that restores the previous tip and exits clean is not a no.";
+  const decide = [
+    "Answer with one line: **Heal:** edit, **Heal:** wait, or **Heal:** login.",
+    "edit changes the owner above and lands that trunk.",
+    "wait means the step is not broken. Do not edit. The step runs again.",
+    "login means the login was rejected. Do not edit. The login is replaced and the step runs again.",
+  ].join(" ");
   return [
-    "A required step returned no. Fix that owner so this no cannot happen again.",
+    "A required step returned no. Fix that owner so this no cannot happen again. One heal decides. There is no list of failure phrases.",
     input.reason,
     where,
+    decide,
     "One code path. A note, a watcher, or a ticket exception is not the fix.",
   ].join("\n\n");
 }

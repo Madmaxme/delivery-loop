@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { ownerHealMarker, shipNoIsCredentialRejection, shipNoIsWait, shipNoSignature, stallOwner } from "./stall.ts";
+import { healVerdict, ownerHealMarker, shipNoSignature, stallOwner } from "./stall.ts";
 
 describe("stall", () => {
   it("sorts a no with the existing causes", () => {
@@ -31,11 +31,12 @@ describe("stall", () => {
     assert.match(social, /socialMedia/);
     assert.match(other, /exportCompliance/);
     assert.notEqual(social, other);
-    assert.equal(shipNoIsWait('GH006: Required status check "quality" is in progress.'), true);
-    assert.equal(shipNoIsWait("missing required attribute socialMedia"), false);
-    assert.equal(shipNoIsCredentialRejection("HTTP 401: Bad credentials"), true);
-    assert.equal(shipNoIsCredentialRejection("missing required attribute socialMedia"), false);
-    assert.equal(shipNoSignature("ok"), "");
+    assert.equal(shipNoSignature(""), "");
+    assert.equal(shipNoSignature("ok"), "ok");
     assert.equal(shipNoSignature("error token abcdefghijklmnopqrstuvwxyz123456"), "error token");
+    assert.equal(healVerdict("**Heal:** wait"), "wait");
+    assert.equal(healVerdict("**Heal:** login"), "login");
+    assert.equal(healVerdict("**Heal:** edit"), "edit");
+    assert.equal(healVerdict("**Verdict:** BUILDABLE"), "edit");
   });
 });
