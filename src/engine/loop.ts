@@ -47,7 +47,7 @@ import {
   type QualityCause,
   type QualitySample,
 } from "./quality-cause.js";
-import { ownerHealMarker, ownerHealPrompt, shipNoIsCredentialRejection, shipNoIsWait, shipNoSignature, stallOwner } from "./stall.js";
+import { healVerdict, ownerHealMarker, ownerHealPrompt, shipNoSignature, stallOwner, type HealVerdict } from "./stall.js";
 
 export type LoopDeps = {
   pack: ProjectPack;
@@ -78,12 +78,12 @@ export type LoopDeps = {
    * Shared with every ticket on this page. An owner edit sets `stop` so the
    * page ends and the next page loads the edited trunk.
    */
-  pageControl?: { stop: boolean; healed: string[] };
+  pageControl?: { stop: boolean; healed: string[]; verdicts?: Record<string, HealVerdict> };
   /**
    * Starts the owner edit. Ship sets this so a successful ship does not
    * construct a coding worker. Sweep uses `worker` when this is absent.
    */
-  ownerHeal?: (input: { prompt: string; repoUrl: string; baseRef: string }) => Promise<void>;
+  ownerHeal?: (input: { prompt: string; repoUrl: string; baseRef: string }) => Promise<void | string>;
   /** Builds the real tracker after a ship step returns no. Success does not call it. */
   openTracker?: () => TrackerAdapter;
   /** Runs `qualityCommand` when `check` is `command`. Default runs it in the checkout. */
@@ -964,19 +964,33 @@ function runDevCommands(deps: LoopDeps, commands: string[]): string | null {
   return null;
 }
 
+function isShipStepKey(key: string): boolean {
+  return key.startsWith("install:steps:") || key.startsWith("install:continue:");
+}
+
+function rememberedVerdict(deps: LoopDeps, key: string): HealVerdict | undefined {
+  return deps.pageControl?.verdicts?.[key];
+}
+
+function rememberVerdict(deps: LoopDeps, key: string, verdict: HealVerdict): void {
+  if (!deps.pageControl) deps.pageControl = { stop: false, healed: [] };
+  if (!deps.pageControl.verdicts) deps.pageControl.verdicts = {};
+  deps.pageControl.verdicts[key] = verdict;
+}
+
 async function healShipStep(
   deps: LoopDeps,
   ticket: Ticket,
   step: string,
   mode: "steps" | "continue",
   tail = "",
-): Promise<void> {
+): Promise<HealVerdict> {
   const signature = shipNoSignature(tail);
   const key = signature ? `install:${mode}:${step}:${signature}` : `install:${mode}:${step}`;
   const owner = stallOwner({ kind: "ship", healsAlready: healAlready(deps, ticket, key) ? 1 : 0 });
-  if (owner !== "install") return;
+  if (owner !== "install") return "edit";
   const reason = signature ? `Ship step returned no: ${step}\n${signature}` : `Ship step returned no: ${step}`;
-  await applyOwnerHeal(deps, ticket, key, reason, "install");
+  return applyOwnerHeal(deps, ticket, key, reason, "install");
 }
 
 function refreshShipGithubToken(env: NodeJS.ProcessEnv): boolean {
@@ -1309,8 +1323,8 @@ async function applyOwnerHeal(
   key: string,
   reason: string,
   owner: "install" | "runner",
-): Promise<boolean> {
-  if (healAlready(deps, ticket, key)) return false;
+): Promise<HealVerdict> {
+  if (healAlready(deps, ticket, key)) return "wait";
   const decision = stallOwner({
     kind: key.startsWith("install:")
       ? "ship"
@@ -1322,7 +1336,23 @@ async function applyOwnerHeal(
     cause: key.startsWith("install:environment") ? "environment" : undefined,
     healsAlready: healAlready(deps, ticket, key) ? 1 : 0,
   });
-  if (decision === "person" || decision === "wait" || decision === "change") return false;
+  if (decision === "person" || decision === "wait" || decision === "change") return "wait";
+  const home = agentHome(deps.pack);
+  const prompt = ownerHealPrompt({
+    reason,
+    owner,
+    tokenEnv: deps.pack.commitActorTokenEnv,
+  });
+  let text = "";
+  if (deps.ownerHeal) {
+    text = (await deps.ownerHeal({ prompt, repoUrl: home.url, baseRef: home.trunk })) ?? "";
+  } else {
+    const started = await deps.worker.start({ prompt, repoUrl: home.url, baseRef: home.trunk });
+    text = (await finishWorker(deps.worker, started.runId)).text;
+  }
+  const verdict = isShipStepKey(key) ? healVerdict(text) : "edit";
+  rememberVerdict(deps, key, verdict);
+  if (verdict !== "edit") return verdict;
   const body = `${ownerHealMarker(key)}\n${reason}`;
   ticket.comments = [...ticket.comments, { body }];
   try {
@@ -1330,22 +1360,10 @@ async function applyOwnerHeal(
   } catch {
     // The marker is already on this ticket object and on pageControl.
   }
-  const home = agentHome(deps.pack);
-  const prompt = ownerHealPrompt({
-    reason,
-    owner,
-    tokenEnv: deps.pack.commitActorTokenEnv,
-  });
-  if (deps.ownerHeal) {
-    await deps.ownerHeal({ prompt, repoUrl: home.url, baseRef: home.trunk });
-  } else {
-    const started = await deps.worker.start({ prompt, repoUrl: home.url, baseRef: home.trunk });
-    await finishWorker(deps.worker, started.runId);
-  }
   if (!deps.pageControl) deps.pageControl = { stop: false, healed: [] };
   deps.pageControl.healed.push(key);
   deps.pageControl.stop = true;
-  return true;
+  return "edit";
 }
 
 function pauseLand(identifier: string, url: string, reason: string, tail = "The sweep continues with the next ticket."): TicketResult {
@@ -1425,11 +1443,11 @@ async function spendFix(
             `Still blocked after ${fixMax} attempts on \`${current.branch}\`.`,
             "runner",
           )
-        : false;
+        : "wait";
       const paused = pauseLand(
         ticket.identifier,
         current.url,
-        healed
+        healed === "edit"
           ? "The procedure owner was edited. The next page resumes this branch."
           : "This page already edited that owner. The next page edits it again.",
         "",
@@ -1542,11 +1560,11 @@ async function landPull(
               `Quality did not run the same check as the workflow. ${quality.detail}`,
               "install",
             )
-          : false;
+          : "wait";
         const paused = pauseLand(
           ticket.identifier,
           current.url,
-          healed
+          healed === "edit"
             ? "The procedure owner was edited. The next page resumes this branch."
             : "This page already edited that owner. The next page edits it again.",
           "",
@@ -1874,18 +1892,6 @@ export async function ship(
     let waits = 0;
     let refreshedLogin = false;
     while (result.status !== 0) {
-      if (!refreshedLogin && shipNoIsCredentialRejection(result.tail) && refreshShipGithubToken(env)) {
-        refreshedLogin = true;
-        result = await runShipStep(step, cwd, env);
-        continue;
-      }
-      if (shipNoIsWait(result.tail) && waits < 40) {
-        waits += 1;
-        await sleep(30_000);
-        result = await runShipStep(step, cwd, env);
-        continue;
-      }
-      waits = 0;
       if (!current && deps.tracker.kind === "ship-idle" && deps.openTracker) {
         deps.tracker = deps.openTracker();
         current = await loadTicket();
@@ -1906,10 +1912,28 @@ export async function ship(
       const key = signature
         ? `install:${modeName}:${step}:${signature}`
         : `install:${modeName}:${step}`;
-      if (healAlready(deps, standIn, key)) {
+      let verdict = rememberedVerdict(deps, key);
+      if (verdict === "edit" && healAlready(deps, standIn, key)) {
         throw new Error(`ship step failed: ${step}`);
       }
-      await healShipStep(deps, standIn, step, modeName, result.tail);
+      if (!verdict) {
+        if (healAlready(deps, standIn, key)) throw new Error(`ship step failed: ${step}`);
+        verdict = await healShipStep(deps, standIn, step, modeName, result.tail);
+      }
+      if (verdict === "wait") {
+        if (waits >= 40) throw new Error(`ship step failed: ${step}`);
+        waits += 1;
+        await sleep(30_000);
+        result = await runShipStep(step, cwd, env);
+        continue;
+      }
+      if (verdict === "login") {
+        if (refreshedLogin || !refreshShipGithubToken(env)) throw new Error(`ship step failed: ${step}`);
+        refreshedLogin = true;
+        result = await runShipStep(step, cwd, env);
+        continue;
+      }
+      waits = 0;
       result = await runShipStep(step, cwd, env);
     }
   }

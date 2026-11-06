@@ -170,6 +170,7 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       const started = await worker.start(input);
       const joined = await worker.join(started.runId);
       if (joined.status === "failed") throw new Error(joined.text || "owner edit failed");
+      return joined.text;
     };
     ship(deps, issue?.toUpperCase(), extra, continueMode ? "continue" : "ship").then(
       () => console.log("shipped"),
