@@ -21,7 +21,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
-  actions: read
+  actions: write
 
 jobs:
   delivery-loop:
@@ -46,24 +46,20 @@ jobs:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          LEDGER_WEBHOOK_URL: ${{ secrets.LEDGER_WEBHOOK_URL }}
-          LEDGER_WEBHOOK_AUTH: ${{ secrets.LEDGER_WEBHOOK_AUTH }}
+          # Empty URL writes the event file and does not post.
+          # The header is one line from the client's own store.
+          # REQUIRED true or 1 fails the run when the post fails.
+          DELIVERY_LOOP_EVENT_URL: ${{ vars.DELIVERY_LOOP_EVENT_URL }}
+          DELIVERY_LOOP_EVENT_HEADER: ${{ secrets.DELIVERY_LOOP_EVENT_HEADER }}
+          DELIVERY_LOOP_EVENT_REQUIRED: ${{ vars.DELIVERY_LOOP_EVENT_REQUIRED }}
         run: |
           set -euo pipefail
           dir="$(mktemp -d)/delivery-loop"
           git clone --depth 1 --branch __DELIVERY_LOOP_REF__ https://github.com/Madmaxme/delivery-loop.git "$dir"
-          # Optional. An empty LEDGER_WEBHOOK_URL skips both writes, so a client
-          # without the secret is unchanged. A set URL fail-closes before the loop.
-          ledger() {
-            if [ -z "${LEDGER_WEBHOOK_URL:-}" ]; then
-              return 0
-            fi
-            bash "$dir/scripts/ledger-report.sh" "$@"
-          }
-          ledger_failed=0
-          ledger started other || ledger_failed=1
+          event_failed=0
+          bash "$dir/scripts/run-event.sh" started || event_failed=1
           code=0
-          if [ "$ledger_failed" -eq 0 ]; then
+          if [ "$event_failed" -eq 0 ]; then
             set +e
             (cd "$dir" && npm install --omit=dev --ignore-scripts)
             code=$?
@@ -83,13 +79,21 @@ jobs:
             fi
             set -e
           fi
-          if [ "$ledger_failed" -ne 0 ] || [ "$code" -ne 0 ]; then
-            ledger_status=failure
+          if [ "$event_failed" -ne 0 ] || [ "$code" -ne 0 ]; then
+            event_status=failure
           else
-            ledger_status=success
+            event_status=success
           fi
-          ledger finished other "$ledger_status" || ledger_failed=1
-          if [ "$ledger_failed" -ne 0 ]; then
+          bash "$dir/scripts/run-event.sh" finished "$event_status" || event_failed=1
+          if [ "$event_failed" -ne 0 ]; then
             exit 1
           fi
           exit "$code"
+      - name: Upload run events
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delivery-loop-run-events
+          path: .delivery-loop/events/
+          if-no-files-found: warn
+          include-hidden-files: true

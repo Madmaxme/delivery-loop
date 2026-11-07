@@ -12,27 +12,16 @@ An engine heal of this package opens a pull request on `engine-heal/<ticket>` wi
 
 The `engine-heal` workflow waits until the `pull_request` `quality` check is green on that head, squash-merges, reads the version from the merged `package.json`, and tags that commit `vX.Y.Z`. The tag push is not blocked. A pull request that arrives without the bump gets a comment and stops. A `workflow_dispatch` run does not satisfy the required check, so the workflow does not start one.
 
-## Worker ledger
+## Run events
 
-Every worker workflow writes the run to the owner's ledger before it does its work, then writes again when it finishes. The writer is `scripts/ledger-report.sh`. `quality` does not call it. That check has to stay green or red on the code alone, so a ledger outage cannot block every pull request. Results for pushes to `main` already reach the ledger through the owner's GitHub listener.
+A worker run writes two JSON events, `delivery-loop.run.started` and `delivery-loop.run.finished`. The writer is `scripts/run-event.sh`. The schema is [schemas/run-event-1.0.schema.json](schemas/run-event-1.0.schema.json). `specversion` is `1.0`.
 
-The repository secrets are:
+Each event has `specversion`, `id`, `source`, `type`, and `time`. `data` has `repo`, `sha`, `workflow`, `run_id`, `run_attempt`, `phase`, and `status`. `id` is `gh:<run id>:<run attempt>:<phase>`. `source` is `<server>/<repository>`. `time` is UTC. `sha` is the workflow_run head sha when that payload has one, otherwise `GITHUB_SHA`. `phase` is `started` or `finished`. `status` is the second argument, or empty. `type` is `delivery-loop.run.` plus the phase. The script builds the JSON with `jq` when `jq` is on `PATH`, and with bash otherwise.
 
-- `LEDGER_WEBHOOK_URL`, the HTTPS endpoint that accepts the POST.
-- `LEDGER_WEBHOOK_AUTH`, one HTTP header line, such as `Authorization: Bearer ...`.
+The script writes `.delivery-loop/events/<type>.json` under `GITHUB_WORKSPACE`, or under the current directory when that variable is empty. It does not print the file. The workflow uploads that directory as the artifact `delivery-loop-run-events`. The directory name starts with a dot, so the upload sets `include-hidden-files`. The file has no endpoint and no header.
 
-The script posts JSON. `key` is `gh:<repository>:run:<run id>:<run attempt>:<phase>`. `source` is `engine-heal`, `ci`, or `other`. `repo` is `GITHUB_REPOSITORY`. `subject` is the workflow name, a space, and the event. For `engine-heal`, when the workflow_run payload lists a pull request, the subject ends with ` #<number>`. `link` is `<server>/<repository>/actions/runs/<run id>`. The body also sends `phase` (`started` or `finished`), `status` (the third argument, or empty), `run_id`, `run_attempt`, `workflow`, and `sha`. `sha` is the workflow_run head sha when the event has one, otherwise `GITHUB_SHA`. The event in the subject is the workflow_run's own event when that payload has one, so an engine-heal run records `pull_request` rather than `workflow_run`.
+`engine-heal` records `started` after checkout and before Node, install, and the merge. It records `finished` with `job.status` and `if: always()`, then uploads the artifact with `if: always()`. That workflow does not set an endpoint, so it never posts. The merge and the tag use `github.token`. The job still runs only after a successful `pull_request` quality run. A run that does not match never starts a runner. `quality` does not write an event, so this record cannot turn a pull request red.
 
-The POST uses `curl --fail-with-body --retry 3 --retry-all-errors --max-time 20`. The script builds the JSON with `jq` when `jq` is on `PATH`, and with bash otherwise. It never prints the URL or the auth header.
+`templates/runner.yml` is what a client copies. It calls the same script after the package clone and before `npm install`, and again after the loop. It uploads the same artifact. A post is optional and belongs to the client. The client sets the repository variable `DELIVERY_LOOP_EVENT_URL` to an http(s) endpoint. `DELIVERY_LOOP_EVENT_HEADER` is an optional single header line, taken from the client's own store. `DELIVERY_LOOP_EVENT_REQUIRED` defaults to false. When it is `true` or `1`, a failed post fails the run. Otherwise a failed post leaves the run's own exit code. When the started post fails and the flag is set, the runner still writes `finished` with status `failure` and does not start the loop. When the URL is empty, the script only writes the file. The script never prints the URL or the header.
 
-An empty secret or a failed POST fails the job. The annotation looks like this:
-
-```
-::error title=Ledger write failed::LEDGER_WEBHOOK_URL is empty
-::error title=Ledger write failed::LEDGER_WEBHOOK_AUTH is empty
-::error title=Ledger write failed::POST failed after retries (HTTP 500)
-```
-
-`engine-heal` checks out the repository only so the script is on disk, then reports `started` before Node, install, and the merge script. The last step reports `finished` with `job.status` and `if: always()`. The job `if` still requires a successful `pull_request` quality run. A run that does not match never starts a runner, so it does not write a `skipped` row. A run that starts and then prints `Not an engine-heal merge` exits 0. That row is `started`, then `finished` with status `success`, which is the real job status.
-
-The runner shipped to clients, `templates/runner.yml`, calls the same script only when `LEDGER_WEBHOOK_URL` is set. The call is after the package clone and before `npm install` and `delivery-loop`. An empty URL skips both writes, so a client without the secret is unchanged. A set URL that cannot be written fails the job before the loop runs.
+An integrator reads the artifact, or sets the endpoint in its own repository. This package does not name an endpoint and does not ship one.
