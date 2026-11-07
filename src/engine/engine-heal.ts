@@ -51,12 +51,55 @@ export function laterVersion(a: string, b: string): string {
   return a.trim();
 }
 
+/** `v1.2.3` from a tag name or `refs/tags/` line. Annotated peels are ignored. */
+export function releaseVersionFromTag(ref: string): string | null {
+  const cleaned = ref.trim().replace(/\^\{\}$/, "");
+  const match = /^(?:refs\/tags\/)?v(\d+\.\d+\.\d+)$/.exec(cleaned);
+  return match ? match[1] : null;
+}
+
+/** Highest `vX.Y.Z` tag. Other refs are ignored. */
+export function highestReleaseVersion(tags: readonly string[]): string | null {
+  const versions = tags
+    .map((tag) => releaseVersionFromTag(tag))
+    .filter((version): version is string => version !== null);
+  if (versions.length === 0) return null;
+  return versions.reduce((best, version) => laterVersion(best, version));
+}
+
+export function releaseTagExists(version: string, tags: readonly string[]): boolean {
+  const wanted = engineHealTag(version);
+  return tags.some((tag) => {
+    const parsed = releaseVersionFromTag(tag);
+    return parsed !== null && engineHealTag(parsed) === wanted;
+  });
+}
+
 /**
- * Next patch after the greater of main and the pull request.
- * The first heal after 1.0.0 is 1.0.1.
+ * Next patch after the highest v* tag.
+ * The first heal after v1.0.0 is 1.0.1.
+ * Two heals that both see v1.0.0 both ask for 1.0.1. The second stops once that tag exists.
  */
-export function engineHealNextVersion(mainVersion: string, branchVersion: string): string {
-  return nextPatchVersion(laterVersion(mainVersion, branchVersion));
+export function engineHealBumpVersion(tags: readonly string[]): string {
+  const latest = highestReleaseVersion(tags);
+  if (!latest) throw new Error("no release tag");
+  const next = nextPatchVersion(latest);
+  if (releaseTagExists(next, tags)) throw new Error(`tag ${engineHealTag(next)} already exists`);
+  return next;
+}
+
+/** What the opener puts in the engine-heal pull request. The workflow does not bump. */
+export function engineHealBumpInstruction(tags?: readonly string[]): string {
+  if (tags && tags.length > 0) {
+    try {
+      const version = engineHealBumpVersion(tags);
+      return `Set package.json and package-lock.json to ${version} in that pull request. That is the next patch after the highest v* tag. Use npm version ${version} --no-git-tag-version. If tag v${version} already exists, stop and do not open the pull request.`;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "the release tag already exists";
+      return `Stop. ${message}. Do not open the pull request.`;
+    }
+  }
+  return "Set package.json and package-lock.json to the next patch after the highest v* tag in that pull request. v1.0.0 becomes 1.0.1. Use npm version with --no-git-tag-version. If that tag already exists, stop and do not open the pull request.";
 }
 
 export function engineHealTag(version: string): string {
@@ -65,27 +108,17 @@ export function engineHealTag(version: string): string {
   return `v${trimmed}`;
 }
 
-export function engineHealReleaseSubject(prNumber: number): string {
-  return `Bump the patch version after engine heal #${prNumber}.`;
+export function engineHealMissingBumpComment(prNumber: number, mainVersion: string, tipVersion: string): string {
+  return `Engine-heal pull request #${prNumber} does not bump package.json. The branch is ${tipVersion} and main is ${mainVersion}. Add the next patch after the highest v* tag to package.json and package-lock.json in this pull request, and push it with the commit-actor token. This workflow does not push a commit.`;
 }
 
-export function engineHealReleaseBody(prNumber: number, previous: string, next: string): string {
-  return `Automated patch on engine-heal pull request #${prNumber}. The previous version was ${previous}. This commit sets ${next} on the pull request so the squash merge carries it. No commit is pushed to main.`;
+export function engineHealTagCollisionComment(version: string): string {
+  const tag = engineHealTag(version);
+  return `Tag ${tag} already exists. This pull request was not merged. Pick the next patch after the highest v* tag. This workflow does not push a commit.`;
 }
 
 export function engineHealReleaseNotes(prNumber: number): string {
   return `Automated patch on the merge commit of engine-heal pull request #${prNumber}. Quality was green on the bumped tip before the squash merge. Clients install this tag.`;
-}
-
-/** Ref to push. A commit is never pushed to main. */
-export function engineHealBranchRef(branch: string): string {
-  const name = branch.trim();
-  if (!name || name === "main" || name === "refs/heads/main" || name.startsWith("refs/heads/main")) {
-    throw new Error("engine heal must not push a commit to main");
-  }
-  if (name.startsWith("-") || name.includes(" ") || name.includes("..")) throw new Error(`bad branch ${branch}`);
-  if (name.startsWith("refs/heads/")) return name;
-  return `refs/heads/${name}`;
 }
 
 export type EngineHealCheck = "success" | "failure" | "pending" | "none";
@@ -116,19 +149,25 @@ export function engineHealQualityState(
 export type EngineHealPlan =
   | { action: "skip"; reason: string }
   | { action: "fail"; reason: string }
-  | { action: "bump-branch"; branchRef: string; version: string; subject: string; body: string }
+  | { action: "comment"; body: string }
   | { action: "wait-for-quality"; branch: string; sha: string }
   | { action: "merge-and-tag"; version: string; tag: string }
   | { action: "tag-merged"; version: string; tag: string };
 
+function versionIsBump(mainVersion: string, tipVersion: string): boolean {
+  const tip = tipVersion.trim();
+  const main = mainVersion.trim();
+  if (!tip || tip === main) return false;
+  return laterVersion(main, tip) === tip;
+}
+
 /**
- * What to do after a green quality run on an engine-heal pull request.
- * The patch is committed on the pull request, quality must be green on that
- * tip, and the squash merge is what lands the bump. Nothing pushes a commit to main.
+ * What to do after a green pull_request quality run on an engine-heal pull request.
+ * The opener already committed the patch. This plan never pushes a commit.
+ * A head without a bump, or a version whose tag already exists, gets a comment and stops.
  */
 export function planEngineHealRelease(input: {
   pullState: "OPEN" | "MERGED" | "CLOSED";
-  bumpOnBranch: boolean;
   qualityOnTip: EngineHealCheck;
   mainVersion: string;
   tipVersion: string;
@@ -142,35 +181,21 @@ export function planEngineHealRelease(input: {
     if (input.tagExists) return { action: "skip", reason: "tag already exists" };
     return { action: "tag-merged", version: input.tipVersion, tag: engineHealTag(input.tipVersion) };
   }
-  if (!input.bumpOnBranch) {
-    const version = engineHealNextVersion(input.mainVersion, input.tipVersion);
-    const previous = laterVersion(input.mainVersion, input.tipVersion);
+  if (!versionIsBump(input.mainVersion, input.tipVersion)) {
     return {
-      action: "bump-branch",
-      branchRef: engineHealBranchRef(input.branch),
-      version,
-      subject: engineHealReleaseSubject(input.prNumber),
-      body: engineHealReleaseBody(input.prNumber, previous, version),
+      action: "comment",
+      body: engineHealMissingBumpComment(input.prNumber, input.mainVersion, input.tipVersion),
     };
   }
+  if (input.tagExists) {
+    return { action: "comment", body: engineHealTagCollisionComment(input.tipVersion) };
+  }
   if (input.qualityOnTip === "failure") {
-    return { action: "fail", reason: "quality failed on the bumped tip" };
+    return { action: "fail", reason: "quality failed on the pull request head" };
   }
   if (input.qualityOnTip !== "success") {
     if (!input.branchTip.trim()) return { action: "fail", reason: "branch tip is missing" };
     return { action: "wait-for-quality", branch: input.branch, sha: input.branchTip.trim() };
-  }
-  if (laterVersion(input.mainVersion, input.tipVersion) !== input.tipVersion.trim()) {
-    return {
-      action: "fail",
-      reason: `release version ${input.tipVersion} is not newer than main ${input.mainVersion}`,
-    };
-  }
-  if (input.tipVersion.trim() === input.mainVersion.trim()) {
-    return {
-      action: "fail",
-      reason: `release version ${input.tipVersion} is not newer than main ${input.mainVersion}`,
-    };
   }
   return { action: "merge-and-tag", version: input.tipVersion.trim(), tag: engineHealTag(input.tipVersion) };
 }

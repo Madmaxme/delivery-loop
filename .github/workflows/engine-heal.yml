@@ -1,7 +1,6 @@
-# Commits the next patch onto an engine-heal pull request, waits until quality
-# is green on that tip, squash-merges, and tags the merge commit.
-# It does not push a commit to main. A push from this token does not start
-# on: push workflows, so the job starts quality with workflow_dispatch and waits.
+# Waits until pull_request quality is green on an engine-heal pull request,
+# squash-merges, and tags the merge commit. The opener already committed the
+# patch. This workflow does not push a commit. A missing bump gets a comment.
 # No review and no manual approval. See METHODOLOGY.md.
 
 name: engine-heal
@@ -14,7 +13,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  actions: write
 
 concurrency:
   group: engine-heal-release
@@ -33,11 +31,12 @@ jobs:
         with:
           node-version: 22
       - run: npm install
-      - name: Bump the pull request, merge when quality is green, and tag the merge commit
+      - name: Merge when pull_request quality is green and tag the merge commit
         env:
           GH_TOKEN: ${{ github.token }}
           HEAL_EVENT: ${{ github.event.workflow_run.event }}
           HEAL_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAL_SHA: ${{ github.event.workflow_run.head_sha }}
           HEAL_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAL_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           HEAL_BASE_REPO: ${{ github.repository }}

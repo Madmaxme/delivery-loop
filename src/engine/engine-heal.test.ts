@@ -3,15 +3,15 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import {
-  engineHealBranchRef,
-  engineHealNextVersion,
+  engineHealBumpInstruction,
+  engineHealBumpVersion,
   engineHealQualityState,
-  engineHealReleaseBody,
-  engineHealReleaseSubject,
   engineHealTag,
+  highestReleaseVersion,
   isEngineHealPull,
   nextPatchVersion,
   planEngineHealRelease,
+  releaseTagExists,
   shouldMergeEngineHeal,
 } from "./engine-heal.ts";
 
@@ -54,43 +54,49 @@ describe("engine heal release", () => {
     assert.equal(isEngineHealPull({ branch: "engine-heal/APP-1" }), true);
   });
 
-  it("bumps only the patch and names the release commit after the pull request", () => {
+  it("takes the next patch after the highest tag and stops when that tag exists", () => {
     assert.equal(nextPatchVersion("1.0.0"), "1.0.1");
     assert.equal(nextPatchVersion("1.2.9"), "1.2.10");
     assert.throws(() => nextPatchVersion("1.0"), /bad version/);
-    assert.equal(engineHealNextVersion("1.0.0", "1.0.0"), "1.0.1");
-    assert.equal(engineHealNextVersion("1.0.9", "1.0.10"), "1.0.11");
+    assert.equal(highestReleaseVersion(["refs/tags/v1.0.0", "refs/tags/v1.0.0^{}", "refs/tags/v0.9.0"]), "1.0.0");
+    assert.equal(engineHealBumpVersion(["v1.0.0"]), "1.0.1");
+    assert.equal(engineHealBumpVersion(["refs/tags/v1.0.0", "refs/tags/v1.0.2"]), "1.0.3");
     assert.equal(engineHealTag("1.0.1"), "v1.0.1");
-    assert.equal(engineHealReleaseSubject(41), "Bump the patch version after engine heal #41.");
-    assert.match(engineHealReleaseBody(41, "1.0.0", "1.0.1"), /sets 1\.0\.1 on the pull request/);
-    assert.match(engineHealReleaseBody(41, "1.0.0", "1.0.1"), /No commit is pushed to main/);
+    assert.equal(releaseTagExists("1.0.1", ["refs/tags/v1.0.1"]), true);
+    assert.throws(() => engineHealBumpVersion([]), /no release tag/);
+    assert.match(engineHealBumpInstruction(["v1.0.0"]), /Set package.json and package-lock.json to 1.0.1/);
+    assert.match(engineHealBumpInstruction(), /v1\.0\.0 becomes 1\.0\.1/);
   });
 
-  it("commits the first patch after v1.0.0 on the pull request, then tags the merge", () => {
-    const bump = planEngineHealRelease({
+  it("comments when the pull request has no bump and does not push one", () => {
+    const missing = planEngineHealRelease({
       ...open,
-      bumpOnBranch: false,
       qualityOnTip: "success",
       mainVersion: "1.0.0",
       tipVersion: "1.0.0",
     });
-    assert.equal(bump.action, "bump-branch");
-    if (bump.action !== "bump-branch") return;
-    assert.equal(bump.version, "1.0.1");
-    assert.equal(bump.branchRef, "refs/heads/engine-heal/APP-1");
-    assert.equal(engineHealTag(bump.version), "v1.0.1");
+    assert.equal(missing.action, "comment");
+    if (missing.action !== "comment") return;
+    assert.match(missing.body, /does not bump package.json/);
+    assert.match(missing.body, /does not push a commit/);
   });
 
-  it("refuses a commit ref on main", () => {
-    assert.throws(() => engineHealBranchRef("main"), /must not push a commit to main/);
-    assert.throws(() => engineHealBranchRef("refs/heads/main"), /must not push a commit to main/);
-    assert.equal(engineHealBranchRef("engine-heal/APP-1"), "refs/heads/engine-heal/APP-1");
+  it("comments when the bumped version is already tagged", () => {
+    const collision = planEngineHealRelease({
+      ...open,
+      qualityOnTip: "success",
+      mainVersion: "1.0.0",
+      tipVersion: "1.0.1",
+      tagExists: true,
+    });
+    assert.equal(collision.action, "comment");
+    if (collision.action !== "comment") return;
+    assert.match(collision.body, /Tag v1\.0\.1 already exists/);
   });
 
-  it("waits for quality on the bumped tip and does not merge before that", () => {
+  it("waits for pull_request quality on the bumped tip and does not merge before that", () => {
     const waiting = planEngineHealRelease({
       ...open,
-      bumpOnBranch: true,
       qualityOnTip: "none",
       mainVersion: "1.0.0",
       tipVersion: "1.0.1",
@@ -99,7 +105,6 @@ describe("engine heal release", () => {
     assert.deepEqual(waiting, { action: "wait-for-quality", branch: "engine-heal/APP-1", sha: "def222" });
     const pending = planEngineHealRelease({
       ...open,
-      bumpOnBranch: true,
       qualityOnTip: "pending",
       mainVersion: "1.0.0",
       tipVersion: "1.0.1",
@@ -108,7 +113,6 @@ describe("engine heal release", () => {
     assert.equal(pending.action, "wait-for-quality");
     const failed = planEngineHealRelease({
       ...open,
-      bumpOnBranch: true,
       qualityOnTip: "failure",
       mainVersion: "1.0.0",
       tipVersion: "1.0.1",
@@ -119,28 +123,25 @@ describe("engine heal release", () => {
   it("squash-merges only when the bumped tip is green, then tags that version", () => {
     const merge = planEngineHealRelease({
       ...open,
-      bumpOnBranch: true,
       qualityOnTip: "success",
       mainVersion: "1.0.0",
       tipVersion: "1.0.1",
       branchTip: "def222",
     });
     assert.deepEqual(merge, { action: "merge-and-tag", version: "1.0.1", tag: "v1.0.1" });
-    const same = planEngineHealRelease({
+    const behind = planEngineHealRelease({
       ...open,
-      bumpOnBranch: true,
       qualityOnTip: "success",
-      mainVersion: "1.0.0",
-      tipVersion: "1.0.0",
+      mainVersion: "1.0.2",
+      tipVersion: "1.0.1",
     });
-    assert.equal(same.action, "fail");
+    assert.equal(behind.action, "comment");
   });
 
   it("tags a merged pull request and does not open another bump", () => {
     const tag = planEngineHealRelease({
       ...open,
       pullState: "MERGED",
-      bumpOnBranch: true,
       qualityOnTip: "success",
       mainVersion: "1.0.0",
       tipVersion: "1.0.1",
@@ -149,7 +150,6 @@ describe("engine heal release", () => {
     const done = planEngineHealRelease({
       ...open,
       pullState: "MERGED",
-      bumpOnBranch: true,
       qualityOnTip: "success",
       mainVersion: "1.0.0",
       tipVersion: "1.0.1",
@@ -159,7 +159,6 @@ describe("engine heal release", () => {
     const closed = planEngineHealRelease({
       ...open,
       pullState: "CLOSED",
-      bumpOnBranch: false,
       qualityOnTip: "success",
       mainVersion: "1.0.0",
       tipVersion: "1.0.0",
@@ -167,13 +166,16 @@ describe("engine heal release", () => {
     assert.equal(closed.action, "skip");
   });
 
-  it("does not push a commit to main", () => {
+  it("does not push a commit", () => {
     const script = readFileSync(new URL("../../scripts/engine-heal.ts", import.meta.url), "utf8");
     const workflow = readFileSync(new URL("../../.github/workflows/engine-heal.yml", import.meta.url), "utf8");
     assert.equal(script.includes("HEAD:main"), false);
-    assert.equal(workflow.includes("HEAD:main"), false);
-    assert.match(script, /HEAD:\$\{plan\.branchRef\}/);
+    assert.equal(script.includes("npm version"), false);
+    assert.equal(script.includes("workflow_dispatch"), false);
+    assert.equal(workflow.includes("workflow_dispatch"), false);
     assert.match(script, /refs\/tags\//);
+    assert.match(script, /pr", "comment"/);
+    assert.match(script, /event === "pull_request"/);
   });
 
   it("reads the quality check on the tip", () => {

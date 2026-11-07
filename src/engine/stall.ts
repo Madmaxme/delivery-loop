@@ -1,3 +1,4 @@
+import { engineHealBumpInstruction } from "./engine-heal.ts";
 import type { QualityCause } from "./quality-cause.js";
 
 /**
@@ -162,21 +163,24 @@ export function ownerHealPrompt(input: {
   reason: string;
   tokenEnv?: string;
   issue?: string;
+  releaseTags?: readonly string[];
 }): string {
   const token = input.tokenEnv?.trim();
   const branch = input.issue?.trim() ? `engine-heal/${input.issue.trim()}` : "engine-heal/<ticket>";
+  const bumped = engineHealBumpInstruction(input.releaseTags);
   const where = [
     "Edit the owner of the behavior that returned no.",
     "That owner may be the ticket branch, this checkout, a repo the command ships, or the package that executes this loop.",
     "When the owner is the package that executes this loop, open a pull request. Do not merge it to main.",
     `Name the branch \`${branch}\` and label the pull request \`engine-heal\`.`,
-    "The quality check gates that pull request. A green check commits the next patch onto that pull request, waits until quality is green on that tip, squash-merges, and tags the merge commit. It does not push a commit to main. Clients install a tag. They do not install main.",
+    bumped,
+    "The pull_request quality check gates that head. The engine-heal workflow does not push a commit. It waits until that check is green, squash-merges, reads the version from the merged package.json, and tags that commit. A pull request without the bump gets a comment and stops. Clients install the tag. They do not install main.",
     "When the owner is anything else, land that owner's trunk before you finish.",
     "This step runs again when you return.",
     "An open pull request is not landed.",
     token
-      ? `Push the runner package with the token in \`${token}\`. An installation token must not merge that package.`
-      : "Push the runner package with the commit-actor token. An installation token must not merge that package.",
+      ? `Push the runner package with the token in \`${token}\`. Do not use GITHUB_TOKEN. An installation token must not merge that package.`
+      : "Push the runner package with the commit-actor token. Do not use GITHUB_TOKEN. An installation token must not merge that package.",
   ].join(" ");
   const decide = [
     "Answer with one line: **Heal:** edit, **Heal:** wait, or **Heal:** login.",
