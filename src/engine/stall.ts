@@ -46,20 +46,132 @@ export function healVerdict(text: string): HealVerdict {
   return "edit";
 }
 
-/** One owner edit per key on this page. The marker is a record. It does not retire the owner. */
+/**
+ * Failure types the runner caps. The key prefix is the source of the type.
+ * `other` is a heal key that matches none of those prefixes.
+ */
+export const HEAL_FAILURE_TYPES = [
+  "quality-red",
+  "merge-conflict",
+  "promote-failed",
+  "ship-failed",
+  "quality-pending",
+  "quality-unscheduled",
+  "runner-blocked",
+  "other",
+] as const;
+
+export type HealFailureType = (typeof HEAL_FAILURE_TYPES)[number];
+
+/** Attempts recorded on the ticket before the runner stops that failure type. */
+export const DEFAULT_HEAL_CAP = 3;
+
+export const HEAL_EXHAUSTED_LABEL = "heal-exhausted";
+
+const HEAL_FAILURE_TYPE_SET = new Set<string>(HEAL_FAILURE_TYPES);
+
+export function isHealFailureType(value: string): value is HealFailureType {
+  return HEAL_FAILURE_TYPE_SET.has(value);
+}
+
+/** The durable failure type for a heal key. Signature stays in the key. The cap is this type. */
+export function failureTypeForHealKey(key: string): HealFailureType {
+  if (key.startsWith("heal:quality:")) return "quality-red";
+  if (key.startsWith("heal:merge:")) return "merge-conflict";
+  if (key.startsWith("heal:dev:")) return "promote-failed";
+  if (key.startsWith("install:")) return "ship-failed";
+  if (key.startsWith("heal:pending:")) return "quality-pending";
+  if (key.startsWith("heal:unscheduled:")) return "quality-unscheduled";
+  if (key.startsWith("runner:")) return "runner-blocked";
+  return "other";
+}
+
+export function healCapFor(
+  heal: { maxAttempts?: number; caps?: Record<string, number> } | undefined,
+  type: string,
+): number {
+  const named = heal?.caps?.[type];
+  if (typeof named === "number" && Number.isFinite(named) && named >= 0) return Math.floor(named);
+  const fallback = heal?.maxAttempts;
+  if (typeof fallback === "number" && Number.isFinite(fallback) && fallback >= 0) {
+    return Math.floor(fallback);
+  }
+  return DEFAULT_HEAL_CAP;
+}
+
+/** One owner edit per key on this page. The marker is the cross-run count for its failure type. */
 export function ownerHealMarker(key: string): string {
-  return `<!-- OWNER_HEAL ${key} -->`;
+  return `<!-- OWNER_HEAL type=${failureTypeForHealKey(key)} ${key} -->`;
+}
+
+export function ownerHealRecords(body: string): { key: string; type: HealFailureType }[] {
+  const records: { key: string; type: HealFailureType }[] = [];
+  for (const match of body.matchAll(/<!--\s*OWNER_HEAL\b([^>]*)-->/gi)) {
+    const attrs = (match[1] ?? "").trim();
+    const named = attrs.match(/\btype=([a-z0-9-]+)\b/i)?.[1]?.toLowerCase() ?? "";
+    const key = attrs.replace(/\btype=[a-z0-9-]+\b/i, "").trim();
+    const type = isHealFailureType(named) ? named : failureTypeForHealKey(key);
+    records.push({ key, type });
+  }
+  return records;
+}
+
+export function countOwnerHeals(
+  comments: readonly { body: string }[],
+  type: string,
+): number {
+  let count = 0;
+  for (const comment of comments) {
+    for (const record of ownerHealRecords(comment.body)) {
+      if (record.type === type) count += 1;
+    }
+  }
+  return count;
+}
+
+export function healExhaustedMarker(type: string): string {
+  return `<!-- HEAL_EXHAUSTED ${HEAL_EXHAUSTED_LABEL} type=${type} -->`;
+}
+
+/** The failure type already stopped on this ticket. Null when the cap has not been recorded. */
+export function exhaustedFailureType(input: {
+  labels?: readonly string[];
+  comments?: readonly { body: string }[];
+}): HealFailureType | "heal-exhausted" | null {
+  for (const comment of input.comments ?? []) {
+    const named = comment.body.match(/<!--\s*HEAL_EXHAUSTED\b[^>]*\btype=([a-z0-9-]+)/i)?.[1]?.toLowerCase() ?? "";
+    if (isHealFailureType(named)) return named;
+    if (/<!--\s*HEAL_EXHAUSTED\b/i.test(comment.body)) return "heal-exhausted";
+  }
+  const labels = (input.labels ?? []).map((label) => label.toLowerCase());
+  if (!labels.includes(HEAL_EXHAUSTED_LABEL)) return null;
+  return HEAL_FAILURE_TYPES.find((type) => labels.includes(type)) ?? "heal-exhausted";
+}
+
+export class HealExhaustedError extends Error {
+  readonly failureType: string;
+
+  constructor(failureType: string) {
+    super(`heal exhausted: ${failureType}`);
+    this.name = "HealExhaustedError";
+    this.failureType = failureType;
+  }
 }
 
 export function ownerHealPrompt(input: {
   reason: string;
   tokenEnv?: string;
+  issue?: string;
 }): string {
   const token = input.tokenEnv?.trim();
+  const branch = input.issue?.trim() ? `engine-heal/${input.issue.trim()}` : "engine-heal/<ticket>";
   const where = [
     "Edit the owner of the behavior that returned no.",
     "That owner may be the ticket branch, this checkout, a repo the command ships, or the package that executes this loop.",
-    "Land that owner's trunk before you finish.",
+    "When the owner is the package that executes this loop, open a pull request. Do not merge it to main.",
+    `Name the branch \`${branch}\` and label the pull request \`engine-heal\`.`,
+    "The quality check gates that pull request. A green check merges it and tags the next patch release. Clients install a tag. They do not install main.",
+    "When the owner is anything else, land that owner's trunk before you finish.",
     "This step runs again when you return.",
     "An open pull request is not landed.",
     token
@@ -68,7 +180,7 @@ export function ownerHealPrompt(input: {
   ].join(" ");
   const decide = [
     "Answer with one line: **Heal:** edit, **Heal:** wait, or **Heal:** login.",
-    "edit changes the owner above and lands that trunk.",
+    "edit changes the owner above. Land that trunk, unless the owner is the package that executes this loop. That edit opens the engine-heal pull request and does not merge to main.",
     "wait means the step is not broken. Do not edit. The step runs again.",
     "login means the login was rejected. Do not edit. The login is replaced and the step runs again.",
   ].join(" ");

@@ -40,6 +40,7 @@ function ticket(overrides: Partial<Ticket> = {}): Ticket {
 
 function harness(text: string, opts?: { quality?: "success" | "failure" | "pending"; branch?: string }) {
   const comments: string[] = [];
+  const labels: string[] = [];
   let state = "Todo";
   const tracker: TrackerAdapter = {
     kind: "github",
@@ -55,7 +56,9 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
     async setState(_id, next) {
       state = next;
     },
-    async addLabel() {},
+    async addLabel(_id, label) {
+      labels.push(label);
+    },
     async removeLabel() {},
     async projectSnapshot() {
       return null;
@@ -109,6 +112,7 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
   };
   return {
     comments,
+    labels,
     merged: () => merged,
     state: () => state,
     deps: {
@@ -1453,8 +1457,8 @@ describe("loop", () => {
     assert.match(heals[0], /Ship step returned no: false/);
     assert.match(heals[0], /repo the command ships/);
     assert.match(heals[0], /An open pull request is not landed/);
-    assert.match(env.comments.join("\n"), /OWNER_HEAL install:steps:false/);
-    assert.match(env.comments.join("\n"), /OWNER_HEAL install:continue:false/);
+    assert.match(env.comments.join("\n"), /OWNER_HEAL type=ship-failed install:steps:false/);
+    assert.match(env.comments.join("\n"), /OWNER_HEAL type=ship-failed install:continue:false/);
     assert.match(ownerHealPrompt({ reason: "no", tokenEnv: "COMMIT_ACTOR_TOKEN" }), /COMMIT_ACTOR_TOKEN/);
   });
 
@@ -1518,7 +1522,7 @@ describe("loop", () => {
     await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed: false/);
     const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
     assert.equal(heals.length, 2);
-    assert.match(env.comments.join("\n"), /OWNER_HEAL install:steps:false/);
+    assert.match(env.comments.join("\n"), /OWNER_HEAL type=ship-failed install:steps:false/);
   });
 
   it("waits out a ship check that is still running and does not edit an owner", async () => {
@@ -1594,6 +1598,75 @@ describe("loop", () => {
     assert.equal(heals.length, 2);
     assert.match(heals[0], /socialMedia/);
     assert.match(heals[1], /exportCompliance/);
+  });
+
+  it("stops a failure type after its cap and does not start another heal", async () => {
+    const env = harness(BUILDABLE);
+    const prompts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return start(input);
+    };
+    env.deps.pack = {
+      ...pack,
+      heal: { caps: { "ship-failed": 1 } },
+      ship: { steps: ["false"], markStatus: false },
+    };
+    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed: false/);
+    env.deps.pageControl = { stop: false, healed: [] };
+    await assert.rejects(() => ship(env.deps, "API-1"), /heal exhausted: ship-failed/);
+    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
+    assert.equal(heals.length, 1);
+    assert.match(heals[0], /engine-heal\/API-1/);
+    assert.match(heals[0], /Do not merge it to main/);
+    assert.deepEqual(env.labels, ["heal-exhausted", "ship-failed"]);
+    assert.match(env.comments.join("\n"), /HEAL_EXHAUSTED heal-exhausted type=ship-failed/);
+    env.deps.pageControl = { stop: false, healed: [] };
+    const before = heals.length;
+    await assert.rejects(() => ship(env.deps, "API-1"), /heal exhausted: ship-failed/);
+    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, before);
+  });
+
+  it("does not record a heal when the marker comment fails", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = { ...pack, ship: { steps: ["false"], markStatus: false } };
+    env.deps.tracker.comment = async () => {
+      throw new Error("comment failed");
+    };
+    await assert.rejects(() => ship(env.deps, "API-1"), /comment failed/);
+    assert.equal(env.deps.pageControl?.healed?.length ?? 0, 0);
+    assert.equal(env.deps.pageControl?.stop ?? false, false);
+    assert.equal(env.deps.pageControl?.verdicts, undefined);
+  });
+
+  it("stops a red quality check at the heal cap and does not chain another page", async () => {
+    const env = harness(BUILDABLE);
+    const prompts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return start(input);
+    };
+    env.deps.pack = { ...pack, heal: { caps: { "quality-red": 0 } } };
+    env.deps.forge.quality = async () => ({ state: "failure", detail: "quality failure" });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "heal-exhausted");
+    assert.equal(result.detail, "quality-red");
+    assert.equal(sweepNeedsAnotherPage([result]), false);
+    assert.equal(prompts.some((prompt) => prompt.includes("Fix that owner")), false);
+    assert.deepEqual(env.labels, ["heal-exhausted", "quality-red"]);
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "later" };
+    };
+    const again = await runTicket(
+      env.deps,
+      ticket({ comments: env.comments.map((body) => ({ body })), labels: ["heal-exhausted", "quality-red"] }),
+    );
+    assert.equal(again.outcome, "heal-exhausted");
+    assert.equal(starts, 0);
   });
 
   it("leaves prod status to the pack when markStatus is false", async () => {

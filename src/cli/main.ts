@@ -46,6 +46,26 @@ function copyTree(from: string, to: string): void {
   cpSync(from, to, { recursive: true });
 }
 
+/** The runner installs the tag of the package that wrote the workflow. Clients do not install main. */
+export function runnerWorkflowText(): string {
+  const version = (JSON.parse(readFileSync(resolve(packageRoot, "package.json"), "utf8")) as { version: string }).version;
+  return readFileSync(resolve(packageRoot, "templates/runner.yml"), "utf8").replaceAll(
+    "__DELIVERY_LOOP_REF__",
+    `v${version}`,
+  );
+}
+
+function installHarnessFiles(dir: string): void {
+  copyTree(resolve(packageRoot, "conduct"), resolve(dir, ".cursor/skills"));
+  mkdirSync(resolve(dir, ".cursor/rules"), { recursive: true });
+  cpSync(
+    resolve(packageRoot, ".cursor/rules/delivery-loop.mdc"),
+    resolve(dir, ".cursor/rules/delivery-loop.mdc"),
+  );
+  mkdirSync(resolve(dir, ".github/workflows"), { recursive: true });
+  writeFileSync(resolve(dir, ".github/workflows/delivery-loop.yml"), runnerWorkflowText());
+}
+
 export function writeProject(dir: string, pack: ProjectPack): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(resolve(dir, "delivery-loop.yaml"), stringify(pack));
@@ -57,10 +77,7 @@ export function writeProject(dir: string, pack: ProjectPack): void {
       "# Invariants\n\n## example-rule\n\nA rule that must still be true after a change.\n",
     );
   }
-  copyTree(resolve(packageRoot, "conduct"), resolve(dir, ".cursor/skills"));
-  mkdirSync(resolve(dir, ".github/workflows"), { recursive: true });
-  const workflow = readFileSync(resolve(packageRoot, "templates/runner.yml"), "utf8");
-  writeFileSync(resolve(dir, ".github/workflows/delivery-loop.yml"), workflow);
+  installHarnessFiles(dir);
 }
 
 export function installConnector(dir: string, name: string): void {
@@ -292,12 +309,7 @@ export function update(argv: string[]): void {
   const yaml = readFileSync(packPath(dir), "utf8");
   const invariantsPath = resolve(dir, (parse(yaml) as ProjectPack).invariantsFile);
   const invariants = existsSync(invariantsPath) ? readFileSync(invariantsPath, "utf8") : "";
-  copyTree(resolve(packageRoot, "conduct"), resolve(dir, ".cursor/skills"));
-  mkdirSync(resolve(dir, ".github/workflows"), { recursive: true });
-  writeFileSync(
-    resolve(dir, ".github/workflows/delivery-loop.yml"),
-    readFileSync(resolve(packageRoot, "templates/runner.yml"), "utf8"),
-  );
+  installHarnessFiles(dir);
   if (readFileSync(packPath(dir), "utf8") !== yaml) {
     throw new Error("update changed delivery-loop.yaml");
   }

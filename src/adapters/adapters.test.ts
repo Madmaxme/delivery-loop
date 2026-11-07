@@ -325,6 +325,58 @@ describe("adapters", () => {
     assert.equal(issues[0]?.blockedBy[0]?.identifier, "API-1");
   });
 
+  it("adds a Linear label and keeps labels already on the issue", async () => {
+    const calls: { query: string; variables: Record<string, unknown> }[] = [];
+    const linear = linearTracker({
+      apiKey: "k",
+      team: "APP",
+      intakeState: "Todo",
+      fetch: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+        calls.push(body);
+        if (body.query.includes("issues(filter")) {
+          return jsonResponse({
+            data: {
+              issues: {
+                nodes: [
+                  {
+                    id: "uuid",
+                    identifier: "APP-3",
+                    title: "Fix",
+                    description: "",
+                    state: { name: "Todo" },
+                    labels: { nodes: [] },
+                    comments: { nodes: [] },
+                    inverseRelations: { nodes: [] },
+                  },
+                ],
+              },
+            },
+          });
+        }
+        if (body.query.includes("teams(filter")) {
+          return jsonResponse({ data: { teams: { nodes: [{ id: "team-1" }] } } });
+        }
+        if (body.query.includes("issueLabels")) {
+          return jsonResponse({ data: { issueLabels: { nodes: [] } } });
+        }
+        if (body.query.includes("issueLabelCreate")) {
+          return jsonResponse({ data: { issueLabelCreate: { issueLabel: { id: "lab-new" } } } });
+        }
+        if (body.query.includes("issue(id:")) {
+          return jsonResponse({ data: { issue: { labels: { nodes: [{ id: "keep" }] } } } });
+        }
+        if (body.query.includes("issueUpdate")) {
+          return jsonResponse({ data: { issueUpdate: { success: true } } });
+        }
+        return jsonResponse({ data: {} });
+      },
+    });
+    await linear.addLabel("APP-3", "heal-exhausted");
+    const update = calls.find((call) => call.query.includes("issueUpdate"));
+    assert.deepEqual(update?.variables.labelIds, ["keep", "lab-new"]);
+  });
+
   it("uses the Cursor run result string, not the run envelope", async () => {
     const receipt = "**Verdict:** WRONG DIAGNOSIS\n\nThe calendar already filters that row.";
     assert.equal(
