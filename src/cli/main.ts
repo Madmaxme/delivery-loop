@@ -111,8 +111,6 @@ function requireEnv(name: string): string {
 
 /** Named owners come from the fetched trunk file. The working copy is not the allowlist. */
 export function commitActorsFromTrustedRef(pack: ProjectPack): ProjectPack["commitActors"] {
-  const named = pack.commitActors ?? [];
-  if (!named.length) return named;
   const trunk = pack.agent?.trunk ?? "main";
   const ref = `origin/${trunk}:delivery-loop.yaml`;
   const shown = spawnSync("git", ["show", ref], { cwd: process.cwd(), encoding: "utf8" });
