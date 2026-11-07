@@ -36,6 +36,10 @@ The product remote is https://github.com/Madmaxme/delivery-loop. `bash scripts/b
 npm install -g github:Madmaxme/delivery-loop#v1.0.0
 ```
 
+## Run events
+
+A worker run writes `delivery-loop.run.started` and `delivery-loop.run.finished` as JSON files and uploads those files as a workflow artifact. The writer is `scripts/run-event.sh`. This repository does not post those files. A client workflow posts one only when that client sets `DELIVERY_LOOP_EVENT_URL`. The field contract is in [METHODOLOGY.md](METHODOLOGY.md).
+
 ## Contribute
 
 Clone this repo, branch from `main`, and open a pull request. The `quality` workflow runs the tests. Titles and bodies are in [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -21,7 +21,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
-  actions: read
+  actions: write
 
 jobs:
   delivery-loop:
@@ -46,16 +46,54 @@ jobs:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Empty URL writes the event file and does not post.
+          # The header is one line from the client's own store.
+          # REQUIRED true or 1 fails the run when the post fails.
+          DELIVERY_LOOP_EVENT_URL: ${{ vars.DELIVERY_LOOP_EVENT_URL }}
+          DELIVERY_LOOP_EVENT_HEADER: ${{ secrets.DELIVERY_LOOP_EVENT_HEADER }}
+          DELIVERY_LOOP_EVENT_REQUIRED: ${{ vars.DELIVERY_LOOP_EVENT_REQUIRED }}
         run: |
           set -euo pipefail
           dir="$(mktemp -d)/delivery-loop"
           git clone --depth 1 --branch __DELIVERY_LOOP_REF__ https://github.com/Madmaxme/delivery-loop.git "$dir"
-          (cd "$dir" && npm install --omit=dev --ignore-scripts)
-          npm install -g "$dir"
-          if [ "${{ inputs.mode }}" = "sweep" ]; then
-            delivery-loop sweep
-          elif [ "${{ inputs.mode }}" = "ship" ]; then
-            delivery-loop ship ${{ inputs.issue }}
-          else
-            delivery-loop deliver ${{ inputs.issue }}
+          event_failed=0
+          bash "$dir/scripts/run-event.sh" started || event_failed=1
+          code=0
+          if [ "$event_failed" -eq 0 ]; then
+            set +e
+            (cd "$dir" && npm install --omit=dev --ignore-scripts)
+            code=$?
+            if [ "$code" -eq 0 ]; then
+              npm install -g "$dir"
+              code=$?
+            fi
+            if [ "$code" -eq 0 ]; then
+              if [ "${{ inputs.mode }}" = "sweep" ]; then
+                delivery-loop sweep
+              elif [ "${{ inputs.mode }}" = "ship" ]; then
+                delivery-loop ship ${{ inputs.issue }}
+              else
+                delivery-loop deliver ${{ inputs.issue }}
+              fi
+              code=$?
+            fi
+            set -e
           fi
+          if [ "$event_failed" -ne 0 ] || [ "$code" -ne 0 ]; then
+            event_status=failure
+          else
+            event_status=success
+          fi
+          bash "$dir/scripts/run-event.sh" finished "$event_status" || event_failed=1
+          if [ "$event_failed" -ne 0 ]; then
+            exit 1
+          fi
+          exit "$code"
+      - name: Upload run events
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delivery-loop-run-events
+          path: .delivery-loop/events/
+          if-no-files-found: warn
+          include-hidden-files: true

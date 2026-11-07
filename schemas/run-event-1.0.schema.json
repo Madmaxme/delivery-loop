@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Madmaxme/delivery-loop/schemas/run-event-1.0.schema.json",
+  "title": "delivery-loop run event",
+  "description": "One run phase. specversion 1.0. The file is the record. An endpoint is not part of the record.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["specversion", "id", "source", "type", "time", "data"],
+  "properties": {
+    "specversion": { "const": "1.0" },
+    "id": { "type": "string", "minLength": 1 },
+    "source": { "type": "string", "minLength": 1 },
+    "type": {
+      "enum": ["delivery-loop.run.started", "delivery-loop.run.finished"]
+    },
+    "time": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "sha", "workflow", "run_id", "run_attempt", "phase", "status"],
+      "properties": {
+        "repo": { "type": "string" },
+        "sha": { "type": "string" },
+        "workflow": { "type": "string" },
+        "run_id": { "type": "string" },
+        "run_attempt": { "type": "string" },
+        "phase": { "enum": ["started", "finished"] },
+        "status": { "type": "string" }
+      }
+    }
+  }
+}
