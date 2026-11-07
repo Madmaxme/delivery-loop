@@ -109,6 +109,20 @@ function requireEnv(name: string): string {
   return value;
 }
 
+/** Named owners come from the fetched trunk file. The working copy is not the allowlist. */
+export function commitActorsFromTrustedRef(pack: ProjectPack): ProjectPack["commitActors"] {
+  const named = pack.commitActors ?? [];
+  if (!named.length) return named;
+  const trunk = pack.agent?.trunk ?? "main";
+  const ref = `origin/${trunk}:delivery-loop.yaml`;
+  const shown = spawnSync("git", ["show", ref], { cwd: process.cwd(), encoding: "utf8" });
+  if (shown.status !== 0 || !shown.stdout?.trim()) {
+    throw new Error(`commitActors must be read from ${ref}, not the working tree`);
+  }
+  const parsed = parse(shown.stdout) as { commitActors?: ProjectPack["commitActors"] };
+  return parsed.commitActors ?? [];
+}
+
 export function adaptersFor(pack: ProjectPack): {
   tracker: TrackerAdapter;
   worker: WorkerAdapter;
@@ -123,7 +137,7 @@ export function adaptersFor(pack: ProjectPack): {
           repo:
             pack.githubRepo ??
             githubRepoFromUrl(pack.repos[0].url).owner + "/" + githubRepoFromUrl(pack.repos[0].url).repo,
-          commitActors: pack.commitActors,
+          commitActors: commitActorsFromTrustedRef(pack),
         });
   const tracker =
     pack.tracker === "linear"
@@ -262,7 +276,8 @@ function dispatchOrRun(mode: string, argv: string[]): void {
   }
   const issue = plan.issue;
   if (!issue) throw new Error("deliver needs a ticket id");
-  deliver(deps, issue).then((result) => console.log(JSON.stringify(result, null, 2)));
+  const until = mode === "ground" ? "ground" : undefined;
+  deliver(deps, issue, until ? { until } : undefined).then((result) => console.log(JSON.stringify(result, null, 2)));
 }
 
 function init(argv: string[]): void {
@@ -329,10 +344,10 @@ if (isCli) {
   else if (command === "connector" && argv[1] === "add") {
     installConnector(arg("--dir", argv) ?? process.cwd(), argv[2]);
     console.log(`Added connector ${argv[2]}`);
-  } else if (command === "sweep" || command === "deliver" || command === "ship") {
+  } else if (command === "sweep" || command === "deliver" || command === "ground" || command === "ship") {
     dispatchOrRun(command === "deliver" ? "pipeline" : command, argv.slice(1));
   } else {
-    console.error("Usage: delivery-loop init|update|connector add <name>|sweep|deliver <id>|ship [continue] [id]");
+    console.error("Usage: delivery-loop init|update|connector add <name>|sweep|deliver <id>|ground <id>|ship [continue] [id]");
     process.exit(command ? 1 : 0);
   }
 }

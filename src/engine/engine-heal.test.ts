@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 
 import {
   engineHealBumpInstruction,
+  engineHealMergeArgs,
   engineHealBumpVersion,
   engineHealQualityState,
   engineHealTag,
@@ -118,6 +119,22 @@ describe("engine heal release", () => {
       tipVersion: "1.0.1",
     });
     assert.equal(failed.action, "fail");
+  });
+
+  it("pins the squash merge to the green head sha", () => {
+    const sha = "a".repeat(40);
+    assert.deepEqual(engineHealMergeArgs("acme/loop", 4, sha), [
+      "pr",
+      "merge",
+      "4",
+      "--repo",
+      "acme/loop",
+      "--squash",
+      "--match-head-commit",
+      sha,
+      "--delete-branch",
+    ]);
+    assert.throws(() => engineHealMergeArgs("acme/loop", 4, "def222"), /head sha/);
   });
 
   it("squash-merges only when the bumped tip is green, then tags that version", () => {

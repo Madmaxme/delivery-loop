@@ -74,6 +74,8 @@ export type LoopDeps = {
   maxQualityPolls?: number;
   /** Linear project name. Limits intake and loads the sibling snapshot. */
   project?: string | null;
+  /** Stop after the ground verdict. The build and land path does not run. */
+  until?: "ground";
   /** Compiled once per sweep. Ground and build prompts include it. */
   program?: CompileProgramResult | null;
   /** Override for tests. Default asks `gh` whether the stamped run is still live. */
@@ -165,6 +167,7 @@ export type TicketResult = {
     | "ship-blocked"
     | "journey-missing"
     | "worker-failed"
+    | "worker-running"
     | "heal-exhausted";
   detail: string;
 };
@@ -195,6 +198,36 @@ function noteDone(deps: LoopDeps, result: TicketResult): void {
     outcome: result.outcome,
     detail: result.detail,
   });
+}
+
+function leaseRunToken(runId: string): string {
+  try {
+    const parsed = JSON.parse(runId) as { agentId?: string };
+    if (parsed.agentId && /^[A-Za-z0-9_.-]+$/.test(parsed.agentId)) return parsed.agentId;
+  } catch {
+    /* plain id */
+  }
+  if (/^[A-Za-z0-9_.-]+$/.test(runId)) return runId;
+  return "pending";
+}
+
+async function noteLiveRun(
+  deps: LoopDeps,
+  ticket: Ticket,
+  phase: string,
+  runId: string,
+): Promise<void> {
+  const token = leaseRunToken(runId);
+  if (token === "pending") return;
+  const now = deps.nowMs ?? Date.now();
+  await deps.tracker.comment(ticket.identifier, leaseComment(now, phase, token));
+}
+
+/** 401 and 403 from the forge. Message text is not a signal. */
+export function ownerOnlyLandFailure(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const status = (error as { httpStatus?: unknown }).httpStatus;
+  return status === 401 || status === 403;
 }
 
 function leaseComment(nowMs: number, phase: string, runId: string): string {
@@ -588,6 +621,14 @@ async function executeTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResu
   }
 
   const home = agentHome(deps.pack);
+  if (lease.cursorRunId && lease.cursorRunId !== "pending") {
+    const joined = await deps.worker.join(
+      JSON.stringify({ agentId: lease.cursorRunId, runId: lease.cursorRunId, status: "running" }),
+    );
+    if (joined.status === "running") {
+      return { identifier: ticket.identifier, outcome: "worker-running", detail: lease.cursorRunId };
+    }
+  }
   await deps.tracker.comment(ticket.identifier, leaseComment(now, "ground", "pending"));
   try {
     return await runHeldTicket(deps, ticket, home);
@@ -611,7 +652,15 @@ async function runHeldTicket(
       repoUrl: home.url,
       baseRef: home.trunk,
     });
+    await noteLiveRun(deps, ticket, "ground", started.runId);
     ground = await finishWorker(deps.worker, started.runId);
+    if (ground.status === "running") {
+      return {
+        identifier: ticket.identifier,
+        outcome: "worker-running",
+        detail: `cursor_run=${started.runId}`,
+      };
+    }
   } catch (error) {
     return {
       identifier: ticket.identifier,
@@ -755,6 +804,13 @@ async function runHeldTicket(
   }
 
   await deps.tracker.comment(ticket.identifier, ground.text);
+  if (deps.until === "ground") {
+    return {
+      identifier: ticket.identifier,
+      outcome: "verdict",
+      detail: verdict ?? "BUILDABLE",
+    };
+  }
 
   const target = repoByName(deps.pack, order.repos[0])!;
   const lookup = deps.lookupHead ?? lookupRemoteHead;
@@ -804,7 +860,15 @@ async function runHeldTicket(
         repoUrl: home.url,
         baseRef: home.trunk,
       });
+      await noteLiveRun(deps, ticket, "build", started.runId);
       built = await finishWorker(deps.worker, started.runId);
+      if (built.status === "running") {
+        return {
+          identifier: ticket.identifier,
+          outcome: "worker-running",
+          detail: `cursor_run=${started.runId}`,
+        };
+      }
       builtReceipt = built.text;
     } catch (error) {
       return {
@@ -1414,6 +1478,7 @@ async function applyOwnerHeal(
     text = (await deps.ownerHeal({ prompt, repoUrl: home.url, baseRef: home.trunk })) ?? "";
   } else {
     const started = await deps.worker.start({ prompt, repoUrl: home.url, baseRef: home.trunk });
+    await noteLiveRun(deps, ticket, "build", started.runId);
     text = (await finishWorker(deps.worker, started.runId)).text;
   }
   const verdict = healVerdict(text);
@@ -1655,7 +1720,7 @@ async function landPull(
       continue;
     }
     if (merge.state === "conflict" || (merge.state === "behind" && updates >= MAX_BRANCH_UPDATES)) {
-      const why = `The branch ${merge.state === "conflict" ? "conflicts with" : "is still behind"} \`${current.repo.trunk}\`.`;
+      const why = `The branch ${merge.state === "conflict" ? "conflicts with" : "is still behind"} \`${current.repo.trunk}\`. Hand off to heal.`;
       const paused = await healNo(
         deps,
         ticket,
@@ -1689,11 +1754,22 @@ async function landPull(
         number: current.number,
         branch: current.branch,
         base: current.repo.trunk,
+        headSha: head,
       });
       if (!mergedSha?.trim()) throw new Error("merge did not return a commit");
       return { mergedSha };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
+      if (ownerOnlyLandFailure(error)) {
+        const paused = pauseLand(
+          ticket.identifier,
+          current.url,
+          "Needs the owner. The merge was refused for a token, scope, or protection failure. The next page does not start a coding worker.",
+          "",
+        );
+        await deps.tracker.comment(ticket.identifier, paused.detail);
+        return paused;
+      }
       const paused = await healNo(
         deps,
         ticket,
@@ -1898,10 +1974,15 @@ export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
   return results;
 }
 
-export async function deliver(deps: LoopDeps, identifier: string): Promise<TicketResult> {
+export async function deliver(
+  deps: LoopDeps,
+  identifier: string,
+  opts?: { until?: "ground" },
+): Promise<TicketResult> {
   const ticket = await deps.tracker.get(identifier);
   const program = await loadProgram(deps, deps.project ?? ticket.projectName ?? null);
-  return runTicket(program ? { ...deps, program } : deps, ticket);
+  const next = opts?.until ? { ...deps, until: opts.until } : deps;
+  return runTicket(program ? { ...next, program } : next, ticket);
 }
 
 export async function ship(

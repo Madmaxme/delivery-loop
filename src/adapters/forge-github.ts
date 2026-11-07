@@ -88,7 +88,10 @@ export function githubForge(opts: {
       headers: { ...headers, ...(init?.headers ?? {}) },
     });
     if (!response.ok) {
-      throw new Error(`GitHub ${path} failed: ${response.status} ${await response.text()}`);
+      const err = new Error(`GitHub ${path} failed: ${response.status}`);
+      (err as Error & { httpStatus: number }).httpStatus = response.status;
+      await response.text().catch(() => undefined);
+      throw err;
     }
     return response;
   }
@@ -251,9 +254,12 @@ export function githubForge(opts: {
     async squashMerge(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
       await requireActor(`https://github.com/${owner}/${repo}`);
+      if (!input.headSha || !/^[0-9a-f]{40}$/i.test(input.headSha)) {
+        throw new Error("refusing to merge without the pull request head sha");
+      }
       const response = await api(`/repos/${owner}/${repo}/pulls/${input.number}/merge`, {
         method: "PUT",
-        body: JSON.stringify({ merge_method: "squash" }),
+        body: JSON.stringify({ merge_method: "squash", sha: input.headSha }),
       });
       const json = (await response.json()) as { sha?: string };
       const sha = json.sha?.trim() ?? "";

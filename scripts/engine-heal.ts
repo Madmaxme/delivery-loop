@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 
 import {
+  engineHealMergeArgs,
   engineHealQualityState,
   engineHealReleaseNotes,
   planEngineHealRelease,
@@ -170,8 +171,8 @@ function publishTagAt(prNumber: number, version: string, sha: string): void {
   process.stdout.write(`Tagged ${sha} as ${tag} after #${prNumber}.\n`);
 }
 
-function mergePull(repo: string, prNumber: number): string {
-  run("gh", ["pr", "merge", String(prNumber), "--repo", repo, "--squash", "--delete-branch"]);
+function mergePull(repo: string, prNumber: number, headSha: string): string {
+  run("gh", engineHealMergeArgs(repo, prNumber, headSha));
   let sha = "";
   for (let attempt = 0; attempt < 5 && !sha; attempt += 1) {
     const view = JSON.parse(
@@ -285,6 +286,7 @@ function main(): void {
   const tip = run("git", ["rev-parse", `refs/remotes/origin/${branch}`]).trim();
   const mainVersion = readVersionAt("refs/remotes/origin/main");
   const tipVersion = readVersionAt(tip);
+  let greenSha = tip;
   let plan = releasePlan({
     state,
     repo: baseRepo,
@@ -306,6 +308,7 @@ function main(): void {
     }
     const checked = run("git", ["rev-parse", `refs/remotes/origin/${branch}`]).trim();
     if (checked !== plan.sha) throw new Error(`branch tip moved from ${plan.sha} to ${checked}`);
+    greenSha = checked;
     plan = planEngineHealRelease({
       pullState: "OPEN",
       qualityOnTip: "success",
@@ -323,7 +326,7 @@ function main(): void {
     return;
   }
   if (plan.action === "merge-and-tag") {
-    const sha = mergePull(baseRepo, pull.number);
+    const sha = mergePull(baseRepo, pull.number, greenSha);
     const mergedVersion = readVersionAt(sha);
     if (mergedVersion !== plan.version) {
       throw new Error(`merge commit ${sha} is ${mergedVersion}, expected ${plan.version}`);

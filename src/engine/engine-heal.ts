@@ -146,6 +146,23 @@ export function engineHealQualityState(
   return "none";
 }
 
+export function engineHealMergeArgs(repo: string, prNumber: number, headSha: string): string[] {
+  if (!/^[0-9a-f]{40}$/i.test(headSha)) {
+    throw new Error("refusing to merge without the pull request head sha");
+  }
+  return [
+    "pr",
+    "merge",
+    String(prNumber),
+    "--repo",
+    repo,
+    "--squash",
+    "--match-head-commit",
+    headSha,
+    "--delete-branch",
+  ];
+}
+
 export type EngineHealPlan =
   | { action: "skip"; reason: string }
   | { action: "fail"; reason: string }
