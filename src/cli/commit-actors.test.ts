@@ -9,7 +9,17 @@ import { commitActorsFromTrustedRef } from "./main.ts";
 import type { ProjectPack } from "../schema/pack.ts";
 
 function git(cwd: string, args: string[]) {
-  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  const result = spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "test",
+      GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "test",
+      GIT_COMMITTER_EMAIL: "test@example.com",
+    },
+  });
   assert.equal(result.status, 0, result.stderr);
 }
 
