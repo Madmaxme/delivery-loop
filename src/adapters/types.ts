@@ -119,6 +119,8 @@ export type ForgeAdapter = {
     /** Set for a git merge. GitHub squash uses `number`. */
     branch?: string;
     base?: string;
+    /** Current pull request head. GitHub rejects the merge when it moved. */
+    headSha?: string;
   }): Promise<string>;
   dispatch(input: { workflow: string; ref: string; inputs: Record<string, string> }): Promise<void>;
 };

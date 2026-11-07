@@ -226,7 +226,7 @@ export type CursorSdk = {
     cloud: { repos: { url: string; startingRef: string }[]; autoCreatePR: boolean };
   }): Promise<{
     agentId: string;
-    send(prompt: string): Promise<{ wait(): Promise<CursorRunResult> }>;
+    send(prompt: string): Promise<{ id?: string; wait(): Promise<CursorRunResult> }>;
     [Symbol.asyncDispose](): Promise<void>;
   }>;
   messages: { list(agentId: string): Promise<unknown> };
@@ -293,10 +293,18 @@ export function cursorBranches(done: CursorRunResult): { repoUrl: string; branch
   return out;
 }
 
+type CursorLiveRun = {
+  agentId: string;
+  wait(): Promise<CursorRunResult>;
+  dispose(): Promise<void>;
+  repoUrl: string;
+};
+
 export function cursorWorker(opts: {
   apiKey: string;
   sdk?: CursorSdk;
 }): WorkerAdapter {
+  const live = new Map<string, CursorLiveRun>();
   return {
     kind: "cursor",
     async start(input) {
@@ -311,37 +319,76 @@ export function cursorWorker(opts: {
         },
       });
       const run = await agent.send(input.prompt);
-      const done = await run.wait();
-      let messages: unknown = [];
-      try {
-        messages = await sdk.messages.list(agent.agentId);
-      } catch {
-        messages = [];
-      }
-      await agent[Symbol.asyncDispose]();
-      const text = cursorReceiptText(done, messages);
-      const branches = cursorBranches(done);
-      const own = branches.find((row) => sameGithubRepo(row.repoUrl, input.repoUrl));
-      const failed = done.status === "error" || done.status === "cancelled";
+      const runKey = run.id?.trim() || agent.agentId;
+      live.set(runKey, {
+        agentId: agent.agentId,
+        wait: () => run.wait(),
+        dispose: () => agent[Symbol.asyncDispose](),
+        repoUrl: input.repoUrl,
+      });
       return {
         runId: JSON.stringify({
           agentId: agent.agentId,
-          status: failed ? "failed" : (done.status ?? "finished"),
-          branch: own?.branch ?? branches[0]?.branch,
-          branches,
-          text,
+          runId: runKey,
+          status: "running",
         }),
       };
     },
     async join(runId) {
-      const stored = JSON.parse(runId) as WorkerResult & { status: string };
-      const status = stored.status === "failed" ? "failed" : "finished";
+      const stored = JSON.parse(runId) as {
+        agentId?: string;
+        runId?: string;
+        status?: string;
+        branch?: string;
+        head?: string;
+        branches?: { repoUrl: string; branch: string }[];
+        text?: string;
+      };
+      if (stored.status !== "running") {
+        const status = stored.status === "failed" ? "failed" : "finished";
+        return {
+          status,
+          branch: stored.branch,
+          head: stored.head,
+          branches: stored.branches,
+          text: stored.text ?? "",
+        };
+      }
+      const handle = stored.runId ? live.get(stored.runId) : undefined;
+      const sdk =
+        opts.sdk ??
+        ((await import("@cursor/sdk")) as { Agent: CursorSdk }).Agent;
+      if (!handle) {
+        let messages: unknown = [];
+        try {
+          if (stored.agentId) messages = await sdk.messages.list(stored.agentId);
+        } catch {
+          messages = [];
+        }
+        const text = assistantTextFromMessages(messages);
+        if (text.trim() && CLOSED_HANDOFF.test(text)) {
+          return { status: "finished", text };
+        }
+        return { status: "running", text };
+      }
+      const done = await handle.wait();
+      let messages: unknown = [];
+      try {
+        messages = await sdk.messages.list(handle.agentId);
+      } catch {
+        messages = [];
+      }
+      await handle.dispose().catch(() => undefined);
+      live.delete(stored.runId ?? "");
+      const text = cursorReceiptText(done, messages);
+      const branches = cursorBranches(done);
+      const own = branches.find((row) => sameGithubRepo(row.repoUrl, handle.repoUrl));
+      const failed = done.status === "error" || done.status === "cancelled";
       return {
-        status,
-        branch: stored.branch,
-        head: stored.head,
-        branches: stored.branches,
-        text: stored.text,
+        status: failed ? "failed" : "finished",
+        branch: own?.branch ?? branches[0]?.branch,
+        branches,
+        text,
       };
     },
   };

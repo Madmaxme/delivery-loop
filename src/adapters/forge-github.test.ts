@@ -46,6 +46,10 @@ describe("github mergeability", () => {
       token: "token",
       fetch: async (url, init) => {
         if ((init?.method ?? "GET") === "PUT" && url.includes("/merge")) {
+          const body = JSON.parse(String(init?.body ?? "{}")) as { sha?: string };
+          if (body.sha !== "a".repeat(40)) {
+            return new Response("missing sha", { status: 409 });
+          }
           return new Response(JSON.stringify({ sha: "deadbeef" }), { status: 200 });
         }
         return new Response(JSON.stringify({ status: "identical" }), { status: 200 });
@@ -60,7 +64,11 @@ describe("github mergeability", () => {
       "identical",
     );
     assert.equal(
-      await forge.squashMerge({ repoUrl: "https://github.com/acme/api", number: 4 }),
+      await forge.squashMerge({
+        repoUrl: "https://github.com/acme/api",
+        number: 4,
+        headSha: "a".repeat(40),
+      }),
       "deadbeef",
     );
   });
