@@ -46,16 +46,50 @@ jobs:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LEDGER_WEBHOOK_URL: ${{ secrets.LEDGER_WEBHOOK_URL }}
+          LEDGER_WEBHOOK_AUTH: ${{ secrets.LEDGER_WEBHOOK_AUTH }}
         run: |
           set -euo pipefail
           dir="$(mktemp -d)/delivery-loop"
           git clone --depth 1 --branch __DELIVERY_LOOP_REF__ https://github.com/Madmaxme/delivery-loop.git "$dir"
-          (cd "$dir" && npm install --omit=dev --ignore-scripts)
-          npm install -g "$dir"
-          if [ "${{ inputs.mode }}" = "sweep" ]; then
-            delivery-loop sweep
-          elif [ "${{ inputs.mode }}" = "ship" ]; then
-            delivery-loop ship ${{ inputs.issue }}
-          else
-            delivery-loop deliver ${{ inputs.issue }}
+          # Optional. An empty LEDGER_WEBHOOK_URL skips both writes, so a client
+          # without the secret is unchanged. A set URL fail-closes before the loop.
+          ledger() {
+            if [ -z "${LEDGER_WEBHOOK_URL:-}" ]; then
+              return 0
+            fi
+            bash "$dir/scripts/ledger-report.sh" "$@"
+          }
+          ledger_failed=0
+          ledger started other || ledger_failed=1
+          code=0
+          if [ "$ledger_failed" -eq 0 ]; then
+            set +e
+            (cd "$dir" && npm install --omit=dev --ignore-scripts)
+            code=$?
+            if [ "$code" -eq 0 ]; then
+              npm install -g "$dir"
+              code=$?
+            fi
+            if [ "$code" -eq 0 ]; then
+              if [ "${{ inputs.mode }}" = "sweep" ]; then
+                delivery-loop sweep
+              elif [ "${{ inputs.mode }}" = "ship" ]; then
+                delivery-loop ship ${{ inputs.issue }}
+              else
+                delivery-loop deliver ${{ inputs.issue }}
+              fi
+              code=$?
+            fi
+            set -e
           fi
+          if [ "$ledger_failed" -ne 0 ] || [ "$code" -ne 0 ]; then
+            ledger_status=failure
+          else
+            ledger_status=success
+          fi
+          ledger finished other "$ledger_status" || ledger_failed=1
+          if [ "$ledger_failed" -ne 0 ]; then
+            exit 1
+          fi
+          exit "$code"

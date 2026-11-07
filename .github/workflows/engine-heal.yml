@@ -23,10 +23,18 @@ jobs:
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     steps:
+      # The reporter is a file in this repo, so the checkout that fetches it
+      # is the only step before the ledger write. The write runs before Node,
+      # install, and the merge. A failed write stops the job.
       - uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+      - name: Report the run to the worker ledger
+        env:
+          LEDGER_WEBHOOK_URL: ${{ secrets.LEDGER_WEBHOOK_URL }}
+          LEDGER_WEBHOOK_AUTH: ${{ secrets.LEDGER_WEBHOOK_AUTH }}
+        run: bash scripts/ledger-report.sh started engine-heal
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -41,3 +49,9 @@ jobs:
           HEAL_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           HEAL_BASE_REPO: ${{ github.repository }}
         run: npx tsx scripts/engine-heal.ts
+      - name: Report the ledger result
+        if: always()
+        env:
+          LEDGER_WEBHOOK_URL: ${{ secrets.LEDGER_WEBHOOK_URL }}
+          LEDGER_WEBHOOK_AUTH: ${{ secrets.LEDGER_WEBHOOK_AUTH }}
+        run: bash scripts/ledger-report.sh finished engine-heal "${{ job.status }}"

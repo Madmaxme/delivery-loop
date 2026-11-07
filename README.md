@@ -36,6 +36,10 @@ The product remote is https://github.com/Madmaxme/delivery-loop. `bash scripts/b
 npm install -g github:Madmaxme/delivery-loop#v1.0.0
 ```
 
+## Worker ledger
+
+Worker workflows POST each run to the ledger named by the repository secrets `LEDGER_WEBHOOK_URL` and `LEDGER_WEBHOOK_AUTH` before they do their work. The script is `scripts/ledger-report.sh`. An empty secret or a failed POST prints `::error title=Ledger write failed::...` and exits 1. The message does not contain the URL or the auth header. The `quality` workflow does not call the script. The field contract is in [METHODOLOGY.md](METHODOLOGY.md).
+
 ## Contribute
 
 Clone this repo, branch from `main`, and open a pull request. The `quality` workflow runs the tests. Titles and bodies are in [CONTRIBUTING.md](CONTRIBUTING.md).
