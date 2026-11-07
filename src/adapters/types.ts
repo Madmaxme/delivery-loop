@@ -16,6 +16,11 @@ export type Ticket = {
   projectName?: string;
   blockedBy: { identifier: string; stateName: string }[];
   comments: TicketComment[];
+  /**
+   * Figma URLs from the description, comments, and tracker attachments.
+   * The engine also reads URLs still sitting in the text.
+   */
+  figmaUrls?: string[];
 };
 
 export type WorkerStart = {
@@ -70,6 +75,13 @@ export type QualityProbe = {
   committedAt?: string;
 };
 
+/** A named check on one commit. `headSha` null means no run for that commit. */
+export type DesignCheckProbe = {
+  state: "success" | "failure" | "pending" | "missing";
+  detail: string;
+  headSha: string | null;
+};
+
 /** What the forge knows before a merge. `unknown` means the host has not computed it yet. */
 export type Mergeability = "clean" | "behind" | "conflict" | "blocked" | "unknown";
 
@@ -94,6 +106,11 @@ export type ForgeAdapter = {
     base: string;
   }): Promise<PullRequest>;
   quality(input: { repoUrl: string; headSha: string; workflow: string }): Promise<QualityProbe>;
+  /**
+   * One check run on `headSha`. A run recorded on another sha is not a result.
+   * Forges that have no check API omit this.
+   */
+  designCheck?(input: { repoUrl: string; headSha: string; name: string }): Promise<DesignCheckProbe>;
   /**
    * One empty commit on an existing head so a pull_request workflow can start.
    * Returns the new SHA, or null when this head already requested that run.

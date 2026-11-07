@@ -3,8 +3,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { CompareStatus, ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
+import type { CompareStatus, DesignCheckProbe, FetchLike, ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { agentHome, holdStatus, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
+import {
+  designRepairText,
+  designRepo,
+  designWorkOrderStop,
+  figmaTokenValue,
+  ticketFigmaUrls,
+} from "./design-gate.ts";
 import { releaseVersionFromTag } from "./engine-heal.ts";
 import { isGithubActionsRunActive } from "./github-run-status.js";
 import {
@@ -104,6 +111,15 @@ export type LoopDeps = {
   /** Runs `qualityCommand` when `check` is `command`. Default runs it in the checkout. */
   runCommand?: (command: string, cwd: string) => { status: number | null };
   /**
+   * Figma REST token. `null` means the token is absent. Unset reads
+   * `design.figmaTokenEnv`, which defaults to FIGMA_ACCESS_TOKEN.
+   */
+  figmaToken?: string | null;
+  /** Override for tests. Default is global fetch. The token is not written into prompts. */
+  figmaFetch?: FetchLike;
+  /** Frame read for the ground prompt. Set for the current ticket only. */
+  figmaGroundBlock?: string;
+  /**
    * Runs a pack command with stdin. Default is a shell in the checkout.
    * Symbol and journey commands use this.
    */
@@ -156,6 +172,7 @@ export type TicketResult = {
     | "skipped-page"
     | "verdict"
     | "missing-connector"
+    | "missing-credential"
     | "invalid-packet"
     | "landed"
     | "quality-failed"
@@ -331,7 +348,23 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "blocked means that proof cannot be produced in this run. A missing line or blocked stays in intake and does not mark dev-done.",
     `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
     landRepoLine(deps.pack),
+    designPromptLines(ticket, deps),
   ].join("\n\n");
+}
+
+function designPromptLines(ticket: Ticket, deps: LoopDeps): string {
+  const frames = ticketFigmaUrls(ticket);
+  const repos = deps.pack.design?.repos ?? [];
+  const lines = [
+    "When a Figma frame is listed below, the work order includes **Design source:** naming that URL. The runner stops when the line is missing.",
+    "When no Figma frame is listed and a land repo is a UI repo, Validation includes that repo's UI check command. The runner reads the check on the pull request head and stops when it is missing or red.",
+  ];
+  if (repos.length > 0) {
+    lines.push(repos.map((repo) => `${repo.name}: \`${repo.check}\` (check \`${repo.checkName}\`)`).join("\n"));
+  }
+  if (deps.figmaGroundBlock) lines.push(deps.figmaGroundBlock);
+  else if (frames.length > 0) lines.push(frames.map((url) => `- ${url}`).join("\n"));
+  return lines.join("\n\n");
 }
 
 function buildPrompt(
@@ -642,6 +675,8 @@ async function runHeldTicket(
   ticket: Ticket,
   home: { url: string; trunk: string },
 ): Promise<TicketResult> {
+  const credential = await stopForMissingFigmaToken(deps, ticket);
+  if (credential) return credential;
   const resumed = await resumeMarkedLand(deps, ticket);
   if (resumed) return resumed;
   let ground;
@@ -789,6 +824,16 @@ async function runHeldTicket(
       outcome: "invalid-packet",
       detail: `repo ${unknownRepos.join(", ")} is not in the pack`,
     };
+  }
+  const designStop = designWorkOrderStop({
+    ticket,
+    orderText: ground.text,
+    repos: order.repos,
+    design: deps.pack.design,
+  });
+  if (!designStop.ok) {
+    await deps.tracker.comment(ticket.identifier, designStop.comment);
+    return { identifier: ticket.identifier, outcome: "invalid-packet", detail: designStop.detail };
   }
   if (order.connector && !deps.pack.connectors.includes(order.connector)) {
     const command = `npx @delivery-loop/cli connector add ${order.connector}`;
@@ -1680,6 +1725,73 @@ async function healNo(
   return null;
 }
 
+async function stopForMissingFigmaToken(deps: LoopDeps, ticket: Ticket): Promise<TicketResult | null> {
+  deps.figmaGroundBlock = undefined;
+  const frames = ticketFigmaUrls(ticket);
+  if (frames.length === 0) return null;
+  const token = figmaTokenValue({ figmaToken: deps.figmaToken, design: deps.pack.design });
+  if (!token) {
+    const envName = deps.pack.design?.figmaTokenEnv?.trim() || "FIGMA_ACCESS_TOKEN";
+    await deps.tracker.comment(
+      ticket.identifier,
+      `missing-credential: figma. Set ${envName}. The ticket stays in intake.`,
+    );
+    return { identifier: ticket.identifier, outcome: "missing-credential", detail: "figma" };
+  }
+  deps.figmaGroundBlock = await designRepairText({
+    ticket,
+    design: deps.pack.design,
+    repoName: "",
+    repoDir: deps.cwd ?? process.cwd(),
+    figmaToken: deps.figmaToken,
+    figmaFetch: deps.figmaFetch,
+  });
+  return null;
+}
+
+async function repairContext(deps: LoopDeps, ticket: Ticket, pr: OpenPull): Promise<string> {
+  const text = await designRepairText({
+    ticket,
+    design: deps.pack.design,
+    repoName: pr.repo.name,
+    repoDir: repoCheckoutDir(deps.cwd ?? process.cwd(), pr.repo, deps.pack),
+    figmaToken: deps.figmaToken,
+    figmaFetch: deps.figmaFetch,
+  });
+  return text ? `\n${text}` : "";
+}
+
+/** UI check on this head when the ticket has no Figma frame. Null means the check does not apply. */
+async function readDesignCheck(
+  deps: LoopDeps,
+  ticket: Ticket,
+  pr: OpenPull,
+): Promise<DesignCheckProbe | null> {
+  if (ticketFigmaUrls(ticket).length > 0) return null;
+  const spec = designRepo(deps.pack.design, pr.repo.name);
+  if (!spec) return null;
+  if (!deps.forge.designCheck) {
+    return {
+      state: "missing",
+      detail: `design check ${spec.checkName} missing on ${pr.headSha}`,
+      headSha: null,
+    };
+  }
+  const probe = await deps.forge.designCheck({
+    repoUrl: pr.repo.url,
+    headSha: pr.headSha,
+    name: spec.checkName,
+  });
+  if (probe.headSha !== pr.headSha) {
+    return {
+      state: "missing",
+      detail: probe.detail || `stale design check ${spec.checkName} ignored`,
+      headSha: null,
+    };
+  }
+  return probe;
+}
+
 async function landPull(
   deps: LoopDeps,
   ticket: Ticket,
@@ -1696,17 +1808,41 @@ async function landPull(
     const quality = await waitForQuality(deps, current);
     if (quality.state === "failure") {
       const signature = shipNoSignature(quality.detail) || "quality";
+      const repair = await repairContext(deps, ticket, current);
       const paused = await healNo(
         deps,
         ticket,
         current,
         `heal:quality:${current.repo.name}:${signature}`,
-        `Quality returned no on \`${current.repo.name}\` branch \`${current.branch}\`.\n${quality.detail}`,
+        `Quality returned no on \`${current.repo.name}\` branch \`${current.branch}\`.\n${quality.detail}${repair}`,
         sleep,
         tries,
       );
       if (paused) return paused;
       continue;
+    }
+    const design = await readDesignCheck(deps, ticket, current);
+    if (design && design.state !== "success") {
+      if (design.state === "pending") {
+        const earlyDesign = await explainQuality(deps, ticket, current, {
+          state: "pending",
+          detail: design.detail,
+        });
+        if (earlyDesign) return earlyDesign;
+      } else {
+        const repair = await repairContext(deps, ticket, current);
+        const paused = await healNo(
+          deps,
+          ticket,
+          current,
+          `heal:quality:${current.repo.name}:design-check`,
+          `Design check returned no on \`${current.repo.name}\` branch \`${current.branch}\`.\n${design.detail}${repair}`,
+          sleep,
+          tries,
+        );
+        if (paused) return paused;
+        continue;
+      }
     }
     const early = await explainQuality(deps, ticket, current, quality);
     if (early) return early;
