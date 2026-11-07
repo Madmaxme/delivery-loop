@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
 import { installConnector, update, writeProject } from "./main.ts";
@@ -28,9 +29,14 @@ describe("installer", () => {
     assert.match(readFileSync(join(dir, ".cursor/skills/methodology/SKILL.md"), "utf8"), /master copy/);
     assert.match(readFileSync(join(dir, ".cursor/rules/delivery-loop.mdc"), "utf8"), /engine is the only status writer/);
     const workflow = readFileSync(join(dir, ".github/workflows/delivery-loop.yml"), "utf8");
+    const version = (
+      JSON.parse(
+        readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../../package.json"), "utf8"),
+      ) as { version: string }
+    ).version;
     assert.match(workflow, /workflow_dispatch/);
     assert.doesNotMatch(workflow, /DELIVERY_LOOP_DEPLOY_KEY/);
-    assert.match(workflow, /--branch v1\.0\.0/);
+    assert.match(workflow, new RegExp(`--branch v${version.replaceAll(".", "\\.")}`));
     assert.match(workflow, /https:\/\/github.com\/Madmaxme\/delivery-loop.git/);
     assert.doesNotMatch(workflow, /__DELIVERY_LOOP_REF__/);
     assert.match(workflow, /npm install --omit=dev/);
