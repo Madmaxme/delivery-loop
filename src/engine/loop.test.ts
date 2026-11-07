@@ -1620,6 +1620,8 @@ describe("loop", () => {
     assert.equal(heals.length, 1);
     assert.match(heals[0], /engine-heal\/API-1/);
     assert.match(heals[0], /Do not merge it to main/);
+    assert.match(heals[0], /package\.json/);
+    assert.match(heals[0], /does not push a commit/);
     assert.deepEqual(env.labels, ["heal-exhausted", "ship-failed"]);
     assert.match(env.comments.join("\n"), /HEAL_EXHAUSTED heal-exhausted type=ship-failed/);
     env.deps.pageControl = { stop: false, healed: [] };

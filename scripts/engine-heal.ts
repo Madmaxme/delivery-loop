@@ -1,10 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 
 import {
   engineHealQualityState,
   engineHealReleaseNotes,
-  engineHealReleaseSubject,
   planEngineHealRelease,
   shouldMergeEngineHeal,
   type EngineHealPlan,
@@ -70,14 +68,6 @@ function fetchBranch(branch: string): void {
   run("git", ["fetch", "origin", `refs/heads/${branch}:refs/remotes/origin/${branch}`]);
 }
 
-function bumpCommit(branch: string, subject: string): string {
-  return run(
-    "git",
-    ["log", `refs/remotes/origin/${branch}`, "--fixed-strings", "--grep", subject, "-1", "--format=%H"],
-    true,
-  ).trim();
-}
-
 function tagExists(version: string): boolean {
   const tag = `v${version}`;
   const remote = run("git", ["ls-remote", "--tags", "origin", `refs/tags/${tag}`], true).trim();
@@ -105,6 +95,12 @@ function qualityRuns(repo: string, branch: string, sha: string): QualityRun[] {
   return runs.filter((item) => (item.headSha ?? "").toLowerCase() === sha.toLowerCase());
 }
 
+/** Branch protection reads the pull_request quality check. A dispatched run does not. */
+function pullRequestQuality(repo: string, branch: string, sha: string): ReturnType<typeof engineHealQualityState> {
+  const runs = qualityRuns(repo, branch, sha).filter((item) => (item.event ?? "") === "pull_request");
+  return engineHealQualityState(runs);
+}
+
 function pullState(state: string): "OPEN" | "MERGED" | "CLOSED" {
   if (state === "OPEN" || state === "MERGED") return state;
   return "CLOSED";
@@ -114,40 +110,20 @@ function sleep(seconds: number): void {
   spawnSync("sleep", [String(seconds)]);
 }
 
-function approveRun(repo: string, runId: number): void {
-  run("gh", ["api", "--method", "POST", `repos/${repo}/actions/runs/${runId}/approve`], true);
-}
-
 function inflight(run: QualityRun): boolean {
   const status = (run.status ?? "").toLowerCase();
   return status === "queued" || status === "in_progress" || status === "waiting" || status === "pending" || status === "requested";
 }
 
 /**
- * A push with the workflow token does not start on: push, and the pull_request
- * run it creates waits for a person to approve it. workflow_dispatch starts
- * quality on this tip without that approval. The check name is still quality.
+ * Watch a pull_request quality run that is already in progress.
+ * This job does not start a run and does not approve one. The opener's push does that.
  */
-function ensureQualityGreen(repo: string, branch: string, sha: string): void {
-  const listed = () => qualityRuns(repo, branch, sha);
-  if (engineHealQualityState(listed()) === "success") return;
-
-  const waitingApproval = listed().find((item) => (item.status ?? "").toLowerCase() === "action_required");
-  if (waitingApproval) approveRun(repo, waitingApproval.databaseId);
-
-  let current = listed();
-  if (engineHealQualityState(current) === "success") return;
-  let active = current.find(inflight);
-  if (!active) {
-    run("gh", ["workflow", "run", "quality.yml", "--repo", repo, "--ref", branch]);
-    for (let attempt = 0; attempt < 30 && !active; attempt += 1) {
-      sleep(2);
-      current = listed();
-      if (engineHealQualityState(current) === "success") return;
-      active = current.find(inflight);
-    }
-  }
-  if (!active) throw new Error(`quality did not start on ${sha}`);
+function watchPullRequestQuality(repo: string, branch: string, sha: string): boolean {
+  const active = qualityRuns(repo, branch, sha)
+    .filter((item) => (item.event ?? "") === "pull_request")
+    .find(inflight);
+  if (!active) return false;
   const watched = spawnSync("gh", ["run", "watch", String(active.databaseId), "--repo", repo, "--exit-status"], {
     encoding: "utf8",
     timeout: 20 * 60 * 1000,
@@ -156,26 +132,12 @@ function ensureQualityGreen(repo: string, branch: string, sha: string): void {
     const detail = `${watched.stderr ?? ""}${watched.stdout ?? ""}`.trim();
     throw new Error(`quality on ${sha} did not pass${detail ? `: ${detail}` : ""}`);
   }
+  return true;
 }
 
-function commitBump(branch: string, plan: Extract<EngineHealPlan, { action: "bump-branch" }>): void {
-  const remote = `refs/remotes/origin/${branch}`;
-  run("git", ["reset", "--hard", "HEAD"]);
-  run("git", ["checkout", "-B", branch, remote]);
-  run("git", ["reset", "--hard", remote]);
-  run("npm", ["version", plan.version, "--no-git-tag-version"]);
-  const changed = run("git", ["diff", "HEAD", "--name-only", "--", "package.json", "package-lock.json"]);
-  if (!changed.includes("package.json") || !changed.includes("package-lock.json")) {
-    throw new Error(`patch bump did not change package.json and package-lock.json:\n${changed.trim()}`);
-  }
-  const written = readVersionFile(readFileSync("package.json", "utf8"));
-  if (written !== plan.version) throw new Error(`package.json is ${written}, expected ${plan.version}`);
-  run("git", ["config", "user.name", "github-actions[bot]"]);
-  run("git", ["config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"]);
-  run("git", ["add", "package.json", "package-lock.json"]);
-  run("git", ["commit", "-m", plan.subject, "-m", plan.body]);
-  run("git", ["push", "origin", `HEAD:${plan.branchRef}`]);
-  process.stdout.write(`Pushed ${plan.version} to ${plan.branchRef}.\n`);
+function commentOnPull(repo: string, prNumber: number, body: string): void {
+  run("gh", ["pr", "comment", String(prNumber), "--repo", repo, "--body", body]);
+  process.stdout.write(`${body}\n`);
 }
 
 function publishTagAt(prNumber: number, version: string, sha: string): void {
@@ -223,12 +185,55 @@ function mergePull(repo: string, prNumber: number): string {
   return sha;
 }
 
+function releasePlan(input: {
+  state: "OPEN" | "MERGED" | "CLOSED";
+  repo: string;
+  branch: string;
+  tip: string;
+  mainVersion: string;
+  tipVersion: string;
+  prNumber: number;
+  triggeredSha: string;
+  event: string;
+  conclusion: string;
+}): EngineHealPlan {
+  const triggered =
+    input.triggeredSha.length > 0 &&
+    input.triggeredSha === input.tip &&
+    input.event === "pull_request" &&
+    input.conclusion === "success";
+  return planEngineHealRelease({
+    pullState: input.state,
+    qualityOnTip: input.state === "MERGED" || triggered ? "success" : pullRequestQuality(input.repo, input.branch, input.tip),
+    mainVersion: input.mainVersion,
+    tipVersion: input.tipVersion,
+    tagExists: tagExists(input.tipVersion),
+    branch: input.branch,
+    branchTip: input.tip,
+    prNumber: input.prNumber,
+  });
+}
+
+function finish(repo: string, prNumber: number, plan: EngineHealPlan): void {
+  if (plan.action === "comment") {
+    commentOnPull(repo, prNumber, plan.body);
+    return;
+  }
+  if (plan.action === "fail") throw new Error(plan.reason);
+  if (plan.action === "skip") {
+    process.stdout.write(`${plan.reason}.\n`);
+    return;
+  }
+  throw new Error(`unexpected engine-heal plan ${plan.action}`);
+}
+
 function main(): void {
   const event = process.env.HEAL_EVENT ?? "";
   const conclusion = process.env.HEAL_CONCLUSION ?? "";
   const branch = process.env.HEAL_BRANCH ?? "";
   const headRepo = process.env.HEAL_HEAD_REPO ?? "";
   const baseRepo = process.env.HEAL_BASE_REPO ?? "";
+  const triggeredSha = (process.env.HEAL_SHA ?? "").trim();
   if (!branch || !baseRepo) {
     process.stdout.write("No engine-heal pull request context.\n");
     return;
@@ -259,7 +264,6 @@ function main(): void {
     const version = readVersionAt(sha);
     const plan = planEngineHealRelease({
       pullState: "MERGED",
-      bumpOnBranch: true,
       qualityOnTip: "success",
       mainVersion: version,
       tipVersion: version,
@@ -278,48 +282,32 @@ function main(): void {
   }
 
   fetchBranch(branch);
-  const subject = engineHealReleaseSubject(pull.number);
-  const bumped = bumpCommit(branch, subject);
   const tip = run("git", ["rev-parse", `refs/remotes/origin/${branch}`]).trim();
   const mainVersion = readVersionAt("refs/remotes/origin/main");
   const tipVersion = readVersionAt(tip);
-  let plan = planEngineHealRelease({
-    pullState: "OPEN",
-    bumpOnBranch: bumped.length > 0,
-    qualityOnTip: engineHealQualityState(qualityRuns(baseRepo, branch, tip)),
+  let plan = releasePlan({
+    state,
+    repo: baseRepo,
+    branch,
+    tip,
     mainVersion,
     tipVersion,
-    tagExists: tagExists(tipVersion),
-    branch,
-    branchTip: tip,
     prNumber: pull.number,
+    triggeredSha,
+    event,
+    conclusion,
   });
 
-  if (plan.action === "bump-branch") {
-    commitBump(branch, plan);
-    fetchBranch(branch);
-    const nextTip = run("git", ["rev-parse", `refs/remotes/origin/${branch}`]).trim();
-    const nextVersion = readVersionAt(nextTip);
-    plan = planEngineHealRelease({
-      pullState: "OPEN",
-      bumpOnBranch: true,
-      qualityOnTip: "none",
-      mainVersion,
-      tipVersion: nextVersion,
-      tagExists: tagExists(nextVersion),
-      branch,
-      branchTip: nextTip,
-      prNumber: pull.number,
-    });
-  }
-
   if (plan.action === "wait-for-quality") {
-    ensureQualityGreen(baseRepo, plan.branch, plan.sha);
+    const watched = watchPullRequestQuality(baseRepo, plan.branch, plan.sha);
+    if (!watched) {
+      process.stdout.write(`Waiting for pull_request quality on ${plan.sha}.\n`);
+      return;
+    }
     const checked = run("git", ["rev-parse", `refs/remotes/origin/${branch}`]).trim();
     if (checked !== plan.sha) throw new Error(`branch tip moved from ${plan.sha} to ${checked}`);
     plan = planEngineHealRelease({
       pullState: "OPEN",
-      bumpOnBranch: true,
       qualityOnTip: "success",
       mainVersion,
       tipVersion: readVersionAt(checked),
@@ -330,19 +318,20 @@ function main(): void {
     });
   }
 
-  if (plan.action === "fail") throw new Error(plan.reason);
-  if (plan.action === "skip") {
-    process.stdout.write(`${plan.reason}.\n`);
+  if (plan.action === "tag-merged") {
+    publishTagAt(pull.number, plan.version, tip);
     return;
   }
-  if (plan.action !== "merge-and-tag") throw new Error(`unexpected engine-heal plan ${plan.action}`);
-
-  const mergeSha = mergePull(baseRepo, pull.number);
-  const mergedVersion = readVersionAt(mergeSha);
-  if (mergedVersion !== plan.version) {
-    throw new Error(`merge commit ${mergeSha} is ${mergedVersion}, expected ${plan.version}`);
+  if (plan.action === "merge-and-tag") {
+    const sha = mergePull(baseRepo, pull.number);
+    const mergedVersion = readVersionAt(sha);
+    if (mergedVersion !== plan.version) {
+      throw new Error(`merge commit ${sha} is ${mergedVersion}, expected ${plan.version}`);
+    }
+    publishTagAt(pull.number, mergedVersion, sha);
+    return;
   }
-  publishTagAt(pull.number, plan.version, mergeSha);
+  finish(baseRepo, pull.number, plan);
 }
 
 main();

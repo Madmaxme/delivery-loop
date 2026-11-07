@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import type { CompareStatus, ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { agentHome, holdStatus, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
+import { releaseVersionFromTag } from "./engine-heal.ts";
 import { isGithubActionsRunActive } from "./github-run-status.js";
 import {
   compileDeliveryProgramFromLinear,
@@ -1358,6 +1359,27 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
   return settleTrunk(deps, ticket, marker.hold, rows, "trunk green");
 }
 
+let releaseTagCache: string[] | undefined | null = null;
+
+/** Tags the opener can see with the checkout's existing remote. No new credential. */
+function releaseTagsForHeal(): string[] | undefined {
+  if (releaseTagCache !== null) return releaseTagCache;
+  const listed = spawnSync("git", ["ls-remote", "--tags", "--refs", "origin"], {
+    encoding: "utf8",
+    timeout: 8000,
+  });
+  if (listed.status !== 0 || !listed.stdout?.trim()) {
+    releaseTagCache = undefined;
+    return undefined;
+  }
+  const tags = listed.stdout
+    .split("\n")
+    .map((line) => line.trim().split(/\s+/).pop() ?? "")
+    .filter((ref) => releaseVersionFromTag(ref) !== null);
+  releaseTagCache = tags.length > 0 ? tags : undefined;
+  return releaseTagCache;
+}
+
 function healAlready(deps: LoopDeps, ticket: Ticket, key: string): boolean {
   void ticket;
   return deps.pageControl?.healed.includes(key) ?? false;
@@ -1385,6 +1407,7 @@ async function applyOwnerHeal(
     reason,
     tokenEnv: deps.pack.commitActorTokenEnv,
     issue: ticket.identifier,
+    releaseTags: releaseTagsForHeal(),
   });
   let text = "";
   if (deps.ownerHeal) {
