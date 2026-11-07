@@ -10,4 +10,4 @@ The body is a short explanation in plain sentences. Say what changed and why. A 
 
 ## Engine heals
 
-A heal of this package opens a pull request on `engine-heal/<ticket>` with the label `engine-heal`. It does not push a commit to `main`. When `quality` is green, the `engine-heal` workflow commits the next patch version onto that pull request, waits until `quality` is green on the new tip, squash-merges, and tags that merge commit. The first heal after `v1.0.0` is `v1.0.1`. That path has no review step. Clients install the tag.
+A heal of this package opens a pull request on `engine-heal/<ticket>` with the label `engine-heal`. It does not push a commit to `main`. When `quality` is green, the `engine-heal` workflow commits the next patch version onto that pull request, waits until `quality` is green on the new tip, squash-merges, and tags that merge commit. That release job starts only from a successful `quality` run whose event is `pull_request` and whose head is this repository. The first heal after `v1.0.0` is `v1.0.1`. That path has no review step. Clients install the tag.
