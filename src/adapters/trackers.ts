@@ -1,3 +1,4 @@
+import { figmaUrlsFromText } from "../engine/design-gate.ts";
 import type { IssueBlocker, LinearProgramSnapshot } from "../engine/linear-harness-policy.js";
 import type { FetchLike, Ticket, TrackerAdapter } from "./types.js";
 
@@ -16,6 +17,7 @@ type LinearIssue = {
     }[];
   };
   comments?: { nodes: { body: string; createdAt?: string }[] };
+  attachments?: { nodes: { url?: string | null; title?: string | null }[] };
 };
 
 export function linearTracker(opts: {
@@ -46,11 +48,26 @@ export function linearTracker(opts: {
   }
 
   function toTicket(issue: LinearIssue): Ticket {
+    const comments = [...(issue.comments?.nodes ?? [])]
+      .sort((a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? ""))
+      .map((c) => ({ body: c.body, createdAt: c.createdAt }));
+    const body = issue.description ?? "";
+    const urls = [
+      ...figmaUrlsFromText(body),
+      ...comments.flatMap((comment) => figmaUrlsFromText(comment.body)),
+      ...(issue.attachments?.nodes ?? []).flatMap((attachment) =>
+        attachment.url ? figmaUrlsFromText(attachment.url) : [],
+      ),
+    ];
+    const figmaUrls: string[] = [];
+    for (const url of urls) {
+      if (!figmaUrls.includes(url)) figmaUrls.push(url);
+    }
     return {
       id: issue.id,
       identifier: issue.identifier,
       title: issue.title,
-      body: issue.description ?? "",
+      body,
       stateName: issue.state?.name ?? "",
       labels: (issue.labels?.nodes ?? []).map((l) => l.name),
       projectName: issue.project?.name,
@@ -60,9 +77,8 @@ export function linearTracker(opts: {
           identifier: rel.issue!.identifier,
           stateName: rel.issue!.state?.name ?? "",
         })),
-      comments: [...(issue.comments?.nodes ?? [])]
-        .sort((a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? ""))
-        .map((c) => ({ body: c.body, createdAt: c.createdAt })),
+      comments,
+      figmaUrls,
     };
   }
 
@@ -72,6 +88,7 @@ export function linearTracker(opts: {
     project { name }
     labels { nodes { name } }
     comments { nodes { body createdAt } }
+    attachments { nodes { url title } }
     inverseRelations { nodes { type issue { identifier state { name } } } }
   `;
 
@@ -327,18 +344,25 @@ export function githubIssuesTracker(opts: {
     const blocked = [...(issue.body ?? "").matchAll(/blocked by ([A-Za-z0-9]+-\d+)/gi)].map(
       (m) => m[1],
     );
+    const commentRows = [...comments]
+      .sort((a, b) => Date.parse(a.created_at ?? "") - Date.parse(b.created_at ?? ""))
+      .map((c) => ({ body: c.body, createdAt: c.created_at }));
+    const body = issue.body ?? "";
+    const figmaUrls = [
+      ...figmaUrlsFromText(body),
+      ...commentRows.flatMap((comment) => figmaUrlsFromText(comment.body)),
+    ];
     return {
       id: String(issue.number),
       identifier: `${opts.repo.split("/")[1]}-${issue.number}`,
       title: issue.title,
-      body: issue.body ?? "",
+      body,
       stateName: issue.labels.map((l) => l.name).find((n) => n.startsWith("status:"))?.slice(7)
         ?? (issue.state === "open" ? opts.intakeLabel : "closed"),
       labels: issue.labels.map((l) => l.name),
       blockedBy: blocked.map((identifier) => ({ identifier, stateName: "unknown" })),
-      comments: [...comments]
-        .sort((a, b) => Date.parse(a.created_at ?? "") - Date.parse(b.created_at ?? ""))
-        .map((c) => ({ body: c.body, createdAt: c.created_at })),
+      comments: commentRows,
+      figmaUrls,
     };
   }
 

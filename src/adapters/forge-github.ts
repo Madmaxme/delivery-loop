@@ -30,6 +30,7 @@ async function readCommit(
     committedAt: json.commit?.committer?.date ?? "",
   };
 }
+import { interpretDesignChecks } from "../engine/design-gate.ts";
 import {
   interpretQualityActions,
   qualityRunUnscheduled,
@@ -147,6 +148,30 @@ export function githubForge(opts: {
         branch: json.head.ref,
         created: true,
       };
+    },
+    async designCheck(input) {
+      const { owner, repo } = githubRepoFromUrl(input.repoUrl);
+      const response = await api(
+        `/repos/${owner}/${repo}/commits/${input.headSha}/check-runs?per_page=100`,
+      );
+      const json = (await response.json()) as {
+        check_runs?: {
+          name?: string;
+          status?: string;
+          conclusion?: string | null;
+          head_sha?: string;
+        }[];
+      };
+      return interpretDesignChecks(
+        (json.check_runs ?? []).map((run) => ({
+          name: run.name ?? "",
+          status: run.status ?? "",
+          conclusion: run.conclusion ?? null,
+          headSha: run.head_sha ?? "",
+        })),
+        input.headSha,
+        input.name,
+      );
     },
     async quality(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);

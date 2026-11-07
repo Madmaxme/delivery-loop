@@ -87,6 +87,29 @@ heal:
     assert.equal(loadPack(write(base)).heal, undefined);
   });
 
+  it("keeps the design block and defaults the Figma token env name", () => {
+    const pack = loadPack(
+      write(`${base}
+design:
+  repos:
+    - name: admin-web
+      check: npm run check:ui-primitives
+      checkName: ui-primitives
+      tokenFile: src/tokens.scss
+`),
+    );
+    assert.equal(pack.design?.figmaTokenEnv, "FIGMA_ACCESS_TOKEN");
+    assert.equal(pack.design?.repos[0]?.checkName, "ui-primitives");
+    assert.equal(pack.design?.repos[0]?.tokenFile, "src/tokens.scss");
+  });
+
+  it("refuses a design repo that omits its check", () => {
+    assert.throws(
+      () => loadPack(write(`${base}\ndesign:\n  repos:\n    - name: admin-web\n`)),
+      /tokenFile/,
+    );
+  });
+
   it("refuses a tracker that is not a real queue", () => {
     assert.throws(() => loadPack(write(base.replace("tracker: linear", "tracker: files"))), /tracker/);
   });

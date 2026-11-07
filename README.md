@@ -52,6 +52,18 @@ The runner prepends `conduct/conduct/SKILL.md` to every ground and build prompt.
 
 A rule about how any ticket moves belongs in this repository. An install's product names, repos, and proof belong in that install. `status.hold` is the install's name for the status that does not clear blockers after owned code lands and the grant is still outside the repo. The default is `Hold`. `status.dev` and `status.prod` stay the done states.
 
+`design` names UI repos. When a ticket has a `figma.com` frame in the description, a comment, or a tracker attachment, the work order must include `**Design source:**` with that URL. The runner reads the frame from the Figma REST API. The token is the env var `design.figmaTokenEnv`, which defaults to `FIGMA_ACCESS_TOKEN`. The package does not ship a token and does not start when a frame is present and the variable is empty. The stop is `missing-credential: figma`. When the ticket has no frame and a land repo is listed under `design.repos`, Validation must include that repo's `check` command. After the pull request opens, the runner reads the check run named `checkName` on that pull request's head sha. A result recorded on a different sha is ignored. A missing or red check is a quality failure and uses the same heal cap. The repair prompt includes the frame URL and the REST read, or the repo's `tokenFile` path and contents when there is no frame.
+
+```yaml
+design:
+  figmaTokenEnv: FIGMA_ACCESS_TOKEN
+  repos:
+    - name: web
+      check: npm run check:ui-primitives
+      checkName: ui-primitives
+      tokenFile: src/tokens.css
+```
+
 `prompts.ground` and `prompts.build` are workspace-relative files the runner puts in the worker prompt after that law. `invariantHeadings` lists heading files that count as invariant ids beside `invariantsFile`. A heading titled `Commission resolution` in a file with `prefix: billing` is the id `billing/commission-resolution`.
 
 ```yaml

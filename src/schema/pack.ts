@@ -15,6 +15,26 @@ export type RepoSpec = {
   packages?: string[];
 };
 
+/** A UI repo whose check is required when a ticket has no Figma frame. */
+export type DesignRepo = {
+  name: string;
+  /** Exact command the work order Validation must include. */
+  check: string;
+  /** GitHub check-run name on the pull request head. */
+  checkName: string;
+  /** Token file read into a repair prompt when the ticket has no Figma frame. */
+  tokenFile: string;
+};
+
+/**
+ * UI repos and the Figma token env name.
+ * The token value is never stored here. `figmaTokenEnv` defaults to FIGMA_ACCESS_TOKEN.
+ */
+export type DesignSpec = {
+  figmaTokenEnv: string;
+  repos: DesignRepo[];
+};
+
 /** A heading file the install owns. `prefix/slug` matches a heading in `file`. */
 export type InvariantHeading = {
   prefix: string;
@@ -120,6 +140,11 @@ export type ProjectPack = {
   };
   connectors: string[];
   /**
+   * UI repos and the env var that holds a Figma REST token.
+   * Absent means this install has no UI check. A Figma URL still requires the token.
+   */
+  design?: DesignSpec;
+  /**
    * After trunk quality is green. `promote` runs `command` once per landed
    * repo that is also listed in `repos`, with `{repo}` replaced.
    * When `promote` is set, `steps` are not run.
@@ -214,7 +239,25 @@ export function loadPack(path: string): ProjectPack {
     build: raw.prompts?.build ?? [],
   };
   raw.invariantHeadings = raw.invariantHeadings ?? [];
+  raw.design = loadDesign(raw.design, path);
   return raw;
+}
+
+function loadDesign(design: DesignSpec | undefined, path: string): DesignSpec | undefined {
+  if (!design) return undefined;
+  const figmaTokenEnv = design.figmaTokenEnv?.trim() || "FIGMA_ACCESS_TOKEN";
+  if (!Array.isArray(design.repos)) throw new Error(`${path} design.repos must be a list`);
+  const repos = design.repos.map((repo) => {
+    const name = repo?.name?.trim();
+    const check = repo?.check?.trim();
+    const checkName = repo?.checkName?.trim();
+    const tokenFile = repo?.tokenFile?.trim();
+    if (!name || !check || !checkName || !tokenFile) {
+      throw new Error(`${path} design.repos entries need name, check, checkName, and tokenFile`);
+    }
+    return { name, check, checkName, tokenFile };
+  });
+  return { figmaTokenEnv, repos };
 }
 
 export function unblockingStates(pack: ProjectPack): string[] {
