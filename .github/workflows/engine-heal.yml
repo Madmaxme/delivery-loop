@@ -1,6 +1,8 @@
-# Merges an engine-heal pull request after quality is green, then tags the next patch.
-# No review and no manual approval. Branch protection on main must let this
-# workflow's token merge and push the tag. See METHODOLOGY.md.
+# Commits the next patch onto an engine-heal pull request, waits until quality
+# is green on that tip, squash-merges, and tags the merge commit.
+# It does not push a commit to main. A push from this token does not start
+# on: push workflows, so the job starts quality with workflow_dispatch and waits.
+# No review and no manual approval. See METHODOLOGY.md.
 
 name: engine-heal
 
@@ -12,6 +14,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 concurrency:
   group: engine-heal-release
@@ -30,7 +33,7 @@ jobs:
         with:
           node-version: 22
       - run: npm install
-      - name: Merge the green engine-heal pull request and tag the patch
+      - name: Bump the pull request, merge when quality is green, and tag the merge commit
         env:
           GH_TOKEN: ${{ github.token }}
           HEAL_EVENT: ${{ github.event.workflow_run.event }}

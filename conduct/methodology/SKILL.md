@@ -75,7 +75,7 @@ Promote runs only after the trunk check is green, and only for repos named in `d
 
 edit changes the owner of the step that returned no. That owner may be the ticket branch, the checkout, a repo the command ships, or this package. Production promote and store continue use that same heal. A note or a side watcher is not the fix.
 
-When the owner is this package, the edit opens a pull request. It does not merge to main. The branch is `engine-heal/<ticket>` and the label is `engine-heal`. The `quality` check gates it. The `engine-heal` workflow merges that pull request when the check is green, bumps the patch version, and pushes the tag and the GitHub release. No person approves that path. Clients install the tag. They do not install main.
+When the owner is this package, the edit opens a pull request. It does not push a commit to main. The branch is `engine-heal/<ticket>` and the label is `engine-heal`. The `quality` check gates it. The `engine-heal` workflow commits the next patch version onto that pull request, waits until `quality` is green on that tip, squash-merges, and tags the merge commit. It also publishes the GitHub release. No person approves that path. Clients install the tag. They do not install main. The first heal after `v1.0.0` is `v1.0.1`.
 
 Each failure type has a cap. The default is 3. `heal.maxAttempts` changes the default. `heal.caps.<type>` overrides one type. The count is the `OWNER_HEAL` comments of that type on the ticket, so it survives the next run. At the cap the engine writes the labels and the exhausted comment and stops. A failed write of the `OWNER_HEAL` comment fails the heal. The attempt is not counted, so the cap cannot be skipped by ignoring that error.
 

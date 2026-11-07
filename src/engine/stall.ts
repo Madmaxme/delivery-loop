@@ -170,7 +170,7 @@ export function ownerHealPrompt(input: {
     "That owner may be the ticket branch, this checkout, a repo the command ships, or the package that executes this loop.",
     "When the owner is the package that executes this loop, open a pull request. Do not merge it to main.",
     `Name the branch \`${branch}\` and label the pull request \`engine-heal\`.`,
-    "The quality check gates that pull request. A green check merges it and tags the next patch release. Clients install a tag. They do not install main.",
+    "The quality check gates that pull request. A green check commits the next patch onto that pull request, waits until quality is green on that tip, squash-merges, and tags the merge commit. It does not push a commit to main. Clients install a tag. They do not install main.",
     "When the owner is anything else, land that owner's trunk before you finish.",
     "This step runs again when you return.",
     "An open pull request is not landed.",
