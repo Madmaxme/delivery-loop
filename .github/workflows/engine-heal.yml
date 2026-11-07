@@ -1,0 +1,41 @@
+# Merges an engine-heal pull request after quality is green, then tags the next patch.
+# No review and no manual approval. Branch protection on main must let this
+# workflow's token merge and push the tag. See METHODOLOGY.md.
+
+name: engine-heal
+
+on:
+  workflow_run:
+    workflows: ["quality"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: engine-heal-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Merge the green engine-heal pull request and tag the patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAL_EVENT: ${{ github.event.workflow_run.event }}
+          HEAL_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAL_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAL_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAL_BASE_REPO: ${{ github.repository }}
+        run: npx tsx scripts/engine-heal.ts

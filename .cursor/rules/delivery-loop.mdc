@@ -1,0 +1,16 @@
+---
+description: Delivery-loop harness. The engine is the only status writer. Clients pin a tag.
+alwaysApply: true
+---
+
+# Delivery loop
+
+The master copy is `conduct/methodology/SKILL.md`, versioned by git tags. Clients pin a tag and add overlays. Code conduct is `conduct/conduct/SKILL.md`. Do not copy it.
+
+The engine is the only status writer. Workers do not call the tracker.
+
+Sweep reads `status.intake` (default Todo). One runner holds the ticket with a `DELIVERY_LEASE` comment. Ground, then build, then one pull request per land repo. Quality must be green. The merge is a squash. Trunk quality must be green before `dev.promote` and before the dev status. `dev.promote` runs only for repos listed in `dev.promote.repos`. Ship is a separate command unless `ship.afterDev` is set. A failed ship step leaves the dev status.
+
+A required step that returned no has one heal: edit, wait, or login. There is no list of failure phrases. edit changes the owner of the failure. When that owner is this package, open branch `engine-heal/<ticket>`, label it `engine-heal`, and do not merge to main. The `quality` check gates it. A green check merges it and tags the next patch. Clients install the tag.
+
+Heal caps live in `delivery-loop.yaml` under `heal.maxAttempts` and `heal.caps`. The default is 3 per failure type (`quality-red`, `merge-conflict`, `promote-failed`, `ship-failed`, `quality-pending`, `quality-unscheduled`, `runner-blocked`, `other`). The count is `OWNER_HEAL` comments on the ticket. At the cap the engine labels `heal-exhausted` and the failure type, writes `HEAL_EXHAUSTED`, and stops. A failed marker comment fails the heal.

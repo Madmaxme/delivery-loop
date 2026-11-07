@@ -71,6 +71,22 @@ ship:
     assert.deepEqual(pack.dev?.promote?.repos, ["customer-app"]);
   });
 
+  it("keeps heal caps and leaves an absent cap at the runner default", () => {
+    const pack = loadPack(
+      write(`${base}
+heal:
+  maxAttempts: 4
+  caps:
+    quality-red: 2
+    ship-failed: 1
+`),
+    );
+    assert.equal(pack.heal?.maxAttempts, 4);
+    assert.equal(pack.heal?.caps?.["quality-red"], 2);
+    assert.equal(pack.heal?.caps?.["ship-failed"], 1);
+    assert.equal(loadPack(write(base)).heal, undefined);
+  });
+
   it("refuses a tracker that is not a real queue", () => {
     assert.throws(() => loadPack(write(base.replace("tracker: linear", "tracker: files"))), /tracker/);
   });

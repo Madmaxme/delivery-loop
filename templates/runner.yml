@@ -49,7 +49,7 @@ jobs:
         run: |
           set -euo pipefail
           dir="$(mktemp -d)/delivery-loop"
-          git clone --depth 1 https://github.com/Madmaxme/delivery-loop.git "$dir"
+          git clone --depth 1 --branch __DELIVERY_LOOP_REF__ https://github.com/Madmaxme/delivery-loop.git "$dir"
           (cd "$dir" && npm install --omit=dev --ignore-scripts)
           npm install -g "$dir"
           if [ "${{ inputs.mode }}" = "sweep" ]; then

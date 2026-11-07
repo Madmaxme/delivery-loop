@@ -150,6 +150,17 @@ export type ProjectPack = {
    * A clean exit, including a store wait, is not a failure.
    */
   ship?: { steps: string[]; continue?: string[]; markStatus?: boolean; afterDev?: boolean };
+  /**
+   * Heal attempts per failure type, counted from OWNER_HEAL comments on the ticket.
+   * `maxAttempts` is the default. `caps` overrides one type.
+   * Types: quality-red, merge-conflict, promote-failed, ship-failed,
+   * quality-pending, quality-unscheduled, runner-blocked, other.
+   * Absent means 3.
+   */
+  heal?: {
+    maxAttempts?: number;
+    caps?: Record<string, number>;
+  };
 };
 
 export function defaultStatus(): ProjectPack["status"] {

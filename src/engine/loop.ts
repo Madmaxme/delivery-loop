@@ -46,7 +46,20 @@ import {
   type QualityCause,
   type QualitySample,
 } from "./quality-cause.js";
-import { healVerdict, ownerHealMarker, ownerHealPrompt, shipNoSignature, type HealVerdict } from "./stall.js";
+import {
+  countOwnerHeals,
+  exhaustedFailureType,
+  failureTypeForHealKey,
+  healCapFor,
+  healExhaustedMarker,
+  HealExhaustedError,
+  HEAL_EXHAUSTED_LABEL,
+  healVerdict,
+  ownerHealMarker,
+  ownerHealPrompt,
+  shipNoSignature,
+  type HealVerdict,
+} from "./stall.js";
 
 export type LoopDeps = {
   pack: ProjectPack;
@@ -150,7 +163,8 @@ export type TicketResult = {
     | "trunk-waiting"
     | "ship-blocked"
     | "journey-missing"
-    | "worker-failed";
+    | "worker-failed"
+    | "heal-exhausted";
   detail: string;
 };
 
@@ -504,12 +518,47 @@ async function finishWorker(worker: WorkerAdapter, runId: string) {
 }
 
 export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResult> {
-  const result = await executeTicket(deps, ticket);
-  noteDone(deps, result);
-  return result;
+  try {
+    const result = await executeTicket(deps, ticket);
+    noteDone(deps, result);
+    return result;
+  } catch (error) {
+    if (error instanceof HealExhaustedError) {
+      const result: TicketResult = {
+        identifier: ticket.identifier,
+        outcome: "heal-exhausted",
+        detail: error.failureType,
+      };
+      noteDone(deps, result);
+      return result;
+    }
+    throw error;
+  }
+}
+
+async function markHealExhausted(deps: LoopDeps, ticket: Ticket, type: string): Promise<void> {
+  if (!exhaustedFailureType(ticket)) {
+    const body = healExhaustedMarker(type);
+    await deps.tracker.comment(ticket.identifier, body);
+    ticket.comments = [...ticket.comments, { body }];
+  }
+  const labels = new Set(ticket.labels.map((label) => label.toLowerCase()));
+  if (!labels.has(HEAL_EXHAUSTED_LABEL)) {
+    await deps.tracker.addLabel(ticket.identifier, HEAL_EXHAUSTED_LABEL);
+    ticket.labels = [...ticket.labels, HEAL_EXHAUSTED_LABEL];
+  }
+  if (!labels.has(type.toLowerCase())) {
+    await deps.tracker.addLabel(ticket.identifier, type);
+    ticket.labels = [...ticket.labels, type];
+  }
 }
 
 async function executeTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResult> {
+  const exhausted = exhaustedFailureType(ticket);
+  if (exhausted) {
+    await markHealExhausted(deps, ticket, exhausted);
+    return { identifier: ticket.identifier, outcome: "heal-exhausted", detail: exhausted };
+  }
   const now = deps.nowMs ?? Date.now();
   const remaining = pageBudgetRemainingMs({
     nowMs: now,
@@ -833,6 +882,13 @@ async function runHeldTicket(
       if ("outcome" in landed) return landed;
       merged.push({ repo: pr.repo, sha: landed.mergedSha, url: pr.url });
     } catch (error) {
+      if (error instanceof HealExhaustedError) {
+        return {
+          identifier: ticket.identifier,
+          outcome: "heal-exhausted",
+          detail: error.failureType,
+        };
+      }
       const paused = pauseLand(
         ticket.identifier,
         pr.url,
@@ -1319,10 +1375,16 @@ async function applyOwnerHeal(
   reason: string,
 ): Promise<HealVerdict> {
   if (healAlready(deps, ticket, key)) return "wait";
+  const type = failureTypeForHealKey(key);
+  if (countOwnerHeals(ticket.comments, type) >= healCapFor(deps.pack.heal, type)) {
+    await markHealExhausted(deps, ticket, type);
+    throw new HealExhaustedError(type);
+  }
   const home = agentHome(deps.pack);
   const prompt = ownerHealPrompt({
     reason,
     tokenEnv: deps.pack.commitActorTokenEnv,
+    issue: ticket.identifier,
   });
   let text = "";
   if (deps.ownerHeal) {
@@ -1332,15 +1394,14 @@ async function applyOwnerHeal(
     text = (await finishWorker(deps.worker, started.runId)).text;
   }
   const verdict = healVerdict(text);
-  rememberVerdict(deps, key, verdict);
-  if (verdict !== "edit") return verdict;
-  const body = `${ownerHealMarker(key)}\n${reason}`;
-  ticket.comments = [...ticket.comments, { body }];
-  try {
-    await deps.tracker.comment(ticket.identifier, body);
-  } catch {
-    // The marker is already on this ticket object and on pageControl.
+  if (verdict !== "edit") {
+    rememberVerdict(deps, key, verdict);
+    return verdict;
   }
+  const body = `${ownerHealMarker(key)}\n${reason}`;
+  await deps.tracker.comment(ticket.identifier, body);
+  ticket.comments = [...ticket.comments, { body }];
+  rememberVerdict(deps, key, verdict);
   if (!deps.pageControl) deps.pageControl = { stop: false, healed: [] };
   deps.pageControl.healed.push(key);
   deps.pageControl.stop = true;
@@ -1842,6 +1903,8 @@ export async function ship(
     }
   }
   let current = await loadTicket();
+  const stopped = current ? exhaustedFailureType(current) : null;
+  if (stopped) throw new HealExhaustedError(stopped);
   const cwd = deps.cwd ?? process.cwd();
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
   for (const step of steps) {

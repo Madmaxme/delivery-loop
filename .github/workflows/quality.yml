@@ -1,11 +1,18 @@
+# Required status check for main and for engine-heal pull requests.
+# The check name is quality.
+
 name: quality
 
 on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  quality:
+    name: quality
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -9,28 +9,36 @@ Versioned autonomous delivery loop. Four things are required. The vendor behind 
 
 `check: workflow` polls the named quality workflow on GitHub. `check: command` runs `qualityCommand` in the checkout. A workflow check requires `forge: github`.
 
-Land merges one pull request at a time, in `repos` order from the install pack. A branch that is only behind an open pull request is updated, then quality runs again on the new head. A branch that is identical to trunk, or has no commits of its own, is not opened. The next sweep leaves that ticket alone while that commit is still the branch tip. A red quality check on the pull request starts the coding worker on that same branch, up to the fix budget, and the next page resumes land. A conflict or a refused merge starts that same worker on that same branch. After the squash, quality runs on the trunk tip that contains the merge. A later green commit on that trunk counts. A red or pending tip stays in intake. The runner does not start a coding worker from trunk. The next page reads that tip again, and a page that is still waiting starts the next page. When the install sets `dev.promote`, the runner executes that command for each landed repo named in `dev.promote.repos`, and only after the trunk check is green. The sweep continues with the next ticket. When a ticket lands or a verdict moves it, the sweep reads the queue again in that same page so a ticket that was waiting on it can run. The runner writes one line when a ticket enters ground, build, or land, and one line when that ticket finishes. The JSON list is still printed when the page returns.
+Land merges one pull request at a time, in `repos` order from the install pack. A branch that is only behind an open pull request is updated, then quality runs again on the new head. A branch that is identical to trunk, or has no commits of its own, is not opened. The next sweep leaves that ticket alone while that commit is still the branch tip. A red quality check, a conflict, or a refused merge uses one heal. The heal answers edit, wait, or login. edit changes the owner of the failure. When that owner is this package, the edit opens an `engine-heal/` pull request and does not merge to main. The `quality` check gates it. A green check merges it and tags the next patch. Clients install that tag. After the squash, quality runs on the trunk tip that contains the merge. A later green commit on that trunk counts. A red or pending tip stays in intake. The runner does not start a coding worker from trunk. The next page reads that tip again, and a page that is still waiting starts the next page. When the install sets `dev.promote`, the runner executes that command for each landed repo named in `dev.promote.repos`, and only after the trunk check is green. The sweep continues with the next ticket. When a ticket lands or a verdict moves it, the sweep reads the queue again in that same page so a ticket that was waiting on it can run. The runner writes one line when a ticket enters ground, build, or land, and one line when that ticket finishes. The JSON list is still printed when the page returns.
 
 An install keeps its own `delivery-loop.yaml` and invariants file. This repository does not name those projects.
 
 Licensed under Apache-2.0. See `LICENSE`. The repository is public.
 
 ```bash
-npm install -g github:Madmaxme/delivery-loop
+npm install -g github:Madmaxme/delivery-loop#v1.0.0
 delivery-loop init
 delivery-loop connector add sentry
 delivery-loop update
 ```
 
-`init` and `update` replace installed skills, the runner workflow, and adapters. They leave `delivery-loop.yaml` and the invariants file alone.
+`init` and `update` replace installed skills, the Cursor rule, and the runner workflow. They leave `delivery-loop.yaml` and the invariants file alone.
 
-The runner clones https://github.com/Madmaxme/delivery-loop over HTTPS. It installs dependencies in that checkout before the global install, because `npm install -g <dir>` only symlinks the directory.
+The runner clones the pinned tag of https://github.com/Madmaxme/delivery-loop over HTTPS. It installs dependencies in that checkout before the global install, because `npm install -g <dir>` only symlinks the directory.
 
 The product remote is https://github.com/Madmaxme/delivery-loop. `bash scripts/bootstrap-remote.sh` pushes `main` there only when `GET /user` on the token is that remote's owner. An install names the same rule with `commitActors`: a write to one of those repos is refused unless the token's login is the actor. Other repos keep whatever account the token already is.
 
+## Methodology
+
+[METHODOLOGY.md](METHODOLOGY.md) is the index. [conduct/methodology/SKILL.md](conduct/methodology/SKILL.md) is the master copy, versioned by git tags. [conduct/conduct/SKILL.md](conduct/conduct/SKILL.md) is the code conduct that copy references. A client pins a tag and adds overlays. It does not install `main`.
+
+```bash
+npm install -g github:Madmaxme/delivery-loop#v1.0.0
+```
+
 ## Contribute
 
-Clone this repo, branch from `main`, and open a pull request. The `quality` workflow runs the tests.
+Clone this repo, branch from `main`, and open a pull request. The `quality` workflow runs the tests. Titles and bodies are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 A new tracker, forge, or worker is a file in `src/adapters` plus a test. Trackers implement `listIntake`, `get`, `comment`, and `setState`. Workers implement `start` and `join`. Forges implement `openPullRequest`, `quality`, `mergeability`, `compare`, `updateBranch`, and `squashMerge`. `squashMerge` returns the merge commit.
 
