@@ -1776,7 +1776,8 @@ async function readDesignCheck(
       headSha: null,
     };
   }
-  const proofPaths = proofPathsFromTrustedRef(deps.cwd ?? process.cwd(), deps.pack, pr.repo.name) ?? [];
+  const proofPaths =
+    (await proofPathsFromTrustedRef(deps.forge, pr.repo.url, pr.repo.trunk, pr.headSha, pr.repo.name)) ?? [];
   const probe = await deps.forge.designCheck({
     repoUrl: pr.repo.url,
     headSha: pr.headSha,

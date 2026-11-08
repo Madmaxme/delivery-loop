@@ -5,6 +5,12 @@ import {
   type CommitActor,
 } from "./github-actor.js";
 import type { CompareStatus, FetchLike, ForgeAdapter, PullMerge, PullRequest } from "./types.js";
+
+/** Reads a file through the forge. The local checkout is not a source. */
+export type ForgeTreeReader = {
+  pullBaseSha(input: { repoUrl: string; base: string; head: string }): Promise<string | null>;
+  readTextFile(input: { repoUrl: string; path: string; ref: string }): Promise<string | null>;
+};
 import { githubRepoFromUrl } from "./types.js";
 import {
   interpretDesignChecks,
@@ -63,6 +69,29 @@ async function compareForDesign(
   const changedPaths = json.files.map((file) => file.filename ?? "").filter((name) => name.length > 0);
   if (changedPaths.length !== json.files.length) return { complete: false, changedPaths: null, baseSha };
   return { complete: true, changedPaths, baseSha };
+}
+
+/** File text at `ref`. Null when the response is not a single base64 file. */
+async function contentText(
+  fetchImpl: FetchLike,
+  headers: Record<string, string>,
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string,
+): Promise<string | null> {
+  if (!ref.trim() || path.split("/").some((part) => part === "" || part === "." || part === "..")) return null;
+  const encoded = path.split("/").map((part) => encodeURIComponent(part)).join("/");
+  const response = await fetchImpl(
+    `https://api.github.com/repos/${owner}/${repo}/contents/${encoded}?ref=${encodeURIComponent(ref)}`,
+    { headers },
+  );
+  if (!response.ok) return null;
+  const json = (await response.json()) as { type?: string; encoding?: string; content?: string };
+  if (json.type !== "file" || json.encoding !== "base64" || typeof json.content !== "string" || !json.content.trim()) {
+    return null;
+  }
+  return Buffer.from(json.content.replace(/\s/g, ""), "base64").toString("utf8");
 }
 
 /** File blob sha. Null when the path is absent. Undefined when the response is unusable. */
@@ -145,7 +174,7 @@ export function githubForge(opts: {
   repo?: string;
   /** Writes to a listed repo require `GET /user` to be that login. */
   commitActors?: CommitActor[];
-}): ForgeAdapter {
+}): ForgeAdapter & ForgeTreeReader {
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
     Authorization: `Bearer ${opts.token}`,
@@ -374,6 +403,18 @@ export function githubForge(opts: {
           head?: { sha?: string | null };
         },
       );
+    },
+    async pullBaseSha(input) {
+      const { owner, repo } = githubRepoFromUrl(input.repoUrl);
+      const compared = await compareForDesign(fetchImpl, headers, owner, repo, input.base, input.head);
+      const sha = compared.baseSha?.trim().toLowerCase() ?? "";
+      return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+    },
+    async readTextFile(input) {
+      const ref = input.ref.trim();
+      if (!/^[0-9a-f]{40}$/i.test(ref)) return null;
+      const { owner, repo } = githubRepoFromUrl(input.repoUrl);
+      return contentText(fetchImpl, headers, owner, repo, input.path, ref);
     },
     async compare(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);

@@ -586,17 +586,22 @@ describe("independent design check", () => {
     env.deps.figmaFetch = async () => Response.json({ name: "Home" });
     env.deps.lookupHead = () => null;
     let merged = false;
-    env.deps.cwd = packCheckout("admin-web", ["src"]);
+    env.deps.cwd = checkoutWithOrigin(["docs"]);
     env.deps.pack = {
       ...pack,
       design: {
         ...pack.design!,
-        repos: [{ ...pack.design!.repos[0]!, proofPaths: ["."] }],
+        repos: [{ ...pack.design!.repos[0]!, proofPaths: ["vendor"] }],
       },
     };
     env.deps.forge = githubForge({
       token: "t",
-      fetch: designFetch({ headBlob: BLOB, baseBlob: BLOB, appId: GITHUB_ACTIONS_APP_ID }, () => {
+      fetch: designFetch({
+        headBlob: BLOB,
+        baseBlob: BLOB,
+        appId: GITHUB_ACTIONS_APP_ID,
+        packText: packYaml("admin-web", ["src"]),
+      }, () => {
         merged = true;
       }),
     });
@@ -605,23 +610,28 @@ describe("independent design check", () => {
     assert.equal(result.outcome, "landed");
   });
 
-  it("reads proof paths from the trunk pack, not the working tree", async () => {
+  it("reads proof paths from the pull request base when origin points at a different repo", async () => {
     const env = harness(order(`**Design source:** \`${FRAME}\``));
     env.deps.figmaToken = "fixture-token";
     env.deps.figmaFetch = async () => Response.json({ name: "Home" });
     env.deps.lookupHead = () => null;
-    env.deps.cwd = packCheckout("admin-web", ["src/kept"]);
+    env.deps.cwd = checkoutWithOrigin(["."]);
     env.deps.pack = {
       ...pack,
       design: {
         ...pack.design!,
-        repos: [{ ...pack.design!.repos[0]!, proofPaths: ["src"] }],
+        repos: [{ ...pack.design!.repos[0]!, proofPaths: ["."] }],
       },
     };
     let merged = false;
     env.deps.forge = githubForge({
       token: "t",
-      fetch: designFetch({ headBlob: BLOB, baseBlob: BLOB, appId: GITHUB_ACTIONS_APP_ID }, () => {
+      fetch: designFetch({
+        headBlob: BLOB,
+        baseBlob: BLOB,
+        appId: GITHUB_ACTIONS_APP_ID,
+        packText: packYaml("admin-web", ["src/kept"]),
+      }, () => {
         merged = true;
       }),
     });
@@ -632,30 +642,43 @@ describe("independent design check", () => {
   });
 });
 
-function packCheckout(repoName: string, proofPaths: string[]): string {
-  const cwd = mkdtempSync(join(tmpdir(), "proof-paths-"));
+function packYaml(repoName: string, proofPaths: string[]): string {
   const lines = ["design:", "  repos:", `    - name: ${repoName}`, "      proofPaths:", ...proofPaths.map((path) => `        - ${path}`)];
-  writeFileSync(join(cwd, "delivery-loop.yaml"), `${lines.join("\n")}\n`);
-  const git = (...args: string[]) => {
-    const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  return `${lines.join("\n")}\n`;
+}
+
+/** Checkout whose origin is another repo. That repo and the working tree both list `originPaths`. */
+function checkoutWithOrigin(originPaths: string[]): string {
+  const cwd = mkdtempSync(join(tmpdir(), "proof-paths-"));
+  const other = mkdtempSync(join(tmpdir(), "proof-origin-"));
+  writeFileSync(join(other, "delivery-loop.yaml"), packYaml("admin-web", originPaths));
+  const git = (dir: string, args: string[]) => {
+    const result = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
   };
-  git("init", "-b", "main");
-  git("config", "user.email", "dev@example.com");
-  git("config", "user.name", "Dev");
-  git("add", "delivery-loop.yaml");
-  git("commit", "-m", "pack");
-  const bare = join(cwd, "remote.git");
+  git(other, ["init", "-b", "main"]);
+  git(other, ["config", "user.email", "dev@example.com"]);
+  git(other, ["config", "user.name", "Dev"]);
+  git(other, ["add", "delivery-loop.yaml"]);
+  git(other, ["commit", "-m", "other pack"]);
+  const bare = join(cwd, "other.git");
   const initBare = spawnSync("git", ["init", "--bare", "-b", "main", bare], { encoding: "utf8" });
   assert.equal(initBare.status, 0, initBare.stderr);
-  git("remote", "add", "origin", bare);
-  git("push", "origin", "HEAD:refs/heads/main");
-  writeFileSync(join(cwd, "delivery-loop.yaml"), "design:\n  repos:\n    - name: admin-web\n      proofPaths:\n        - .\n");
+  git(other, ["remote", "add", "origin", bare]);
+  git(other, ["push", "origin", "HEAD:refs/heads/main"]);
+  git(cwd, ["init", "-b", "main"]);
+  git(cwd, ["config", "user.email", "dev@example.com"]);
+  git(cwd, ["config", "user.name", "Dev"]);
+  writeFileSync(join(cwd, "delivery-loop.yaml"), packYaml("admin-web", originPaths));
+  git(cwd, ["add", "delivery-loop.yaml"]);
+  git(cwd, ["commit", "-m", "workspace pack"]);
+  git(cwd, ["remote", "add", "origin", bare]);
+  writeFileSync(join(cwd, "delivery-loop.yaml"), packYaml("admin-web", ["."]));
   return cwd;
 }
 
 function designFetch(
-  input: { headBlob: string; baseBlob: string | null; appId: number | null },
+  input: { headBlob: string; baseBlob: string | null; appId: number | null; packText?: string },
   onMerge: () => void,
 ): (url: string | URL, init?: RequestInit) => Promise<Response> {
   return async (url, init) => {
@@ -676,7 +699,16 @@ function designFetch(
       });
     }
     if (href.includes("/contents/")) {
-      const ref = new URL(href).searchParams.get("ref");
+      const url = new URL(href);
+      const ref = url.searchParams.get("ref");
+      if (url.pathname.endsWith("/delivery-loop.yaml")) {
+        if (ref !== "e".repeat(40) || !input.packText) return new Response("missing", { status: 404 });
+        return Response.json({
+          type: "file",
+          encoding: "base64",
+          content: Buffer.from(input.packText).toString("base64"),
+        });
+      }
       const sha = ref === HEAD ? input.headBlob : ref === "development" ? input.baseBlob : null;
       if (!sha) return new Response("missing", { status: 404 });
       return Response.json({ type: "file", sha });

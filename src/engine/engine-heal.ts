@@ -331,10 +331,26 @@ function stripLockVersion(value: Record<string, unknown>): Record<string, unknow
   return copy;
 }
 
-function packageLockNeedsReview(baseText: string | null, headText: string | null): boolean {
+function headPackageVersion(text: string | null): string | null {
+  const parsed = parsedObject(text);
+  if (!parsed || typeof parsed.version !== "string" || !parsed.version.trim()) return null;
+  return parsed.version;
+}
+
+function packageLockNeedsReview(
+  baseText: string | null,
+  headText: string | null,
+  packageVersion: string | null,
+): boolean {
   const base = parsedObject(baseText);
   const head = parsedObject(headText);
-  if (!base || !head) return true;
+  if (!base || !head || !packageVersion) return true;
+  if (head.version !== packageVersion) return true;
+  const packages = head.packages;
+  if (!packages || typeof packages !== "object" || Array.isArray(packages)) return true;
+  const root = (packages as Record<string, unknown>)[""];
+  if (!root || typeof root !== "object" || Array.isArray(root)) return true;
+  if ((root as Record<string, unknown>).version !== packageVersion) return true;
   return JSON.stringify(sortKeys(stripLockVersion(base))) !== JSON.stringify(sortKeys(stripLockVersion(head)));
 }
 
@@ -360,20 +376,22 @@ export function engineHealAutoMergePath(path: string): boolean {
  * Only the allowlist may auto-merge. A version-only package.json and package-lock.json change is on that list.
  * Anything else, including .npmrc, tsconfig, and test or tool config, needs a normal review.
  */
-export function engineHealFileNeedsReview(file: EngineHealFile): boolean {
+export function engineHealFileNeedsReview(file: EngineHealFile, packageVersion: string | null = null): boolean {
   if (file.symlinkOrTypeChange) return true;
   const path = normalizeRepoPath(file.path);
   if (!path || !engineHealAutoMergePath(path)) return true;
   if (path === "package.json") return packageManifestNeedsReview(file.baseText, file.headText);
-  if (path === "package-lock.json") return packageLockNeedsReview(file.baseText, file.headText);
+  if (path === "package-lock.json") return packageLockNeedsReview(file.baseText, file.headText, packageVersion);
   return false;
 }
 
 /** Null when the file list is unknown. */
 export function engineHealFilesNeedReview(files: readonly EngineHealFile[] | null): boolean | null {
   if (files === null) return null;
+  const manifest = files.find((file) => normalizeRepoPath(file.path) === "package.json" && !file.symlinkOrTypeChange);
+  const packageVersion = manifest ? headPackageVersion(manifest.headText) : null;
   for (const file of files) {
-    if (engineHealFileNeedsReview(file)) return true;
+    if (engineHealFileNeedsReview(file, packageVersion)) return true;
   }
   return false;
 }
@@ -521,6 +539,16 @@ export function gitChangedFiles(cwd: string, baseRev: string, headRev: string): 
     const baseText = gitText(cwd, ["show", `${baseRev}:${item.path}`]);
     const headText = gitText(cwd, ["show", `${headRev}:${item.path}`]);
     files.push({ path: item.path, baseText, headText, symlinkOrTypeChange: false });
+  }
+  const hasLock = files.some((file) => file.path === "package-lock.json" && !file.symlinkOrTypeChange);
+  const hasManifest = files.some((file) => file.path === "package.json");
+  if (hasLock && !hasManifest) {
+    files.push({
+      path: "package.json",
+      baseText: gitText(cwd, ["show", `${baseRev}:package.json`]),
+      headText: gitText(cwd, ["show", `${headRev}:package.json`]),
+      symlinkOrTypeChange: false,
+    });
   }
   return files;
 }

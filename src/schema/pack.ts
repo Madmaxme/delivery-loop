@@ -1,7 +1,8 @@
-import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { parse } from "yaml";
+
+import type { ForgeTreeReader } from "../adapters/forge-github.ts";
 
 import { loadBotBundle, resolveBotRoot } from "../bots/load.ts";
 import type { BotBundle } from "../bots/types.ts";
@@ -328,26 +329,14 @@ function loadDesign(design: DesignSpec | undefined, path: string): DesignSpec | 
 }
 
 /**
- * `proofPaths` from the fetched trunk pack. The working tree and the pull request checkout are not read.
- * Null when that file cannot be read. An empty list is a real answer.
+ * `proofPaths` from pack text the forge returned. Null when the text is not a usable pack.
+ * An empty list is a real answer.
  */
-export function proofPathsFromTrustedRef(cwd: string, pack: ProjectPack, repoName: string): string[] | null {
-  const trunk = pack.agent?.trunk?.trim() || "main";
-  if (!/^[A-Za-z0-9._/-]+$/.test(trunk) || trunk.includes("..")) return null;
-  const fetched = spawnSync(
-    "git",
-    ["fetch", "origin", `refs/heads/${trunk}:refs/remotes/origin/${trunk}`],
-    { cwd, encoding: "utf8" },
-  );
-  if (fetched.status !== 0) return null;
-  const shown = spawnSync("git", ["show", `refs/remotes/origin/${trunk}:delivery-loop.yaml`], {
-    cwd,
-    encoding: "utf8",
-  });
-  if (shown.status !== 0 || !shown.stdout?.trim()) return null;
+export function proofPathsFromPackText(text: string, repoName: string): string[] | null {
+  if (!text.trim()) return null;
   let parsed: { design?: { repos?: { name?: string; proofPaths?: unknown }[] } };
   try {
-    parsed = parse(shown.stdout) as { design?: { repos?: { name?: string; proofPaths?: unknown }[] } };
+    parsed = parse(text) as { design?: { repos?: { name?: string; proofPaths?: unknown }[] } };
   } catch {
     return null;
   }
@@ -357,6 +346,27 @@ export function proofPathsFromTrustedRef(cwd: string, pack: ProjectPack, repoNam
   if (!match || match.proofPaths == null) return [];
   if (!Array.isArray(match.proofPaths) || match.proofPaths.some((item) => typeof item !== "string")) return null;
   return match.proofPaths.map((item) => item.trim()).filter(Boolean);
+}
+
+/**
+ * `proofPaths` from `delivery-loop.yaml` at the pull request base, read through the forge.
+ * The workspace checkout, its `origin`, and the working tree are not read.
+ * Null when the forge cannot show that file. An empty list is a real answer.
+ */
+export async function proofPathsFromTrustedRef(
+  forge: Partial<ForgeTreeReader>,
+  repoUrl: string,
+  baseRef: string,
+  headSha: string,
+  repoName: string,
+): Promise<string[] | null> {
+  if (!forge.pullBaseSha || !forge.readTextFile) return null;
+  if (!repoUrl.trim() || !baseRef.trim() || !/^[0-9a-f]{40}$/i.test(headSha)) return null;
+  const baseSha = (await forge.pullBaseSha({ repoUrl, base: baseRef, head: headSha }))?.trim().toLowerCase() ?? "";
+  if (!/^[0-9a-f]{40}$/.test(baseSha)) return null;
+  const text = await forge.readTextFile({ repoUrl, path: "delivery-loop.yaml", ref: baseSha });
+  if (text == null) return null;
+  return proofPathsFromPackText(text, repoName);
 }
 
 export function unblockingStates(pack: ProjectPack): string[] {

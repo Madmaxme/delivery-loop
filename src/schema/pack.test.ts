@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
-import { loadPack } from "./pack.ts";
+import { loadPack, proofPathsFromTrustedRef } from "./pack.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -203,5 +204,57 @@ design:
 
   it("refuses bots without a path", () => {
     assert.throws(() => loadPack(write(`${base}\nbots: {}\n`)), /bots.path/);
+  });
+
+  it("reads proof paths from the forge at the pull request base when origin is another repo", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pack-origin-"));
+    const other = mkdtempSync(join(tmpdir(), "pack-other-"));
+    const wide = "design:\n  repos:\n    - name: admin-web\n      proofPaths:\n        - .\n";
+    writeFileSync(join(other, "delivery-loop.yaml"), wide);
+    const git = (dir: string, args: string[]) => {
+      const result = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+    };
+    git(other, ["init", "-b", "main"]);
+    git(other, ["config", "user.email", "dev@example.com"]);
+    git(other, ["config", "user.name", "Dev"]);
+    git(other, ["add", "delivery-loop.yaml"]);
+    git(other, ["commit", "-m", "wide"]);
+    const bare = join(cwd, "other.git");
+    assert.equal(spawnSync("git", ["init", "--bare", "-b", "main", bare], { encoding: "utf8" }).status, 0);
+    git(other, ["remote", "add", "origin", bare]);
+    git(other, ["push", "origin", "HEAD:refs/heads/main"]);
+    git(cwd, ["init", "-b", "main"]);
+    git(cwd, ["remote", "add", "origin", bare]);
+    writeFileSync(join(cwd, "delivery-loop.yaml"), wide);
+    const baseSha = "b".repeat(40);
+    const headSha = "a".repeat(40);
+    let sawRef = "";
+    const forge = {
+      async pullBaseSha() {
+        return baseSha;
+      },
+      async readTextFile(input: { repoUrl: string; path: string; ref: string }) {
+        sawRef = input.ref;
+        assert.equal(input.repoUrl, "https://github.com/acme/admin-web");
+        assert.equal(input.path, "delivery-loop.yaml");
+        return "design:\n  repos:\n    - name: admin-web\n      proofPaths:\n        - src/kept\n";
+      },
+    };
+    const previous = process.cwd();
+    process.chdir(cwd);
+    try {
+      const paths = await proofPathsFromTrustedRef(
+        forge,
+        "https://github.com/acme/admin-web",
+        "development",
+        headSha,
+        "admin-web",
+      );
+      assert.deepEqual(paths, ["src/kept"]);
+      assert.equal(sawRef, baseSha);
+    } finally {
+      process.chdir(previous);
+    }
   });
 });

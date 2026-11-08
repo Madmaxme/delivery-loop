@@ -403,38 +403,67 @@ describe("engine heal release", () => {
       version: "1.0.1",
       packages: { "": { version: "1.0.1", dependencies: { tsx: "^4.0.0" } } },
     };
+    const lockManifest: EngineHealFile = {
+      path: "package.json",
+      baseText: JSON.stringify({ name: "loop", version: "1.0.0" }),
+      headText: JSON.stringify({ name: "loop", version: "1.0.1" }),
+    };
     assert.equal(
-      engineHealFileNeedsReview({
-        path: "package-lock.json",
-        baseText: JSON.stringify(lock),
-        headText: JSON.stringify(lockBump),
-      }),
+      engineHealFilesNeedReview([
+        lockManifest,
+        { path: "package-lock.json", baseText: JSON.stringify(lock), headText: JSON.stringify(lockBump) },
+      ]),
       false,
+    );
+    const lockAhead = {
+      ...lockBump,
+      version: "1.0.2",
+      packages: { "": { version: "1.0.2", dependencies: { tsx: "^4.0.0" } } },
+    };
+    assert.equal(
+      engineHealFilesNeedReview([
+        lockManifest,
+        { path: "package-lock.json", baseText: JSON.stringify(lock), headText: JSON.stringify(lockAhead) },
+      ]),
+      true,
+    );
+    const rootBehind = {
+      ...lockBump,
+      packages: { "": { version: "1.0.0", dependencies: { tsx: "^4.0.0" } } },
+    };
+    assert.equal(
+      engineHealFilesNeedReview([
+        lockManifest,
+        { path: "package-lock.json", baseText: JSON.stringify(lock), headText: JSON.stringify(rootBehind) },
+      ]),
+      true,
     );
     const lockDep = {
       ...lockBump,
       packages: { "": { version: "1.0.1", dependencies: { tsx: "^9.0.0" } } },
     };
     assert.equal(
-      engineHealFileNeedsReview({
-        path: "package-lock.json",
-        baseText: JSON.stringify(lock),
-        headText: JSON.stringify(lockDep),
-      }),
+      engineHealFilesNeedReview([
+        lockManifest,
+        { path: "package-lock.json", baseText: JSON.stringify(lock), headText: JSON.stringify(lockDep) },
+      ]),
       true,
     );
     assert.equal(
-      engineHealFileNeedsReview({
-        path: "package-lock.json",
-        baseText: JSON.stringify({
-          version: "1.0.0",
-          packages: { "": { version: "1.0.0" }, "node_modules/tsx": { version: "4.0.0" } },
-        }),
-        headText: JSON.stringify({
-          version: "1.0.1",
-          packages: { "": { version: "1.0.1" }, "node_modules/tsx": { version: "9.0.0" } },
-        }),
-      }),
+      engineHealFilesNeedReview([
+        lockManifest,
+        {
+          path: "package-lock.json",
+          baseText: JSON.stringify({
+            version: "1.0.0",
+            packages: { "": { version: "1.0.0" }, "node_modules/tsx": { version: "4.0.0" } },
+          }),
+          headText: JSON.stringify({
+            version: "1.0.1",
+            packages: { "": { version: "1.0.1" }, "node_modules/tsx": { version: "9.0.0" } },
+          }),
+        },
+      ]),
       true,
     );
     assert.equal(engineHealFileNeedsReview({ path: ".github/workflows/quality.yml", baseText: null, headText: null }), true);
