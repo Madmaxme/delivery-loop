@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
@@ -127,25 +127,45 @@ design:
     assert.equal(pack.qualityCommand, "npm test");
   });
 
-  it("validates a relative bots directory and keeps only the path", () => {
+  it("validates a bots directory inside the client directory and keeps only the path", () => {
     const dir = mkdtempSync(join(tmpdir(), "pack-"));
-    const rel = relative(dir, join(root, "bots/templates"));
-    writeFileSync(join(dir, "delivery-loop.yaml"), `${base}\nbots:\n  path: ${rel}\n`);
+    cpSync(join(root, "bots/templates"), join(dir, "bots"), { recursive: true });
+    writeFileSync(join(dir, "delivery-loop.yaml"), `${base}\nbots:\n  path: bots\n`);
     const pack = loadPack(join(dir, "delivery-loop.yaml"));
-    assert.deepEqual(pack.bots, { path: rel });
+    assert.deepEqual(pack.bots, { path: "bots" });
     assert.equal(pack.qualityCommand, "npm test");
     assert.equal("definitions" in (pack.bots as object), false);
   });
 
-  it("follows a bots directory symlink and still confines reads to that directory", () => {
+  it("accepts a directory whose name starts with two dots", () => {
     const dir = mkdtempSync(join(tmpdir(), "pack-"));
-    symlinkSync(join(root, "bots/templates"), join(dir, "linked"));
-    writeFileSync(join(dir, "delivery-loop.yaml"), `${base}\nbots:\n  path: linked\n`);
-    assert.deepEqual(loadPack(join(dir, "delivery-loop.yaml")).bots, { path: "linked" });
+    cpSync(join(root, "bots/templates"), join(dir, "..foo"), { recursive: true });
+    writeFileSync(join(dir, "delivery-loop.yaml"), `${base}\nbots:\n  path: ..foo\n`);
+    assert.deepEqual(loadPack(join(dir, "delivery-loop.yaml")).bots, { path: "..foo" });
   });
 
-  it("refuses an absolute bots path", () => {
-    assert.throws(() => loadPack(write(`${base}\nbots:\n  path: /tmp/bots\n`)), /relative/);
+  it("refuses a bots path that leaves the client directory", () => {
+    const parent = mkdtempSync(join(tmpdir(), "pack-"));
+    const client = join(parent, "client");
+    mkdirSync(client);
+    cpSync(join(root, "bots/templates"), join(parent, "outside"), { recursive: true });
+    writeFileSync(join(client, "delivery-loop.yaml"), `${base}\nbots:\n  path: ../outside\n`);
+    assert.throws(() => loadPack(join(client, "delivery-loop.yaml")), /escapes the client directory/);
+  });
+
+  it("refuses a bots symlink that points outside the client directory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pack-"));
+    const outside = join(mkdtempSync(join(tmpdir(), "pack-out-")), "bundle");
+    cpSync(join(root, "bots/templates"), outside, { recursive: true });
+    symlinkSync(outside, join(dir, "linked"));
+    writeFileSync(join(dir, "delivery-loop.yaml"), `${base}\nbots:\n  path: linked\n`);
+    assert.throws(() => loadPack(join(dir, "delivery-loop.yaml")), /symlink escapes the client directory/);
+  });
+
+  it("refuses an absolute bots path outside the client directory", () => {
+    const outside = join(mkdtempSync(join(tmpdir(), "pack-abs-")), "bundle");
+    cpSync(join(root, "bots/templates"), outside, { recursive: true });
+    assert.throws(() => loadPack(write(`${base}\nbots:\n  path: ${outside}\n`)), /relative/);
   });
 
   it("refuses bots without a path", () => {

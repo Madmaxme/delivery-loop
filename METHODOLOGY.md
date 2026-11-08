@@ -40,4 +40,4 @@ The orchestrator monitors existing delivery runs and reports evidence. It does n
 
 The inventory cross-checks the three roles. It does not add a capability. A source that was not read is a coverage gap with status `unreached` or `unverified`, a reason, and a timestamp. The gap is written down. It is not omitted.
 
-The files are data. They do not relax a gate and they do not grant authority. `delivery-loop bots validate` and `delivery-loop bots list` only read. They do not schedule a routine.
+The files are data. They do not relax a gate and they do not grant authority. A policy id such as `no-self-merge` or `head-pinned-squash` records the bound. This layer does not install a runtime identity-separation gate. The engine does not read those ids when it merges. `bots.path` must stay inside the client directory that holds the pack file, including through symlinks. `delivery-loop bots validate` and `delivery-loop bots list` only read. They do not schedule a routine.

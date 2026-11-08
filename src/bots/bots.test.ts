@@ -70,17 +70,58 @@ describe("bot templates", () => {
     }
   });
 
-  it("states the orchestrator and delivery-agent bounds", () => {
-    const orchestrator = readFileSync(join(templates, "orchestrator.yaml"), "utf8").toLowerCase();
-    for (const phrase of ["start", "dispatch", "re-dispatch", "resume", "sweep", "ground-only", "status", "label"]) {
-      assert.match(orchestrator, new RegExp(phrase));
+  it("requires policy ids and rejects a missing or contradicted bound", () => {
+    const bundle = loadBotBundle(templates);
+    const delivery = bundle.definitions.find((definition) => definition.role === "delivery-agent");
+    assert.ok(delivery?.policies.includes("head-pinned-squash"));
+    assert.ok(delivery?.policies.includes("no-merge-on-red"));
+    assert.ok(delivery?.policies.includes("checks-on-exact-head"));
+    const orchestrator = bundle.definitions.find((definition) => definition.role === "orchestrator");
+    assert.ok(orchestrator?.policies.includes("orchestrator-no-dispatch"));
+
+    const droppedHead = copyTemplates();
+    writeFileSync(join(droppedHead, "delivery-agent.yaml"), dropPolicy(readFileSync(join(droppedHead, "delivery-agent.yaml"), "utf8"), "head-pinned-squash"));
+    assert.throws(() => loadBotBundle(droppedHead), /missing policy head-pinned-squash/);
+
+    const droppedGreen = copyTemplates();
+    writeFileSync(join(droppedGreen, "delivery-agent.yaml"), dropPolicy(readFileSync(join(droppedGreen, "delivery-agent.yaml"), "utf8"), "no-merge-on-red"));
+    assert.throws(() => loadBotBundle(droppedGreen), /missing policy no-merge-on-red/);
+
+    const droppedChecks = copyTemplates();
+    writeFileSync(
+      join(droppedChecks, "delivery-agent.yaml"),
+      dropPolicy(readFileSync(join(droppedChecks, "delivery-agent.yaml"), "utf8"), "checks-on-exact-head"),
+    );
+    assert.throws(() => loadBotBundle(droppedChecks), /missing policy checks-on-exact-head/);
+
+    for (const id of ["no-self-merge", "independent-review", "no-rebase"]) {
+      const dropped = copyTemplates();
+      writeFileSync(join(dropped, "delivery-agent.yaml"), dropPolicy(readFileSync(join(dropped, "delivery-agent.yaml"), "utf8"), id));
+      assert.throws(() => loadBotBundle(dropped), new RegExp(`missing policy ${id}`));
     }
-    const delivery = readFileSync(join(templates, "delivery-agent.yaml"), "utf8").toLowerCase();
-    for (const phrase of ["opened", "pushed", "independent", "check-runs", "exact", "squash", "rebase", "force-merge", "red"]) {
-      assert.match(delivery, new RegExp(phrase));
-    }
-    assert.match(delivery, /not a bot/);
-    assert.doesNotMatch(delivery, /merge-agent/);
+
+    const contradicted = copyTemplates();
+    writeFileSync(
+      join(contradicted, "orchestrator.yaml"),
+      readFileSync(join(contradicted, "orchestrator.yaml"), "utf8").replace(
+        "    - id: monitor-runs\n",
+        "    - id: start-delivery-loop\n      statement: Start the delivery loop\n    - id: monitor-runs\n",
+      ),
+    );
+    assert.throws(() => loadBotBundle(contradicted), /may start-delivery-loop conflicts with orchestrator-no-dispatch/);
+
+    const reworded = copyTemplates();
+    writeFileSync(
+      join(reworded, "delivery-agent.yaml"),
+      readFileSync(join(reworded, "delivery-agent.yaml"), "utf8").replace(
+        "statement: Merge a head other than the exact reviewed head",
+        "statement: A different sentence for the same policy id",
+      ),
+    );
+    assert.equal(
+      loadBotBundle(reworded).definitions.find((definition) => definition.role === "delivery-agent")?.policies.includes("head-pinned-squash"),
+      true,
+    );
   });
 
   it("maps the delivery agent to the adapter interfaces and the connector catalog", () => {
@@ -165,6 +206,21 @@ describe("bot templates", () => {
       ),
     );
     assert.throws(() => loadBotBundle(extraRole), /cannot add merge-agent/);
+
+    const impossible = copyTemplates();
+    writeFileSync(
+      join(impossible, "inventory.yaml"),
+      readFileSync(join(impossible, "inventory.yaml"), "utf8").replace("2026-11-08T00:00:00Z", "2026-02-31T00:00:00Z"),
+    );
+    assert.throws(() => loadBotBundle(impossible), /not a real date/);
+
+    const named = copyTemplates();
+    writeFileSync(join(named, "..foo.yaml"), readFileSync(join(named, "orchestrator.yaml"), "utf8"));
+    writeFileSync(
+      join(named, "manifest.yaml"),
+      readFileSync(join(named, "manifest.yaml"), "utf8").replace("orchestrator: orchestrator.yaml", "orchestrator: ..foo.yaml"),
+    );
+    assert.equal(loadBotBundle(named).definitions.some((definition) => definition.role === "orchestrator"), true);
   });
 
   it("prints inventory rows and coverage gaps only", () => {
@@ -201,4 +257,10 @@ describe("bot templates", () => {
 
 function existsTemplate(name: string): boolean {
   return readdirSync(templates).includes(name);
+}
+
+function dropPolicy(text: string, id: string): string {
+  return text
+    .replace(new RegExp(`  - ${id}\\n`), "")
+    .replace(new RegExp(`    - id: ${id}\\n      statement:.*\\n`), "");
 }

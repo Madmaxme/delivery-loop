@@ -5,7 +5,7 @@
   "description": "A role template, or a client instance of that role. specversion 1.0. The file is data. It names no credential and no platform id. An identity is a reference. effect is data-only and cannot grant authority or relax a gate.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["specversion", "role", "effect", "purpose", "authority"],
+  "required": ["specversion", "role", "effect", "purpose", "policies", "authority"],
   "properties": {
     "specversion": { "type": "string", "const": "1.0" },
     "role": { "enum": ["orchestrator", "verdict-writer", "delivery-agent"] },
@@ -45,6 +45,24 @@
         }
       }
     },
+    "policies": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "enum": [
+          "no-self-merge",
+          "independent-review",
+          "checks-on-exact-head",
+          "head-pinned-squash",
+          "no-rebase",
+          "no-merge-on-red",
+          "orchestrator-no-dispatch",
+          "orchestrator-no-status-writes",
+          "verdict-no-status-writes",
+          "verdict-no-relax-gate"
+        ]
+      }
+    },
     "authority": {
       "type": "object",
       "additionalProperties": false,
@@ -53,12 +71,61 @@
         "may": {
           "type": "array",
           "minItems": 1,
-          "items": { "type": "string", "minLength": 1 }
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "statement"],
+            "properties": {
+              "id": {
+                "enum": [
+                  "monitor-runs",
+                  "report-evidence",
+                  "record-verdict",
+                  "record-evidence",
+                  "call-adapters",
+                  "review-independently",
+                  "read-checks-on-exact-head",
+                  "squash-exact-green-head",
+                  "start-delivery-loop",
+                  "dispatch-delivery-loop",
+                  "write-delivery-status",
+                  "write-delivery-label",
+                  "merge-own-head",
+                  "merge-other-head",
+                  "rebase-head",
+                  "force-merge-on-red",
+                  "relax-quality-gate"
+                ]
+              },
+              "statement": { "type": "string", "minLength": 1 }
+            }
+          }
         },
         "mustNot": {
           "type": "array",
           "minItems": 1,
-          "items": { "type": "string", "minLength": 1 }
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "statement"],
+            "properties": {
+              "id": {
+                "enum": [
+                  "no-self-merge",
+                  "independent-review",
+                  "checks-on-exact-head",
+                  "head-pinned-squash",
+                  "no-rebase",
+                  "no-merge-on-red",
+                  "orchestrator-no-dispatch",
+                  "orchestrator-no-status-writes",
+                  "verdict-no-status-writes",
+                  "verdict-no-relax-gate"
+                ]
+              },
+              "statement": { "type": "string", "minLength": 1 }
+            }
+          }
         }
       }
     }

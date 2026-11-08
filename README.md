@@ -48,7 +48,7 @@ This repository holds role templates in `bots/templates/`. The roles are the orc
 
 An orchestrator instance and a verdict-writer instance are per client. A delivery-agent instance may be shared across clients when it is the same bot everywhere. The inventory is a cross-check of those roles. A source that was not read is a coverage gap (`unreached` or `unverified`, with a reason and a timestamp), not a missing row.
 
-Definitions are data. They do not relax a gate and they do not grant authority. `delivery-loop bots validate` checks them. `delivery-loop bots list` prints the inventory. Neither command uses a credential, the network, or a write, and neither dispatches or schedules. See [bots/README.md](bots/README.md).
+Definitions are data. They do not relax a gate and they do not grant authority. Policy ids record the role bounds. This layer does not install a runtime identity-separation gate. `bots.path` must stay inside the client directory. `delivery-loop bots validate` checks them. `delivery-loop bots list` prints the inventory. Neither command uses a credential, the network, or a write, and neither dispatches or schedules. See [bots/README.md](bots/README.md).
 
 ## Contribute
 

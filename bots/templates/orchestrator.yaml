@@ -3,15 +3,17 @@ role: orchestrator
 effect: data-only
 identityRef: ref:orchestrator
 purpose: Monitors existing delivery runs and reports evidence.
+policies:
+  - orchestrator-no-dispatch
+  - orchestrator-no-status-writes
 authority:
   may:
-    - Monitor existing delivery runs
-    - Report evidence from those runs
+    - id: monitor-runs
+      statement: Monitor existing delivery runs
+    - id: report-evidence
+      statement: Report evidence from those runs
   mustNot:
-    - Start the delivery loop
-    - Dispatch the delivery loop
-    - Re-dispatch the delivery loop
-    - Resume the delivery loop
-    - Run the delivery loop, including a scheduled sweep and a ground-only compile
-    - Write a delivery status
-    - Write a delivery label
+    - id: orchestrator-no-dispatch
+      statement: Start, dispatch, re-dispatch, resume, or run the delivery loop, including a scheduled sweep and a ground-only compile
+    - id: orchestrator-no-status-writes
+      statement: Write a delivery status or a delivery label

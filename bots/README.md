@@ -37,7 +37,11 @@ When `bots` is absent, the engine does not read a bots directory. Sweep, deliver
 
 `specversion` is `1.0` on every file. `effect` is `data-only` on the manifest, the definitions, and the routines. Unknown fields are refused. A field that would carry a token, a secret, a password, a cookie, or a platform bot id is refused. Use a reference.
 
-Definitions are data. Loading them does not relax a quality gate, write a status, write a label, merge a pull request, dispatch a run, or grant an authority the engine did not already have. The pack keeps `bots.path` and drops the bundle. The delivery loop does not read the bundle.
+Definitions are data. Loading them does not relax a quality gate, write a status, write a label, merge a pull request, dispatch a run, or grant an authority the engine did not already have. The pack keeps `bots.path` and drops the bundle. The delivery loop does not read the bundle. This layer does not install a runtime identity-separation gate. A policy id records a bound. The engine does not consult that id when it merges.
+
+`bots.path` is relative to the client pack file and must stay inside that file's directory. A `../` step is refused. A symlink whose target is outside that directory is refused. The check is the lexical path and the real path.
+
+Each role definition carries `policies`, an enum of required policy ids. The delivery agent requires `no-self-merge`, `independent-review`, `checks-on-exact-head`, `head-pinned-squash`, `no-rebase`, and `no-merge-on-red`. The orchestrator requires `orchestrator-no-dispatch` and `orchestrator-no-status-writes`. The verdict writer requires `verdict-no-status-writes` and `verdict-no-relax-gate`. A `may` id that conflicts with one of those ids is rejected. The sentence text is not the check.
 
 ## Roles
 

@@ -2,7 +2,8 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { BotDefinition, BotRole } from "./types.ts";
+import type { BotDefinition, MayId, PolicyId } from "./types.ts";
+import { MAY_IDS, POLICY_CONFLICTS, REQUIRED_POLICIES } from "./types.ts";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -119,39 +120,65 @@ export function validateSchema(schema: JsonSchema, value: unknown, at: string): 
   check(schema, value, at);
 }
 
-function joined(lines: string[]): string {
-  return lines.join("\n").toLowerCase();
+function sameIds(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const seen = new Set(left);
+  return right.every((id) => seen.has(id));
 }
 
-function requirePhrases(text: string, phrases: readonly string[], at: string, field: string): void {
-  for (const phrase of phrases) {
-    if (!text.includes(phrase)) throw new Error(`${at}: ${field} must state "${phrase}"`);
+/**
+ * A real UTC timestamp. The schema pattern accepts impossible dates such as month 13.
+ * This does not. A definition that states a policy still does not enforce it.
+ */
+export function assertRealTimestamp(value: string, at: string): void {
+  const match = /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z$/.exec(value);
+  if (!match) throw new Error(`${at}: expected a UTC timestamp`);
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) {
+    throw new Error(`${at}: not a real date`);
+  }
+  const parsed = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  if (
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() !== month - 1 ||
+    parsed.getUTCDate() !== day
+  ) {
+    throw new Error(`${at}: not a real date`);
   }
 }
 
 /**
- * Role bounds live in the engine, not in the file's claim of authority.
- * A definition that omits a bound is invalid. Stating the bound grants nothing.
+ * Required policy ids for the role must be present.
+ * A may id that conflicts with one of those ids is rejected.
+ * The sentences are not consulted. This is not a runtime gate.
  */
 export function assertRoleSemantics(definition: BotDefinition, at: string): void {
-  const mustNot = joined(definition.authority.mustNot);
-  const may = joined(definition.authority.may);
-  const role: BotRole = definition.role;
-  if (role === "orchestrator") {
-    requirePhrases(
-      mustNot,
-      ["start", "dispatch", "re-dispatch", "resume", "run the delivery loop", "sweep", "ground-only", "status", "label"],
-      at,
-      "mustNot",
-    );
-    requirePhrases(may, ["monitor", "evidence"], at, "may");
-  } else if (role === "verdict-writer") {
-    requirePhrases(mustNot, ["status", "label", "start", "gate"], at, "mustNot");
-    requirePhrases(may, ["verdict", "evidence"], at, "may");
-  } else if (role === "delivery-agent") {
-    requirePhrases(mustNot, ["opened", "pushed", "rebase", "force-merge", "red", "gate"], at, "mustNot");
-    requirePhrases(may, ["independent", "check-runs", "exact", "squash", "adapter"], at, "may");
-  } else {
-    throw new Error(`${at}: unknown role ${role}`);
+  const required = REQUIRED_POLICIES[definition.role];
+  if (!required) throw new Error(`${at}: unknown role ${definition.role}`);
+  const policies = definition.policies ?? [];
+  if (new Set(policies).size !== policies.length) throw new Error(`${at}: duplicate policy`);
+  if (!sameIds(policies, required)) {
+    const missing = required.filter((id) => !policies.includes(id));
+    const unexpected = policies.filter((id) => !required.includes(id as PolicyId));
+    if (missing.length > 0) throw new Error(`${at}: missing policy ${missing[0]}`);
+    throw new Error(`${at}: unexpected policy ${unexpected[0]}`);
+  }
+  const prohibited = new Set(policies);
+  const mustNot = definition.authority.mustNot.map((entry) => entry.id);
+  if (!sameIds(mustNot, policies)) {
+    const missing = policies.filter((id) => !mustNot.includes(id));
+    throw new Error(`${at}: mustNot is missing policy ${missing[0] ?? "id"}`);
+  }
+  for (const entry of definition.authority.may) {
+    if (!MAY_IDS.includes(entry.id as MayId)) throw new Error(`${at}: unknown may id ${entry.id}`);
+    if (prohibited.has(entry.id)) throw new Error(`${at}: may ${entry.id} conflicts with ${entry.id}`);
+    for (const policy of POLICY_CONFLICTS[entry.id as MayId] ?? []) {
+      if (prohibited.has(policy)) throw new Error(`${at}: may ${entry.id} conflicts with ${policy}`);
+    }
   }
 }

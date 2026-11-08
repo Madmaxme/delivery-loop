@@ -21,9 +21,90 @@ export type BotIdentity = {
   purpose: string;
 };
 
+/** Required bounds. A missing id is invalid. Stating an id does not enforce it at merge time. */
+export const POLICY_IDS = [
+  "no-self-merge",
+  "independent-review",
+  "checks-on-exact-head",
+  "head-pinned-squash",
+  "no-rebase",
+  "no-merge-on-red",
+  "orchestrator-no-dispatch",
+  "orchestrator-no-status-writes",
+  "verdict-no-status-writes",
+  "verdict-no-relax-gate",
+] as const;
+
+export type PolicyId = (typeof POLICY_IDS)[number];
+
+/**
+ * Allowance ids, plus action ids that conflict with a required policy.
+ * A conflicting id is schema-valid and rejected by the validator.
+ */
+export const MAY_IDS = [
+  "monitor-runs",
+  "report-evidence",
+  "record-verdict",
+  "record-evidence",
+  "call-adapters",
+  "review-independently",
+  "read-checks-on-exact-head",
+  "squash-exact-green-head",
+  "start-delivery-loop",
+  "dispatch-delivery-loop",
+  "write-delivery-status",
+  "write-delivery-label",
+  "merge-own-head",
+  "merge-other-head",
+  "rebase-head",
+  "force-merge-on-red",
+  "relax-quality-gate",
+] as const;
+
+export type MayId = (typeof MAY_IDS)[number];
+
+export const REQUIRED_POLICIES: Record<BotRole, readonly PolicyId[]> = {
+  orchestrator: ["orchestrator-no-dispatch", "orchestrator-no-status-writes"],
+  "verdict-writer": ["verdict-no-status-writes", "verdict-no-relax-gate"],
+  "delivery-agent": [
+    "no-self-merge",
+    "independent-review",
+    "checks-on-exact-head",
+    "head-pinned-squash",
+    "no-rebase",
+    "no-merge-on-red",
+  ],
+};
+
+/** may id -> policy ids it contradicts. The check is the id, not the sentence. */
+export const POLICY_CONFLICTS: Record<MayId, readonly PolicyId[]> = {
+  "monitor-runs": [],
+  "report-evidence": [],
+  "record-verdict": [],
+  "record-evidence": [],
+  "call-adapters": [],
+  "review-independently": [],
+  "read-checks-on-exact-head": [],
+  "squash-exact-green-head": [],
+  "start-delivery-loop": ["orchestrator-no-dispatch", "verdict-no-relax-gate"],
+  "dispatch-delivery-loop": ["orchestrator-no-dispatch"],
+  "write-delivery-status": ["orchestrator-no-status-writes", "verdict-no-status-writes"],
+  "write-delivery-label": ["orchestrator-no-status-writes", "verdict-no-status-writes"],
+  "merge-own-head": ["no-self-merge", "independent-review"],
+  "merge-other-head": ["head-pinned-squash", "checks-on-exact-head"],
+  "rebase-head": ["no-rebase"],
+  "force-merge-on-red": ["no-merge-on-red"],
+  "relax-quality-gate": ["verdict-no-relax-gate"],
+};
+
+export type BotStatement = {
+  id: string;
+  statement: string;
+};
+
 export type BotAuthority = {
-  may: string[];
-  mustNot: string[];
+  may: BotStatement[];
+  mustNot: BotStatement[];
 };
 
 /**
@@ -38,6 +119,7 @@ export type BotDefinition = {
   identityRef?: string;
   tools?: BotTool[];
   identities?: BotIdentity[];
+  policies: PolicyId[];
   authority: BotAuthority;
 };
 

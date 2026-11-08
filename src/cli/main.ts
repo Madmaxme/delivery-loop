@@ -27,8 +27,8 @@ import { findConnector } from "../connectors/catalog.js";
 import { deliver, ship, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
 import { shipInvocationDeps } from "./ship-deps.js";
 import { ghaDispatchFields, planDeliveryInvocation } from "../engine/delivery-runtime.js";
-import { formatInventory, loadBotBundle, resolveBotRoot } from "../bots/load.ts";
-import { defaultStatus, loadPack, type ProjectPack } from "../schema/pack.js";
+import { formatInventory } from "../bots/load.ts";
+import { defaultStatus, loadPack, openPack, type ProjectPack } from "../schema/pack.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -329,21 +329,13 @@ export function botsCommand(argv: string[]): number {
     return 1;
   }
   const dir = arg("--dir", argv) ?? process.cwd();
-  const file = packPath(dir);
-  let pack: ProjectPack;
   try {
-    pack = loadPack(file);
-  } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
-    return 1;
-  }
-  if (!pack.bots) {
-    console.error("bots.path is not set");
-    return 1;
-  }
-  try {
-    const bundle = loadBotBundle(resolveBotRoot(file, pack.bots.path));
-    if (sub === "list") process.stdout.write(formatInventory(bundle.inventory));
+    const opened = openPack(packPath(dir));
+    if (!opened.bots) {
+      console.error("bots.path is not set");
+      return 1;
+    }
+    if (sub === "list") process.stdout.write(formatInventory(opened.bots.inventory));
     else process.stdout.write("valid\n");
     return 0;
   } catch (error) {

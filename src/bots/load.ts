@@ -6,7 +6,14 @@ import { CONNECTORS } from "../connectors/catalog.ts";
 import { assertDeliverySurface } from "./surface.ts";
 import type { BotBundle, BotDefinition, BotInventory, BotManifest, BotRole, BotRoutine } from "./types.ts";
 import { INVENTORY_FIELDS } from "./types.ts";
-import { assertNoCredentialFields, assertRoleSemantics, BOT_SCHEMA_FILES, loadBotSchema, validateSchema } from "./validate.ts";
+import {
+  assertNoCredentialFields,
+  assertRealTimestamp,
+  assertRoleSemantics,
+  BOT_SCHEMA_FILES,
+  loadBotSchema,
+  validateSchema,
+} from "./validate.ts";
 
 const ROLES: readonly BotRole[] = ["orchestrator", "verdict-writer", "delivery-agent"];
 
@@ -14,18 +21,36 @@ function readDocument(path: string): unknown {
   return parse(readFileSync(path, "utf8"));
 }
 
+/** Path segments. `..foo` is a name. `..` is a parent step. */
+function pathSegments(value: string): string[] {
+  return value.split(/[\\/]/).filter((part) => part !== "" && part !== ".");
+}
+
+function leaves(base: string, candidate: string, allowBase: boolean): boolean {
+  const rel = relative(base, candidate);
+  if (rel === "") return !allowBase;
+  if (isAbsolute(rel)) return true;
+  return pathSegments(rel).includes("..");
+}
+
 /**
- * The directory a pack's `bots.path` names, relative to the pack file.
- * The returned path is the real directory. Later reads stay inside it.
+ * The directory a pack's `bots.path` names.
+ * The lexical path and the real path must both stay inside the client directory
+ * that contains the pack file. A `../` step or a symlink that points outside is refused.
  */
 export function resolveBotRoot(packFile: string, rel: string): string {
   const trimmed = rel.trim();
-  if (!trimmed) throw new Error("bots.path is empty");
-  if (isAbsolute(trimmed) || trimmed.includes("\0")) throw new Error(`bots.path must be relative to the pack file`);
-  const lexical = resolve(dirname(resolve(packFile)), trimmed);
+  if (!trimmed || trimmed.includes("\0")) throw new Error("bots.path is empty");
+  if (isAbsolute(trimmed)) throw new Error("bots.path must be relative to the pack file");
+  if (pathSegments(trimmed).includes("..")) throw new Error(`bots.path escapes the client directory: ${trimmed}`);
+  const clientDir = dirname(resolve(packFile));
+  const lexical = resolve(clientDir, trimmed);
+  if (leaves(clientDir, lexical, true)) throw new Error(`bots.path escapes the client directory: ${trimmed}`);
   if (!existsSync(lexical)) throw new Error(`bots directory not found: ${trimmed}`);
+  const clientReal = realpathSync(clientDir);
   const real = realpathSync(lexical);
   if (!statSync(real).isDirectory()) throw new Error(`bots.path is not a directory: ${trimmed}`);
+  if (leaves(clientReal, real, true)) throw new Error(`bots.path symlink escapes the client directory: ${trimmed}`);
   return real;
 }
 
@@ -33,18 +58,13 @@ export function resolveBotRoot(packFile: string, rel: string): string {
 export function resolveInside(root: string, rel: string): string {
   if (typeof rel !== "string" || !rel.trim()) throw new Error("empty bots ref");
   if (isAbsolute(rel) || rel.includes("\0")) throw new Error(`absolute bots ref refused: ${rel}`);
+  if (pathSegments(rel).includes("..")) throw new Error(`bots ref escapes the directory: ${rel}`);
   const rootReal = realpathSync(root);
   const lexical = resolve(rootReal, rel);
-  const lexicalRel = relative(rootReal, lexical);
-  if (lexicalRel === "" || lexicalRel.startsWith("..") || isAbsolute(lexicalRel)) {
-    throw new Error(`bots ref escapes the directory: ${rel}`);
-  }
+  if (leaves(rootReal, lexical, false)) throw new Error(`bots ref escapes the directory: ${rel}`);
   if (!existsSync(lexical)) throw new Error(`bots ref not found: ${rel}`);
   const real = realpathSync(lexical);
-  const realRel = relative(rootReal, real);
-  if (realRel.startsWith("..") || isAbsolute(realRel)) {
-    throw new Error(`bots ref symlink escapes the directory: ${rel}`);
-  }
+  if (leaves(rootReal, real, false)) throw new Error(`bots ref symlink escapes the directory: ${rel}`);
   if (!statSync(real).isFile()) throw new Error(`bots ref is not a file: ${rel}`);
   return real;
 }
@@ -104,6 +124,8 @@ export function loadBotBundle(root: string): BotBundle {
   assertNoCredentialFields(inventoryDoc, inventoryRel);
   validateSchema(loadBotSchema(BOT_SCHEMA_FILES.inventory), inventoryDoc, inventoryRel);
   const inventory = inventoryDoc as BotInventory;
+  inventory.items.forEach((item, index) => assertRealTimestamp(item.observedAt, `${inventoryRel}/items/${index}/observedAt`));
+  inventory.coverageGaps.forEach((gap, index) => assertRealTimestamp(gap.observedAt, `${inventoryRel}/coverageGaps/${index}/observedAt`));
   unique(inventory.items.map((item) => item.id), "inventory id");
   unique(inventory.items.map((item) => item.identityRef), "identityRef");
   for (const role of ROLES) {
