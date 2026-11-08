@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -13,6 +12,7 @@ import { EXECUTION_IDENTITIES, FORGE_OPERATIONS, TRACKER_OPERATIONS, WORKER_OPER
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const templates = join(root, "bots/templates");
+const threeRoleFixture = join(root, "src/bots/fixtures/v1.0.5");
 
 function copyTemplates(): string {
   const dir = join(mkdtempSync(join(tmpdir(), "bots-")), "defs");
@@ -216,21 +216,26 @@ describe("bot templates", () => {
       readFileSync(join(badParent, "engineering-bot.yaml"), "utf8").replace("reportsTo: orchestrator", "reportsTo: delivery-agent"),
     );
     assert.throws(() => loadBotBundle(badParent), /reportsTo must be orchestrator/);
+
+    const blank = copyTemplates();
+    writeFileSync(
+      join(blank, "manifest.yaml"),
+      readFileSync(join(blank, "manifest.yaml"), "utf8").replace(
+        "engineering-bot: engineering-bot.yaml",
+        'engineering-bot: "   "',
+      ),
+    );
+    assert.throws(() => loadBotBundle(blank), /engineering-bot/);
   });
 
-  it("loads an unchanged three-role bundle from v1.0.5", () => {
-    const extracted = mkdtempSync(join(tmpdir(), "bots-v105-"));
-    const archive = execFileSync("git", ["archive", "35789212576d94e00a6220ec9f5d1f7777abe648", "bots/templates"], {
-      cwd: root,
-    });
-    execFileSync("tar", ["-x", "-C", extracted], { input: archive });
-    const bundle = loadBotBundle(join(extracted, "bots/templates"));
+  it("loads the committed v1.0.5 three-role bundle", () => {
+    const bundle = loadBotBundle(threeRoleFixture);
     assert.deepEqual(
       bundle.definitions.map((definition) => definition.role).sort(),
       ["delivery-agent", "orchestrator", "verdict-writer"],
     );
     const client = mkdtempSync(join(tmpdir(), "pack-v105-"));
-    cpSync(join(extracted, "bots/templates"), join(client, "bots"), { recursive: true });
+    cpSync(threeRoleFixture, join(client, "bots"), { recursive: true });
     writeFileSync(
       join(client, "delivery-loop.yaml"),
       `tracker: linear

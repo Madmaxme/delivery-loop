@@ -1,0 +1,18 @@
+specversion: "1.0"
+id: worker-webhook
+effect: data-only
+purpose: Describes an inbound worker callback as data. Nothing listens.
+trigger:
+  kind: webhook
+  spec: A described callback that names a run and a phase. This file contains no address and no header.
+inputs:
+  - name: callback
+    source: ref:worker-callback
+output:
+  event: bot.routine.worker-webhook.reported
+  contract: The run reference and the phase the callback names. A duplicate callback is the same result.
+idempotency: One result per callback id.
+overlap: refuse
+approval:
+  boundary: Accepting a described callback into a report. No loop start and no status write.
+  requires: A person approves any live listener. This file does not open one.

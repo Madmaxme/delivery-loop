@@ -17,7 +17,7 @@
         "orchestrator": { "type": "string", "minLength": 1 },
         "verdict-writer": { "type": "string", "minLength": 1 },
         "delivery-agent": { "type": "string", "minLength": 1 },
-        "engineering-bot": { "type": "string", "minLength": 1 }
+        "engineering-bot": { "type": "string", "minLength": 1, "pattern": "\\S" }
       }
     },
     "routines": {

@@ -21,8 +21,10 @@ const OPTIONAL_ROLES: readonly BotRole[] = ["engineering-bot"];
 function declaredRoles(manifest: BotManifest): BotRole[] {
   const roles: BotRole[] = [...REQUIRED_ROLES];
   for (const role of OPTIONAL_ROLES) {
+    if (!Object.hasOwn(manifest.roles, role)) continue;
     const rel = manifest.roles[role];
-    if (typeof rel === "string" && rel.trim()) roles.push(role);
+    if (typeof rel !== "string" || rel.trim() === "") throw new Error(`manifest ${role} path is blank`);
+    roles.push(role);
   }
   return roles;
 }
