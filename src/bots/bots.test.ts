@@ -58,7 +58,7 @@ describe("bot templates", () => {
     const bundle = loadBotBundle(templates);
     assert.deepEqual(
       bundle.definitions.map((definition) => definition.role).sort(),
-      ["delivery-agent", "orchestrator", "verdict-writer"],
+      ["delivery-agent", "engineering-bot", "orchestrator", "verdict-writer"],
     );
     assert.equal(bundle.routines.length, 5);
     assert.equal(existsTemplate("merge-agent.yaml"), false);
@@ -171,6 +171,49 @@ describe("bot templates", () => {
       loadBotBundle(reworded).definitions.find((definition) => definition.role === "delivery-agent")?.policies.includes("head-pinned-squash"),
       true,
     );
+  });
+
+  it("validates the engineering bot and rejects a broken bound or parent", () => {
+    const loaded = loadBotBundle(templates).definitions.find((definition) => definition.role === "engineering-bot");
+    assert.equal(loaded?.reportsTo, "orchestrator");
+    assert.deepEqual(
+      [...(loaded?.policies ?? [])].sort(),
+      [
+        "engineering-no-dispatch",
+        "engineering-no-relax-gate",
+        "engineering-no-status-writes",
+        "engineering-reports-only-to-orchestrator",
+        "no-self-merge",
+      ],
+    );
+
+    for (const id of [
+      "no-self-merge",
+      "engineering-no-dispatch",
+      "engineering-no-status-writes",
+      "engineering-no-relax-gate",
+      "engineering-reports-only-to-orchestrator",
+    ]) {
+      const dropped = copyTemplates();
+      writeFileSync(join(dropped, "engineering-bot.yaml"), dropPolicy(readFileSync(join(dropped, "engineering-bot.yaml"), "utf8"), id));
+      assert.throws(() => loadBotBundle(dropped), new RegExp(`missing policy ${id}`));
+    }
+
+    for (const id of ["merge-pr", "self-merge", "dispatch-delivery-loop", "write-tracker-status", "relax-quality-gate"]) {
+      const denied = copyTemplates();
+      writeFileSync(
+        join(denied, "engineering-bot.yaml"),
+        readFileSync(join(denied, "engineering-bot.yaml"), "utf8").replace("id: engineer-task", `id: ${id}`),
+      );
+      assert.throws(() => loadBotBundle(denied), new RegExp(`may ${id} is not allowed for engineering-bot`));
+    }
+
+    const badParent = copyTemplates();
+    writeFileSync(
+      join(badParent, "engineering-bot.yaml"),
+      readFileSync(join(badParent, "engineering-bot.yaml"), "utf8").replace("reportsTo: orchestrator", "reportsTo: delivery-agent"),
+    );
+    assert.throws(() => loadBotBundle(badParent), /reportsTo must be orchestrator/);
   });
 
   it("maps the delivery agent to the adapter interfaces and the connector catalog", () => {

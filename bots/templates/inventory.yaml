@@ -21,6 +21,13 @@ items:
     verification: unverified
     evidence: evidence/delivery-agent.md
     observedAt: "2026-11-08T00:00:00Z"
+  - id: engineering-bot
+    platform: unspecified
+    purpose: Role template for scoped engineering work handed down by the orchestrator. The adapter interfaces are the source. This row is a cross-check.
+    identityRef: ref:engineering-bot
+    verification: unverified
+    evidence: evidence/engineering-bot.md
+    observedAt: "2026-11-08T00:00:00Z"
 coverageGaps:
   - source: ref:bot-listing
     status: unreached

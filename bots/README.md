@@ -30,7 +30,7 @@ When `bots` is absent, the engine does not read a bots directory. Sweep, deliver
 
 `manifest.yaml` names the files. Every path is relative to the directory. A path that leaves the directory, including through a symlink, is refused.
 
-- `orchestrator.yaml`, `verdict-writer.yaml`, `delivery-agent.yaml` are role definitions ([bot-definition-1.0](../schemas/bot-definition-1.0.schema.json)).
+- `orchestrator.yaml`, `verdict-writer.yaml`, `delivery-agent.yaml`, and `engineering-bot.yaml` are role definitions ([bot-definition-1.0](../schemas/bot-definition-1.0.schema.json)).
 - `routines/` holds described routines ([bot-routine-1.0](../schemas/bot-routine-1.0.schema.json)).
 - `inventory.yaml` cross-checks the roles and records coverage gaps ([bot-inventory-1.0](../schemas/bot-inventory-1.0.schema.json)).
 - `manifest.yaml` ties them together ([bot-manifest-1.0](../schemas/bot-manifest-1.0.schema.json)).
@@ -41,7 +41,7 @@ Definitions are data. Loading them does not relax a quality gate, write a status
 
 `bots.path` is relative to the client pack file and must stay inside that file's directory. A `../` step is refused. A symlink whose target is outside that directory is refused. The check is the lexical path and the real path.
 
-Each role definition carries `policies`, an enum of required policy ids. The delivery agent requires `no-self-merge`, `independent-review`, `checks-on-exact-head`, `head-pinned-squash`, `no-rebase`, and `no-merge-on-red`. The orchestrator requires `orchestrator-no-dispatch` and `orchestrator-no-status-writes`. The verdict writer requires `verdict-no-status-writes` and `verdict-no-relax-gate`. Each role has its own `may` allowlist. An id that is not on that list is rejected, including an id that is valid for a different role. The sentence text is not the check.
+Each role definition carries `policies`, an enum of required policy ids. The delivery agent requires `no-self-merge`, `independent-review`, `checks-on-exact-head`, `head-pinned-squash`, `no-rebase`, and `no-merge-on-red`. The orchestrator requires `orchestrator-no-dispatch` and `orchestrator-no-status-writes`. The verdict writer requires `verdict-no-status-writes` and `verdict-no-relax-gate`. The engineering bot requires `no-self-merge`, `engineering-no-dispatch`, `engineering-no-status-writes`, `engineering-no-relax-gate`, and `engineering-reports-only-to-orchestrator`. Its `reportsTo` value must be the orchestrator role. Each role has its own `may` allowlist. An id that is not on that list is rejected, including an id that is valid for a different role. The sentence text is not the check.
 
 ## Roles
 
@@ -74,6 +74,16 @@ An identity that opened or pushed a head does not merge that head. Review is ind
 
 The delivery agent does not relax a quality gate. Stating these tools does not call them.
 
+### Engineering bot
+
+Sits under the orchestrator. The orchestrator talks to the user and hands this role a scoped engineering task. This role does not talk to the user.
+
+It takes that task, carries it out with its skills and tools, and returns a structured result to the orchestrator: the outcome, evidence links, and what is unverified. `reportsTo` is `orchestrator`.
+
+The allowed work follows the adapters. `ForgeAdapter.openPullRequest` opens a pull request. `WorkerAdapter` `start` and `join` are how a branch, a commit, and a test run are described. It does not call `ForgeAdapter.squashMerge`, so it does not merge its own pull request (`no-self-merge`). It does not call `ForgeAdapter.dispatch`, and it does not start or run the delivery loop (`engineering-no-dispatch`). It does not call `TrackerAdapter` `setState`, `addLabel`, or `removeLabel` (`engineering-no-status-writes`). It does not relax a quality gate (`engineering-no-relax-gate`). It does not talk to the user or to anyone else except by returning the result to the orchestrator (`engineering-reports-only-to-orchestrator`).
+
+Its `may` allowlist is `engineer-task` and `report-to-orchestrator`. It does not name the delivery agent's tool surface. Stating the work does not start it. The role is optional. When `bots.path` is absent, nothing reads this file.
+
 ## Routines
 
 A routine file is a description. It has a trigger spec, inputs, an output event contract, an idempotency rule, an overlap policy (`skip`, `queue`, or `refuse`), and an approval boundary. The trigger kind is `event`, `schedule`, or `webhook`. Nothing in this package registers that trigger. `delivery-loop bots validate` does not schedule it either.
@@ -90,7 +100,7 @@ Input `source` values are references (`ref:open-runs`), not credentials.
 
 ## Inventory
 
-The inventory lists the three roles and nothing else. A fourth bot, including an execution identity, does not belong here.
+The inventory lists the four roles and nothing else. An execution identity is not a role row.
 
 Each role row has:
 

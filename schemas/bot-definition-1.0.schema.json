@@ -8,7 +8,7 @@
   "required": ["specversion", "role", "effect", "purpose", "policies", "authority"],
   "properties": {
     "specversion": { "type": "string", "const": "1.0" },
-    "role": { "enum": ["orchestrator", "verdict-writer", "delivery-agent"] },
+    "role": { "enum": ["orchestrator", "verdict-writer", "delivery-agent", "engineering-bot"] },
     "effect": { "const": "data-only" },
     "purpose": { "type": "string", "minLength": 1 },
     "identityRef": {
@@ -59,9 +59,16 @@
           "orchestrator-no-dispatch",
           "orchestrator-no-status-writes",
           "verdict-no-status-writes",
-          "verdict-no-relax-gate"
+          "verdict-no-relax-gate",
+          "engineering-no-dispatch",
+          "engineering-no-status-writes",
+          "engineering-no-relax-gate",
+          "engineering-reports-only-to-orchestrator"
         ]
       }
+    },
+    "reportsTo": {
+      "enum": ["orchestrator", "verdict-writer", "delivery-agent", "engineering-bot"]
     },
     "authority": {
       "type": "object",
@@ -94,7 +101,12 @@
                   "merge-other-head",
                   "rebase-head",
                   "force-merge-on-red",
-                  "relax-quality-gate"
+                  "relax-quality-gate",
+                  "engineer-task",
+                  "report-to-orchestrator",
+                  "merge-pr",
+                  "self-merge",
+                  "write-tracker-status"
                 ]
               },
               "statement": { "type": "string", "minLength": 1 }
@@ -120,7 +132,11 @@
                   "orchestrator-no-dispatch",
                   "orchestrator-no-status-writes",
                   "verdict-no-status-writes",
-                  "verdict-no-relax-gate"
+                  "verdict-no-relax-gate",
+                  "engineering-no-dispatch",
+                  "engineering-no-status-writes",
+                  "engineering-no-relax-gate",
+                  "engineering-reports-only-to-orchestrator"
                 ]
               },
               "statement": { "type": "string", "minLength": 1 }

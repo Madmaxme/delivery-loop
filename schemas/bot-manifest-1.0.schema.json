@@ -12,11 +12,12 @@
     "roles": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["orchestrator", "verdict-writer", "delivery-agent"],
+      "required": ["orchestrator", "verdict-writer", "delivery-agent", "engineering-bot"],
       "properties": {
         "orchestrator": { "type": "string", "minLength": 1 },
         "verdict-writer": { "type": "string", "minLength": 1 },
-        "delivery-agent": { "type": "string", "minLength": 1 }
+        "delivery-agent": { "type": "string", "minLength": 1 },
+        "engineering-bot": { "type": "string", "minLength": 1 }
       }
     },
     "routines": {

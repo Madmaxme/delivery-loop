@@ -178,4 +178,9 @@ export function assertRoleSemantics(definition: BotDefinition, at: string): void
     if (!MAY_IDS.includes(entry.id as MayId)) throw new Error(`${at}: unknown may id ${entry.id}`);
     if (!allowed.has(entry.id)) throw new Error(`${at}: may ${entry.id} is not allowed for ${definition.role}`);
   }
+  if (definition.role === "engineering-bot") {
+    if (definition.reportsTo !== "orchestrator") throw new Error(`${at}: reportsTo must be orchestrator`);
+  } else if (definition.reportsTo !== undefined) {
+    throw new Error(`${at}: reportsTo is only valid on engineering-bot`);
+  }
 }

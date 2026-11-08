@@ -15,7 +15,7 @@ import {
   validateSchema,
 } from "./validate.ts";
 
-const ROLES: readonly BotRole[] = ["orchestrator", "verdict-writer", "delivery-agent"];
+const ROLES: readonly BotRole[] = ["orchestrator", "verdict-writer", "delivery-agent", "engineering-bot"];
 
 function readDocument(path: string): unknown {
   return parse(readFileSync(path, "utf8"));
