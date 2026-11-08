@@ -359,10 +359,14 @@ function designRun(overrides: Partial<DesignCheckRun> = {}): DesignCheckRun {
 function designEvidence(overrides: Partial<DesignCheckEvidence> = {}): DesignCheckEvidence {
   return {
     complete: true,
+    changedPaths: ["src/home.tsx"],
+    allowPaths: ["src"],
     workflows: [
       {
         path: ".github/workflows/ui.yml",
         headSha: HEAD,
+        runHeadSha: HEAD,
+        event: "pull_request",
         checkSuiteId: 77,
         headBlobSha: BLOB,
         baseBlobSha: BLOB,
@@ -377,6 +381,112 @@ describe("independent design check", () => {
     const result = interpretDesignChecks([designRun()], HEAD, "ui-primitives", designEvidence());
     assert.equal(result.state, "success");
     assert.equal(result.headSha, HEAD);
+  });
+
+  it("rejects a pull request that changes a file the workflow can execute", () => {
+    const npmrc = interpretDesignChecks(
+      [designRun()],
+      HEAD,
+      "ui-primitives",
+      designEvidence({ changedPaths: [".npmrc"] }),
+    );
+    assert.equal(npmrc.state, "failure");
+    const config = interpretDesignChecks(
+      [designRun()],
+      HEAD,
+      "ui-primitives",
+      designEvidence({ changedPaths: ["tsconfig.json"] }),
+    );
+    assert.equal(config.state, "failure");
+    const missingEvent = interpretDesignChecks(
+      [designRun()],
+      HEAD,
+      "ui-primitives",
+      designEvidence({
+        workflows: [
+          {
+            path: ".github/workflows/ui.yml",
+            headSha: HEAD,
+            runHeadSha: HEAD,
+            event: "workflow_dispatch",
+            checkSuiteId: 77,
+            headBlobSha: BLOB,
+            baseBlobSha: BLOB,
+          },
+        ],
+      }),
+    );
+    assert.equal(missingEvent.state, "failure");
+  });
+
+  it("accepts a pull_request_target run whose head is the base revision", () => {
+    const base = "e".repeat(40);
+    const proven = interpretDesignChecks(
+      [designRun()],
+      HEAD,
+      "ui-primitives",
+      designEvidence({
+        changedPaths: [".npmrc", "package.json"],
+        workflows: [
+          {
+            path: ".github/workflows/ui.yml",
+            headSha: base,
+            runHeadSha: base,
+            baseSha: base,
+            event: "pull_request_target",
+            checkSuiteId: 77,
+            headBlobSha: BLOB,
+            baseBlobSha: BLOB,
+          },
+        ],
+      }),
+    );
+    assert.equal(proven.state, "success");
+    const wrongHead = interpretDesignChecks(
+      [designRun()],
+      HEAD,
+      "ui-primitives",
+      designEvidence({
+        workflows: [
+          {
+            path: ".github/workflows/ui.yml",
+            headSha: HEAD,
+            runHeadSha: HEAD,
+            baseSha: base,
+            event: "pull_request_target",
+            checkSuiteId: 77,
+            headBlobSha: BLOB,
+            baseBlobSha: BLOB,
+          },
+        ],
+      }),
+    );
+    assert.equal(wrongHead.state, "failure");
+  });
+
+  it("uses the latest design check and ignores an older success", () => {
+    const older = designRun({ id: 1, startedAt: "2026-01-01T00:00:00Z", conclusion: "success" });
+    const newer = designRun({
+      id: 2,
+      startedAt: "2026-01-02T00:00:00Z",
+      status: "completed",
+      conclusion: "failure",
+    });
+    assert.equal(interpretDesignChecks([older, newer], HEAD, "ui-primitives", designEvidence()).state, "failure");
+    const pending = designRun({
+      id: 3,
+      startedAt: "2026-01-03T00:00:00Z",
+      status: "in_progress",
+      conclusion: null,
+    });
+    assert.equal(interpretDesignChecks([older, pending], HEAD, "ui-primitives", designEvidence()).state, "pending");
+    const unordered = interpretDesignChecks(
+      [designRun({ conclusion: "success" }), designRun({ conclusion: "failure" })],
+      HEAD,
+      "ui-primitives",
+      designEvidence(),
+    );
+    assert.equal(unordered.state, "failure");
   });
 
   it("rejects a check the pull request can forge", () => {
@@ -467,6 +577,13 @@ describe("independent design check", () => {
     env.deps.figmaFetch = async () => Response.json({ name: "Home" });
     env.deps.lookupHead = () => null;
     let merged = false;
+    env.deps.pack = {
+      ...pack,
+      design: {
+        ...pack.design!,
+        repos: [{ ...pack.design!.repos[0]!, proofPaths: ["src"] }],
+      },
+    };
     env.deps.forge = githubForge({
       token: "t",
       fetch: designFetch({ headBlob: BLOB, baseBlob: BLOB, appId: GITHUB_ACTIONS_APP_ID }, () => {
@@ -516,6 +633,7 @@ function designFetch(
             path: ".github/workflows/quality.yml",
             status: "completed",
             conclusion: "success",
+            event: "pull_request",
             head_sha: requested,
             check_suite_id: 11,
             html_url: "https://example.test/quality",
@@ -526,6 +644,7 @@ function designFetch(
             path: ".github/workflows/ui.yml",
             status: "completed",
             conclusion: "success",
+            event: "pull_request",
             head_sha: requested,
             check_suite_id: 77,
             html_url: "https://example.test/ui",
@@ -541,7 +660,13 @@ function designFetch(
         head: { sha: HEAD, ref: "delivery/qui-1" },
       });
     }
-    if (href.includes("/compare/")) return Response.json({ status: "ahead" });
+    if (href.includes("/compare/")) {
+      return Response.json({
+        status: "ahead",
+        base_commit: { sha: "e".repeat(40) },
+        files: [{ filename: "src/home.tsx" }],
+      });
+    }
     if (href.endsWith("/pulls/4") && (init?.method ?? "GET") === "GET") {
       return Response.json({ mergeable_state: "clean", mergeable: true, head: { sha: HEAD } });
     }

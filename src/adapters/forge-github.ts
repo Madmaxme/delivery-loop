@@ -14,6 +14,57 @@ import {
   type DesignWorkflowEvidence,
 } from "../engine/design-gate.ts";
 
+async function workflowRunsAt(
+  api: (path: string, init?: RequestInit) => Promise<Response>,
+  owner: string,
+  repo: string,
+  sha: string,
+): Promise<{
+  complete: boolean;
+  runs: { path?: string | null; head_sha?: string | null; event?: string | null; check_suite_id?: number | null }[];
+}> {
+  const response = await api(
+    `/repos/${owner}/${repo}/actions/runs?head_sha=${encodeURIComponent(sha)}&per_page=100`,
+  );
+  const json = (await response.json()) as {
+    total_count?: number;
+    workflow_runs?: {
+      path?: string | null;
+      head_sha?: string | null;
+      event?: string | null;
+      check_suite_id?: number | null;
+    }[];
+  };
+  const runs = json.workflow_runs ?? [];
+  return {
+    complete: typeof json.total_count === "number" && json.total_count === runs.length,
+    runs,
+  };
+}
+
+async function compareForDesign(
+  fetchImpl: FetchLike,
+  headers: Record<string, string>,
+  owner: string,
+  repo: string,
+  baseRef: string,
+  headSha: string,
+): Promise<{ complete: boolean; changedPaths: string[] | null; baseSha: string | null }> {
+  if (!baseRef.trim() || !headSha.trim()) return { complete: false, changedPaths: null, baseSha: null };
+  const spec = `${encodeURIComponent(baseRef)}...${encodeURIComponent(headSha)}`;
+  const response = await fetchImpl(`https://api.github.com/repos/${owner}/${repo}/compare/${spec}`, { headers });
+  if (!response.ok) return { complete: false, changedPaths: null, baseSha: null };
+  const json = (await response.json()) as {
+    base_commit?: { sha?: string };
+    files?: { filename?: string }[];
+  };
+  const baseSha = typeof json.base_commit?.sha === "string" ? json.base_commit.sha : null;
+  if (!Array.isArray(json.files) || !baseSha) return { complete: false, changedPaths: null, baseSha };
+  const changedPaths = json.files.map((file) => file.filename ?? "").filter((name) => name.length > 0);
+  if (changedPaths.length !== json.files.length) return { complete: false, changedPaths: null, baseSha };
+  return { complete: true, changedPaths, baseSha };
+}
+
 /** File blob sha. Null when the path is absent. Undefined when the response is unusable. */
 async function contentBlob(
   fetchImpl: FetchLike,
@@ -186,23 +237,14 @@ export function githubForge(opts: {
       const json = (await response.json()) as {
         total_count?: number;
         check_runs?: {
+          id?: number;
           name?: string;
           status?: string;
           conclusion?: string | null;
           head_sha?: string;
+          started_at?: string | null;
           app?: { id?: number; slug?: string } | null;
           check_suite?: { id?: number } | null;
-        }[];
-      };
-      const runsResponse = await api(
-        `/repos/${owner}/${repo}/actions/runs?head_sha=${encodeURIComponent(input.headSha)}&per_page=100`,
-      );
-      const runsJson = (await runsResponse.json()) as {
-        total_count?: number;
-        workflow_runs?: {
-          path?: string | null;
-          head_sha?: string | null;
-          check_suite_id?: number | null;
         }[];
       };
       const runs: DesignCheckRun[] = (json.check_runs ?? []).map((run) => ({
@@ -216,20 +258,30 @@ export function githubForge(opts: {
           typeof run.check_suite?.id === "number" && Number.isInteger(run.check_suite.id)
             ? run.check_suite.id
             : null,
+        id: typeof run.id === "number" && Number.isInteger(run.id) ? run.id : null,
+        startedAt: typeof run.started_at === "string" ? run.started_at : null,
       }));
-      const workflows: DesignWorkflowEvidence[] = (runsJson.workflow_runs ?? []).map((run) => ({
-        path: run.path ?? "",
-        headSha: run.head_sha ?? "",
-        checkSuiteId:
-          typeof run.check_suite_id === "number" && Number.isInteger(run.check_suite_id)
-            ? run.check_suite_id
-            : null,
-      }));
+      const compared = await compareForDesign(fetchImpl, headers, owner, repo, baseRef, input.headSha);
+      const shas = [input.headSha, compared.baseSha ?? ""].filter(
+        (sha, index, all) => sha.length > 0 && all.indexOf(sha) === index,
+      );
+      const loaded = await Promise.all(shas.map((sha) => workflowRunsAt(api, owner, repo, sha)));
+      const runsComplete = loaded.every((item) => item.complete);
+      const workflows: DesignWorkflowEvidence[] = loaded.flatMap((item) =>
+        item.runs.map((run) => ({
+          path: run.path ?? "",
+          headSha: run.head_sha ?? "",
+          runHeadSha: run.head_sha ?? "",
+          baseSha: compared.baseSha,
+          event: typeof run.event === "string" ? run.event : "",
+          checkSuiteId:
+            typeof run.check_suite_id === "number" && Number.isInteger(run.check_suite_id)
+              ? run.check_suite_id
+              : null,
+        })),
+      );
       const checksComplete =
         typeof json.total_count === "number" && json.total_count === (json.check_runs ?? []).length;
-      const runsComplete =
-        typeof runsJson.total_count === "number" &&
-        runsJson.total_count === (runsJson.workflow_runs ?? []).length;
       let complete = checksComplete && runsComplete && baseRef.length > 0;
       const paths = [
         ...new Set(workflows.map((run) => run.path ?? "").filter((path) => isActionsWorkflowPath(path))),
@@ -247,7 +299,12 @@ export function githubForge(opts: {
           workflow.baseBlobSha = baseBlob;
         }
       }
-      const evidence: DesignCheckEvidence = { complete, workflows };
+      const evidence: DesignCheckEvidence = {
+        complete: complete && compared.complete,
+        workflows,
+        changedPaths: compared.changedPaths,
+        allowPaths: input.proofPaths ?? [],
+      };
       return interpretDesignChecks(runs, input.headSha, input.name, evidence);
     },
     async quality(input) {

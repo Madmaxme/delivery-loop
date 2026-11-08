@@ -6,6 +6,7 @@ import {
   engineHealReleaseNotes,
   gitBlobSha,
   gitChangedFiles,
+  latestQualityProof,
   observeQualityRun,
   planEngineHealRelease,
   QUALITY_WORKFLOW_PATH,
@@ -20,14 +21,6 @@ type Pull = {
   headRefName?: string;
   labels?: { name: string }[];
   mergeCommit?: { oid?: string } | null;
-};
-
-type QualityRun = {
-  databaseId: number;
-  status?: string;
-  conclusion?: string;
-  event?: string;
-  headSha?: string;
 };
 
 function run(command: string, args: string[], allowFailure = false): string {
@@ -80,27 +73,6 @@ function tagExists(version: string): boolean {
   return remote.length > 0;
 }
 
-function qualityRuns(repo: string, branch: string, sha: string): QualityRun[] {
-  const stdout = run("gh", [
-    "run",
-    "list",
-    "--repo",
-    repo,
-    "--workflow",
-    "quality.yml",
-    "--branch",
-    branch,
-    "--commit",
-    sha,
-    "--json",
-    "databaseId,status,conclusion,event,headSha",
-    "--limit",
-    "20",
-  ]);
-  const runs = JSON.parse(stdout) as QualityRun[];
-  return runs.filter((item) => (item.headSha ?? "").toLowerCase() === sha.toLowerCase());
-}
-
 function pullState(state: string): "OPEN" | "MERGED" | "CLOSED" {
   if (state === "OPEN" || state === "MERGED") return state;
   return "CLOSED";
@@ -110,7 +82,7 @@ function sleep(seconds: number): void {
   spawnSync("sleep", [String(seconds)]);
 }
 
-function inflight(run: QualityRun): boolean {
+function inflight(run: QualityRunProof): boolean {
   const status = (run.status ?? "").toLowerCase();
   return status === "queued" || status === "in_progress" || status === "waiting" || status === "pending" || status === "requested";
 }
@@ -119,12 +91,11 @@ function inflight(run: QualityRun): boolean {
  * Watch a pull_request quality run that is already in progress.
  * This job does not start a run and does not approve one. The opener's push does that.
  */
-function watchPullRequestQuality(repo: string, branch: string, sha: string): number | null {
-  const active = qualityRuns(repo, branch, sha)
-    .filter((item) => (item.event ?? "") === "pull_request")
-    .find(inflight);
-  if (!active || !Number.isInteger(active.databaseId) || active.databaseId <= 0) return null;
-  const watched = spawnSync("gh", ["run", "watch", String(active.databaseId), "--repo", repo, "--exit-status"], {
+function watchPullRequestQuality(repo: string, _branch: string, sha: string): number | null {
+  const attempts = qualityAttempts(repo, sha);
+  const latest = latestQualityProof((attempts ?? []).filter((item) => item.event === "pull_request"));
+  if (!latest || typeof latest.id !== "number" || !inflight(latest)) return null;
+  const watched = spawnSync("gh", ["run", "watch", String(latest.id), "--repo", repo, "--exit-status"], {
     encoding: "utf8",
     timeout: 20 * 60 * 1000,
   });
@@ -132,7 +103,7 @@ function watchPullRequestQuality(repo: string, branch: string, sha: string): num
     const detail = `${watched.stderr ?? ""}${watched.stdout ?? ""}`.trim();
     throw new Error(`quality on ${sha} did not pass${detail ? `: ${detail}` : ""}`);
   }
-  return active.databaseId;
+  return latest.id;
 }
 
 function commentOnPull(repo: string, prNumber: number, body: string): void {
@@ -195,7 +166,7 @@ function releasePlan(input: {
   prNumber: number;
   runId: string;
 }): EngineHealPlan {
-  const observed = observeQualityRun(readQualityProof(input.repo, input.runId, input.tip), input.tip);
+  const observed = observeQualityRun(qualityProof(input.repo, input.tip, input.runId), input.tip);
   const files = gitChangedFiles(process.cwd(), "refs/remotes/origin/main", input.tip);
   return planEngineHealRelease({
     pullState: input.state,
@@ -247,13 +218,55 @@ function fetchPullHead(prNumber: number): string | null {
   return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
 }
 
-/** The Actions run, re-read from the API. Event env fields are not the proof. */
-function readQualityProof(repo: string, runId: string, pullHead: string): QualityRunProof | null {
-  if (!/^[1-9]\d*$/.test(runId)) return null;
-  const run = readGhJson(["api", "--method", "GET", `repos/${repo}/actions/runs/${runId}`]);
+/** Every quality attempt on this SHA. Null when the list is truncated or malformed. */
+function qualityAttempts(repo: string, sha: string): QualityRunProof[] | null {
+  const listed = readGhJson([
+    "api",
+    "--method",
+    "GET",
+    `repos/${repo}/actions/workflows/quality.yml/runs?head_sha=${encodeURIComponent(sha)}&per_page=100`,
+  ]);
+  if (!listed || typeof listed !== "object") return null;
+  const body = listed as { total_count?: unknown; workflow_runs?: unknown };
+  if (!Array.isArray(body.workflow_runs)) return null;
+  if (typeof body.total_count !== "number" || body.total_count !== body.workflow_runs.length) return null;
+  const proofs: QualityRunProof[] = [];
+  for (const item of body.workflow_runs) {
+    if (!item || typeof item !== "object") return null;
+    const run = item as Record<string, unknown>;
+    const id = integer(run.id);
+    const attempt = integer(run.run_attempt);
+    if (id === null || attempt === null || attempt <= 0) return null;
+    if (typeof run.created_at !== "string" || run.created_at.length === 0) return null;
+    proofs.push({
+      id,
+      attempt,
+      createdAt: run.created_at,
+      event: typeof run.event === "string" ? run.event : "",
+      status: typeof run.status === "string" ? run.status : "",
+      conclusion: typeof run.conclusion === "string" ? run.conclusion : "",
+      headSha: typeof run.head_sha === "string" ? run.head_sha : "",
+      path: typeof run.path === "string" ? run.path : "",
+      appId: null,
+      appSlug: null,
+      workflowBlobSha: null,
+      mainWorkflowBlobSha: null,
+    });
+  }
+  return proofs;
+}
+
+/** The latest attempt, with the app and workflow blob filled in. An older success is not used. */
+function qualityProof(repo: string, pullHead: string, triggeringId: string): QualityRunProof | null {
+  if (!/^[1-9]\d*$/.test(triggeringId)) return null;
+  const attempts = qualityAttempts(repo, pullHead);
+  if (!attempts || !attempts.some((item) => String(item.id) === triggeringId)) return null;
+  const latest = latestQualityProof(attempts);
+  if (!latest || typeof latest.id !== "number") return null;
+  const run = readGhJson(["api", "--method", "GET", `repos/${repo}/actions/runs/${latest.id}`]);
   if (!run || typeof run !== "object") return null;
   const body = run as Record<string, unknown>;
-  if (integer(body.id) !== Number(runId)) return null;
+  if (integer(body.id) !== latest.id) return null;
   const suiteId = integer(body.check_suite_id);
   if (suiteId === null) return null;
   const suite = readGhJson(["api", "--method", "GET", `repos/${repo}/check-suites/${suiteId}`]);
@@ -265,20 +278,15 @@ function readQualityProof(repo: string, runId: string, pullHead: string): Qualit
   if (slugValue != null && typeof slugValue !== "string") return null;
   const path = typeof body.path === "string" ? body.path : "";
   const headSha = typeof body.head_sha === "string" ? body.head_sha : "";
-  const event = typeof body.event === "string" ? body.event : "";
-  const status = typeof body.status === "string" ? body.status : "";
-  const conclusion = typeof body.conclusion === "string" ? body.conclusion : "";
   const proof: QualityRunProof = {
-    id: Number(runId),
-    event,
-    status,
-    conclusion,
+    ...latest,
+    event: typeof body.event === "string" ? body.event : latest.event,
+    status: typeof body.status === "string" ? body.status : latest.status,
+    conclusion: typeof body.conclusion === "string" ? body.conclusion : latest.conclusion,
     headSha,
     path,
     appId,
     appSlug: typeof slugValue === "string" ? slugValue : null,
-    workflowBlobSha: null,
-    mainWorkflowBlobSha: null,
   };
   if (path !== QUALITY_WORKFLOW_PATH || headSha.toLowerCase() !== pullHead.toLowerCase()) return proof;
   proof.workflowBlobSha = gitBlobSha(process.cwd(), headSha, path);

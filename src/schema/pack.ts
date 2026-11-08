@@ -28,6 +28,12 @@ export type DesignRepo = {
   checkName: string;
   /** Token file read into a repair prompt when the ticket has no Figma frame. */
   tokenFile: string;
+  /**
+   * Path prefixes a pull request may change while `checkName` stays independent.
+   * A pull_request run is ignored when a changed path is outside this list.
+   * Empty means that mode fails closed. pull_request_target from the base revision does not use this list.
+   */
+  proofPaths?: string[];
 };
 
 /**
@@ -163,9 +169,11 @@ export type ProjectPack = {
    */
   symbolsCommand?: string;
   /**
-   * Verifies a recorded journey. The engine runs it and reads stdout.
-   * Exit 0 and a `**Journey proof:**` token are the proof. A missing command,
-   * a nonzero exit, worker text, and a file that exists are not proof.
+   * Verifies a recorded journey from the trunk revision, in a separate worktree.
+   * The engine does not pass the worker handoff on stdin. Stdin is the revision SHA.
+   * The command must observe external state itself. Exit 0 and a `**Journey proof:**`
+   * token are the proof. A missing command keeps a recorded journey in intake.
+   * A nonzero exit, worker text, and a file that exists are not proof.
    */
   journeyCommand?: string;
   /**
@@ -290,7 +298,13 @@ function loadDesign(design: DesignSpec | undefined, path: string): DesignSpec | 
     if (!name || !check || !checkName || !tokenFile) {
       throw new Error(`${path} design.repos entries need name, check, checkName, and tokenFile`);
     }
-    return { name, check, checkName, tokenFile };
+    const proofPaths = Array.isArray(repo.proofPaths)
+      ? repo.proofPaths.map((item: string) => item.trim()).filter(Boolean)
+      : [];
+    if (repo.proofPaths != null && !Array.isArray(repo.proofPaths)) {
+      throw new Error(`${path} design.repos proofPaths must be a list`);
+    }
+    return { name, check, checkName, tokenFile, proofPaths };
   });
   return { figmaTokenEnv, repos };
 }

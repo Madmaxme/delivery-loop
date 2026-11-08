@@ -130,26 +130,32 @@ export function engineHealReleaseNotes(prNumber: number): string {
 
 export type EngineHealCheck = "success" | "failure" | "pending" | "none";
 
-/** Quality on one commit. A success wins. A run that has not finished is pending. */
+/** Quality on one commit. The latest attempt wins. An older success does not. */
 export function engineHealQualityState(
-  runs: readonly { status?: string; conclusion?: string }[],
+  runs: readonly { status?: string; conclusion?: string; id?: number; attempt?: number; createdAt?: string }[],
 ): EngineHealCheck {
-  if (runs.some((run) => (run.conclusion ?? "").toLowerCase() === "success")) return "success";
-  const pending = runs.some((run) => {
-    const status = (run.status ?? "").toLowerCase();
-    return status.length > 0 && status !== "completed";
-  });
-  if (pending) return "pending";
-  const failed = runs.some((run) => {
-    const conclusion = (run.conclusion ?? "").toLowerCase();
-    return (
-      conclusion === "failure" ||
-      conclusion === "cancelled" ||
-      conclusion === "timed_out" ||
-      conclusion === "startup_failure"
-    );
-  });
-  if (failed) return "failure";
+  const latest = latestQualityProof(
+    runs.map((run) => ({
+      id: run.id,
+      attempt: run.attempt,
+      createdAt: run.createdAt,
+      status: run.status,
+      conclusion: run.conclusion,
+    })),
+  );
+  if (!latest) return runs.length > 1 ? "none" : "none";
+  const status = (latest.status ?? "").toLowerCase();
+  if (status.length > 0 && status !== "completed") return "pending";
+  const conclusion = (latest.conclusion ?? "").toLowerCase();
+  if (conclusion === "success") return "success";
+  if (
+    conclusion === "failure" ||
+    conclusion === "cancelled" ||
+    conclusion === "timed_out" ||
+    conclusion === "startup_failure"
+  ) {
+    return "failure";
+  }
   return "none";
 }
 
@@ -187,7 +193,7 @@ const QUALITY_UNTRUSTED =
   "The quality run is not a GitHub Actions pull_request run of .github/workflows/quality.yml on this head with the same workflow file as main.";
 const FILES_UNKNOWN = "The changed files are unknown.";
 const FILES_SENSITIVE =
-  "It changes a workflow, a CI script, the heal program, or a test.";
+  "It changes a file outside the auto-merge allowlist. Workflows, CI config, tests, and the heal program need a normal review.";
 const QUALITY_UNREADABLE = "The quality run could not be read.";
 
 function versionIsBump(mainVersion: string, tipVersion: string): boolean {
@@ -322,19 +328,32 @@ function packageLockNeedsReview(baseText: string | null, headText: string | null
   return JSON.stringify(sortKeys(stripLockVersion(base))) !== JSON.stringify(sortKeys(stripLockVersion(head)));
 }
 
+const AUTO_MERGE_SOURCE_SUFFIXES = [".ts", ".tsx", ".js", ".mjs", ".cjs"] as const;
+
+/**
+ * True when this path is product source an engine-heal pull request may auto-merge.
+ * Config, tests, workflows, and the heal program are outside the list.
+ */
+export function engineHealAutoMergePath(path: string): boolean {
+  const normalized = normalizeRepoPath(path);
+  if (!normalized) return false;
+  if (normalized === "package.json" || normalized === "package-lock.json") return true;
+  if (!normalized.startsWith("src/")) return false;
+  if (normalized === "src/engine/engine-heal.ts") return false;
+  if (/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(normalized)) return false;
+  return AUTO_MERGE_SOURCE_SUFFIXES.some((suffix) => normalized.endsWith(suffix));
+}
+
 /**
  * True when auto-merge must stop.
- * Workflow files, CI scripts, the heal program, tests, and package script edits cannot certify themselves.
- * A version-only package.json and package-lock.json change does not.
+ * Only the allowlist may auto-merge. A version-only package.json and package-lock.json change is on that list.
+ * Anything else, including .npmrc, tsconfig, and test or tool config, needs a normal review.
  */
 export function engineHealFileNeedsReview(file: EngineHealFile): boolean {
   const path = normalizeRepoPath(file.path);
-  if (!path) return true;
+  if (!path || !engineHealAutoMergePath(path)) return true;
   if (path === "package.json") return packageManifestNeedsReview(file.baseText, file.headText);
   if (path === "package-lock.json") return packageLockNeedsReview(file.baseText, file.headText);
-  if (path.startsWith(".github/") || path.startsWith("scripts/")) return true;
-  if (path === "src/engine/engine-heal.ts") return true;
-  if (path.endsWith(".test.ts") || path.endsWith(".spec.ts")) return true;
   return false;
 }
 
@@ -349,6 +368,8 @@ export function engineHealFilesNeedReview(files: readonly EngineHealFile[] | nul
 
 export type QualityRunProof = {
   id?: number | null;
+  attempt?: number | null;
+  createdAt?: string | null;
   event?: string | null;
   status?: string | null;
   conclusion?: string | null;
@@ -359,6 +380,30 @@ export type QualityRunProof = {
   workflowBlobSha?: string | null;
   mainWorkflowBlobSha?: string | null;
 };
+
+/** The newest attempt. Null when more than one run cannot be ordered. */
+export function latestQualityProof(proofs: readonly QualityRunProof[]): QualityRunProof | null {
+  if (proofs.length === 0) return null;
+  if (proofs.length === 1) return proofs[0] ?? null;
+  const ordered = proofs.every(
+    (proof) =>
+      typeof proof.id === "number" &&
+      Number.isInteger(proof.id) &&
+      typeof proof.attempt === "number" &&
+      Number.isInteger(proof.attempt) &&
+      proof.attempt > 0 &&
+      typeof proof.createdAt === "string" &&
+      proof.createdAt.length > 0,
+  );
+  if (!ordered) return null;
+  return [...proofs].sort((left, right) => {
+    const attempt = (right.attempt ?? 0) - (left.attempt ?? 0);
+    if (attempt !== 0) return attempt;
+    const created = (right.createdAt ?? "").localeCompare(left.createdAt ?? "");
+    if (created !== 0) return created;
+    return (right.id ?? 0) - (left.id ?? 0);
+  })[0] ?? null;
+}
 
 function sha40(value: string | null | undefined): string | null {
   const sha = (value ?? "").trim().toLowerCase();

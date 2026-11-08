@@ -116,6 +116,8 @@ export type ForgeAdapter = {
     name: string;
     /** Base branch. The workflow file on the head has to match this ref. */
     baseRef: string;
+    /** Prefixes a pull_request may change. Empty fails that mode closed. */
+    proofPaths?: readonly string[];
   }): Promise<DesignCheckProbe>;
   /**
    * One empty commit on an existing head so a pull_request workflow can start.

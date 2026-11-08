@@ -39,18 +39,24 @@ function ticket(overrides: Partial<Ticket> = {}): Ticket {
   };
 }
 
-function trunkCheckout(identifier: string): string {
+function trunkCheckout(identifier: string, files: Record<string, string> = {}): string {
   const cwd = mkdtempSync(join(tmpdir(), "shipped-trunk-"));
   const repo = join(cwd, "api");
   mkdirSync(repo, { recursive: true });
   const git = (...args: string[]) => {
     const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
   };
   git("init", "-b", "main");
   git("config", "user.email", "dev@example.com");
   git("config", "user.name", "Dev");
   writeFileSync(join(repo, "note.txt"), "shipped\n");
+  for (const [name, body] of Object.entries(files)) {
+    const abs = join(repo, name);
+    mkdirSync(join(abs, ".."), { recursive: true });
+    writeFileSync(abs, body);
+  }
   git("add", ".");
   git("commit", "-m", `land ${identifier}`);
   return cwd;
@@ -848,9 +854,9 @@ describe("loop", () => {
 
   it("marks an already-shipped ticket dev-done when the journey command proves it", async () => {
     const url = "https://example.test/artifacts/signup.mp4";
-    const cwd = trunkCheckout("API-1");
-    const script = join(cwd, "prove.js");
-    writeFileSync(script, `process.stdout.write(${JSON.stringify(`**Journey proof:** \`${url}\``)});\n`);
+    const cwd = trunkCheckout("API-1", {
+      "prove.js": `process.stdout.write(${JSON.stringify(`**Journey proof:** \`${url}\``)});\n`,
+    });
     const text = [
       "**Verdict:** ALREADY SHIPPED",
       "**Repos:** `api`",
@@ -859,10 +865,50 @@ describe("loop", () => {
     ].join("\n");
     const env = harness(text);
     env.deps.cwd = cwd;
-    env.deps.pack = { ...pack, journeyCommand: `node ${script}` };
+    env.deps.pack = { ...pack, journeyCommand: "node prove.js" };
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "verdict");
     assert.equal(env.state(), "Dev");
+  });
+
+  it("ignores a worker edit of the journey command", async () => {
+    const log = join(mkdtempSync(join(tmpdir(), "journey-log-")), "stdin.txt");
+    const baseUrl = "https://example.test/artifacts/base.mp4";
+    const cwd = trunkCheckout("API-1", {
+      "prove.js": [
+        'const fs = require("fs");',
+        "const stdin = fs.readFileSync(0, \"utf8\");",
+        "fs.writeFileSync(process.argv[2], stdin);",
+        "if (stdin.includes(\"Journey proof\")) process.exit(3);",
+        `process.stdout.write(${JSON.stringify(`**Journey proof:** \`${baseUrl}\``)});`,
+        "",
+      ].join("\n"),
+    });
+    writeFileSync(
+      join(cwd, "api", "prove.js"),
+      [
+        'const fs = require("fs");',
+        "fs.writeFileSync(process.argv[2], \"EVIL\\n\" + fs.readFileSync(0, \"utf8\"));",
+        "process.stdout.write(\"**Journey proof:** `https://example.test/artifacts/evil.mp4`\");",
+        "",
+      ].join("\n"),
+    );
+    const text = [
+      "**Verdict:** ALREADY SHIPPED",
+      "**Repos:** `api`",
+      "**Outside grant:** none",
+      "**Journey evidence:** recorded",
+      "**Journey proof:** `https://example.test/artifacts/evil.mp4`",
+    ].join("\n");
+    const env = harness(text);
+    env.deps.cwd = cwd;
+    env.deps.pack = { ...pack, journeyCommand: `node prove.js ${log}` };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "verdict");
+    assert.equal(env.state(), "Dev");
+    const recorded = readFileSync(log, "utf8");
+    assert.equal(recorded.includes("EVIL"), false);
+    assert.equal(recorded.includes("Journey proof"), false);
   });
 
   it("marks an already-shipped ticket dev-done when the journey is not applicable", async () => {
@@ -1408,12 +1454,15 @@ describe("loop", () => {
 
   it("marks dev-done when the journey command prints a proof token", async () => {
     const url = "https://example.test/artifacts/signup.mp4";
-    const cwd = mkdtempSync(join(tmpdir(), "journey-ok-"));
-    const script = join(cwd, "prove.js");
-    writeFileSync(script, `process.stdout.write(${JSON.stringify(`**Journey proof:** \`${url}\``)});\n`);
+    const cwd = trunkCheckout("API-1", {
+      "prove.js": `process.stdout.write(${JSON.stringify(`**Journey proof:** \`${url}\``)});\n`,
+    });
+    const sha = spawnSync("git", ["-C", join(cwd, "api"), "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
     const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded"));
     env.deps.cwd = cwd;
-    env.deps.pack = { ...pack, journeyCommand: `node ${script}` };
+    env.deps.lookupHead = (_url, branch) => (branch === "main" ? sha : null);
+    env.deps.forge.squashMerge = async () => sha;
+    env.deps.pack = { ...pack, journeyCommand: "node prove.js" };
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
     assert.equal(env.state(), "Dev");
@@ -1617,7 +1666,7 @@ describe("loop", () => {
     );
     writeFileSync(
       stepFile,
-      `const fs = require("fs"); const token = process.env.GH_TOKEN || ""; if (!token) { console.error("HTTP 401"); process.exit(1); } fs.writeFileSync(process.argv[2], token);`,
+      `const fs = require("fs"); const token = process.env.GH_TOKEN || ""; if (!token) { console.error("HTTP 401"); process.exit(1); } fs.writeFileSync(process.argv[2], token); process.stdout.write(token + "\\n");`,
     );
     const previousMint = process.env.DELIVERY_LOOP_GITHUB_MINT;
     const previousGh = process.env.GH_TOKEN;
@@ -1626,6 +1675,12 @@ describe("loop", () => {
     delete process.env.GITHUB_TOKEN;
     process.env.DELIVERY_LOOP_GITHUB_MINT = `node ${mint} ${during}`;
     env.deps.pack = { ...pack, ship: { steps: [`node ${stepFile} ${seen}`], markStatus: false } };
+    const echoed: string[] = [];
+    const write = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array, enc?: BufferEncoding, cb?: (error?: Error | null) => void) => {
+      echoed.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return write(chunk, enc as BufferEncoding, cb);
+    }) as typeof process.stdout.write;
     try {
       await ship(env.deps, "API-1");
       const later = spawnSync(process.execPath, ["-e", "process.stdout.write(process.env.GH_TOKEN || '')"], {
@@ -1636,7 +1691,10 @@ describe("loop", () => {
       assert.equal(process.env.GITHUB_TOKEN, undefined);
       assert.equal(readFileSync(during, "utf8"), "");
       assert.equal(readFileSync(seen, "utf8"), "minted-for-ship");
+      assert.equal(echoed.join("").includes("minted-for-ship"), false);
+      assert.match(echoed.join(""), /\[redacted\]/);
     } finally {
+      process.stdout.write = write;
       if (previousMint === undefined) delete process.env.DELIVERY_LOOP_GITHUB_MINT;
       else process.env.DELIVERY_LOOP_GITHUB_MINT = previousMint;
       if (previousGh === undefined) delete process.env.GH_TOKEN;

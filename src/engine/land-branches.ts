@@ -1,4 +1,7 @@
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { RepoSpec } from "../schema/pack.ts";
 
@@ -67,16 +70,34 @@ export function confirmLandBranches(input: {
 
 export function lookupRemoteHead(repoUrl: string, branch: string, token = ""): string | null {
   const credential = token.trim() || process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
-  const remote =
-    credential && repoUrl.startsWith("https://")
-      ? repoUrl.replace("https://", `https://x-access-token:${credential}@`)
-      : repoUrl;
-  const result = spawnSync("git", ["ls-remote", remote, `refs/heads/${branch}`], {
-    encoding: "utf8",
-  });
-  if (result.status !== 0) return null;
-  const sha = result.stdout.trim().split(/\s+/)[0] ?? "";
-  return /^[0-9a-f]{7,40}$/i.test(sha) ? sha : null;
+  const ask = credential ? gitAskPass(credential) : null;
+  try {
+    const result = spawnSync("git", ["ls-remote", repoUrl, `refs/heads/${branch}`], {
+      encoding: "utf8",
+      env: ask?.env,
+    });
+    if (result.status !== 0) return null;
+    const sha = result.stdout.trim().split(/\s+/)[0] ?? "";
+    return /^[0-9a-f]{7,40}$/i.test(sha) ? sha : null;
+  } finally {
+    if (ask) rmSync(ask.dir, { recursive: true, force: true });
+  }
+}
+
+/** A git child reads the token from the environment. The token is not a URL argument. */
+function gitAskPass(token: string): { dir: string; env: NodeJS.ProcessEnv } {
+  const dir = mkdtempSync(join(tmpdir(), "git-askpass-"));
+  const file = join(dir, "askpass.sh");
+  writeFileSync(file, "#!/bin/sh\nprintf '%s\\n' \"$DELIVERY_LOOP_GIT_TOKEN\"\n", { mode: 0o700 });
+  return {
+    dir,
+    env: {
+      ...process.env,
+      GIT_ASKPASS: file,
+      GIT_TERMINAL_PROMPT: "0",
+      DELIVERY_LOOP_GIT_TOKEN: token,
+    },
+  };
 }
 
 function sameRepo(a: string, b: string): boolean {

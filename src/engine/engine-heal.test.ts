@@ -9,6 +9,7 @@ import { join } from "node:path";
 
 import { GITHUB_ACTIONS_APP_ID } from "./github-actions.ts";
 import {
+  engineHealAutoMergePath,
   engineHealBumpInstruction,
   engineHealFilesNeedReview,
   engineHealMergeArgs,
@@ -19,6 +20,7 @@ import {
   gitBlobSha,
   gitChangedFiles,
   highestReleaseVersion,
+  latestQualityProof,
   isEngineHealPull,
   nextPatchVersion,
   observeQualityRun,
@@ -258,8 +260,31 @@ describe("engine heal release", () => {
         { status: "completed", conclusion: "failure" },
         { status: "completed", conclusion: "success" },
       ]),
-      "success",
+      "none",
     );
+    assert.equal(
+      engineHealQualityState([
+        { id: 1, attempt: 1, createdAt: "2026-01-01T00:00:00Z", status: "completed", conclusion: "success" },
+        { id: 2, attempt: 2, createdAt: "2026-01-02T00:00:00Z", status: "completed", conclusion: "failure" },
+      ]),
+      "failure",
+    );
+    assert.equal(
+      engineHealQualityState([
+        { id: 1, attempt: 1, createdAt: "2026-01-01T00:00:00Z", status: "completed", conclusion: "success" },
+        { id: 2, attempt: 2, createdAt: "2026-01-02T00:00:00Z", status: "in_progress", conclusion: "" },
+      ]),
+      "pending",
+    );
+    const older = proof({ id: 1, attempt: 1, createdAt: "2026-01-01T00:00:00Z" });
+    const newer = proof({
+      id: 2,
+      attempt: 2,
+      createdAt: "2026-01-02T00:00:00Z",
+      conclusion: "failure",
+    });
+    assert.equal(latestQualityProof([older, newer])?.id, 2);
+    assert.equal(qualityRunIsBaseWorkflow(latestQualityProof([older, newer]), head), false);
     assert.equal(engineHealQualityState([{ status: "in_progress", conclusion: "" }]), "pending");
     assert.equal(engineHealQualityState([{ status: "action_required", conclusion: "" }]), "pending");
     assert.equal(engineHealQualityState([{ status: "completed", conclusion: "failure" }]), "failure");
@@ -379,6 +404,24 @@ describe("engine heal release", () => {
     assert.equal(engineHealFileNeedsReview({ path: "src/engine/engine-heal.ts", baseText: null, headText: null }), true);
     assert.equal(engineHealFileNeedsReview({ path: "src/engine/loop.test.ts", baseText: null, headText: null }), true);
     assert.equal(engineHealFileNeedsReview({ path: "src/engine/loop.ts", baseText: null, headText: null }), false);
+    assert.equal(engineHealAutoMergePath(".npmrc"), false);
+    assert.equal(engineHealAutoMergePath("tsconfig.json"), false);
+    assert.equal(engineHealAutoMergePath("vitest.config.ts"), false);
+    assert.equal(
+      engineHealFileNeedsReview({ path: ".npmrc", baseText: null, headText: "script-shell=/bin/true\n" }),
+      true,
+    );
+    const npmrc = planEngineHealRelease({
+      ...open,
+      mainVersion: "1.0.0",
+      tipVersion: "1.0.1",
+      filesNeedReview: engineHealFileNeedsReview({
+        path: ".npmrc",
+        baseText: null,
+        headText: "script-shell=/bin/true\n",
+      }),
+    });
+    assert.equal(npmrc.action, "review");
     assert.equal(engineHealFileNeedsReview({ path: "../quality.yml", baseText: null, headText: null }), true);
     assert.equal(engineHealFileNeedsReview({ path: "package.json", baseText: null, headText: "{}" }), true);
     assert.equal(engineHealFilesNeedReview(null), null);
@@ -401,7 +444,8 @@ describe("engine heal release", () => {
     writeFileSync(join(root, "package.json"), JSON.stringify({ name: "loop", version: "1.0.0", scripts: { test: "tsx --test" } }));
     mkdirSync(join(root, ".github/workflows"), { recursive: true });
     writeFileSync(join(root, ".github/workflows/quality.yml"), "name: quality\non: pull_request\n");
-    writeFileSync(join(root, "src-note.txt"), "ok\n");
+    mkdirSync(join(root, "src"), { recursive: true });
+    writeFileSync(join(root, "src", "note.ts"), "export const note = true;\n");
     git("add", ".");
     git("commit", "-m", "base");
     git("checkout", "-b", "engine-heal/APP-1");
@@ -438,7 +482,7 @@ describe("engine heal release", () => {
     git("checkout", "main");
     git("checkout", "-b", "engine-heal/APP-2");
     writeFileSync(join(root, "package.json"), JSON.stringify({ name: "loop", version: "1.0.1", scripts: { test: "tsx --test" } }));
-    writeFileSync(join(root, "src-note.txt"), "changed\n");
+    writeFileSync(join(root, "src", "note.ts"), "export const note = false;\n");
     git("add", ".");
     git("commit", "-m", "bump only");
     const cleanTip = git("rev-parse", "HEAD");
@@ -463,5 +507,14 @@ describe("engine heal release", () => {
       filesNeedReview: engineHealFilesNeedReview(cleanFiles),
     });
     assert.equal(merge.action, "merge-and-tag");
+
+    git("checkout", "main");
+    git("checkout", "-b", "engine-heal/APP-3");
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "loop", version: "1.0.1", scripts: { test: "tsx --test" } }));
+    writeFileSync(join(root, ".npmrc"), "script-shell=/bin/true\n");
+    git("add", ".");
+    git("commit", "-m", "make npm test a no-op");
+    const npmTip = git("rev-parse", "HEAD");
+    assert.equal(engineHealFilesNeedReview(gitChangedFiles(root, "main", npmTip)), true);
   });
 });

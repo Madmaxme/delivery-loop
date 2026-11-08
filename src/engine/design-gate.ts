@@ -16,11 +16,18 @@ export type DesignCheckRun = {
   appId?: number | null;
   appSlug?: string | null;
   checkSuiteId?: number | null;
+  id?: number | null;
+  startedAt?: string | null;
 };
 
 export type DesignWorkflowEvidence = {
   path?: string | null;
+  /** Head SHA of the workflow run. For pull_request this is the pull request head. */
   headSha?: string | null;
+  /** SHA the job executed. pull_request_target uses the base revision. */
+  runHeadSha?: string | null;
+  baseSha?: string | null;
+  event?: string | null;
   checkSuiteId?: number | null;
   headBlobSha?: string | null;
   baseBlobSha?: string | null;
@@ -30,6 +37,10 @@ export type DesignWorkflowEvidence = {
 export type DesignCheckEvidence = {
   complete: boolean;
   workflows: readonly DesignWorkflowEvidence[];
+  /** Null when the changed-file list could not be read. */
+  changedPaths: readonly string[] | null;
+  /** Prefixes a pull_request may change without touching what the check executes. */
+  allowPaths: readonly string[];
 };
 
 /** A workflow file under .github/workflows. Nested paths and `..` are rejected. */
@@ -159,9 +170,8 @@ function sha40(value: string | null | undefined): string | null {
   return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
 }
 
-function workflowIsBase(workflow: DesignWorkflowEvidence, suiteId: number, head: string): boolean {
+function workflowFileMatchesBase(workflow: DesignWorkflowEvidence, suiteId: number): boolean {
   if (workflow.checkSuiteId !== suiteId) return false;
-  if (sha40(workflow.headSha) !== head) return false;
   const path = workflow.path ?? "";
   if (!isActionsWorkflowPath(path)) return false;
   const headBlob = sha40(workflow.headBlobSha);
@@ -169,7 +179,44 @@ function workflowIsBase(workflow: DesignWorkflowEvidence, suiteId: number, head:
   return Boolean(headBlob && baseBlob && headBlob === baseBlob);
 }
 
-/** A success the pull request cannot forge by editing the workflow. */
+/** A pull_request may change only these prefixes. Config and tool files are not prefixes. */
+export function designChangesAreAllowlisted(
+  changedPaths: readonly string[] | null,
+  allowPaths: readonly string[],
+): boolean {
+  if (changedPaths == null || allowPaths.length === 0) return false;
+  const roots = allowPaths.map((prefix) => prefix.trim().replace(/\\/g, "/").replace(/\/+$/, "")).filter(Boolean);
+  if (roots.length === 0 || roots.some((root) => root.includes("..") || root.startsWith("/"))) return false;
+  return changedPaths.every((path) => {
+    const normalized = path.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+    if (!normalized || normalized.startsWith("/") || normalized.split("/").some((part) => part === "" || part === "." || part === "..")) {
+      return false;
+    }
+    return roots.some((root) => normalized === root || normalized.startsWith(`${root}/`));
+  });
+}
+
+/**
+ * pull_request plus an allowlist, or pull_request_target whose run head is the base revision.
+ * Any other event is not provenance.
+ */
+export function designWorkflowProvenance(
+  workflow: DesignWorkflowEvidence,
+  evidence: DesignCheckEvidence,
+  head: string,
+): boolean {
+  const event = (workflow.event ?? "").trim();
+  if (event === "pull_request_target") {
+    const runHead = sha40(workflow.runHeadSha);
+    const base = sha40(workflow.baseSha);
+    return Boolean(runHead && base && runHead === base);
+  }
+  if (event !== "pull_request") return false;
+  if (sha40(workflow.headSha) !== head) return false;
+  return designChangesAreAllowlisted(evidence.changedPaths, evidence.allowPaths);
+}
+
+/** A success the pull request cannot forge by editing the workflow or what it executes. */
 function independentDesignRun(run: DesignCheckRun, evidence: DesignCheckEvidence, head: string): boolean {
   if (run.status !== "completed" || run.conclusion !== "success") return false;
   if (sha40(run.headSha) !== head) return false;
@@ -178,7 +225,26 @@ function independentDesignRun(run: DesignCheckRun, evidence: DesignCheckEvidence
   if (typeof run.checkSuiteId !== "number" || !Number.isInteger(run.checkSuiteId) || run.checkSuiteId <= 0) {
     return false;
   }
-  return evidence.workflows.some((workflow) => workflowIsBase(workflow, run.checkSuiteId as number, head));
+  return evidence.workflows.some(
+    (workflow) =>
+      workflowFileMatchesBase(workflow, run.checkSuiteId as number) &&
+      designWorkflowProvenance(workflow, evidence, head),
+  );
+}
+
+/** Newest attempt for one check name. "unordered" when several runs cannot be sorted. */
+export function latestDesignCheck(runs: readonly DesignCheckRun[]): DesignCheckRun | "unordered" | null {
+  if (runs.length === 0) return null;
+  if (runs.length === 1) return runs[0] ?? null;
+  const sortable = runs.every(
+    (run) => typeof run.id === "number" && Number.isInteger(run.id) && typeof run.startedAt === "string" && run.startedAt.length > 0,
+  );
+  if (!sortable) return "unordered";
+  return [...runs].sort((left, right) => {
+    const time = (left.startedAt ?? "").localeCompare(right.startedAt ?? "");
+    if (time !== 0) return time;
+    return (left.id ?? 0) - (right.id ?? 0);
+  }).at(-1) ?? null;
 }
 
 /**
@@ -209,6 +275,17 @@ export function interpretDesignChecks(
       headSha: null,
     };
   }
+  const latest = latestDesignCheck(fresh);
+  if (latest === "unordered") {
+    return {
+      state: "failure",
+      detail: `design check ${expected} attempts on ${head} cannot be ordered`,
+      headSha: null,
+    };
+  }
+  if (!latest) {
+    return { state: "missing", detail: `design check ${expected} missing on ${headSha}`, headSha: null };
+  }
   if (!evidence.complete) {
     return {
       state: "failure",
@@ -216,16 +293,14 @@ export function interpretDesignChecks(
       headSha: null,
     };
   }
-  if (fresh.some((run) => independentDesignRun(run, evidence, head))) {
+  if (latest.status !== "completed") {
+    return { state: "pending", detail: `${expected} ${latest.status || "pending"}`, headSha: head };
+  }
+  if (latest.conclusion && latest.conclusion !== "success") {
+    return { state: "failure", detail: `${expected} ${latest.conclusion}`, headSha: head };
+  }
+  if (independentDesignRun(latest, evidence, head)) {
     return { state: "success", detail: `${expected} success`, headSha: head };
-  }
-  const pending = fresh.find((run) => run.status !== "completed");
-  if (pending) {
-    return { state: "pending", detail: `${expected} ${pending.status || "pending"}`, headSha: head };
-  }
-  const failure = fresh.find((run) => run.status === "completed" && run.conclusion && run.conclusion !== "success");
-  if (failure && fresh.every((run) => run.conclusion !== "success")) {
-    return { state: "failure", detail: `${expected} ${failure.conclusion}`, headSha: head };
   }
   return {
     state: "failure",

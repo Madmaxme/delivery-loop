@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -344,7 +345,7 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "A missing line stays in intake. Reading a vendor's documentation is not the grant.",
     "Every BUILDABLE handoff includes **Journey evidence:** recorded | not-applicable | blocked.",
     "not-applicable means the done-state is not a journey a person walks.",
-    "recorded means it is. The install's journey command is the proof. It has to exit 0 and print a **Journey proof:** token. A URL in this handoff is not proof. A file that exists is not proof. A sentence that names no token is not proof.",
+    "recorded means it is. The install's journey command is the proof. The runner checks out the trunk revision in a separate worktree and runs that command there. Stdin is the revision, not this handoff. The command must observe external state itself. It has to exit 0 and print a **Journey proof:** token. An install with no journey command keeps a recorded journey in intake. A URL in this handoff is not proof. A file that exists is not proof. A sentence that names no token is not proof.",
     "blocked means that proof cannot be produced in this run. A missing line or blocked stays in intake and does not mark dev-done.",
     `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
     landRepoLine(deps.pack),
@@ -390,7 +391,7 @@ function buildPrompt(
       ? `Push these branches from each repo trunk: ${branches.join(", ")}. Include repo and branch in the handoff. Do not merge.`
       : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
     "Stay inside the allowlist. Run the validation commands.",
-    "When the handoff says **Journey evidence:** recorded, the install's journey command is the proof. It has to exit 0 and print **Journey proof:**. Do not write that token. A URL in the handoff is not proof. A file that exists is not proof. The runner does not mark dev-done without the command.",
+    "When the handoff says **Journey evidence:** recorded, the install's journey command is the proof. The runner checks out the trunk revision in a separate worktree and runs that command there. Do not write the token. Do not change the command and expect that change to run. A URL in the handoff is not proof. A file that exists is not proof. An install with no journey command keeps the ticket in intake.",
     retry,
   ].filter((part) => part.length > 0).join("\n\n");
 }
@@ -1153,6 +1154,16 @@ async function healShipStep(
   return applyOwnerHeal(deps, ticket, key, reason);
 }
 
+/** Replace secret values before they are written to the runner's own output. */
+export function redactSecrets(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const secret of secrets) {
+    if (secret.length < 4) continue;
+    out = out.split(secret).join("[redacted]");
+  }
+  return out;
+}
+
 function refreshShipGithubToken(deps: LoopDeps, env: NodeJS.ProcessEnv): boolean {
   const command = (env.DELIVERY_LOOP_GITHUB_MINT ?? process.env.DELIVERY_LOOP_GITHUB_MINT ?? "").trim();
   if (!command) return false;
@@ -1178,9 +1189,13 @@ function runShipStep(
   return new Promise((resolve) => {
     const child = spawn(step, { shell: true, cwd, env, stdio: ["inherit", "pipe", "pipe"] });
     const lines: string[] = [];
+    const secrets = [env.GH_TOKEN, env.GITHUB_TOKEN, env.DELIVERY_LOOP_GIT_TOKEN].filter(
+      (value): value is string => typeof value === "string" && value.length >= 4,
+    );
     const take = (chunk: Buffer, dest: NodeJS.WriteStream) => {
-      dest.write(chunk);
-      for (const piece of chunk.toString("utf8").split(/\n/)) {
+      const redacted = redactSecrets(chunk.toString("utf8"), secrets);
+      dest.write(redacted);
+      for (const piece of redacted.split(/\n/)) {
         const trimmed = piece.trim();
         if (!trimmed) continue;
         lines.push(trimmed);
@@ -1228,26 +1243,72 @@ async function symbolsResolve(deps: LoopDeps, symbols: string[]): Promise<boolea
   return result.status === 0;
 }
 
+function gitCommitSha(repoDir: string, rev: string): string | null {
+  if (!rev.trim() || rev.includes("\0")) return null;
+  const result = spawnSync("git", ["-C", repoDir, "rev-parse", "--verify", `${rev}^{commit}`], {
+    encoding: "utf8",
+  });
+  if (result.status !== 0) return null;
+  const sha = (result.stdout ?? "").trim().toLowerCase();
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+}
+
 /**
- * Stdout of the configured journey command when it exits 0 and prints a proof token.
- * Null when the command is missing, exits nonzero, or prints no token.
- * The worker's text is not a result.
+ * Run `body` in a detached worktree at `sha`. The worker checkout is not the cwd.
+ * Returns null when git cannot check that revision out.
  */
-function journeyVerifierStdout(deps: LoopDeps, stdin: string): string | null {
+function inRevisionWorktree(repoDir: string, sha: string, body: (dir: string) => string | null): string | null {
+  const dir = mkdtempSync(join(tmpdir(), "journey-verify-"));
+  const added = spawnSync("git", ["-C", repoDir, "worktree", "add", "--detach", "--force", dir, sha], {
+    encoding: "utf8",
+  });
+  if (added.status !== 0) {
+    rmSync(dir, { recursive: true, force: true });
+    return null;
+  }
+  try {
+    return body(dir);
+  } finally {
+    spawnSync("git", ["-C", repoDir, "worktree", "remove", "--force", dir], { encoding: "utf8" });
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Stdout of journeyCommand at an independently checked-out revision.
+ * Stdin is that revision SHA, never the worker handoff.
+ * Null when the command is missing, the revision is unknown, the command exits nonzero, or it prints no token.
+ * The command must observe external state itself. Echoing stdin is not a proof the engine will supply.
+ */
+function journeyVerifierStdout(deps: LoopDeps, repoDir: string, revision: string): string | null {
   const command = deps.pack.journeyCommand?.trim();
   if (!command) return null;
-  const run = deps.runPackCommand ?? defaultRunPackCommand;
-  const result = run(command, deps.cwd ?? process.cwd(), stdin);
-  if (result.status !== 0) return null;
-  if (parseJourneyProofs(result.stdout).length === 0) return null;
-  return result.stdout;
+  const sha = gitCommitSha(repoDir, revision);
+  if (!sha) return null;
+  return inRevisionWorktree(repoDir, sha, (dir) => {
+    const run = deps.runPackCommand ?? defaultRunPackCommand;
+    const result = run(command, dir, `${sha}\n`);
+    if (result.status !== 0) return null;
+    if (parseJourneyProofs(result.stdout).length === 0) return null;
+    return result.stdout;
+  });
 }
 
 function alreadyShippedJourney(deps: LoopDeps, text: string): boolean {
   const evidence = parseJourneyEvidence(text);
   if (evidence === "not-applicable") return true;
   if (evidence !== "recorded") return false;
-  return journeyEvidenceProven(evidence, journeyVerifierStdout(deps, text));
+  const cwd = deps.cwd ?? process.cwd();
+  const names = [...text.matchAll(/\*\*Repos:\*\*\s*(.+)/gi)].flatMap((match) => repoNames(match[1] ?? ""));
+  for (const name of names) {
+    const spec = repoByName(deps.pack, name);
+    if (!spec) continue;
+    const dir = repoCheckoutDir(cwd, spec, deps.pack);
+    const sha = gitCommitSha(dir, spec.trunk);
+    if (!sha) return false;
+    return journeyEvidenceProven(evidence, journeyVerifierStdout(deps, dir, sha));
+  }
+  return false;
 }
 
 async function trunkQuality(
@@ -1307,8 +1368,10 @@ async function settleTrunk(
   receipt = "",
 ): Promise<TicketResult> {
   const waiting: { repo: string; sha: string }[] = [];
+  const tips: { repo: RepoSpec; sha: string }[] = [];
   for (const row of rows) {
     const tip = await trunkTip(deps, row.repo, row.sha);
+    tips.push({ repo: row.repo, sha: tip });
     const quality = await trunkQuality(deps, { repo: row.repo, sha: tip });
     if (quality.state !== "success") waiting.push({ repo: row.repo.name, sha: tip });
   }
@@ -1339,8 +1402,11 @@ async function settleTrunk(
   }
   const journeyEvidence = landJourneyEvidence(declared, receipt);
   if (journeyEvidence === "recorded" || journeyEvidence === "blocked") {
+    const first = tips[0];
     const stdout =
-      journeyEvidence === "recorded" ? journeyVerifierStdout(deps, `${declared}\n${receipt}`) : null;
+      journeyEvidence === "recorded" && first
+        ? journeyVerifierStdout(deps, repoCheckoutDir(deps.cwd ?? process.cwd(), first.repo, deps.pack), first.sha)
+        : null;
     if (!journeyEvidenceProven(journeyEvidence, stdout)) {
       await deps.tracker.comment(
         ticket.identifier,
@@ -1774,6 +1840,7 @@ async function readDesignCheck(
     headSha: pr.headSha,
     name: spec.checkName,
     baseRef: pr.repo.trunk,
+    proofPaths: spec.proofPaths ?? [],
   });
   if ((probe.headSha ?? "").toLowerCase() !== pr.headSha.toLowerCase()) {
     return {
