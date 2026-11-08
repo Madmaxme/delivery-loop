@@ -41,7 +41,7 @@ Definitions are data. Loading them does not relax a quality gate, write a status
 
 `bots.path` is relative to the client pack file and must stay inside that file's directory. A `../` step is refused. A symlink whose target is outside that directory is refused. The check is the lexical path and the real path.
 
-Each role definition carries `policies`, an enum of required policy ids. The delivery agent requires `no-self-merge`, `independent-review`, `checks-on-exact-head`, `head-pinned-squash`, `no-rebase`, and `no-merge-on-red`. The orchestrator requires `orchestrator-no-dispatch` and `orchestrator-no-status-writes`. The verdict writer requires `verdict-no-status-writes` and `verdict-no-relax-gate`. A `may` id that conflicts with one of those ids is rejected. The sentence text is not the check.
+Each role definition carries `policies`, an enum of required policy ids. The delivery agent requires `no-self-merge`, `independent-review`, `checks-on-exact-head`, `head-pinned-squash`, `no-rebase`, and `no-merge-on-red`. The orchestrator requires `orchestrator-no-dispatch` and `orchestrator-no-status-writes`. The verdict writer requires `verdict-no-status-writes` and `verdict-no-relax-gate`. Each role has its own `may` allowlist. An id that is not on that list is rejected, including an id that is valid for a different role. The sentence text is not the check.
 
 ## Roles
 

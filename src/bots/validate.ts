@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { BotDefinition, MayId, PolicyId } from "./types.ts";
-import { MAY_IDS, POLICY_CONFLICTS, REQUIRED_POLICIES } from "./types.ts";
+import { ALLOWED_MAY, MAY_IDS, REQUIRED_POLICIES } from "./types.ts";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -154,7 +154,7 @@ export function assertRealTimestamp(value: string, at: string): void {
 
 /**
  * Required policy ids for the role must be present.
- * A may id that conflicts with one of those ids is rejected.
+ * A may id is accepted only when it is on that role's allowlist.
  * The sentences are not consulted. This is not a runtime gate.
  */
 export function assertRoleSemantics(definition: BotDefinition, at: string): void {
@@ -168,17 +168,14 @@ export function assertRoleSemantics(definition: BotDefinition, at: string): void
     if (missing.length > 0) throw new Error(`${at}: missing policy ${missing[0]}`);
     throw new Error(`${at}: unexpected policy ${unexpected[0]}`);
   }
-  const prohibited = new Set(policies);
   const mustNot = definition.authority.mustNot.map((entry) => entry.id);
   if (!sameIds(mustNot, policies)) {
     const missing = policies.filter((id) => !mustNot.includes(id));
     throw new Error(`${at}: mustNot is missing policy ${missing[0] ?? "id"}`);
   }
+  const allowed = new Set<string>(ALLOWED_MAY[definition.role]);
   for (const entry of definition.authority.may) {
     if (!MAY_IDS.includes(entry.id as MayId)) throw new Error(`${at}: unknown may id ${entry.id}`);
-    if (prohibited.has(entry.id)) throw new Error(`${at}: may ${entry.id} conflicts with ${entry.id}`);
-    for (const policy of POLICY_CONFLICTS[entry.id as MayId] ?? []) {
-      if (prohibited.has(policy)) throw new Error(`${at}: may ${entry.id} conflicts with ${policy}`);
-    }
+    if (!allowed.has(entry.id)) throw new Error(`${at}: may ${entry.id} is not allowed for ${definition.role}`);
   }
 }

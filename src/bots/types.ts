@@ -38,8 +38,8 @@ export const POLICY_IDS = [
 export type PolicyId = (typeof POLICY_IDS)[number];
 
 /**
- * Allowance ids, plus action ids that conflict with a required policy.
- * A conflicting id is schema-valid and rejected by the validator.
+ * Every may id the schema accepts.
+ * A role may use only the ids in ALLOWED_MAY. The others stay in the schema so a wrong role is rejected by the allowlist.
  */
 export const MAY_IDS = [
   "monitor-runs",
@@ -76,25 +76,11 @@ export const REQUIRED_POLICIES: Record<BotRole, readonly PolicyId[]> = {
   ],
 };
 
-/** may id -> policy ids it contradicts. The check is the id, not the sentence. */
-export const POLICY_CONFLICTS: Record<MayId, readonly PolicyId[]> = {
-  "monitor-runs": [],
-  "report-evidence": [],
-  "record-verdict": [],
-  "record-evidence": [],
-  "call-adapters": [],
-  "review-independently": [],
-  "read-checks-on-exact-head": [],
-  "squash-exact-green-head": [],
-  "start-delivery-loop": ["orchestrator-no-dispatch", "verdict-no-relax-gate"],
-  "dispatch-delivery-loop": ["orchestrator-no-dispatch"],
-  "write-delivery-status": ["orchestrator-no-status-writes", "verdict-no-status-writes"],
-  "write-delivery-label": ["orchestrator-no-status-writes", "verdict-no-status-writes"],
-  "merge-own-head": ["no-self-merge", "independent-review"],
-  "merge-other-head": ["head-pinned-squash", "checks-on-exact-head"],
-  "rebase-head": ["no-rebase"],
-  "force-merge-on-red": ["no-merge-on-red"],
-  "relax-quality-gate": ["verdict-no-relax-gate"],
+/** The only may ids a role may list. Anything else is rejected. */
+export const ALLOWED_MAY: Record<BotRole, readonly MayId[]> = {
+  orchestrator: ["monitor-runs", "report-evidence"],
+  "verdict-writer": ["record-verdict", "record-evidence"],
+  "delivery-agent": ["call-adapters", "review-independently", "read-checks-on-exact-head", "squash-exact-green-head"],
 };
 
 export type BotStatement = {

@@ -100,6 +100,55 @@ describe("bot templates", () => {
       assert.throws(() => loadBotBundle(dropped), new RegExp(`missing policy ${id}`));
     }
 
+    for (const id of ["orchestrator-no-dispatch", "orchestrator-no-status-writes"]) {
+      const dropped = copyTemplates();
+      writeFileSync(join(dropped, "orchestrator.yaml"), dropPolicy(readFileSync(join(dropped, "orchestrator.yaml"), "utf8"), id));
+      assert.throws(() => loadBotBundle(dropped), new RegExp(`missing policy ${id}`));
+    }
+    for (const id of ["verdict-no-status-writes", "verdict-no-relax-gate"]) {
+      const dropped = copyTemplates();
+      writeFileSync(join(dropped, "verdict-writer.yaml"), dropPolicy(readFileSync(join(dropped, "verdict-writer.yaml"), "utf8"), id));
+      assert.throws(() => loadBotBundle(dropped), new RegExp(`missing policy ${id}`));
+    }
+
+    const noPolicies = copyTemplates();
+    writeFileSync(
+      join(noPolicies, "orchestrator.yaml"),
+      readFileSync(join(noPolicies, "orchestrator.yaml"), "utf8").replace(/policies:\n(?:  - .+\n)+/, ""),
+    );
+    assert.throws(() => loadBotBundle(noPolicies), /missing policies/);
+
+    const unknownMay = copyTemplates();
+    writeFileSync(
+      join(unknownMay, "orchestrator.yaml"),
+      readFileSync(join(unknownMay, "orchestrator.yaml"), "utf8").replace(
+        "    - id: monitor-runs\n",
+        "    - id: not-a-real-id\n      statement: Not a real allowance\n    - id: monitor-runs\n",
+      ),
+    );
+    assert.throws(() => loadBotBundle(unknownMay), /not-a-real-id|expected one of/);
+
+    const orchestratorCalls = copyTemplates();
+    writeFileSync(
+      join(orchestratorCalls, "orchestrator.yaml"),
+      readFileSync(join(orchestratorCalls, "orchestrator.yaml"), "utf8").replace("id: monitor-runs", "id: call-adapters"),
+    );
+    assert.throws(() => loadBotBundle(orchestratorCalls), /may call-adapters is not allowed for orchestrator/);
+
+    const verdictDispatches = copyTemplates();
+    writeFileSync(
+      join(verdictDispatches, "verdict-writer.yaml"),
+      readFileSync(join(verdictDispatches, "verdict-writer.yaml"), "utf8").replace("id: record-verdict", "id: dispatch-delivery-loop"),
+    );
+    assert.throws(() => loadBotBundle(verdictDispatches), /may dispatch-delivery-loop is not allowed for verdict-writer/);
+
+    const deliveryRelaxes = copyTemplates();
+    writeFileSync(
+      join(deliveryRelaxes, "delivery-agent.yaml"),
+      readFileSync(join(deliveryRelaxes, "delivery-agent.yaml"), "utf8").replace("id: call-adapters", "id: relax-quality-gate"),
+    );
+    assert.throws(() => loadBotBundle(deliveryRelaxes), /may relax-quality-gate is not allowed for delivery-agent/);
+
     const contradicted = copyTemplates();
     writeFileSync(
       join(contradicted, "orchestrator.yaml"),
@@ -108,7 +157,7 @@ describe("bot templates", () => {
         "    - id: start-delivery-loop\n      statement: Start the delivery loop\n    - id: monitor-runs\n",
       ),
     );
-    assert.throws(() => loadBotBundle(contradicted), /may start-delivery-loop conflicts with orchestrator-no-dispatch/);
+    assert.throws(() => loadBotBundle(contradicted), /may start-delivery-loop is not allowed for orchestrator/);
 
     const reworded = copyTemplates();
     writeFileSync(
