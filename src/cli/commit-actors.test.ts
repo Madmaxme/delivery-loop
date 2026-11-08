@@ -24,30 +24,59 @@ function git(cwd: string, args: string[]) {
 }
 
 describe("commitActorsFromTrustedRef", () => {
-  it("reads the trunk file and ignores the working tree", () => {
+  it("reads the pinned trunk file through the forge and ignores the checkout", async () => {
     const dir = mkdtempSync(join(tmpdir(), "commit-actors-"));
     git(dir, ["init", "-b", "main"]);
-    writeFileSync(
-      join(dir, "delivery-loop.yaml"),
-      "commitActors:\n  - login: owner\n",
-    );
+    writeFileSync(join(dir, "delivery-loop.yaml"), "commitActors:\n  - login: git-owner\n");
     git(dir, ["add", "delivery-loop.yaml"]);
     git(dir, ["commit", "-m", "base"]);
     git(dir, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
-    writeFileSync(
-      join(dir, "delivery-loop.yaml"),
-      "commitActors:\n  - login: attacker\n",
-    );
+    writeFileSync(join(dir, "delivery-loop.yaml"), "commitActors:\n  - login: attacker\n");
     const previous = process.cwd();
     process.chdir(dir);
     try {
-      const actors = commitActorsFromTrustedRef({
-        agent: { url: "https://github.com/acme/loop", trunk: "main" },
-        commitActors: [],
-      } as ProjectPack);
-      assert.equal(actors?.[0]?.login, "owner");
+      const actors = await commitActorsFromTrustedRef(
+        {
+          agent: { url: "https://github.com/acme/loop", trunk: "release" },
+          repos: [{ name: "api", url: "https://github.com/acme/api", trunk: "main" }],
+          commitActors: [],
+        } as ProjectPack,
+        {
+          async trunkSha(input) {
+            assert.equal(input.repoUrl, "https://github.com/acme/loop");
+            assert.equal(input.trunk, "release");
+            return "b".repeat(40);
+          },
+          async readTextFile(input) {
+            assert.equal(input.ref, "b".repeat(40));
+            assert.equal(input.path, "delivery-loop.yaml");
+            return "commitActors:\n  - login: forge-owner\n";
+          },
+        },
+      );
+      assert.equal(actors?.[0]?.login, "forge-owner");
     } finally {
       process.chdir(previous);
     }
+  });
+
+  it("refuses a missing workspace home instead of defaulting to main", async () => {
+    await assert.rejects(
+      () =>
+        commitActorsFromTrustedRef(
+          {
+            repos: [{ name: "api", url: "https://github.com/acme/api", trunk: "main" }],
+          } as ProjectPack,
+          {
+            async trunkSha() {
+              throw new Error("trunk was read");
+            },
+            async readTextFile() {
+              throw new Error("file was read");
+            },
+          },
+        ),
+      /workspace trunk/,
+    );
   });
 });

@@ -157,8 +157,31 @@ export type FetchLike = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+const GITHUB_OWNER = "([A-Za-z0-9][A-Za-z0-9._-]*)";
+const GITHUB_REPO = "([A-Za-z0-9][A-Za-z0-9._-]*)";
+const GITHUB_HTTPS = new RegExp(`^https://github\\.com/${GITHUB_OWNER}/${GITHUB_REPO}/?$`, "i");
+const GITHUB_SCP = new RegExp(`^git@github\\.com:${GITHUB_OWNER}/${GITHUB_REPO}$`, "i");
+const GITHUB_SSH = new RegExp(`^ssh://git@github\\.com/${GITHUB_OWNER}/${GITHUB_REPO}/?$`, "i");
+
+/**
+ * `owner/repo` in lowercase.
+ * Accepts only `https://github.com/o/r[.git][/]`, `git@github.com:o/r[.git]`, and `ssh://git@github.com/o/r[.git]`.
+ * Anything else, including http, www, and a lookalike host, is null.
+ */
+export function canonicalGithubRepo(url: string): string | null {
+  const text = url.trim();
+  const match = text.match(GITHUB_HTTPS) ?? text.match(GITHUB_SCP) ?? text.match(GITHUB_SSH);
+  if (!match) return null;
+  const owner = match[1] ?? "";
+  let repo = match[2] ?? "";
+  if (repo.toLowerCase().endsWith(".git")) repo = repo.slice(0, -4);
+  if (!owner || !repo || owner === "." || owner === ".." || repo === "." || repo === "..") return null;
+  return `${owner.toLowerCase()}/${repo.toLowerCase()}`;
+}
+
 export function githubRepoFromUrl(url: string): { owner: string; repo: string } {
-  const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)(?:\.git)?$/i);
-  if (!match) throw new Error(`Not a GitHub repo URL: ${url}`);
-  return { owner: match[1], repo: match[2] };
+  const canonical = canonicalGithubRepo(url);
+  if (!canonical) throw new Error(`Not a GitHub repo URL: ${url}`);
+  const slash = canonical.indexOf("/");
+  return { owner: canonical.slice(0, slash), repo: canonical.slice(slash + 1) };
 }

@@ -1760,8 +1760,14 @@ async function repairContext(deps: LoopDeps, ticket: Ticket, pr: OpenPull): Prom
   return text ? `\n${text}` : "";
 }
 
-/** A design verdict bound to the pack trunk it was read from. Null means the check does not apply. */
-type DesignVerdict = DesignCheckProbe & { trunkSha: string | null };
+/**
+ * A design verdict bound to the pack trunk it was read from.
+ * `reason: "owner-config"` is a pack problem. The lander pauses for the owner and does not start a heal worker.
+ */
+export type DesignVerdict = DesignCheckProbe & {
+  trunkSha: string | null;
+  reason?: "owner-config";
+};
 
 /** UI check on this head. A Figma URL in the work order is not this check. Null means the check does not apply. */
 async function readDesignCheck(
@@ -1784,18 +1790,20 @@ async function readDesignCheck(
   if (!home) {
     return {
       state: "failure",
-      detail: `design check unverified on ${pr.headSha}: agent.url and agent.trunk must name a repo that is not a product repo`,
+      detail: "Needs owner: agent.url and agent.trunk",
       headSha: null,
       trunkSha: null,
+      reason: "owner-config",
     };
   }
   const read = await proofPathsFromTrustedRef(deps.forge, home.url, home.trunk, pr.repo.name);
   if (read.paths == null || !read.trunkSha) {
     return {
       state: "failure",
-      detail: `design check unverified on ${pr.headSha}: the workspace trunk pack could not be read`,
+      detail: "Needs owner: agent.url and agent.trunk",
       headSha: null,
       trunkSha: read.trunkSha,
+      reason: "owner-config",
     };
   }
   const probe = await deps.forge.designCheck({
@@ -1843,6 +1851,11 @@ async function landPull(deps: LoopDeps, ticket: Ticket, pr: OpenPull): Promise<L
       continue;
     }
     const design = await readDesignCheck(deps, ticket, current);
+    if (design?.reason === "owner-config") {
+      const paused = pauseLand(ticket.identifier, current.url, "Needs owner: agent.url and agent.trunk");
+      await deps.tracker.comment(ticket.identifier, paused.detail);
+      return paused;
+    }
     if (design?.state === "success" && design.trunkSha) {
       reviewed = { headSha: current.headSha, trunkSha: design.trunkSha };
     } else if (design) {

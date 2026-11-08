@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import { parse } from "yaml";
 
 import type { ForgeTreeReader } from "../adapters/forge-github.ts";
+import { canonicalGithubRepo } from "../adapters/types.ts";
 
 import { loadBotBundle, resolveBotRoot } from "../bots/load.ts";
 import type { BotBundle } from "../bots/types.ts";
@@ -359,6 +360,35 @@ export type TrustedProofPaths = {
   trunkSha: string | null;
 };
 
+/** File text at a trusted ref. `text` null is a failed read. There is no default branch. */
+export type TrustedRefRead = {
+  text: string | null;
+  trunkSha: string | null;
+};
+
+/**
+ * Read `path` at the workspace trunk through the forge.
+ * A null home, a missing trunk SHA, or a failed file read returns `text` null.
+ * The checkout, `origin`, and a default of `main` are not used.
+ */
+export async function readTrustedRef(
+  forge: Partial<ForgeTreeReader>,
+  home: { url: string; trunk: string } | null,
+  path: string,
+): Promise<TrustedRefRead> {
+  if (!home?.url.trim() || !home.trunk.trim() || !forge.trunkSha || !forge.readTextFile) {
+    return { text: null, trunkSha: null };
+  }
+  if (!path.trim() || path.split("/").some((part) => part === "" || part === "." || part === "..")) {
+    return { text: null, trunkSha: null };
+  }
+  const trunkSha = (await forge.trunkSha({ repoUrl: home.url, trunk: home.trunk }))?.trim().toLowerCase() ?? "";
+  if (!/^[0-9a-f]{40}$/.test(trunkSha)) return { text: null, trunkSha: null };
+  const text = await forge.readTextFile({ repoUrl: home.url, path, ref: trunkSha });
+  if (text == null) return { text: null, trunkSha };
+  return { text, trunkSha };
+}
+
 /**
  * `proofPaths` from `delivery-loop.yaml` at the workspace trunk, read through the forge.
  * `repoUrl` and `trunk` come from `trustedPackHome`. The product repo is not a fallback.
@@ -371,14 +401,9 @@ export async function proofPathsFromTrustedRef(
   trunk: string,
   repoName: string,
 ): Promise<TrustedProofPaths> {
-  if (!forge.trunkSha || !forge.readTextFile || !repoUrl.trim() || !trunk.trim()) {
-    return { paths: null, trunkSha: null };
-  }
-  const trunkSha = (await forge.trunkSha({ repoUrl, trunk }))?.trim().toLowerCase() ?? "";
-  if (!/^[0-9a-f]{40}$/.test(trunkSha)) return { paths: null, trunkSha: null };
-  const text = await forge.readTextFile({ repoUrl, path: "delivery-loop.yaml", ref: trunkSha });
-  if (text == null) return { paths: null, trunkSha };
-  return { paths: proofPathsFromPackText(text, repoName), trunkSha };
+  const read = await readTrustedRef(forge, repoUrl.trim() && trunk.trim() ? { url: repoUrl, trunk } : null, "delivery-loop.yaml");
+  if (read.text == null) return { paths: null, trunkSha: read.trunkSha };
+  return { paths: proofPathsFromPackText(read.text, repoName), trunkSha: read.trunkSha };
 }
 
 export function unblockingStates(pack: ProjectPack): string[] {
@@ -389,22 +414,22 @@ export function repoByName(pack: ProjectPack, name: string): RepoSpec | undefine
   return pack.repos.find((r) => r.name === name);
 }
 
-function repoIdentity(url: string): string {
-  return url.trim().replace(/\.git$/i, "").replace(/\/+$/, "").toLowerCase();
-}
-
 /**
  * Workspace repo for a trust read.
- * Null unless `agent.url` and `agent.trunk` are both set and `agent.url` is not a product repo.
+ * Null unless `agent.url` and `agent.trunk` are both set, both the agent URL and every product URL
+ * are canonical GitHub repos, and the agent repo is not a product repo.
  * There is no fallback to `repos[0]`.
  */
 export function trustedPackHome(pack: ProjectPack): { url: string; trunk: string } | null {
   const url = pack.agent?.url?.trim() ?? "";
   const trunk = pack.agent?.trunk?.trim() ?? "";
   if (!url || !trunk) return null;
-  const home = repoIdentity(url);
+  const home = canonicalGithubRepo(url);
   if (!home) return null;
-  if ((pack.repos ?? []).some((repo) => repoIdentity(repo.url ?? "") === home)) return null;
+  for (const repo of pack.repos ?? []) {
+    const product = canonicalGithubRepo(repo.url ?? "");
+    if (!product || product === home) return null;
+  }
   return { url, trunk };
 }
 

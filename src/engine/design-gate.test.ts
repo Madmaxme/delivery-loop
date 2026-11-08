@@ -142,6 +142,12 @@ function harness(text: string) {
     async designCheck() {
       return { state: "success", detail: "ui-primitives success", headSha: "abc" };
     },
+    async trunkSha() {
+      return TRUNK;
+    },
+    async readTextFile() {
+      return packYaml("admin-web", ["src"]);
+    },
   };
   return {
     comments,
@@ -228,6 +234,7 @@ describe("design gate", () => {
     writeFileSync(join(root, "admin-web", TOKEN_FILE), "$brand: #ff6600;\n");
     const env = harness(order(`**Validation:** \`${UI_CHECK}\``));
     env.deps.cwd = root;
+    env.deps.pack = { ...pack, agent: { url: WORKSPACE, trunk: "main" } };
     env.deps.forge.designCheck = async () => ({
       state: "failure",
       detail: "ui-primitives failure",
@@ -349,6 +356,7 @@ describe("design gate", () => {
 
   it("does not treat a Design source line as proof of the frame", async () => {
     const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.pack = { ...pack, agent: { url: WORKSPACE, trunk: "main" } };
     env.deps.figmaToken = "fixture-token";
     env.deps.figmaFetch = async () =>
       Response.json({ nodes: { "1:2": { document: { id: "1:2", name: "Home frame", type: "FRAME" } } } });
@@ -722,7 +730,34 @@ describe("independent design check", () => {
     assert.equal(merged, false);
     assert.notEqual(result.outcome, "landed");
     assert.deepEqual(productPack, []);
-    assert.match(`${result.detail}\n${env.comments.join("\n")}`, /unverified/);
+    assert.match(`${result.detail}\n${env.comments.join("\n")}`, /Needs owner: agent\.url and agent\.trunk/);
+    assert.doesNotMatch(env.comments.join("\n"), /OWNER_HEAL/);
+    assert.equal(env.prompts.some((prompt) => prompt.includes("agent.url")), false);
+  });
+
+  it("does not start a worker when the workspace trunk pack cannot be read", async () => {
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    env.deps.figmaFetch = async () => Response.json({ name: "Home" });
+    env.deps.lookupHead = () => null;
+    env.deps.pack = { ...pack, agent: { url: WORKSPACE, trunk: "main" } };
+    let merged = false;
+    env.deps.forge = githubForge({
+      token: "t",
+      fetch: designFetch({
+        headBlob: BLOB,
+        baseBlob: BLOB,
+        appId: GITHUB_ACTIONS_APP_ID,
+      }, () => {
+        merged = true;
+      }),
+    });
+    const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
+    assert.equal(merged, false);
+    assert.notEqual(result.outcome, "landed");
+    assert.match(`${result.detail}\n${env.comments.join("\n")}`, /Needs owner: agent\.url and agent\.trunk/);
+    assert.doesNotMatch(env.comments.join("\n"), /OWNER_HEAL/);
+    assert.equal(env.prompts.some((prompt) => prompt.includes("agent.url")), false);
   });
 
   it("refuses the merge when the pack trunk moves after the design verdict", async () => {

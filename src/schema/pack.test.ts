@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
+import { canonicalGithubRepo } from "../adapters/types.ts";
 import { loadPack, packMigrationWarnings, proofPathsFromTrustedRef, trustedPackHome, type ProjectPack } from "./pack.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -271,8 +272,26 @@ design:
     } as ProjectPack;
     assert.equal(trustedPackHome(pack), null);
     assert.match(packMigrationWarnings(pack).join("\n"), /unverified/);
-    const same = { ...pack, agent: { url: "https://github.com/acme/admin-web.git", trunk: "development" } };
-    assert.equal(trustedPackHome(same), null);
+    const ssh = { ...pack, agent: { url: "git@github.com:acme/admin-web.git", trunk: "development" } };
+    assert.equal(trustedPackHome(ssh), null);
+    assert.equal(canonicalGithubRepo("git@github.com:Acme/admin-web.git"), "acme/admin-web");
+    assert.equal(canonicalGithubRepo("https://github.com/Acme/admin-web"), "acme/admin-web");
+    assert.equal(canonicalGithubRepo("ssh://git@github.com/Acme/admin-web.git"), "acme/admin-web");
+    assert.equal(canonicalGithubRepo("https://github.com/Acme/my.repo"), "acme/my.repo");
+    assert.equal(canonicalGithubRepo("http://github.com/Acme/admin-web"), null);
+    assert.equal(canonicalGithubRepo("https://www.github.com/Acme/workspace"), null);
+    assert.equal(canonicalGithubRepo("https://evilgithub.com/Acme/workspace"), null);
+    assert.equal(trustedPackHome({ ...pack, agent: { url: "http://github.com/acme/workspace", trunk: "main" } }), null);
+    assert.equal(trustedPackHome({ ...pack, agent: { url: "https://www.github.com/acme/workspace", trunk: "main" } }), null);
+    assert.equal(trustedPackHome({ ...pack, agent: { url: "https://evilgithub.com/acme/workspace", trunk: "main" } }), null);
+    assert.equal(
+      trustedPackHome({
+        ...pack,
+        agent: { url: "https://github.com/acme/workspace", trunk: "main" },
+        repos: [{ ...pack.repos[0]!, url: "not a github url" }],
+      }),
+      null,
+    );
     const separate = { ...pack, agent: { url: "https://github.com/acme/workspace", trunk: "main" } };
     assert.deepEqual(trustedPackHome(separate), { url: "https://github.com/acme/workspace", trunk: "main" });
   });

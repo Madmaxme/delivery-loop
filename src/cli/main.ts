@@ -21,7 +21,9 @@ import {
   cursorWorker,
   httpWorker,
 } from "../adapters/workers.js";
+import type { ForgeTreeReader } from "../adapters/forge-github.js";
 import { githubRepoFromUrl } from "../adapters/types.js";
+import { readTrustedRef, trustedPackHome } from "../schema/pack.js";
 import type { ForgeAdapter, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { findConnector } from "../connectors/catalog.js";
 import { deliver, ship, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
@@ -110,34 +112,47 @@ function requireEnv(name: string): string {
   return value;
 }
 
-/** Named owners come from the fetched trunk file. The working copy is not the allowlist. */
-export function commitActorsFromTrustedRef(pack: ProjectPack): ProjectPack["commitActors"] {
-  const trunk = pack.agent?.trunk ?? "main";
-  const ref = `origin/${trunk}:delivery-loop.yaml`;
-  const shown = spawnSync("git", ["show", ref], { cwd: process.cwd(), encoding: "utf8" });
-  if (shown.status !== 0 || !shown.stdout?.trim()) {
-    throw new Error(`commitActors must be read from ${ref}, not the working tree`);
+/**
+ * Named owners from `delivery-loop.yaml` at the workspace trunk.
+ * A null home or a failed forge read throws. The working tree and `origin/main` are not read.
+ */
+export async function commitActorsFromTrustedRef(
+  pack: ProjectPack,
+  forge: Partial<ForgeTreeReader>,
+): Promise<ProjectPack["commitActors"]> {
+  const read = await readTrustedRef(forge, trustedPackHome(pack), "delivery-loop.yaml");
+  if (read.text == null || !read.trunkSha) {
+    throw new Error("commitActors must be read from the workspace trunk, not the working tree");
   }
-  const parsed = parse(shown.stdout) as { commitActors?: ProjectPack["commitActors"] };
+  let parsed: { commitActors?: ProjectPack["commitActors"] };
+  try {
+    parsed = parse(read.text) as { commitActors?: ProjectPack["commitActors"] };
+  } catch {
+    throw new Error("commitActors must be read from the workspace trunk, not the working tree");
+  }
   return parsed.commitActors ?? [];
 }
 
-export function adaptersFor(pack: ProjectPack): {
+export async function adaptersFor(pack: ProjectPack): Promise<{
   tracker: TrackerAdapter;
   worker: WorkerAdapter;
   forge: ForgeAdapter;
-} {
+}> {
   const githubToken = () => requireEnv("GH_TOKEN");
+  const repoSlug = (): string => {
+    if (pack.githubRepo) return pack.githubRepo;
+    const parsed = githubRepoFromUrl(pack.repos[0].url);
+    return `${parsed.owner}/${parsed.repo}`;
+  };
   const forge =
     pack.forge === "git"
       ? gitForge({ cwd: process.cwd() })
-      : githubForge({
-          token: githubToken(),
-          repo:
-            pack.githubRepo ??
-            githubRepoFromUrl(pack.repos[0].url).owner + "/" + githubRepoFromUrl(pack.repos[0].url).repo,
-          commitActors: commitActorsFromTrustedRef(pack),
-        });
+      : await (async () => {
+          const repo = repoSlug();
+          const reader = githubForge({ token: githubToken(), repo });
+          const commitActors = await commitActorsFromTrustedRef(pack, reader);
+          return githubForge({ token: githubToken(), repo, commitActors });
+        })();
   const tracker =
     pack.tracker === "linear"
       ? linearTracker({
@@ -246,37 +261,38 @@ function dispatchOrRun(mode: string, argv: string[]): void {
   const started = Number(
     process.env.DELIVERY_LOOP_PAGE_STARTED_MS || "",
   );
-  const deps = {
-    pack,
-    ...adaptersFor(pack),
-    cwd: process.cwd(),
-    project: plan.project,
-    pageStartedAtMs: Number.isFinite(started) && started > 0 ? started : null,
-  };
-  if (mode === "sweep") {
-    sweep(deps)
-      .then((results) => {
-        console.log(JSON.stringify(results, null, 2));
-        const output = process.env.GITHUB_OUTPUT;
-        if (output && sweepNeedsAnotherPage(results)) {
-          appendFileSync(output, "chain=true\n");
-        }
-      })
-      .catch((error: unknown) => {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exit(1);
-      });
-    return;
-  }
-  if (mode === "ship") {
-    const extra = argv.filter((a) => a.toUpperCase() !== (plan.issue ?? "").toUpperCase()).join(" ");
-    ship(deps, plan.issue ?? undefined, extra).then(() => console.log("shipped"));
-    return;
-  }
-  const issue = plan.issue;
-  if (!issue) throw new Error("deliver needs a ticket id");
-  const until = mode === "ground" ? "ground" : undefined;
-  deliver(deps, issue, until ? { until } : undefined).then((result) => console.log(JSON.stringify(result, null, 2)));
+  void (async () => {
+    const deps = {
+      pack,
+      ...(await adaptersFor(pack)),
+      cwd: process.cwd(),
+      project: plan.project,
+      pageStartedAtMs: Number.isFinite(started) && started > 0 ? started : null,
+    };
+    if (mode === "sweep") {
+      const results = await sweep(deps);
+      console.log(JSON.stringify(results, null, 2));
+      const output = process.env.GITHUB_OUTPUT;
+      if (output && sweepNeedsAnotherPage(results)) {
+        appendFileSync(output, "chain=true\n");
+      }
+      return;
+    }
+    if (mode === "ship") {
+      const extra = argv.filter((a) => a.toUpperCase() !== (plan.issue ?? "").toUpperCase()).join(" ");
+      await ship(deps, plan.issue ?? undefined, extra);
+      console.log("shipped");
+      return;
+    }
+    const issue = plan.issue;
+    if (!issue) throw new Error("deliver needs a ticket id");
+    const until = mode === "ground" ? "ground" : undefined;
+    const result = await deliver(deps, issue, until ? { until } : undefined);
+    console.log(JSON.stringify(result, null, 2));
+  })().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
 }
 
 function init(argv: string[]): void {
