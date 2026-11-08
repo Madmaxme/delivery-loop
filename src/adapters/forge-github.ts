@@ -8,7 +8,8 @@ import type { CompareStatus, FetchLike, ForgeAdapter, PullMerge, PullRequest } f
 
 /** Reads a file through the forge. The local checkout is not a source. */
 export type ForgeTreeReader = {
-  pullBaseSha(input: { repoUrl: string; base: string; head: string }): Promise<string | null>;
+  /** Commit at the tip of `trunk` on `repoUrl`. Null when the forge does not answer. */
+  trunkSha(input: { repoUrl: string; trunk: string }): Promise<string | null>;
   readTextFile(input: { repoUrl: string; path: string; ref: string }): Promise<string | null>;
 };
 import { githubRepoFromUrl } from "./types.js";
@@ -66,9 +67,49 @@ async function compareForDesign(
   };
   const baseSha = typeof json.base_commit?.sha === "string" ? json.base_commit.sha : null;
   if (!Array.isArray(json.files) || !baseSha) return { complete: false, changedPaths: null, baseSha };
+  // The compare API keeps at most 300 files and still returns 200. That list is not complete.
+  if (json.files.length >= 300) return { complete: false, changedPaths: null, baseSha };
   const changedPaths = json.files.map((file) => file.filename ?? "").filter((name) => name.length > 0);
   if (changedPaths.length !== json.files.length) return { complete: false, changedPaths: null, baseSha };
   return { complete: true, changedPaths, baseSha };
+}
+
+const PULL_FILES_PAGE = 100;
+const PULL_FILES_MAX_PAGES = 30;
+
+/** Changed paths from `pulls/{number}/files`. A full page without a next link, or a failed page, is incomplete. */
+async function changedPathsFromPull(
+  fetchImpl: FetchLike,
+  headers: Record<string, string>,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<{ complete: boolean; changedPaths: string[] | null }> {
+  if (!Number.isInteger(number) || number <= 0) return { complete: false, changedPaths: null };
+  const changedPaths: string[] = [];
+  for (let page = 1; page <= PULL_FILES_MAX_PAGES; page += 1) {
+    const response = await fetchImpl(
+      `https://api.github.com/repos/${owner}/${repo}/pulls/${number}/files?per_page=${PULL_FILES_PAGE}&page=${page}`,
+      { headers },
+    );
+    if (!response.ok) return { complete: false, changedPaths: null };
+    const json = (await response.json()) as { filename?: string }[];
+    if (!Array.isArray(json)) return { complete: false, changedPaths: null };
+    for (const file of json) {
+      const name = file?.filename ?? "";
+      if (!name) return { complete: false, changedPaths: null };
+      changedPaths.push(name);
+    }
+    const link = response.headers.get("link") ?? "";
+    const hasNext = /rel="next"/.test(link);
+    if (json.length > PULL_FILES_PAGE) return { complete: false, changedPaths: null };
+    if (json.length < PULL_FILES_PAGE) {
+      if (hasNext) return { complete: false, changedPaths: null };
+      return { complete: true, changedPaths };
+    }
+    if (!hasNext || page === PULL_FILES_MAX_PAGES) return { complete: false, changedPaths: null };
+  }
+  return { complete: false, changedPaths: null };
 }
 
 /** File text at `ref`. Null when the response is not a single base64 file. */
@@ -291,6 +332,7 @@ export function githubForge(opts: {
         startedAt: typeof run.started_at === "string" ? run.started_at : null,
       }));
       const compared = await compareForDesign(fetchImpl, headers, owner, repo, baseRef, input.headSha);
+      const listed = await changedPathsFromPull(fetchImpl, headers, owner, repo, input.number);
       const shas = [input.headSha, compared.baseSha ?? ""].filter(
         (sha, index, all) => sha.length > 0 && all.indexOf(sha) === index,
       );
@@ -329,9 +371,9 @@ export function githubForge(opts: {
         }
       }
       const evidence: DesignCheckEvidence = {
-        complete: complete && compared.complete,
+        complete: complete && listed.complete,
         workflows,
-        changedPaths: compared.changedPaths,
+        changedPaths: listed.changedPaths,
         allowPaths: input.proofPaths ?? [],
       };
       return interpretDesignChecks(runs, input.headSha, input.name, evidence);
@@ -404,10 +446,17 @@ export function githubForge(opts: {
         },
       );
     },
-    async pullBaseSha(input) {
+    async trunkSha(input) {
+      const trunk = input.trunk.trim();
+      if (!trunk || trunk.includes("..") || trunk.includes("\0") || !/^[A-Za-z0-9._/-]+$/.test(trunk)) return null;
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
-      const compared = await compareForDesign(fetchImpl, headers, owner, repo, input.base, input.head);
-      const sha = compared.baseSha?.trim().toLowerCase() ?? "";
+      const response = await fetchImpl(
+        `https://api.github.com/repos/${owner}/${repo}/commits/${encodeURIComponent(trunk)}`,
+        { headers },
+      );
+      if (!response.ok) return null;
+      const json = (await response.json()) as { sha?: string };
+      const sha = json.sha?.trim().toLowerCase() ?? "";
       return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
     },
     async readTextFile(input) {

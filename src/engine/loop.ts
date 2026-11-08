@@ -1776,12 +1776,13 @@ async function readDesignCheck(
       headSha: null,
     };
   }
-  const proofPaths =
-    (await proofPathsFromTrustedRef(deps.forge, pr.repo.url, pr.repo.trunk, pr.headSha, pr.repo.name)) ?? [];
+  const home = agentHome(deps.pack);
+  const proofPaths = (await proofPathsFromTrustedRef(deps.forge, home.url, home.trunk, pr.repo.name)) ?? [];
   const probe = await deps.forge.designCheck({
     repoUrl: pr.repo.url,
     headSha: pr.headSha,
     name: spec.checkName,
+    number: pr.number,
     baseRef: pr.repo.trunk,
     proofPaths,
   });

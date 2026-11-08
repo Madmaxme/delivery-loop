@@ -227,16 +227,18 @@ design:
     git(cwd, ["init", "-b", "main"]);
     git(cwd, ["remote", "add", "origin", bare]);
     writeFileSync(join(cwd, "delivery-loop.yaml"), wide);
-    const baseSha = "b".repeat(40);
-    const headSha = "a".repeat(40);
+    const trunkTip = "b".repeat(40);
     let sawRef = "";
     const forge = {
-      async pullBaseSha() {
-        return baseSha;
+      async trunkSha(input: { repoUrl: string; trunk: string }) {
+        assert.equal(input.repoUrl, "https://github.com/acme/workspace");
+        assert.equal(input.trunk, "main");
+        return trunkTip;
       },
       async readTextFile(input: { repoUrl: string; path: string; ref: string }) {
+        if (input.repoUrl.includes("admin-web")) throw new Error("product repo was read");
         sawRef = input.ref;
-        assert.equal(input.repoUrl, "https://github.com/acme/admin-web");
+        assert.equal(input.repoUrl, "https://github.com/acme/workspace");
         assert.equal(input.path, "delivery-loop.yaml");
         return "design:\n  repos:\n    - name: admin-web\n      proofPaths:\n        - src/kept\n";
       },
@@ -244,15 +246,9 @@ design:
     const previous = process.cwd();
     process.chdir(cwd);
     try {
-      const paths = await proofPathsFromTrustedRef(
-        forge,
-        "https://github.com/acme/admin-web",
-        "development",
-        headSha,
-        "admin-web",
-      );
+      const paths = await proofPathsFromTrustedRef(forge, "https://github.com/acme/workspace", "main", "admin-web");
       assert.deepEqual(paths, ["src/kept"]);
-      assert.equal(sawRef, baseSha);
+      assert.equal(sawRef, trunkTip);
     } finally {
       process.chdir(previous);
     }

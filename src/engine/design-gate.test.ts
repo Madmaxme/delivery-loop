@@ -15,6 +15,8 @@ import { runTicket } from "./loop.ts";
 
 const FRAME = "https://www.figma.com/design/ABC123/Home?node-id=1-2";
 const HEAD = "a".repeat(40);
+const TRUNK = "f".repeat(40);
+const WORKSPACE = "https://github.com/acme/workspace";
 const TOKEN_FILE = "src/tokens.scss";
 const UI_CHECK = "npm run check:ui-primitives";
 
@@ -587,8 +589,10 @@ describe("independent design check", () => {
     env.deps.lookupHead = () => null;
     let merged = false;
     env.deps.cwd = checkoutWithOrigin(["docs"]);
+    const productPack: string[] = [];
     env.deps.pack = {
       ...pack,
+      agent: { url: WORKSPACE, trunk: "main" },
       design: {
         ...pack.design!,
         repos: [{ ...pack.design!.repos[0]!, proofPaths: ["vendor"] }],
@@ -601,6 +605,7 @@ describe("independent design check", () => {
         baseBlob: BLOB,
         appId: GITHUB_ACTIONS_APP_ID,
         packText: packYaml("admin-web", ["src"]),
+        productPack,
       }, () => {
         merged = true;
       }),
@@ -608,6 +613,7 @@ describe("independent design check", () => {
     const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
     assert.equal(merged, true);
     assert.equal(result.outcome, "landed");
+    assert.deepEqual(productPack, []);
   });
 
   it("reads proof paths from the pull request base when origin points at a different repo", async () => {
@@ -616,8 +622,10 @@ describe("independent design check", () => {
     env.deps.figmaFetch = async () => Response.json({ name: "Home" });
     env.deps.lookupHead = () => null;
     env.deps.cwd = checkoutWithOrigin(["."]);
+    const productPack: string[] = [];
     env.deps.pack = {
       ...pack,
+      agent: { url: WORKSPACE, trunk: "main" },
       design: {
         ...pack.design!,
         repos: [{ ...pack.design!.repos[0]!, proofPaths: ["."] }],
@@ -631,6 +639,7 @@ describe("independent design check", () => {
         baseBlob: BLOB,
         appId: GITHUB_ACTIONS_APP_ID,
         packText: packYaml("admin-web", ["src/kept"]),
+        productPack,
       }, () => {
         merged = true;
       }),
@@ -638,7 +647,40 @@ describe("independent design check", () => {
     const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
     assert.equal(merged, false);
     assert.notEqual(result.outcome, "landed");
+    assert.deepEqual(productPack, []);
     assert.match(env.comments.join("\n"), /not an independent|design check/);
+  });
+
+  it("sees a path past the compare cap of 300 files", async () => {
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    env.deps.figmaFetch = async () => Response.json({ name: "Home" });
+    env.deps.lookupHead = () => null;
+    const changedFiles = [...Array.from({ length: 300 }, (_, index) => `src/file-${index}.tsx`), "secret.ts"];
+    env.deps.pack = {
+      ...pack,
+      agent: { url: WORKSPACE, trunk: "main" },
+      design: {
+        ...pack.design!,
+        repos: [{ ...pack.design!.repos[0]!, proofPaths: ["src"] }],
+      },
+    };
+    let merged = false;
+    env.deps.forge = githubForge({
+      token: "t",
+      fetch: designFetch({
+        headBlob: BLOB,
+        baseBlob: BLOB,
+        appId: GITHUB_ACTIONS_APP_ID,
+        packText: packYaml("admin-web", ["src"]),
+        changedFiles,
+      }, () => {
+        merged = true;
+      }),
+    });
+    const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
+    assert.equal(merged, false);
+    assert.notEqual(result.outcome, "landed");
   });
 });
 
@@ -678,7 +720,14 @@ function checkoutWithOrigin(originPaths: string[]): string {
 }
 
 function designFetch(
-  input: { headBlob: string; baseBlob: string | null; appId: number | null; packText?: string },
+  input: {
+    headBlob: string;
+    baseBlob: string | null;
+    appId: number | null;
+    packText?: string;
+    changedFiles?: string[];
+    productPack?: string[];
+  },
   onMerge: () => void,
 ): (url: string | URL, init?: RequestInit) => Promise<Response> {
   return async (url, init) => {
@@ -698,11 +747,35 @@ function designFetch(
         ],
       });
     }
+    if (href.includes("/repos/acme/workspace/commits/")) {
+      return Response.json({ sha: TRUNK });
+    }
+    if (href.includes("/pulls/") && href.includes("/files")) {
+      const page = Number(new URL(href).searchParams.get("page") ?? "1");
+      const all = input.changedFiles ?? ["src/home.tsx"];
+      const start = (page - 1) * 100;
+      const slice = all.slice(start, start + 100);
+      const headers = new Headers();
+      if (start + 100 < all.length) {
+        headers.set("link", `<https://api.github.com/repos/acme/admin-web/pulls/4/files?page=${page + 1}>; rel="next"`);
+      }
+      return new Response(JSON.stringify(slice.map((filename) => ({ filename }))), { status: 200, headers });
+    }
     if (href.includes("/contents/")) {
       const url = new URL(href);
       const ref = url.searchParams.get("ref");
       if (url.pathname.endsWith("/delivery-loop.yaml")) {
-        if (ref !== "e".repeat(40) || !input.packText) return new Response("missing", { status: 404 });
+        if (url.pathname.includes("/acme/admin-web/")) {
+          input.productPack?.push(href);
+          return Response.json({
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(packYaml("admin-web", ["."])).toString("base64"),
+          });
+        }
+        if (!url.pathname.includes("/acme/workspace/") || ref !== TRUNK || !input.packText) {
+          return new Response("missing", { status: 404 });
+        }
         return Response.json({
           type: "file",
           encoding: "base64",
@@ -751,10 +824,11 @@ function designFetch(
       });
     }
     if (href.includes("/compare/")) {
+      const changed = input.changedFiles ?? ["src/home.tsx"];
       return Response.json({
         status: "ahead",
         base_commit: { sha: "e".repeat(40) },
-        files: [{ filename: "src/home.tsx" }],
+        files: changed.slice(0, 300).map((filename) => ({ filename })),
       });
     }
     if (href.endsWith("/pulls/4") && (init?.method ?? "GET") === "GET") {

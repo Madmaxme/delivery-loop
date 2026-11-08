@@ -114,6 +114,8 @@ export type ForgeAdapter = {
     repoUrl: string;
     headSha: string;
     name: string;
+    /** Pull request number. The changed-path list is `pulls/{number}/files`. */
+    number: number;
     /** Base branch. The workflow file on the head has to match this ref. */
     baseRef: string;
     /** Prefixes a pull_request may change. Empty fails that mode closed. */

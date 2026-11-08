@@ -349,22 +349,22 @@ export function proofPathsFromPackText(text: string, repoName: string): string[]
 }
 
 /**
- * `proofPaths` from `delivery-loop.yaml` at the pull request base, read through the forge.
- * The workspace checkout, its `origin`, and the working tree are not read.
+ * `proofPaths` from `delivery-loop.yaml` at the workspace trunk, read through the forge.
+ * `repoUrl` and `trunk` come from engine config (`agent`, or the first repo when that is unset).
+ * The product pull request repo, the workspace checkout, its `origin`, and the working tree are not read.
  * Null when the forge cannot show that file. An empty list is a real answer.
  */
 export async function proofPathsFromTrustedRef(
   forge: Partial<ForgeTreeReader>,
   repoUrl: string,
-  baseRef: string,
-  headSha: string,
+  trunk: string,
   repoName: string,
 ): Promise<string[] | null> {
-  if (!forge.pullBaseSha || !forge.readTextFile) return null;
-  if (!repoUrl.trim() || !baseRef.trim() || !/^[0-9a-f]{40}$/i.test(headSha)) return null;
-  const baseSha = (await forge.pullBaseSha({ repoUrl, base: baseRef, head: headSha }))?.trim().toLowerCase() ?? "";
-  if (!/^[0-9a-f]{40}$/.test(baseSha)) return null;
-  const text = await forge.readTextFile({ repoUrl, path: "delivery-loop.yaml", ref: baseSha });
+  if (!forge.trunkSha || !forge.readTextFile) return null;
+  if (!repoUrl.trim() || !trunk.trim()) return null;
+  const trunkSha = (await forge.trunkSha({ repoUrl, trunk }))?.trim().toLowerCase() ?? "";
+  if (!/^[0-9a-f]{40}$/.test(trunkSha)) return null;
+  const text = await forge.readTextFile({ repoUrl, path: "delivery-loop.yaml", ref: trunkSha });
   if (text == null) return null;
   return proofPathsFromPackText(text, repoName);
 }
