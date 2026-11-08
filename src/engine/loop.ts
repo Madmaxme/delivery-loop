@@ -1054,6 +1054,45 @@ function devCommands(pack: ProjectPack, landed: string[]): string[] {
   return pack.dev?.steps ?? [];
 }
 
+const PROOF_RECEIPT_MARKER = "<!-- PROOF_RECEIPT -->";
+
+function proofReceiptBody(receipt: string, rows: { sha: string; url?: string }[]): string {
+  const lines = [PROOF_RECEIPT_MARKER, "Validated proof receipt for the merged commit."];
+  for (const row of rows) {
+    const sha = row.sha.trim();
+    const url = row.url?.trim() ?? "";
+    if (sha && url) lines.push(`${sha} ${url}`);
+    else if (sha) lines.push(sha);
+    else if (url) lines.push(url);
+  }
+  lines.push(receipt.trim());
+  return lines.join("\n");
+}
+
+function publishedProofReceipt(comments: { body: string }[]): string | null {
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const body = comments[i]?.body ?? "";
+    if (body.includes(PROOF_RECEIPT_MARKER)) return body;
+  }
+  return null;
+}
+
+/**
+ * One proof comment before the dev status. A resume that already has the
+ * comment keeps it. A tracker write failure throws, like the other writes.
+ */
+async function publishProofReceipt(
+  deps: LoopDeps,
+  ticket: Ticket,
+  proof: { receipt: string; rows: { sha: string; url?: string }[] } | null,
+): Promise<void> {
+  if (publishedProofReceipt(ticket.comments)) return;
+  if (!proof?.receipt.trim()) return;
+  const body = proofReceiptBody(proof.receipt, proof.rows);
+  await deps.tracker.comment(ticket.identifier, body);
+  ticket.comments = [...ticket.comments, { body }];
+}
+
 function landWaitMarker(hold: boolean, rows: { repo: string; sha: string }[]): string {
   const lines = ["<!-- LAND_WAIT", `hold=${hold ? "1" : "0"}`];
   for (const row of rows) lines.push(`${row.repo} ${row.sha}`);
@@ -1294,7 +1333,7 @@ async function settleTrunk(
   deps: LoopDeps,
   ticket: Ticket,
   hold: boolean,
-  rows: { repo: RepoSpec; sha: string }[],
+  rows: { repo: RepoSpec; sha: string; url?: string }[],
   doneDetail: string,
   declared = "",
   receipt = "",
@@ -1363,6 +1402,16 @@ async function settleTrunk(
     }
   }
   const devState = hold ? holdStatus(deps.pack) : deps.pack.status.dev;
+  if (!hold) {
+    const existing = publishedProofReceipt(ticket.comments);
+    const recorded =
+      parseJourneyEvidence(declared) === "recorded" || parseJourneyEvidence(receipt) === "recorded";
+    await publishProofReceipt(
+      deps,
+      ticket,
+      recorded ? { receipt: proofReceipt, rows } : existing ? { receipt: existing, rows } : null,
+    );
+  }
   if (deps.pack.ship?.afterDev) {
     await deps.tracker.setState(ticket.identifier, devState);
     const failed = runShipSteps(deps, ticket.identifier);
@@ -1404,7 +1453,7 @@ async function finishMerged(
     deps,
     ticket,
     hold,
-    merged.map((row) => ({ repo: row.repo, sha: row.sha })),
+    merged.map((row) => ({ repo: row.repo, sha: row.sha, url: row.url })),
     merged.map((row) => row.url).join(" "),
     declared,
     receipt,
