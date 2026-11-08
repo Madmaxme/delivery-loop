@@ -239,11 +239,18 @@ export async function designRepairText(input: {
   repoName: string;
   repoDir: string;
   figmaToken?: string | null;
+  figmaCredential?: CanonicalCredential | null;
+  credentialMode?: "legacy" | "canonical";
   figmaFetch?: FetchLike;
 }): Promise<string> {
   const frames = ticketFigmaUrls(input.ticket);
   if (frames.length > 0) {
-    const token = figmaTokenValue({ figmaToken: input.figmaToken, design: input.design });
+    const token = figmaTokenValue({
+      figmaToken: input.figmaToken,
+      design: input.design,
+      credential: input.figmaCredential,
+      mode: input.credentialMode ?? "legacy",
+    });
     const fetchImpl = input.figmaFetch ?? fetch;
     const blocks: string[] = [];
     for (const url of frames) {

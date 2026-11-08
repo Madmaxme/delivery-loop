@@ -32,7 +32,7 @@ import {
   type CompileProgramResult,
   type DeliveryLeaseStamp,
 } from "./linear-harness-policy.js";
-import type { CanonicalCredential } from "../adapters/canonical-path.ts";
+import { allowlistedEnv, credentialSecret, type CanonicalCredential } from "../adapters/canonical-path.ts";
 import { lockedGitEnv } from "../adapters/forge-git.ts";
 import { confirmLandBranches, lookupRemoteHead, renderBranch } from "./land-branches.js";
 import {
@@ -116,9 +116,12 @@ export type LoopDeps = {
   runCommand?: (command: string, cwd: string) => { status: number | null };
   /**
    * Figma REST token. `null` means the token is absent. Unset reads
-   * `design.figmaTokenEnv`, which defaults to FIGMA_ACCESS_TOKEN.
+   * `design.figmaTokenEnv` only when `credentialMode` is legacy.
    */
   figmaToken?: string | null;
+  /** Canonical mode does not read an ambient Figma token. */
+  credentialMode?: "legacy" | "canonical";
+  figmaCredential?: CanonicalCredential | null;
   /** Override for tests. Default is global fetch. The token is not written into prompts. */
   figmaFetch?: FetchLike;
   /** Frame read for the ground prompt. Set for the current ticket only. */
@@ -271,7 +274,12 @@ function previousOwnerActive(
   deps: LoopDeps,
 ): boolean | null {
   if (stamp.ghaRunId) {
-    const ask = deps.githubRunActive ?? ((id) => isGithubActionsRunActive(id));
+    const ask =
+      deps.githubRunActive ??
+      ((id) =>
+        isGithubActionsRunActive(id, {
+          env: deps.credentialMode === "canonical" ? githubStatusEnv(deps) : undefined,
+        }));
     return ask(stamp.ghaRunId);
   }
   if (stamp.cursorRunId === "pending") return false;
@@ -1160,6 +1168,17 @@ function refreshShipGithubToken(_env: NodeJS.ProcessEnv): boolean {
   return false;
 }
 
+function githubStatusEnv(deps: LoopDeps): NodeJS.ProcessEnv {
+  if (!deps.githubHandle) return allowlistedEnv(process.env);
+  const token = credentialSecret(deps.githubHandle, {
+    api: "github",
+    operation: "gh",
+    role: "opener",
+    destination: "https://api.github.com",
+  });
+  return allowlistedEnv(process.env, { GH_TOKEN: token, GITHUB_TOKEN: token });
+}
+
 function remoteHead(deps: LoopDeps): (repoUrl: string, branch: string) => string | null {
   if (deps.lookupHead) return deps.lookupHead;
   return (repoUrl, branch) => lookupRemoteHead(repoUrl, branch, deps.githubHandle ?? null);
@@ -1733,7 +1752,12 @@ async function stopForMissingFigmaToken(deps: LoopDeps, ticket: Ticket): Promise
   deps.figmaGroundBlock = undefined;
   const frames = ticketFigmaUrls(ticket);
   if (frames.length === 0) return null;
-  const token = figmaTokenValue({ figmaToken: deps.figmaToken, design: deps.pack.design });
+  const token = figmaTokenValue({
+    figmaToken: deps.figmaToken,
+    design: deps.pack.design,
+    credential: deps.figmaCredential,
+    mode: deps.credentialMode ?? "legacy",
+  });
   if (!token) {
     const envName = deps.pack.design?.figmaTokenEnv?.trim() || "FIGMA_ACCESS_TOKEN";
     await deps.tracker.comment(
@@ -1748,6 +1772,8 @@ async function stopForMissingFigmaToken(deps: LoopDeps, ticket: Ticket): Promise
     repoName: "",
     repoDir: deps.cwd ?? process.cwd(),
     figmaToken: deps.figmaToken,
+    figmaCredential: deps.figmaCredential,
+    credentialMode: deps.credentialMode,
     figmaFetch: deps.figmaFetch,
   });
   return null;
@@ -1760,6 +1786,8 @@ async function repairContext(deps: LoopDeps, ticket: Ticket, pr: OpenPull): Prom
     repoName: pr.repo.name,
     repoDir: repoCheckoutDir(deps.cwd ?? process.cwd(), pr.repo, deps.pack),
     figmaToken: deps.figmaToken,
+    figmaCredential: deps.figmaCredential,
+    credentialMode: deps.credentialMode,
     figmaFetch: deps.figmaFetch,
   });
   return text ? `\n${text}` : "";

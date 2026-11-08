@@ -247,7 +247,21 @@ export async function adaptersFor(pack: ProjectPack, prepared: PreparedCredentia
 }
 
 function workerFor(pack: ProjectPack, prepared: PreparedCredentials | null): WorkerAdapter {
-  if (!prepared) throw new CanonicalPathError("missing-policy", pack.worker, "missing canonical credential");
+  if (!prepared) {
+    if (pack.worker === "cursor") return cursorWorker({ legacyKey: requireEnv("CURSOR_API_KEY") });
+    if (pack.worker === "claude") return claudeWorker({ legacyKey: requireEnv("ANTHROPIC_API_KEY") });
+    if (pack.worker === "codex") return codexWorker({ legacyKey: requireEnv("OPENAI_API_KEY") });
+    if (pack.worker === "copilot") {
+      const repo = pack.githubRepo ?? "";
+      const [owner, name] = repo.split("/");
+      return copilotWorker({ legacyKey: requireEnv("GH_TOKEN"), owner, repo: name });
+    }
+    return httpWorker({
+      startUrl: pack.workerHttp?.startUrl ?? "",
+      statusUrl: pack.workerHttp?.statusUrl ?? "",
+      legacyKey: requireEnv("HTTP_WORKER_TOKEN"),
+    });
+  }
   if (pack.worker === "cursor") {
     const credential = prepared.extensions.cursor;
     if (!credential) throw new CanonicalPathError("missing-policy", "cursor", "missing canonical credential");
@@ -281,7 +295,14 @@ function workerFor(pack: ProjectPack, prepared: PreparedCredentials | null): Wor
 async function dispatchGh(args: string[]): Promise<number | null> {
   const opened = openPack(packPath(process.cwd()));
   const prepared = await preparePackCredentials(opened.pack, readFileSync(packPath(process.cwd()), "utf8"), process.cwd());
-  const credential = prepared?.opener;
+  if (!prepared) {
+    const token = requireEnv("GH_TOKEN");
+    return spawnSync("gh", args, {
+      env: allowlistedEnv(process.env, { GH_TOKEN: token, GITHUB_TOKEN: token }),
+      stdio: "inherit",
+    }).status;
+  }
+  const credential = prepared.opener;
   if (!credential) throw new CanonicalPathError("missing-policy", "github", "missing canonical credential");
   return runGh(credential, args).status;
 }
@@ -367,6 +388,9 @@ async function dispatchOrRun(mode: string, argv: string[]): Promise<void> {
     project: plan.project,
     pageStartedAtMs: Number.isFinite(started) && started > 0 ? started : null,
     lookupHead: (repoUrl: string, branch: string) => lookupRemoteHead(repoUrl, branch, prepared?.opener ?? null),
+    credentialMode: prepared ? "canonical" : "legacy",
+    figmaCredential: prepared?.extensions.figma ?? null,
+    githubHandle: prepared?.opener ?? null,
   };
   if (mode === "sweep") {
     sweep(deps)

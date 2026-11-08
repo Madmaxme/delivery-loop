@@ -1,7 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -12,7 +12,7 @@ import { parse } from "yaml";
 import { assertCanonicalPath, assertCanonicalPaths, type CanonicalPath } from "../bots/canonical.ts";
 import { loadBotBundle } from "../bots/load.ts";
 import type { BotDefinition } from "../bots/types.ts";
-import { OUTBOUND_ADAPTERS, adapterAttempts } from "./registry.ts";
+import { OUTBOUND_ADAPTERS, OUTBOUND_MODULES, adapterAttempts, detectOutboundModules } from "./registry.ts";
 import { awsCaller } from "./aws.ts";
 import {
   authorizationHeader,
@@ -25,7 +25,7 @@ import {
   resolveCredential,
   type CommandSpawn,
 } from "./canonical-path.ts";
-import { healthFetch, issue, linearPath, mergerPath, openerPath, organizationId, readyMerger, viewerId } from "../testing/canonical-fixtures.ts";
+import { healthFetch, issue, linearPath, mergerPath, openerPath, organizationId, readyMerger, readyOpener, viewerId } from "../testing/canonical-fixtures.ts";
 import { githubForge, githubGraphql } from "./forge-github.ts";
 import { gitForge } from "./forge-git.ts";
 import { githubUserLogin } from "./github-actor.ts";
@@ -474,6 +474,24 @@ describe("canonical call path", () => {
     assert.deepEqual(calls, []);
   });
 
+  it("refuses to replay a healthy github credential against Linear", async () => {
+    const calls: string[] = [];
+    const credential = await readyOpener();
+    await assert.rejects(async () => {
+      const tracker = linearTracker({
+        credential,
+        team: "T",
+        intakeState: "Todo",
+        fetch: async (url) => {
+          calls.push(String(url));
+          return json({}, 500);
+        },
+      });
+      await tracker.listIntake();
+    }, /did not come from the canonical path/);
+    assert.deepEqual(calls, []);
+  });
+
   it("parses a multiline AWS caller identity", async () => {
     const credential = await resolveCredential(
       {
@@ -508,10 +526,11 @@ describe("canonical call path", () => {
   });
 
   it("every registered adapter rejects raw, copied, and unprobed credentials before any call", async () => {
-    const files = new Set(readdirSync(here).filter((file) => file.endsWith(".ts") && !file.endsWith(".test.ts")));
+    const detected = detectOutboundModules(join(here, "../.."));
+    assert.deepEqual(detected, [...OUTBOUND_MODULES].sort());
     for (const name of OUTBOUND_ADAPTERS) {
-      if (name === "land-branches.ts") continue;
-      assert.equal(files.has(name), true, name);
+      if (name === "aws.ts") continue;
+      assert.equal(detected.some((file) => file.endsWith(`/${name}`) || file.endsWith(name)), true, name);
     }
     const calls: string[] = [];
     const fetch: FetchLike = async (url) => {

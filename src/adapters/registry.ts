@@ -1,8 +1,14 @@
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join, relative } from "node:path";
+
 import { awsCaller } from "./aws.ts";
 import type { CanonicalCredential } from "./canonical-path.ts";
+import { figmaTokenValue } from "../engine/design-gate.ts";
+import { lookupRemoteHead } from "../engine/land-branches.ts";
 import { gitForge } from "./forge-git.ts";
 import { githubForge, githubGraphql } from "./forge-github.ts";
 import { runGh } from "./gh.ts";
+import { githubUserLogin } from "./github-actor.ts";
 import { githubIssuesTracker, linearTracker } from "./trackers.ts";
 import type { FetchLike } from "./types.ts";
 import { claudeWorker, codexWorker, copilotWorker, cursorWorker, httpWorker } from "./workers.ts";
@@ -18,6 +24,44 @@ export const OUTBOUND_ADAPTERS = [
   "trackers.ts",
   "workers.ts",
 ] as const;
+
+/** Production modules that can open a network or subprocess call. The test compares this to a recursive scan. */
+export const OUTBOUND_MODULES = [
+  "src/adapters/canonical-path.ts",
+  "src/adapters/forge-git.ts",
+  "src/adapters/forge-github.ts",
+  "src/adapters/gh.ts",
+  "src/adapters/github-actor.ts",
+  "src/adapters/trackers.ts",
+  "src/adapters/workers.ts",
+  "src/cli/main.ts",
+  "src/engine/design-gate.ts",
+  "src/engine/github-run-status.ts",
+  "src/engine/land-branches.ts",
+  "src/engine/loop.ts",
+] as const;
+
+const OUTBOUND_TEXT = /\bfetchImpl\s*\(|\bspawnSync\s*\(|\bexecFileSync\s*\(|\bspawn\s*\(/;
+
+export function detectOutboundModules(root: string): string[] {
+  const found: string[] = [];
+  const walk = (dir: string) => {
+    for (const name of readdirSync(dir)) {
+      if (name === "node_modules" || name === "fixtures") continue;
+      const abs = join(dir, name);
+      if (statSync(abs).isDirectory()) {
+        walk(abs);
+        continue;
+      }
+      if (!name.endsWith(".ts") || name.endsWith(".test.ts")) continue;
+      const text = readFileSync(abs, "utf8");
+      if (!OUTBOUND_TEXT.test(text)) continue;
+      found.push(relative(root, abs).split("\\").join("/"));
+    }
+  };
+  walk(join(root, "src"));
+  return found.sort();
+}
 
 export type AdapterAttempt = {
   name: string;
@@ -129,6 +173,26 @@ export function adapterAttempts(unprobed: {
           prompt: "x",
           repoUrl: "https://github.com/example/app",
           baseRef: "main",
+        }),
+    },
+    {
+      name: "land-branches",
+      run: ({ raw }) =>
+        lookupRemoteHead("https://github.com/example/app.git", "main", raw as CanonicalCredential, () => {
+          throw new Error("spawned");
+        }),
+    },
+    {
+      name: "github-actor",
+      run: ({ raw, fetch }) => githubUserLogin(fetch, raw as CanonicalCredential),
+    },
+    {
+      name: "design-gate",
+      run: ({ raw }) =>
+        figmaTokenValue({
+          credential: raw as CanonicalCredential,
+          mode: "canonical",
+          design: undefined,
         }),
     },
     {

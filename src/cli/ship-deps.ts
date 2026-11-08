@@ -123,5 +123,8 @@ export function shipInvocationDeps(pack: ProjectPack, cwd: string, prepared: Pre
     tracker: needsTracker ? trackerFor(pack, prepared) : idleTracker(),
     openTracker: () => trackerFor(pack, prepared),
     lookupHead: (repoUrl, branch) => lookupRemoteHead(repoUrl, branch, opener ?? null),
+    credentialMode: prepared ? "canonical" : "legacy",
+    githubHandle: opener ?? null,
+    figmaCredential: prepared?.extensions.figma ?? null,
   };
 }

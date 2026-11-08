@@ -20,6 +20,15 @@ function issued(credential: CanonicalCredential, api: string): string {
     destination: credentialPrimaryDestination(credential),
   });
 }
+
+function workerSecret(opts: { credential?: CanonicalCredential; legacyKey?: string }, api: string): string {
+  const legacy = Boolean(opts.legacyKey);
+  if (legacy === Boolean(opts.credential)) {
+    throw new CanonicalPathError("invalid-policy", api, "legacy mode is distinct from a canonical credential");
+  }
+  if (legacy) return opts.legacyKey ?? "";
+  return issued(opts.credential as CanonicalCredential, api);
+}
 import type { FetchLike, WorkerAdapter, WorkerResult, WorkerStart } from "./types.js";
 
 async function poll(
@@ -38,14 +47,14 @@ async function poll(
 export function httpWorker(opts: {
   startUrl: string;
   statusUrl: string;
-  credential: CanonicalCredential;
+  credential?: CanonicalCredential;
+  legacyKey?: string;
   fetch?: FetchLike;
 }): WorkerAdapter {
-  assertCanonicalCredential(opts.credential, "http");
   const fetchImpl = opts.fetch ?? fetch;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    Authorization: authorizationHeader(issued(opts.credential, "http")),
+    Authorization: authorizationHeader(workerSecret(opts, "http")),
   };
   return {
     kind: "http",
@@ -72,18 +81,21 @@ export function httpWorker(opts: {
 }
 
 export function copilotWorker(opts: {
-  credential: CanonicalCredential;
+  credential?: CanonicalCredential;
+  legacyKey?: string;
   owner: string;
   repo: string;
   fetch?: FetchLike;
 }): WorkerAdapter {
-  assertCanonicalCredential(opts.credential, "github");
-  if (!isLegacyCredential(opts.credential) && credentialRole(opts.credential) !== "opener") {
-    throw new CanonicalPathError("non-canonical-credential", "github", "copilot uses the github opener credential");
+  if (opts.credential) {
+    assertCanonicalCredential(opts.credential, "github");
+    if (!isLegacyCredential(opts.credential) && credentialRole(opts.credential) !== "opener") {
+      throw new CanonicalPathError("non-canonical-credential", "github", "copilot uses the github opener credential");
+    }
   }
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    Authorization: authorizationHeader(issued(opts.credential, "github")),
+    Authorization: authorizationHeader(workerSecret(opts, "github")),
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2026-03-10",
     "Content-Type": "application/json",
@@ -133,11 +145,14 @@ export function copilotWorker(opts: {
   };
 }
 
-export function codexWorker(opts: { credential: CanonicalCredential; fetch?: FetchLike }): WorkerAdapter {
-  assertCanonicalCredential(opts.credential, "openai");
+export function codexWorker(opts: {
+  credential?: CanonicalCredential;
+  legacyKey?: string;
+  fetch?: FetchLike;
+}): WorkerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    Authorization: authorizationHeader(issued(opts.credential, "openai")),
+    Authorization: authorizationHeader(workerSecret(opts, "openai")),
     "Content-Type": "application/json",
     "OpenAI-Beta": "agents=v1",
   };
@@ -190,11 +205,14 @@ export function codexWorker(opts: { credential: CanonicalCredential; fetch?: Fet
   };
 }
 
-export function claudeWorker(opts: { credential: CanonicalCredential; fetch?: FetchLike }): WorkerAdapter {
-  assertCanonicalCredential(opts.credential, "anthropic");
+export function claudeWorker(opts: {
+  credential?: CanonicalCredential;
+  legacyKey?: string;
+  fetch?: FetchLike;
+}): WorkerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    "x-api-key": issued(opts.credential, "anthropic"),
+    "x-api-key": workerSecret(opts, "anthropic"),
     "anthropic-version": "2023-06-01",
     "Content-Type": "application/json",
   };
@@ -332,10 +350,10 @@ type CursorLiveRun = {
 };
 
 export function cursorWorker(opts: {
-  credential: CanonicalCredential;
+  credential?: CanonicalCredential;
+  legacyKey?: string;
   sdk?: CursorSdk;
 }): WorkerAdapter {
-  assertCanonicalCredential(opts.credential, "cursor");
   const live = new Map<string, CursorLiveRun>();
   return {
     kind: "cursor",
@@ -344,7 +362,7 @@ export function cursorWorker(opts: {
         opts.sdk ??
         ((await import("@cursor/sdk")) as { Agent: CursorSdk }).Agent;
       const agent = await sdk.create({
-        apiKey: issued(opts.credential, "cursor"),
+        apiKey: workerSecret(opts, "cursor"),
         cloud: {
           repos: [{ url: input.repoUrl, startingRef: input.baseRef }],
           autoCreatePR: false,
