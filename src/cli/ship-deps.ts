@@ -1,13 +1,9 @@
+import { CanonicalPathError, type PreparedCredentials } from "../adapters/canonical-path.ts";
 import type { ForgeAdapter, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { githubIssuesTracker, linearTracker } from "../adapters/trackers.js";
+import { lookupRemoteHead } from "../engine/land-branches.ts";
 import type { LoopDeps } from "../engine/loop.js";
 import type { ProjectPack } from "../schema/pack.js";
-
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`${name} is required`);
-  return value;
-}
 
 function idleWorker(): WorkerAdapter {
   return {
@@ -75,17 +71,22 @@ function idleForge(): ForgeAdapter {
   };
 }
 
-function trackerFor(pack: ProjectPack): TrackerAdapter {
-  const token = requireEnv("GH_TOKEN");
+function trackerFor(pack: ProjectPack, prepared: PreparedCredentials | null): TrackerAdapter {
   if (pack.tracker === "linear") {
+    if (!prepared?.linear) {
+      throw new CanonicalPathError("missing-policy", "linear", "missing canonical path for linear");
+    }
     return linearTracker({
-      apiKey: requireEnv("LINEAR_API_KEY"),
+      credential: prepared.linear,
       team: pack.linearTeam ?? "",
       intakeState: pack.status.intake,
     });
   }
+  if (!prepared?.opener) {
+    throw new CanonicalPathError("missing-policy", "github", "missing canonical path for github opener");
+  }
   return githubIssuesTracker({
-    token,
+    credential: prepared.opener,
     repo: pack.githubRepo ?? "",
     intakeLabel: pack.status.intake,
   });
@@ -97,14 +98,16 @@ function trackerFor(pack: ProjectPack): TrackerAdapter {
  * A failed step opens the tracker to record one owner edit, then starts
  * the worker.
  */
-export function shipInvocationDeps(pack: ProjectPack, cwd: string): LoopDeps {
+export function shipInvocationDeps(pack: ProjectPack, cwd: string, prepared: PreparedCredentials | null = null): LoopDeps {
   const needsTracker = pack.ship?.markStatus !== false;
+  const opener = prepared?.opener;
   return {
     pack,
     cwd,
     worker: idleWorker(),
     forge: idleForge(),
-    tracker: needsTracker ? trackerFor(pack) : idleTracker(),
-    openTracker: () => trackerFor(pack),
+    tracker: needsTracker ? trackerFor(pack, prepared) : idleTracker(),
+    openTracker: () => trackerFor(pack, prepared),
+    lookupHead: (repoUrl, branch) => lookupRemoteHead(repoUrl, branch, opener ?? null),
   };
 }

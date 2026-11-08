@@ -1,3 +1,5 @@
+import type { CanonicalPath } from "./canonical.ts";
+
 /** A role. The engine ships the template. A client ships the instance. */
 export type BotRole = "orchestrator" | "verdict-writer" | "delivery-agent" | "engineering-bot";
 
@@ -37,6 +39,7 @@ export const POLICY_IDS = [
   "engineering-no-status-writes",
   "engineering-no-relax-gate",
   "engineering-reports-only-to-orchestrator",
+  "canonical-call-path",
 ] as const;
 
 export type PolicyId = (typeof POLICY_IDS)[number];
@@ -73,9 +76,10 @@ export const MAY_IDS = [
 export type MayId = (typeof MAY_IDS)[number];
 
 export const REQUIRED_POLICIES: Record<BotRole, readonly PolicyId[]> = {
-  orchestrator: ["orchestrator-no-dispatch", "orchestrator-no-status-writes"],
-  "verdict-writer": ["verdict-no-status-writes", "verdict-no-relax-gate"],
+  orchestrator: ["canonical-call-path", "orchestrator-no-dispatch", "orchestrator-no-status-writes"],
+  "verdict-writer": ["canonical-call-path", "verdict-no-status-writes", "verdict-no-relax-gate"],
   "delivery-agent": [
+    "canonical-call-path",
     "no-self-merge",
     "independent-review",
     "checks-on-exact-head",
@@ -84,6 +88,7 @@ export const REQUIRED_POLICIES: Record<BotRole, readonly PolicyId[]> = {
     "no-merge-on-red",
   ],
   "engineering-bot": [
+    "canonical-call-path",
     "no-self-merge",
     "engineering-no-dispatch",
     "engineering-no-status-writes",
@@ -174,6 +179,8 @@ export type BotInventory = {
   specversion: "1.0";
   items: BotInventoryItem[];
   coverageGaps: BotCoverageGap[];
+  /** Per-API credential path for this instance. The engine enforces it. A secret is not stored here. */
+  canonicalPaths?: CanonicalPath[];
 };
 
 /** File references, relative to the manifest's directory. */

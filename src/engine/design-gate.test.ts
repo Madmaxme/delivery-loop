@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
+import { mintCredential } from "../adapters/canonical-path.ts";
 import { githubForge } from "../adapters/forge-github.ts";
 import { linearTracker } from "../adapters/trackers.ts";
-import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
+import type { FetchLike, ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
 import { runTicket } from "./loop.ts";
 
@@ -14,6 +15,71 @@ const FRAME = "https://www.figma.com/design/ABC123/Home?node-id=1-2";
 const HEAD = "a".repeat(40);
 const TOKEN_FILE = "src/tokens.scss";
 const UI_CHECK = "npm run check:ui-primitives";
+
+function opener() {
+  return mintCredential(
+    {
+      api: "github",
+      role: "opener",
+      identityKind: "user",
+      source: "ref:github-opener",
+      acquisition: "mint-per-process",
+      refresh: "per-process",
+      mintCommand: "mint-github-opener",
+      actorRef: "ref:commit-actor",
+    },
+    "t",
+  );
+}
+
+function merger() {
+  return mintCredential(
+    {
+      api: "github",
+      role: "merger",
+      identityKind: "installation",
+      source: "ref:github-merger",
+      acquisition: "mint-per-process",
+      refresh: "per-process",
+      mintCommand: "mint-github-merger",
+    },
+    "merger-token",
+  );
+}
+
+function linearCredential() {
+  return mintCredential(
+    {
+      api: "linear",
+      source: "ref:linear-oauth",
+      acquisition: "mint-per-process",
+      refresh: "per-process",
+      mintCommand: "mint-linear",
+      expectedIdentity: "Example Delivery",
+    },
+    "k",
+  );
+}
+
+function withViewer(fetchImpl: FetchLike): FetchLike {
+  return async (url, init) => {
+    const body = typeof init?.body === "string" ? init.body : "";
+    if (body.includes("viewer")) {
+      return Response.json({ data: { viewer: { id: "v1", name: "Example Delivery" } } });
+    }
+    return fetchImpl(url, init);
+  };
+}
+
+function withGithubHealth(fetchImpl: FetchLike): FetchLike {
+  return async (url, init) => {
+    const href = String(url);
+    if (href.endsWith("/user")) return Response.json({ login: "example-owner" });
+    if (href.includes("/installation/repositories")) return Response.json({ repositories: [] });
+    if (href.endsWith("/rate_limit")) return Response.json({ rate: {} });
+    return fetchImpl(url, init);
+  };
+}
 
 const pack: ProjectPack = {
   tracker: "linear",
@@ -162,10 +228,10 @@ describe("design gate", () => {
     const comment = "https://www.figma.com/design/OTHER/Notes?node-id=2-2";
     let sawAttachments = false;
     const linear = linearTracker({
-      apiKey: "k",
+      credential: linearCredential(),
       team: "QUI",
       intakeState: "Todo",
-      fetch: async (_url, init) => {
+      fetch: withViewer(async (_url, init) => {
         const body = JSON.parse(String(init?.body)) as { query: string };
         sawAttachments = body.query.includes("attachments");
         return Response.json({
@@ -187,7 +253,7 @@ describe("design gate", () => {
             },
           },
         });
-      },
+      }),
     });
     const [found] = await linear.listIntake();
     assert.equal(sawAttachments, true);
@@ -239,8 +305,9 @@ describe("design gate", () => {
     const env = harness(order(`**Validation:** \`${UI_CHECK}\``));
     let merged = false;
     const forge = githubForge({
-      token: "t",
-      fetch: async (url, init) => {
+      opener: opener(),
+      merger: merger(),
+      fetch: withGithubHealth(async (url, init) => {
         const href = String(url);
         if (href.includes(`/commits/${HEAD}/check-runs`)) {
           return Response.json({
@@ -284,7 +351,7 @@ describe("design gate", () => {
           return Response.json({ sha: "c".repeat(40) });
         }
         return Response.json({});
-      },
+      }),
     });
     env.deps.forge = forge;
     const result = await runTicket(env.deps, ticket());

@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 
+import { scopedChildEnv, type CanonicalCredential } from "../adapters/canonical-path.ts";
 import type { RepoSpec } from "../schema/pack.ts";
 
 export function renderBranch(template: string, issue: string, repo: string): string {
@@ -65,14 +66,20 @@ export function confirmLandBranches(input: {
   return confirmed.length ? confirmed : null;
 }
 
-export function lookupRemoteHead(repoUrl: string, branch: string): string | null {
-  const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
+export function lookupRemoteHead(
+  repoUrl: string,
+  branch: string,
+  credential?: CanonicalCredential | null,
+  spawn: typeof spawnSync = spawnSync,
+): string | null {
+  const env = scopedChildEnv(process.env, credential ?? null);
   const remote =
-    token && repoUrl.startsWith("https://")
-      ? repoUrl.replace("https://", `https://x-access-token:${token}@`)
+    credential && repoUrl.startsWith("https://")
+      ? repoUrl.replace("https://", `https://x-access-token:${credential.token}@`)
       : repoUrl;
-  const result = spawnSync("git", ["ls-remote", remote, `refs/heads/${branch}`], {
+  const result = spawn("git", ["ls-remote", remote, `refs/heads/${branch}`], {
     encoding: "utf8",
+    env,
   });
   if (result.status !== 0) return null;
   const sha = result.stdout.trim().split(/\s+/)[0] ?? "";

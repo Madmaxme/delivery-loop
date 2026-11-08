@@ -1,5 +1,13 @@
 import { figmaUrlsFromText } from "../engine/design-gate.ts";
 import type { IssueBlocker, LinearProgramSnapshot } from "../engine/linear-harness-policy.js";
+import {
+  assertCanonicalCredential,
+  authorizationHeader,
+  isHealthy,
+  probeGithub,
+  probeLinearViewer,
+  type CanonicalCredential,
+} from "./canonical-path.ts";
 import type { FetchLike, Ticket, TrackerAdapter } from "./types.js";
 
 type LinearIssue = {
@@ -21,18 +29,27 @@ type LinearIssue = {
 };
 
 export function linearTracker(opts: {
-  apiKey: string;
+  credential: CanonicalCredential;
   team: string;
   intakeState: string;
   fetch?: FetchLike;
 }): TrackerAdapter {
+  assertCanonicalCredential(opts.credential, "linear");
   const fetchImpl = opts.fetch ?? fetch;
+  let ready: Promise<void> | null = null;
+
+  async function gate(): Promise<void> {
+    if (isHealthy(opts.credential)) return;
+    ready ??= probeLinearViewer(opts.credential, fetchImpl);
+    await ready;
+  }
 
   async function gql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+    await gate();
     const response = await fetchImpl("https://api.linear.app/graphql", {
       method: "POST",
       headers: {
-        Authorization: opts.apiKey,
+        Authorization: authorizationHeader(opts.credential.token),
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ query, variables }),
@@ -285,6 +302,14 @@ async function linearProjectSnapshot(
   };
 }
 
+export function rejectRawCredential(): void {
+  linearTracker({
+    credential: { token: "stored", api: "linear" } as CanonicalCredential,
+    team: "T",
+    intakeState: "Todo",
+  });
+}
+
 function blockersFrom(
   nodes: { id?: string; type: string; issue: { identifier: string; state: { name: string } | null } }[] | undefined,
 ): IssueBlocker[] {
@@ -307,20 +332,29 @@ function blockersFrom(
 }
 
 export function githubIssuesTracker(opts: {
-  token: string;
+  credential: CanonicalCredential;
   repo: string;
   intakeLabel: string;
   fetch?: FetchLike;
 }): TrackerAdapter {
+  assertCanonicalCredential(opts.credential, "github");
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    Authorization: `Bearer ${opts.token}`,
+    Authorization: authorizationHeader(opts.credential.token),
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
     "Content-Type": "application/json",
   };
+  let ready: Promise<void> | null = null;
+
+  async function gate(): Promise<void> {
+    if (isHealthy(opts.credential)) return;
+    ready ??= probeGithub(opts.credential, fetchImpl, {});
+    await ready;
+  }
 
   async function api(path: string, init?: RequestInit): Promise<unknown> {
+    await gate();
     const response = await fetchImpl(`https://api.github.com${path}`, {
       ...init,
       headers: { ...headers, ...(init?.headers ?? {}) },

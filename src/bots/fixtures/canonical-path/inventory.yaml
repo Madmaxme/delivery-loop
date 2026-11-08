@@ -1,0 +1,143 @@
+specversion: "1.0"
+items:
+  - id: orchestrator
+    platform: unspecified
+    purpose: Role template for monitoring existing delivery runs and reporting evidence.
+    identityRef: ref:orchestrator
+    verification: unverified
+    evidence: evidence/orchestrator.md
+    observedAt: "2026-11-08T00:00:00Z"
+  - id: verdict-writer
+    platform: unspecified
+    purpose: Role template for recording a ground verdict and the evidence it cites.
+    identityRef: ref:verdict-writer
+    verification: unverified
+    evidence: evidence/verdict-writer.md
+    observedAt: "2026-11-08T00:00:00Z"
+  - id: delivery-agent
+    platform: unspecified
+    purpose: Role template for the harness execution agent. The adapter interfaces are the source. This row is a cross-check.
+    identityRef: ref:delivery-agent
+    verification: unverified
+    evidence: evidence/delivery-agent.md
+    observedAt: "2026-11-08T00:00:00Z"
+  - id: engineering-bot
+    platform: unspecified
+    purpose: Role template for scoped engineering work handed down by the orchestrator. The adapter interfaces are the source. This row is a cross-check.
+    identityRef: ref:engineering-bot
+    verification: unverified
+    evidence: evidence/engineering-bot.md
+    observedAt: "2026-11-08T00:00:00Z"
+coverageGaps:
+  - source: ref:bot-listing
+    status: unreached
+    reason: No bot listing was read. This template does not invent rows for a listing it could not read.
+    observedAt: "2026-11-08T00:00:00Z"
+  - source: ref:trunk-read
+    status: unreached
+    reason: No land-repo trunk was read. This template does not invent a cross-check from a trunk it could not read.
+    observedAt: "2026-11-08T00:00:00Z"
+  - source: ref:adapter-census
+    status: unverified
+    reason: No live inventory was compared with the adapter interfaces. The code is the source. This row records that the comparison was not done.
+    observedAt: "2026-11-08T00:00:00Z"
+canonicalPaths:
+  - api: linear
+    source: ref:linear-oauth
+    acquisition: oauth-client-credentials
+    refresh: per-process
+    envRefs:
+      - LINEAR_OAUTH_CLIENT_ID
+      - LINEAR_OAUTH_CLIENT_SECRET
+    oauthUrl: https://api.linear.app/oauth/token
+    scope: read,write
+    expectedIdentity: Example Delivery
+  - api: github
+    role: opener
+    source: ref:github-opener
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-github-opener
+    identityKind: user
+    actorRef: ref:commit-actor
+  - api: github
+    role: merger
+    source: ref:github-merger
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-github-merger
+    identityKind: installation
+  - api: aws
+    callerClass: agent
+    source: ref:aws-agent
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-aws-agent
+  - api: aws
+    callerClass: actions
+    source: ref:aws-actions
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-aws-actions
+  - api: aws
+    callerClass: runtime
+    source: ref:aws-runtime
+    acquisition: stored-static
+    refresh: static
+    envRefs:
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+  - api: cursor
+    source: ref:cursor-mint
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-cursor
+    healthCommand: probe-cursor
+  - api: anthropic
+    source: ref:anthropic-mint
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-anthropic
+    healthCommand: probe-anthropic
+  - api: openai
+    source: ref:openai-mint
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-openai
+    healthCommand: probe-openai
+  - api: http
+    source: ref:http-mint
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-http
+    healthCommand: probe-http
+  - api: sentry
+    source: ref:sentry-mint
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-sentry
+    healthCommand: probe-sentry
+  - api: posthog
+    source: ref:posthog-mint
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-posthog
+    healthCommand: probe-posthog
+  - api: stripe
+    source: ref:stripe-mint
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-stripe
+    healthCommand: probe-stripe
+  - api: figma
+    source: ref:figma-mint
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-figma
+    healthCommand: probe-figma
+  - api: database
+    source: ref:database-mint
+    acquisition: mint-per-process
+    refresh: per-process
+    mintCommand: mint-database
+    healthCommand: probe-database

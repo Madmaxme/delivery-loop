@@ -1,7 +1,52 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { mintCredential } from "./canonical-path.ts";
 import { githubForge, interpretCompare, interpretMergeability } from "./forge-github.ts";
+import type { FetchLike } from "./types.ts";
+
+function opener(token = "token") {
+  return mintCredential(
+    {
+      api: "github",
+      role: "opener",
+      identityKind: "user",
+      source: "ref:github-opener",
+      acquisition: "mint-per-process",
+      refresh: "per-process",
+      mintCommand: "mint-github-opener",
+      actorRef: "ref:commit-actor",
+    },
+    token,
+  );
+}
+
+function merger(token = "merger-token") {
+  return mintCredential(
+    {
+      api: "github",
+      role: "merger",
+      identityKind: "installation",
+      source: "ref:github-merger",
+      acquisition: "mint-per-process",
+      refresh: "per-process",
+      mintCommand: "mint-github-merger",
+    },
+    token,
+  );
+}
+
+function withGithubHealth(fetchImpl: FetchLike): FetchLike {
+  return async (url, init) => {
+    const href = String(url);
+    if (href.endsWith("/user")) return new Response(JSON.stringify({ login: "example-owner" }), { status: 200 });
+    if (href.includes("/installation/repositories")) {
+      return new Response(JSON.stringify({ repositories: [] }), { status: 200 });
+    }
+    if (href.endsWith("/rate_limit")) return new Response(JSON.stringify({ rate: {} }), { status: 200 });
+    return fetchImpl(url, init);
+  };
+}
 
 describe("github mergeability", () => {
   it("maps the host state onto the land decision", () => {
@@ -21,14 +66,15 @@ describe("github mergeability", () => {
   it("treats an already up-to-date branch as updated", async () => {
     const calls: string[] = [];
     const forge = githubForge({
-      token: "token",
-      fetch: async (url, init) => {
+      opener: opener(),
+      merger: merger(),
+      fetch: withGithubHealth(async (url, init) => {
         calls.push(`${init?.method ?? "GET"} ${url}`);
         return new Response(
           JSON.stringify({ message: "There are no new commits on the base branch." }),
           { status: 422 },
         );
-      },
+      }),
     });
     await forge.updateBranch({
       repoUrl: "https://github.com/acme/api",
@@ -43,8 +89,9 @@ describe("github mergeability", () => {
     assert.equal(interpretCompare("diverged"), "diverged");
     assert.equal(interpretCompare(""), "unknown");
     const forge = githubForge({
-      token: "token",
-      fetch: async (url, init) => {
+      opener: opener(),
+      merger: merger(),
+      fetch: withGithubHealth(async (url, init) => {
         if ((init?.method ?? "GET") === "PUT" && url.includes("/merge")) {
           const body = JSON.parse(String(init?.body ?? "{}")) as { sha?: string };
           if (body.sha !== "a".repeat(40)) {
@@ -53,7 +100,7 @@ describe("github mergeability", () => {
           return new Response(JSON.stringify({ sha: "deadbeef" }), { status: 200 });
         }
         return new Response(JSON.stringify({ status: "identical" }), { status: 200 });
-      },
+      }),
     });
     assert.equal(
       await forge.compare({

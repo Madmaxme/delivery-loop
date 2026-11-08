@@ -5,6 +5,7 @@ identityRef: ref:engineering-bot
 reportsTo: orchestrator
 purpose: Takes a scoped engineering task from the orchestrator, carries it out with skills and tools, and returns a structured result to the orchestrator. It does not talk to the user. Loading this file does not start work.
 policies:
+  - canonical-call-path
   - no-self-merge
   - engineering-no-dispatch
   - engineering-no-status-writes
@@ -17,6 +18,8 @@ authority:
     - id: report-to-orchestrator
       statement: Return that result only to the orchestrator.
   mustNot:
+    - id: canonical-call-path
+      statement: Call an external API with a credential that did not come from that API's canonical path
     - id: no-self-merge
       statement: Merge a pull request this role opened or pushed. ForgeAdapter.squashMerge is not this role.
     - id: engineering-no-dispatch

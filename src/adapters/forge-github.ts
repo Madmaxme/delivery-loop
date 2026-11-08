@@ -1,9 +1,12 @@
 import {
-  assertCommitActor,
-  commitActorLogin,
-  githubUserLogin,
-  type CommitActor,
-} from "./github-actor.js";
+  assertCanonicalCredential,
+  authorizationHeader,
+  CanonicalPathError,
+  isHealthy,
+  probeGithub,
+  type CanonicalCredential,
+} from "./canonical-path.ts";
+import { commitActorLogin, type CommitActor } from "./github-actor.js";
 import type { CompareStatus, FetchLike, ForgeAdapter, PullMerge, PullRequest } from "./types.js";
 import { githubRepoFromUrl } from "./types.js";
 
@@ -60,30 +63,52 @@ export function interpretCompare(status: string | null | undefined): CompareStat
   return "unknown";
 }
 
-export function githubForge(opts: {
-  token: string;
-  fetch?: FetchLike;
-  repo?: string;
-  /** Writes to a listed repo require `GET /user` to be that login. */
-  commitActors?: CommitActor[];
-}): ForgeAdapter {
-  const fetchImpl = opts.fetch ?? fetch;
-  const headers = {
-    Authorization: `Bearer ${opts.token}`,
+function headersFor(credential: CanonicalCredential): Record<string, string> {
+  return {
+    Authorization: authorizationHeader(credential.token),
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
     "Content-Type": "application/json",
   };
-  let loginPromise: Promise<string | null> | null = null;
+}
 
-  async function requireActor(repoUrl: string): Promise<void> {
-    const expected = commitActorLogin(opts.commitActors, repoUrl);
-    if (!expected) return;
-    loginPromise ??= githubUserLogin(fetchImpl, opts.token);
-    assertCommitActor(repoUrl, await loginPromise, expected);
+export function githubForge(opts: {
+  opener: CanonicalCredential;
+  merger: CanonicalCredential;
+  fetch?: FetchLike;
+  repo?: string;
+  /** Writes by the opener require `GET /user` to be that login. The merger is a different identity. */
+  commitActors?: CommitActor[];
+}): ForgeAdapter {
+  assertCanonicalCredential(opts.opener, "github");
+  assertCanonicalCredential(opts.merger, "github");
+  if (opts.opener.role !== "opener" || opts.merger.role !== "merger" || opts.opener.source === opts.merger.source) {
+    throw new CanonicalPathError(
+      "non-canonical-credential",
+      "github",
+      "github opener and merger credentials are different identities",
+    );
+  }
+  const fetchImpl = opts.fetch ?? fetch;
+  const openerHeaders = headersFor(opts.opener);
+  const mergerHeaders = headersFor(opts.merger);
+  let openerReady: Promise<void> | null = null;
+  let mergerReady: Promise<void> | null = null;
+
+  async function gateOpener(repoUrl?: string): Promise<void> {
+    if (isHealthy(opts.opener)) return;
+    const expected = repoUrl ? commitActorLogin(opts.commitActors, repoUrl) : null;
+    openerReady ??= probeGithub(opts.opener, fetchImpl, { expectedLogin: expected });
+    await openerReady;
   }
 
-  async function api(path: string, init?: RequestInit): Promise<Response> {
+  async function gateMerger(): Promise<void> {
+    if (isHealthy(opts.merger)) return;
+    mergerReady ??= probeGithub(opts.merger, fetchImpl, {});
+    await mergerReady;
+  }
+
+  async function api(path: string, init?: RequestInit, headers: Record<string, string> = openerHeaders): Promise<Response> {
     const response = await fetchImpl(`https://api.github.com${path}`, {
       ...init,
       headers: { ...headers, ...(init?.headers ?? {}) },
@@ -99,7 +124,7 @@ export function githubForge(opts: {
 
   return {
     async openPullRequest(input): Promise<PullRequest> {
-      await requireActor(input.repoUrl);
+      await gateOpener(input.repoUrl);
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
       const body = JSON.stringify({
         title: input.title,
@@ -109,7 +134,7 @@ export function githubForge(opts: {
       });
       const created = await fetchImpl(`https://api.github.com/repos/${owner}/${repo}/pulls`, {
         method: "POST",
-        headers,
+        headers: openerHeaders,
         body,
       });
       if (created.status === 422) {
@@ -150,6 +175,7 @@ export function githubForge(opts: {
       };
     },
     async designCheck(input) {
+      await gateOpener(input.repoUrl);
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
       const response = await api(
         `/repos/${owner}/${repo}/commits/${input.headSha}/check-runs?per_page=100`,
@@ -174,6 +200,7 @@ export function githubForge(opts: {
       );
     },
     async quality(input) {
+      await gateOpener(input.repoUrl);
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
       const response = await api(
         `/repos/${owner}/${repo}/actions/runs?head_sha=${input.headSha}&per_page=20`,
@@ -201,18 +228,18 @@ export function githubForge(opts: {
       );
       const interpreted = interpretQualityActions(named, input.headSha);
       if (!qualityRunUnscheduled(interpreted.detail)) return interpreted;
-      const commit = await readCommit(fetchImpl, headers, owner, repo, input.headSha);
+      const commit = await readCommit(fetchImpl, openerHeaders, owner, repo, input.headSha);
       return commit?.committedAt
         ? { ...interpreted, committedAt: commit.committedAt }
         : interpreted;
     },
     async requestQualityRun(input) {
+      await gateOpener(input.repoUrl);
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
-      const commit = await readCommit(fetchImpl, headers, owner, repo, input.headSha);
+      const commit = await readCommit(fetchImpl, openerHeaders, owner, repo, input.headSha);
       const requested = input.message.split("\n")[0]?.trim();
       const current = commit?.message.split("\n")[0]?.trim();
       if (!commit?.tree || !requested || current === requested) return null;
-      await requireActor(input.repoUrl);
       const created = await api(`/repos/${owner}/${repo}/git/commits`, {
         method: "POST",
         body: JSON.stringify({
@@ -231,6 +258,7 @@ export function githubForge(opts: {
       return json.sha;
     },
     async mergeability(input) {
+      await gateOpener(input.repoUrl);
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
       const response = await api(`/repos/${owner}/${repo}/pulls/${input.number}`);
       return interpretMergeability(
@@ -242,11 +270,12 @@ export function githubForge(opts: {
       );
     },
     async compare(input) {
+      await gateOpener(input.repoUrl);
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
       const spec = `${encodeURIComponent(input.base)}...${encodeURIComponent(input.head)}`;
       const response = await fetchImpl(
         `https://api.github.com/repos/${owner}/${repo}/compare/${spec}`,
-        { headers },
+        { headers: openerHeaders },
       );
       if (!response.ok) return "unknown";
       const json = (await response.json()) as { status?: string };
@@ -254,12 +283,12 @@ export function githubForge(opts: {
     },
     async updateBranch(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
-      await requireActor(`https://github.com/${owner}/${repo}`);
+      await gateOpener(`https://github.com/${owner}/${repo}`);
       const response = await fetchImpl(
         `https://api.github.com/repos/${owner}/${repo}/pulls/${input.number}/update-branch`,
         {
           method: "PUT",
-          headers,
+          headers: openerHeaders,
           body: JSON.stringify(
             input.expectedHeadSha ? { expected_head_sha: input.expectedHeadSha } : {},
           ),
@@ -278,14 +307,18 @@ export function githubForge(opts: {
     },
     async squashMerge(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
-      await requireActor(`https://github.com/${owner}/${repo}`);
+      await gateMerger();
       if (!input.headSha || !/^[0-9a-f]{40}$/i.test(input.headSha)) {
         throw new Error("refusing to merge without the pull request head sha");
       }
-      const response = await api(`/repos/${owner}/${repo}/pulls/${input.number}/merge`, {
-        method: "PUT",
-        body: JSON.stringify({ merge_method: "squash", sha: input.headSha }),
-      });
+      const response = await api(
+        `/repos/${owner}/${repo}/pulls/${input.number}/merge`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ merge_method: "squash", sha: input.headSha }),
+        },
+        mergerHeaders,
+      );
       const json = (await response.json()) as { sha?: string };
       const sha = json.sha?.trim() ?? "";
       if (!sha) throw new Error("GitHub merge did not return a commit");
@@ -293,10 +326,40 @@ export function githubForge(opts: {
     },
     async dispatch(input) {
       if (!opts.repo) throw new Error("Forge dispatch needs owner/repo");
+      await gateOpener(`https://github.com/${opts.repo}`);
       await api(`/repos/${opts.repo}/actions/workflows/${input.workflow}/dispatches`, {
         method: "POST",
         body: JSON.stringify({ ref: input.ref, inputs: input.inputs }),
       });
     },
   };
+}
+
+/** GitHub GraphQL uses the same credential gate as REST. The health check runs first. */
+export async function githubGraphql(
+  credential: CanonicalCredential,
+  query: string,
+  fetchImpl: FetchLike,
+): Promise<unknown> {
+  assertCanonicalCredential(credential, "github");
+  if (!isHealthy(credential)) await probeGithub(credential, fetchImpl, {});
+  const response = await fetchImpl("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      Authorization: authorizationHeader(credential.token),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ query }),
+  });
+  if (!response.ok) {
+    throw new CanonicalPathError("credential-unhealthy", "github", "github graphql failed", response.status);
+  }
+  return response.json();
+}
+
+export function rejectRawCredential(): void {
+  githubForge({
+    opener: { token: "stored", api: "github" } as CanonicalCredential,
+    merger: { token: "stored", api: "github" } as CanonicalCredential,
+  });
 }

@@ -4,6 +4,7 @@ effect: data-only
 identityRef: ref:verdict-writer
 purpose: Records a ground verdict and the evidence that verdict cites.
 policies:
+  - canonical-call-path
   - verdict-no-status-writes
   - verdict-no-relax-gate
 authority:
@@ -13,6 +14,8 @@ authority:
     - id: record-evidence
       statement: Record the evidence that verdict cites
   mustNot:
+    - id: canonical-call-path
+      statement: Call an external API with a credential that did not come from that API's canonical path
     - id: verdict-no-status-writes
       statement: Write a delivery status or a delivery label
     - id: verdict-no-relax-gate

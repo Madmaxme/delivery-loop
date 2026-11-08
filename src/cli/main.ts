@@ -11,8 +11,11 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse, stringify } from "yaml";
 
+import { prepareDispatchCredentials, type PreparedCredentials } from "../adapters/canonical-path.ts";
 import { gitForge } from "../adapters/forge-git.js";
 import { githubForge } from "../adapters/forge-github.js";
+import { runGh } from "../adapters/gh.js";
+import { commitActorLogin } from "../adapters/github-actor.ts";
 import { githubIssuesTracker, linearTracker } from "../adapters/trackers.js";
 import {
   claudeWorker,
@@ -24,11 +27,13 @@ import {
 import { githubRepoFromUrl } from "../adapters/types.js";
 import type { ForgeAdapter, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { findConnector } from "../connectors/catalog.js";
+import { lookupRemoteHead } from "../engine/land-branches.ts";
 import { deliver, ship, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
 import { shipInvocationDeps } from "./ship-deps.js";
 import { ghaDispatchFields, planDeliveryInvocation } from "../engine/delivery-runtime.js";
 import { formatInventory } from "../bots/load.ts";
 import { defaultStatus, loadPack, openPack, type ProjectPack } from "../schema/pack.js";
+import type { BotBundle } from "../bots/types.ts";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -104,10 +109,22 @@ export function installConnector(dir: string, name: string): void {
   writeFileSync(mcpPath, `${JSON.stringify(mcp, null, 2)}\n`);
 }
 
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`${name} is required`);
-  return value;
+function commandSpawn(command: string): { status: number | null; stdout: string } {
+  const result = spawnSync(command, { shell: true, encoding: "utf8" });
+  return { status: result.status, stdout: result.stdout ?? "" };
+}
+
+function extensionApi(worker: ProjectPack["worker"]): string | null {
+  if (worker === "cursor") return "cursor";
+  if (worker === "claude") return "anthropic";
+  if (worker === "codex") return "openai";
+  if (worker === "http") return "http";
+  return null;
+}
+
+function expectedLogin(pack: ProjectPack): string | null {
+  const logins = new Set((pack.commitActors ?? []).map((actor) => actor.login));
+  return logins.size === 1 ? [...logins][0] : null;
 }
 
 /** Named owners come from the fetched trunk file. The working copy is not the allowlist. */
@@ -122,55 +139,98 @@ export function commitActorsFromTrustedRef(pack: ProjectPack): ProjectPack["comm
   return parsed.commitActors ?? [];
 }
 
-export function adaptersFor(pack: ProjectPack): {
+export async function preparePackCredentials(pack: ProjectPack, bots: BotBundle | null): Promise<PreparedCredentials> {
+  const extension = extensionApi(pack.worker);
+  return prepareDispatchCredentials({
+    paths: bots?.inventory.canonicalPaths ?? [],
+    env: process.env,
+    fetch,
+    spawn: commandSpawn,
+    linear: pack.tracker === "linear",
+    github: true,
+    extensions: extension ? [extension] : [],
+    expectedLogin: expectedLogin(pack) ?? commitActorLogin(pack.commitActors, pack.repos[0]?.url ?? "") ,
+  });
+}
+
+export async function adaptersFor(pack: ProjectPack, prepared: PreparedCredentials): Promise<{
   tracker: TrackerAdapter;
   worker: WorkerAdapter;
   forge: ForgeAdapter;
-} {
-  const githubToken = () => requireEnv("GH_TOKEN");
+}> {
+  if (!prepared.opener || !prepared.merger) {
+    throw new Error("missing canonical path for github");
+  }
+  const repo =
+    pack.githubRepo ??
+    githubRepoFromUrl(pack.repos[0].url).owner + "/" + githubRepoFromUrl(pack.repos[0].url).repo;
   const forge =
     pack.forge === "git"
-      ? gitForge({ cwd: process.cwd() })
+      ? gitForge({ cwd: process.cwd(), credential: prepared.opener })
       : githubForge({
-          token: githubToken(),
-          repo:
-            pack.githubRepo ??
-            githubRepoFromUrl(pack.repos[0].url).owner + "/" + githubRepoFromUrl(pack.repos[0].url).repo,
+          opener: prepared.opener,
+          merger: prepared.merger,
+          repo,
           commitActors: commitActorsFromTrustedRef(pack),
         });
+  if (pack.tracker === "linear" && !prepared.linear) {
+    throw new Error("missing canonical path for linear");
+  }
   const tracker =
     pack.tracker === "linear"
       ? linearTracker({
-          apiKey: requireEnv("LINEAR_API_KEY"),
+          credential: prepared.linear!,
           team: pack.linearTeam ?? "",
           intakeState: pack.status.intake,
         })
       : githubIssuesTracker({
-          token: githubToken(),
+          credential: prepared.opener,
           repo: pack.githubRepo ?? "",
           intakeLabel: pack.status.intake,
         });
-  const worker = workerFor(pack);
+  const worker = workerFor(pack, prepared);
   return { tracker, worker, forge };
 }
 
-function workerFor(pack: ProjectPack): WorkerAdapter {
-  if (pack.worker === "cursor") return cursorWorker({ apiKey: requireEnv("CURSOR_API_KEY") });
-  if (pack.worker === "claude") return claudeWorker({ apiKey: requireEnv("ANTHROPIC_API_KEY") });
-  if (pack.worker === "codex") return codexWorker({ apiKey: requireEnv("OPENAI_API_KEY") });
+function workerFor(pack: ProjectPack, prepared: PreparedCredentials): WorkerAdapter {
+  if (pack.worker === "cursor") {
+    const credential = prepared.extensions.cursor;
+    if (!credential) throw new Error("missing canonical path for cursor");
+    return cursorWorker({ credential });
+  }
+  if (pack.worker === "claude") {
+    const credential = prepared.extensions.anthropic;
+    if (!credential) throw new Error("missing canonical path for anthropic");
+    return claudeWorker({ credential });
+  }
+  if (pack.worker === "codex") {
+    const credential = prepared.extensions.openai;
+    if (!credential) throw new Error("missing canonical path for openai");
+    return codexWorker({ credential });
+  }
   if (pack.worker === "copilot") {
     const repo = pack.githubRepo ?? "";
     const [owner, name] = repo.split("/");
-    return copilotWorker({ token: requireEnv("GH_TOKEN"), owner, repo: name });
+    if (!prepared.opener) throw new Error("missing canonical path for github opener");
+    return copilotWorker({ credential: prepared.opener, owner, repo: name });
   }
+  const credential = prepared.extensions.http;
+  if (!credential) throw new Error("missing canonical path for http");
   return httpWorker({
     startUrl: pack.workerHttp?.startUrl ?? "",
     statusUrl: pack.workerHttp?.statusUrl ?? "",
-    token: process.env.WORKER_HTTP_TOKEN,
+    credential,
   });
 }
 
-function dispatchOrRun(mode: string, argv: string[]): void {
+async function dispatchGh(args: string[]): Promise<number | null> {
+  const opened = openPack(packPath(process.cwd()));
+  const prepared = await preparePackCredentials(opened.pack, opened.bots);
+  if (!prepared.opener) throw new Error("missing canonical path for github opener");
+  return runGh(prepared.opener, args).status;
+}
+
+async function dispatchOrRun(mode: string, argv: string[]): Promise<void> {
   if (mode === "ship") {
     const packRunner = existsSync(packPath(process.cwd()))
       ? loadPack(packPath(process.cwd())).runner
@@ -185,18 +245,19 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       const issue = argv.find((a) => /^[A-Z][A-Z0-9]*-\d+$/i.test(a));
       const args = ["workflow", "run", "delivery-loop.yml", "--repo", repo, "-f", "mode=ship"];
       if (issue) args.push("-f", `issue=${issue.toUpperCase()}`);
-      const result = spawnSync("gh", args, { stdio: "inherit" });
-      if (result.status !== 0) process.exit(result.status ?? 1);
+      const status = await dispatchGh(args);
+      if (status !== 0) process.exit(status ?? 1);
       return;
     }
-    const pack = loadPack(packPath(process.cwd()));
+    const opened = openPack(packPath(process.cwd()));
+    const prepared = await preparePackCredentials(opened.pack, opened.bots);
     const continueMode = argv.includes("continue");
     const rest = argv.filter((item) => item !== "continue");
     const issue = rest.find((a) => /^[A-Z][A-Z0-9]*-\d+$/i.test(a));
     const extra = rest.filter((a) => a !== issue).join(" ");
-    const deps = shipInvocationDeps(pack, process.cwd());
+    const deps = shipInvocationDeps(opened.pack, process.cwd(), prepared);
     deps.ownerHeal = async (input) => {
-      const worker = workerFor(pack);
+      const worker = workerFor(opened.pack, prepared);
       const started = await worker.start(input);
       const joined = await worker.join(started.runId);
       if (joined.status === "failed") throw new Error(joined.text || "owner edit failed");
@@ -224,34 +285,32 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     const repo = process.env.GITHUB_REPOSITORY;
     if (!repo) throw new Error("GITHUB_REPOSITORY is required to dispatch the runner");
     const fields = ghaDispatchFields(plan);
-    const result = spawnSync(
-      "gh",
-      [
-        "workflow",
-        "run",
-        "delivery-loop.yml",
-        "--repo",
-        repo,
-        "--ref",
-        process.env.DELIVERY_LOOP_GHA_REF ?? "main",
-        ...Object.entries(fields).flatMap(([key, value]) => ["-f", `${key}=${value}`]),
-      ],
-      { stdio: "inherit" },
-    );
-    if (result.status !== 0) process.exit(result.status ?? 1);
+    const status = await dispatchGh([
+      "workflow",
+      "run",
+      "delivery-loop.yml",
+      "--repo",
+      repo,
+      "--ref",
+      process.env.DELIVERY_LOOP_GHA_REF ?? "main",
+      ...Object.entries(fields).flatMap(([key, value]) => ["-f", `${key}=${value}`]),
+    ]);
+    if (status !== 0) process.exit(status ?? 1);
     console.error(`[delivery-loop] runtime=gha (${plan.reason})`);
     return;
   }
-  const pack = loadPack(packPath(process.cwd()));
+  const opened = openPack(packPath(process.cwd()));
+  const prepared = await preparePackCredentials(opened.pack, opened.bots);
   const started = Number(
     process.env.DELIVERY_LOOP_PAGE_STARTED_MS || "",
   );
   const deps = {
-    pack,
-    ...adaptersFor(pack),
+    pack: opened.pack,
+    ...(await adaptersFor(opened.pack, prepared)),
     cwd: process.cwd(),
     project: plan.project,
     pageStartedAtMs: Number.isFinite(started) && started > 0 ? started : null,
+    lookupHead: (repoUrl: string, branch: string) => lookupRemoteHead(repoUrl, branch, prepared.opener ?? null),
   };
   if (mode === "sweep") {
     sweep(deps)
@@ -370,8 +429,11 @@ if (isCli) {
   else if (command === "connector" && argv[1] === "add") {
     installConnector(arg("--dir", argv) ?? process.cwd(), argv[2]);
     console.log(`Added connector ${argv[2]}`);
-  } else if (command === "sweep" || command === "deliver" || command === "ground" || command === "ship") {
-    dispatchOrRun(command === "deliver" ? "pipeline" : command, argv.slice(1));
+  }   else if (command === "sweep" || command === "deliver" || command === "ground" || command === "ship") {
+    dispatchOrRun(command === "deliver" ? "pipeline" : command, argv.slice(1)).catch((error: unknown) => {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    });
   } else {
     console.error(
       "Usage: delivery-loop init|update|connector add <name>|bots validate|bots list|sweep|deliver <id>|ground <id>|ship [continue] [id]",

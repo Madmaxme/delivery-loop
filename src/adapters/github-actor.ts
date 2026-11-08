@@ -1,4 +1,5 @@
 import type { CommitActor } from "../schema/pack.js";
+import { assertCanonicalCredential, assertHealthy, authorizationHeader, type CanonicalCredential } from "./canonical-path.ts";
 import type { FetchLike } from "./types.js";
 
 export type { CommitActor };
@@ -21,11 +22,13 @@ export function commitActorLogin(
   return null;
 }
 
-/** The user a token authenticates as. An installation token has no user login. */
-export async function githubUserLogin(fetchImpl: FetchLike, token: string): Promise<string | null> {
+/** The user a canonical opener credential authenticates as. An installation token does not use this. */
+export async function githubUserLogin(fetchImpl: FetchLike, credential: CanonicalCredential): Promise<string | null> {
+  assertCanonicalCredential(credential, "github");
+  assertHealthy(credential);
   const response = await fetchImpl("https://api.github.com/user", {
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: authorizationHeader(credential.token),
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
     },

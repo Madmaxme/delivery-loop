@@ -1,3 +1,9 @@
+import {
+  assertCanonicalCredential,
+  authorizationHeader,
+  CanonicalPathError,
+  type CanonicalCredential,
+} from "./canonical-path.ts";
 import type { FetchLike, WorkerAdapter, WorkerResult, WorkerStart } from "./types.js";
 
 async function poll(
@@ -16,12 +22,15 @@ async function poll(
 export function httpWorker(opts: {
   startUrl: string;
   statusUrl: string;
-  token?: string;
+  credential: CanonicalCredential;
   fetch?: FetchLike;
 }): WorkerAdapter {
+  assertCanonicalCredential(opts.credential, "http");
   const fetchImpl = opts.fetch ?? fetch;
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: authorizationHeader(opts.credential.token),
+  };
   return {
     kind: "http",
     async start(input: WorkerStart) {
@@ -47,14 +56,18 @@ export function httpWorker(opts: {
 }
 
 export function copilotWorker(opts: {
-  token: string;
+  credential: CanonicalCredential;
   owner: string;
   repo: string;
   fetch?: FetchLike;
 }): WorkerAdapter {
+  assertCanonicalCredential(opts.credential, "github");
+  if (opts.credential.role !== "opener") {
+    throw new CanonicalPathError("non-canonical-credential", "github", "copilot uses the github opener credential");
+  }
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    Authorization: `Bearer ${opts.token}`,
+    Authorization: authorizationHeader(opts.credential.token),
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2026-03-10",
     "Content-Type": "application/json",
@@ -104,10 +117,11 @@ export function copilotWorker(opts: {
   };
 }
 
-export function codexWorker(opts: { apiKey: string; fetch?: FetchLike }): WorkerAdapter {
+export function codexWorker(opts: { credential: CanonicalCredential; fetch?: FetchLike }): WorkerAdapter {
+  assertCanonicalCredential(opts.credential, "openai");
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    Authorization: `Bearer ${opts.apiKey}`,
+    Authorization: authorizationHeader(opts.credential.token),
     "Content-Type": "application/json",
     "OpenAI-Beta": "agents=v1",
   };
@@ -160,10 +174,11 @@ export function codexWorker(opts: { apiKey: string; fetch?: FetchLike }): Worker
   };
 }
 
-export function claudeWorker(opts: { apiKey: string; fetch?: FetchLike }): WorkerAdapter {
+export function claudeWorker(opts: { credential: CanonicalCredential; fetch?: FetchLike }): WorkerAdapter {
+  assertCanonicalCredential(opts.credential, "anthropic");
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    "x-api-key": opts.apiKey,
+    "x-api-key": opts.credential.token,
     "anthropic-version": "2023-06-01",
     "Content-Type": "application/json",
   };
@@ -301,9 +316,10 @@ type CursorLiveRun = {
 };
 
 export function cursorWorker(opts: {
-  apiKey: string;
+  credential: CanonicalCredential;
   sdk?: CursorSdk;
 }): WorkerAdapter {
+  assertCanonicalCredential(opts.credential, "cursor");
   const live = new Map<string, CursorLiveRun>();
   return {
     kind: "cursor",
@@ -312,7 +328,7 @@ export function cursorWorker(opts: {
         opts.sdk ??
         ((await import("@cursor/sdk")) as { Agent: CursorSdk }).Agent;
       const agent = await sdk.create({
-        apiKey: opts.apiKey,
+        apiKey: opts.credential.token,
         cloud: {
           repos: [{ url: input.repoUrl, startingRef: input.baseRef }],
           autoCreatePR: false,
@@ -392,6 +408,10 @@ export function cursorWorker(opts: {
       };
     },
   };
+}
+
+export function rejectRawCredential(): void {
+  cursorWorker({ credential: { token: "stored", api: "cursor" } as CanonicalCredential });
 }
 
 function sameGithubRepo(a: string, b: string): boolean {

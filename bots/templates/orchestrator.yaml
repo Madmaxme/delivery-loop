@@ -4,6 +4,7 @@ effect: data-only
 identityRef: ref:orchestrator
 purpose: Monitors existing delivery runs and reports evidence.
 policies:
+  - canonical-call-path
   - orchestrator-no-dispatch
   - orchestrator-no-status-writes
 authority:
@@ -13,6 +14,8 @@ authority:
     - id: report-evidence
       statement: Report evidence from those runs
   mustNot:
+    - id: canonical-call-path
+      statement: Call an external API with a credential that did not come from that API's canonical path
     - id: orchestrator-no-dispatch
       statement: Start, dispatch, re-dispatch, resume, or run the delivery loop, including a scheduled sweep and a ground-only compile
     - id: orchestrator-no-status-writes

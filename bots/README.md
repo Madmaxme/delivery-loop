@@ -37,11 +37,25 @@ When `bots` is absent, the engine does not read a bots directory. Sweep, deliver
 
 `specversion` is `1.0` on every file. `effect` is `data-only` on the manifest, the definitions, and the routines. Unknown fields are refused. A field that would carry a token, a secret, a password, a cookie, or a platform bot id is refused. Use a reference.
 
-Definitions are data. Loading them does not relax a quality gate, write a status, write a label, merge a pull request, dispatch a run, or grant an authority the engine did not already have. The pack keeps `bots.path` and drops the bundle. The delivery loop does not read the bundle. This layer does not install a runtime identity-separation gate. A policy id records a bound. The engine does not consult that id when it merges.
+Definitions are data. Loading them does not relax a quality gate, write a status, write a label, merge a pull request, dispatch a run, or grant an authority the engine did not already have. The pack keeps `bots.path`. The delivery loop does not read the bundle. This layer does not install a runtime identity-separation gate. A policy id other than `canonical-call-path` records a bound. The engine does not consult those ids when it merges. `canonical-call-path` is enforced by the adapters. A bot cannot opt out of it.
 
 `bots.path` is relative to the client pack file and must stay inside that file's directory. A `../` step is refused. A symlink whose target is outside that directory is refused. The check is the lexical path and the real path.
 
-Each role definition carries `policies`, an enum of required policy ids. The delivery agent requires `no-self-merge`, `independent-review`, `checks-on-exact-head`, `head-pinned-squash`, `no-rebase`, and `no-merge-on-red`. The orchestrator requires `orchestrator-no-dispatch` and `orchestrator-no-status-writes`. The verdict writer requires `verdict-no-status-writes` and `verdict-no-relax-gate`. The engineering bot requires `no-self-merge`, `engineering-no-dispatch`, `engineering-no-status-writes`, `engineering-no-relax-gate`, and `engineering-reports-only-to-orchestrator`. Its `reportsTo` value must be the orchestrator role. Each role has its own `may` allowlist. An id that is not on that list is rejected, including an id that is valid for a different role. The sentence text is not the check.
+Each role definition carries `policies`, an enum of required policy ids. Every role requires `canonical-call-path`. The delivery agent also requires `no-self-merge`, `independent-review`, `checks-on-exact-head`, `head-pinned-squash`, `no-rebase`, and `no-merge-on-red`. The orchestrator also requires `orchestrator-no-dispatch` and `orchestrator-no-status-writes`. The verdict writer also requires `verdict-no-status-writes` and `verdict-no-relax-gate`. The engineering bot also requires `no-self-merge`, `engineering-no-dispatch`, `engineering-no-status-writes`, `engineering-no-relax-gate`, and `engineering-reports-only-to-orchestrator`. Its `reportsTo` value must be the orchestrator role. Each role has its own `may` allowlist. An id that is not on that list is rejected, including an id that is valid for a different role. The sentence text is not the check.
+
+## Canonical call paths
+
+The inventory declares one path per API the bundle uses. The field is `canonicalPaths`. A secret is not stored there. `delivery-loop bots validate` rejects a role that omits `canonical-call-path`, an API the bundle uses with no path, a direct stored key for Linear or GitHub, two GitHub roles that share a source, and two AWS caller classes that share a source. An example inventory is [src/bots/fixtures/canonical-path/inventory.yaml](../src/bots/fixtures/canonical-path/inventory.yaml).
+
+| API | What the path declares | Health check before dispatch |
+| --- | --- | --- |
+| `linear` | OAuth client credentials or a mint command, refreshed per process. `expectedIdentity` is the viewer name. A stored static key is rejected. | `POST https://api.linear.app/graphql` with `{ viewer { id name } }`. HTTP 200 and that name. |
+| `github` opener | A different source from the merger. Mint per process. `identityKind: user`. `actorRef` points at the commit actor. | `GET /user`. The login must match the declared commit actor when one is set. `cursor[bot]` is refused. |
+| `github` merger | Installation mint, or the workflow token in `GITHUB_TOKEN`. | Installation: `GET /installation/repositories`. Workflow: `GET /rate_limit`. `GET /user` is not the installation check. |
+| `aws` | One source for each caller class in use: `agent`, `actions`, `runtime`. Agent and actions mint. Runtime may be a stored key. | `aws sts get-caller-identity`. |
+| any other api | An extension. It names a `healthCommand`. | That command must exit 0. |
+
+The CLI order before dispatch is: mint, the Linear viewer check, then each GitHub identity's check. A mint that returns the same value as the stored copy is refused. The comparison stays in memory and the value is not logged. Adapters take only a credential the resolver stamped. Git, `gh`, and AWS child processes drop ambient tokens and receive the stamped credential. The `Authorization` header is exactly one `Bearer` scheme.
 
 ## Roles
 

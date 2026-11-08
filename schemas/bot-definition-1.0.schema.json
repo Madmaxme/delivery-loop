@@ -63,7 +63,8 @@
           "engineering-no-dispatch",
           "engineering-no-status-writes",
           "engineering-no-relax-gate",
-          "engineering-reports-only-to-orchestrator"
+          "engineering-reports-only-to-orchestrator",
+          "canonical-call-path"
         ]
       }
     },
@@ -136,7 +137,8 @@
                   "engineering-no-dispatch",
                   "engineering-no-status-writes",
                   "engineering-no-relax-gate",
-                  "engineering-reports-only-to-orchestrator"
+                  "engineering-reports-only-to-orchestrator",
+                  "canonical-call-path"
                 ]
               },
               "statement": { "type": "string", "minLength": 1 }

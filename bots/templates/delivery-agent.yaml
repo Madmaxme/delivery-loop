@@ -4,6 +4,7 @@ effect: data-only
 identityRef: ref:delivery-agent
 purpose: The harness execution agent. It thinks, then calls the forge, tracker, worker, and connector adapters. A GitHub App or other execution identity is a tool this role calls. It is not a bot. Loading this file does not start the loop and does not install a runtime identity-separation gate.
 policies:
+  - canonical-call-path
   - no-self-merge
   - independent-review
   - checks-on-exact-head
@@ -144,6 +145,8 @@ authority:
     - id: squash-exact-green-head
       statement: Squash-merge only that exact reviewed head when those check-runs are green
   mustNot:
+    - id: canonical-call-path
+      statement: Call an external API with a credential that did not come from that API's canonical path
     - id: no-self-merge
       statement: Merge a head that this identity opened or pushed
     - id: independent-review

@@ -181,6 +181,7 @@ describe("bot templates", () => {
     assert.deepEqual(
       [...(loaded?.policies ?? [])].sort(),
       [
+        "canonical-call-path",
         "engineering-no-dispatch",
         "engineering-no-relax-gate",
         "engineering-no-status-writes",
@@ -190,6 +191,7 @@ describe("bot templates", () => {
     );
 
     for (const id of [
+      "canonical-call-path",
       "no-self-merge",
       "engineering-no-dispatch",
       "engineering-no-status-writes",
@@ -228,14 +230,10 @@ describe("bot templates", () => {
     assert.throws(() => loadBotBundle(blank), /engineering-bot/);
   });
 
-  it("loads the committed v1.0.5 three-role bundle", () => {
-    const bundle = loadBotBundle(threeRoleFixture);
-    assert.deepEqual(
-      bundle.definitions.map((definition) => definition.role).sort(),
-      ["delivery-agent", "orchestrator", "verdict-writer"],
-    );
+  it("rejects the committed v1.0.5 bundle that has no canonical-call-path", () => {
+    assert.throws(() => loadBotBundle(threeRoleFixture), /missing policy canonical-call-path/);
     const client = mkdtempSync(join(tmpdir(), "pack-v105-"));
-    cpSync(threeRoleFixture, join(client, "bots"), { recursive: true });
+    cpSync(templates, join(client, "bots"), { recursive: true });
     writeFileSync(
       join(client, "delivery-loop.yaml"),
       `tracker: linear

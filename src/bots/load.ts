@@ -3,6 +3,7 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { parse } from "yaml";
 
 import { CONNECTORS } from "../connectors/catalog.ts";
+import { assertCanonicalPaths } from "./canonical.ts";
 import { assertDeliverySurface } from "./surface.ts";
 import type { BotBundle, BotDefinition, BotInventory, BotManifest, BotRole, BotRoutine } from "./types.ts";
 import { INVENTORY_FIELDS } from "./types.ts";
@@ -142,6 +143,7 @@ export function loadBotBundle(root: string): BotBundle {
   assertNoCredentialFields(inventoryDoc, inventoryRel);
   validateSchema(loadBotSchema(BOT_SCHEMA_FILES.inventory), inventoryDoc, inventoryRel);
   const inventory = inventoryDoc as BotInventory;
+  assertCanonicalPaths(definitions, inventory.canonicalPaths, inventoryRel);
   inventory.items.forEach((item, index) => assertRealTimestamp(item.observedAt, `${inventoryRel}/items/${index}/observedAt`));
   inventory.coverageGaps.forEach((gap, index) => assertRealTimestamp(gap.observedAt, `${inventoryRel}/coverageGaps/${index}/observedAt`));
   unique(inventory.items.map((item) => item.id), "inventory id");

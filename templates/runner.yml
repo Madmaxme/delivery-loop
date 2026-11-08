@@ -42,7 +42,9 @@ jobs:
           GITHUB_ACTIONS: "true"
           DELIVERY_LOOP_RUNTIME: local
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          # Linear is minted per process from the OAuth client. A stored key is not injected.
+          LINEAR_OAUTH_CLIENT_ID: ${{ secrets.LINEAR_OAUTH_CLIENT_ID }}
+          LINEAR_OAUTH_CLIENT_SECRET: ${{ secrets.LINEAR_OAUTH_CLIENT_SECRET }}
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

@@ -192,8 +192,9 @@ export type ProjectPack = {
   };
   /**
    * Optional directory of bot instances, relative to this file.
-   * Absent means this install has no bot definitions and nothing there is read.
-   * The directory is validated and then dropped. It is not a gate and not a grant.
+   * Absent means this install has no bot definitions.
+   * The pack keeps the path. The CLI reads that directory when it builds adapters
+   * and refuses a call that did not come from the canonical path declared there.
    */
   bots?: { path: string };
 };

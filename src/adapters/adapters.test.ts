@@ -1,9 +1,88 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { mintCredential } from "./canonical-path.ts";
 import { githubForge } from "./forge-github.ts";
 import { githubIssuesTracker, linearTracker } from "./trackers.ts";
+import type { FetchLike } from "./types.ts";
 import { copilotWorker, cursorReceiptText, cursorWorker, httpWorker } from "./workers.ts";
+
+function opener(token = "t") {
+  return mintCredential(
+    {
+      api: "github",
+      role: "opener",
+      identityKind: "user",
+      source: "ref:github-opener",
+      acquisition: "mint-per-process",
+      refresh: "per-process",
+      mintCommand: "mint-github-opener",
+      actorRef: "ref:commit-actor",
+    },
+    token,
+  );
+}
+
+function merger(token = "merger-token") {
+  return mintCredential(
+    {
+      api: "github",
+      role: "merger",
+      identityKind: "installation",
+      source: "ref:github-merger",
+      acquisition: "mint-per-process",
+      refresh: "per-process",
+      mintCommand: "mint-github-merger",
+    },
+    token,
+  );
+}
+
+function linearCredential(token = "k") {
+  return mintCredential(
+    {
+      api: "linear",
+      source: "ref:linear-oauth",
+      acquisition: "mint-per-process",
+      refresh: "per-process",
+      mintCommand: "mint-linear",
+      expectedIdentity: "Example Delivery",
+    },
+    token,
+  );
+}
+
+function extension(api: string, token = "k") {
+  return mintCredential(
+    {
+      api,
+      source: `ref:${api}-mint`,
+      acquisition: "mint-per-process",
+      refresh: "per-process",
+      mintCommand: `mint-${api}`,
+      healthCommand: `probe-${api}`,
+    },
+    token,
+  );
+}
+
+function withGithubHealth(fetchImpl: FetchLike, login = "example-owner"): FetchLike {
+  return async (url, init) => {
+    const href = String(url);
+    if (href.endsWith("/user")) return jsonResponse({ login });
+    if (href.includes("/installation/repositories")) return jsonResponse({ repositories: [] });
+    if (href.endsWith("/rate_limit")) return jsonResponse({ rate: {} });
+    return fetchImpl(url, init);
+  };
+}
+
+function withViewer(fetchImpl: FetchLike): FetchLike {
+  return async (url, init) => {
+    const body = typeof init?.body === "string" ? init.body : "";
+    if (body.includes("viewer")) return jsonResponse({ data: { viewer: { id: "v1", name: "Example Delivery" } } });
+    return fetchImpl(url, init);
+  };
+}
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -13,11 +92,12 @@ describe("adapters", () => {
   it("refuses a pull request when the token is not the commit actor", async () => {
     const calls: string[] = [];
     const forge = githubForge({
-      token: "app",
+      opener: opener("app"),
+      merger: merger(),
       commitActors: [{ login: "Madmaxme", repos: ["https://github.com/Madmaxme/delivery-loop"] }],
       fetch: async (url, init) => {
         calls.push(`${init?.method ?? "GET"} ${url}`);
-        if (String(url).endsWith("/user")) return jsonResponse({ message: "forbidden" }, 403);
+        if (String(url).endsWith("/user")) return jsonResponse({ login: "someone-else" });
         return jsonResponse({});
       },
     });
@@ -37,7 +117,8 @@ describe("adapters", () => {
 
   it("opens a pull request when the token login is the commit actor", async () => {
     const forge = githubForge({
-      token: "user",
+      opener: opener("user"),
+      merger: merger(),
       commitActors: [{ login: "Madmaxme", repos: ["Madmaxme/delivery-loop"] }],
       fetch: async (url, init) => {
         if (String(url).endsWith("/user")) return jsonResponse({ login: "Madmaxme" });
@@ -64,8 +145,9 @@ describe("adapters", () => {
   it("opens a pull request and reads a green quality run", async () => {
     const calls: string[] = [];
     const forge = githubForge({
-      token: "t",
-      fetch: async (url, init) => {
+      opener: opener(),
+      merger: merger(),
+      fetch: withGithubHealth(async (url, init) => {
         calls.push(`${init?.method ?? "GET"} ${url}`);
         if (String(url).endsWith("/pulls")) {
           return jsonResponse({
@@ -89,7 +171,7 @@ describe("adapters", () => {
           });
         }
         return jsonResponse({});
-      },
+      }),
     });
     const pr = await forge.openPullRequest({
       repoUrl: "https://github.com/acme/api",
@@ -100,8 +182,9 @@ describe("adapters", () => {
     });
     assert.equal(pr.number, 9);
     const again = githubForge({
-      token: "t",
-      fetch: async (url, init) => {
+      opener: opener(),
+      merger: merger(),
+      fetch: withGithubHealth(async (url, init) => {
         if (String(url).endsWith("/pulls") && init?.method === "POST") {
           return jsonResponse({ message: "exists" }, 422);
         }
@@ -111,7 +194,7 @@ describe("adapters", () => {
           ]);
         }
         return jsonResponse({});
-      },
+      }),
     });
     const adopted = await again.openPullRequest({
       repoUrl: "https://github.com/acme/api",
@@ -137,8 +220,9 @@ describe("adapters", () => {
   it("requests one empty commit when quality never started", async () => {
     const calls: string[] = [];
     const forge = githubForge({
-      token: "t",
-      fetch: async (url, init) => {
+      opener: opener(),
+      merger: merger(),
+      fetch: withGithubHealth(async (url, init) => {
         const method = init?.method ?? "GET";
         calls.push(`${method} ${url}`);
         if (String(url).includes("/actions/runs")) return jsonResponse({ workflow_runs: [] });
@@ -158,7 +242,7 @@ describe("adapters", () => {
           return jsonResponse({ ref: "refs/heads/cursor/qui-1-api" });
         }
         return jsonResponse({}, 404);
-      },
+      }),
     });
     const probe = await forge.quality({
       repoUrl: "https://github.com/acme/api",
@@ -177,8 +261,9 @@ describe("adapters", () => {
     assert.equal(next, "def");
     assert.ok(calls.some((call) => call.startsWith("POST ") && call.endsWith("/git/commits")));
     const again = githubForge({
-      token: "t",
-      fetch: async (url) => {
+      opener: opener(),
+      merger: merger(),
+      fetch: withGithubHealth(async (url) => {
         if (String(url).includes("/commits/def")) {
           return jsonResponse({
             commit: {
@@ -189,7 +274,7 @@ describe("adapters", () => {
           });
         }
         return jsonResponse({}, 404);
-      },
+      }),
     });
     assert.equal(
       await again.requestQualityRun({
@@ -204,6 +289,7 @@ describe("adapters", () => {
 
   it("starts and joins a self-hosted worker", async () => {
     const worker = httpWorker({
+      credential: extension("http"),
       startUrl: "https://host.example/start",
       statusUrl: "https://host.example/status",
       fetch: async (url) => {
@@ -223,7 +309,7 @@ describe("adapters", () => {
 
   it("starts a Copilot cloud task", async () => {
     const worker = copilotWorker({
-      token: "t",
+      credential: opener(),
       owner: "acme",
       repo: "api",
       fetch: async (url, init) => {
@@ -240,10 +326,10 @@ describe("adapters", () => {
 
   it("lists Linear intake and GitHub issues", async () => {
     const linear = linearTracker({
-      apiKey: "k",
+      credential: linearCredential(),
       team: "APP",
       intakeState: "Todo",
-      fetch: async () =>
+      fetch: withViewer(async () =>
         jsonResponse({
           data: {
             issues: {
@@ -262,15 +348,16 @@ describe("adapters", () => {
             },
           },
         }),
+      ),
     });
     const tickets = await linear.listIntake();
     assert.equal(tickets[0]?.identifier, "APP-3");
 
     const snapshotTracker = linearTracker({
-      apiKey: "k",
+      credential: linearCredential(),
       team: "APP",
       intakeState: "Todo",
-      fetch: async (_url, init) => {
+      fetch: withViewer(async (_url, init) => {
         const body = JSON.parse(String(init?.body)) as { query: string };
         if (body.query.includes("projects(filter")) {
           return jsonResponse({ data: { projects: { nodes: [{ id: "p1", name: "Billing", url: "https://linear.app/p1" }] } } });
@@ -303,7 +390,7 @@ describe("adapters", () => {
             },
           },
         });
-      },
+      }),
     });
     const snapshot = await snapshotTracker.projectSnapshot("Billing");
     assert.equal(snapshot?.projectName, "Billing");
@@ -311,15 +398,15 @@ describe("adapters", () => {
     assert.equal(snapshot?.milestones[0]?.name, "Stage 1");
 
     const github = githubIssuesTracker({
-      token: "t",
+      credential: opener(),
       repo: "acme/api",
       intakeLabel: "todo",
-      fetch: async (url) => {
+      fetch: withGithubHealth(async (url) => {
         if (String(url).includes("/comments")) return jsonResponse([]);
         return jsonResponse([
           { number: 3, title: "Fix", body: "blocked by API-1", labels: [{ name: "todo" }], state: "open" },
         ]);
-      },
+      }),
     });
     const issues = await github.listIntake();
     assert.equal(issues[0]?.blockedBy[0]?.identifier, "API-1");
@@ -328,10 +415,10 @@ describe("adapters", () => {
   it("adds a Linear label and keeps labels already on the issue", async () => {
     const calls: { query: string; variables: Record<string, unknown> }[] = [];
     const linear = linearTracker({
-      apiKey: "k",
+      credential: linearCredential(),
       team: "APP",
       intakeState: "Todo",
-      fetch: async (_url, init) => {
+      fetch: withViewer(async (_url, init) => {
         const body = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
         calls.push(body);
         if (body.query.includes("issues(filter")) {
@@ -370,7 +457,7 @@ describe("adapters", () => {
           return jsonResponse({ data: { issueUpdate: { success: true } } });
         }
         return jsonResponse({ data: {} });
-      },
+      }),
     });
     await linear.addLabel("APP-3", "heal-exhausted");
     const update = calls.find((call) => call.query.includes("issueUpdate"));
@@ -391,7 +478,7 @@ describe("adapters", () => {
       receipt,
     );
     const worker = cursorWorker({
-      apiKey: "k",
+      credential: extension("cursor"),
       sdk: {
         async create() {
           return {

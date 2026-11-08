@@ -45,6 +45,35 @@
           }
         }
       }
+    },
+    "canonicalPaths": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["api", "source", "acquisition", "refresh"],
+        "properties": {
+          "api": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "source": { "type": "string", "pattern": "^ref:[a-z0-9][a-z0-9-]*$" },
+          "acquisition": {
+            "enum": ["mint-per-process", "oauth-client-credentials", "workflow-token", "stored-static"]
+          },
+          "refresh": { "enum": ["per-process", "static"] },
+          "role": { "enum": ["opener", "merger"] },
+          "identityKind": { "enum": ["user", "installation", "workflow"] },
+          "callerClass": { "enum": ["agent", "actions", "runtime"] },
+          "mintCommand": { "type": "string", "minLength": 1 },
+          "envRefs": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" }
+          },
+          "oauthUrl": { "type": "string", "minLength": 1 },
+          "scope": { "type": "string", "minLength": 1 },
+          "expectedIdentity": { "type": "string", "minLength": 1 },
+          "actorRef": { "type": "string", "pattern": "^ref:[a-z0-9][a-z0-9-]*$" },
+          "healthCommand": { "type": "string", "minLength": 1 }
+        }
+      }
     }
   }
 }
