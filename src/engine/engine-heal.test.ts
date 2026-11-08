@@ -276,14 +276,22 @@ describe("engine heal release", () => {
       ]),
       "pending",
     );
-    const older = proof({ id: 1, attempt: 1, createdAt: "2026-01-01T00:00:00Z" });
+    const older = proof({
+      id: 10,
+      attempt: 9,
+      runStartedAt: "2026-01-01T00:00:00Z",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
     const newer = proof({
-      id: 2,
-      attempt: 2,
+      id: 11,
+      attempt: 1,
+      runStartedAt: "2026-01-02T00:00:00Z",
       createdAt: "2026-01-02T00:00:00Z",
       conclusion: "failure",
     });
-    assert.equal(latestQualityProof([older, newer])?.id, 2);
+    assert.equal(latestQualityProof([older, newer])?.id, 11);
+    assert.equal(latestQualityProof([older, newer], 11)?.conclusion, "failure");
+    assert.equal(latestQualityProof([older, newer], 10), null);
     assert.equal(qualityRunIsBaseWorkflow(latestQualityProof([older, newer]), head), false);
     assert.equal(engineHealQualityState([{ status: "in_progress", conclusion: "" }]), "pending");
     assert.equal(engineHealQualityState([{ status: "action_required", conclusion: "" }]), "pending");
@@ -369,6 +377,22 @@ describe("engine heal release", () => {
       headText: JSON.stringify({ scripts: { test: "tsx --test" }, version: "1.0.1", name: "loop" }),
     };
     assert.equal(engineHealFileNeedsReview(versionOnly), false);
+    const postinstall: EngineHealFile = {
+      path: "package.json",
+      baseText: JSON.stringify({ name: "loop", version: "1.0.0", scripts: { test: "tsx --test" } }),
+      headText: JSON.stringify({
+        name: "loop",
+        version: "1.0.1",
+        scripts: { test: "tsx --test", postinstall: "exit 0" },
+      }),
+    };
+    assert.equal(engineHealFileNeedsReview(postinstall), true);
+    const deps: EngineHealFile = {
+      path: "package.json",
+      baseText: JSON.stringify({ name: "loop", version: "1.0.0", dependencies: { tsx: "^4.0.0" } }),
+      headText: JSON.stringify({ name: "loop", version: "1.0.1", dependencies: { tsx: "^9.0.0" } }),
+    };
+    assert.equal(engineHealFileNeedsReview(deps), true);
     const lock = {
       name: "loop",
       version: "1.0.0",
@@ -399,11 +423,32 @@ describe("engine heal release", () => {
       }),
       true,
     );
+    assert.equal(
+      engineHealFileNeedsReview({
+        path: "package-lock.json",
+        baseText: JSON.stringify({
+          version: "1.0.0",
+          packages: { "": { version: "1.0.0" }, "node_modules/tsx": { version: "4.0.0" } },
+        }),
+        headText: JSON.stringify({
+          version: "1.0.1",
+          packages: { "": { version: "1.0.1" }, "node_modules/tsx": { version: "9.0.0" } },
+        }),
+      }),
+      true,
+    );
     assert.equal(engineHealFileNeedsReview({ path: ".github/workflows/quality.yml", baseText: null, headText: null }), true);
     assert.equal(engineHealFileNeedsReview({ path: "scripts/engine-heal.ts", baseText: null, headText: null }), true);
     assert.equal(engineHealFileNeedsReview({ path: "src/engine/engine-heal.ts", baseText: null, headText: null }), true);
     assert.equal(engineHealFileNeedsReview({ path: "src/engine/loop.test.ts", baseText: null, headText: null }), true);
-    assert.equal(engineHealFileNeedsReview({ path: "src/engine/loop.ts", baseText: null, headText: null }), false);
+    assert.equal(engineHealFileNeedsReview({ path: "src/engine/loop.ts", baseText: null, headText: null }), true);
+    assert.equal(engineHealFileNeedsReview({ path: "src/engine/design-gate.ts", baseText: null, headText: null }), true);
+    assert.equal(engineHealFileNeedsReview({ path: "src/engine/github-actions.ts", baseText: null, headText: null }), true);
+    assert.equal(engineHealFileNeedsReview({ path: "src/engine/land-branches.ts", baseText: null, headText: null }), true);
+    assert.equal(engineHealFileNeedsReview({ path: "src/adapters/forge-github.ts", baseText: null, headText: null }), true);
+    assert.equal(engineHealFileNeedsReview({ path: "src/schema/pack.ts", baseText: null, headText: null }), true);
+    assert.equal(engineHealFileNeedsReview({ path: "src/bots/load.ts", baseText: null, headText: null }), true);
+    assert.equal(engineHealFileNeedsReview({ path: "src/connectors/catalog.ts", baseText: null, headText: null }), false);
     assert.equal(engineHealAutoMergePath(".npmrc"), false);
     assert.equal(engineHealAutoMergePath("tsconfig.json"), false);
     assert.equal(engineHealAutoMergePath("vitest.config.ts"), false);
@@ -426,7 +471,7 @@ describe("engine heal release", () => {
     assert.equal(engineHealFileNeedsReview({ path: "package.json", baseText: null, headText: "{}" }), true);
     assert.equal(engineHealFilesNeedReview(null), null);
     assert.equal(
-      engineHealFilesNeedReview([{ path: "src/engine/loop.ts", baseText: null, headText: null }]),
+      engineHealFilesNeedReview([{ path: "src/connectors/catalog.ts", baseText: null, headText: null }]),
       false,
     );
   });
@@ -444,8 +489,8 @@ describe("engine heal release", () => {
     writeFileSync(join(root, "package.json"), JSON.stringify({ name: "loop", version: "1.0.0", scripts: { test: "tsx --test" } }));
     mkdirSync(join(root, ".github/workflows"), { recursive: true });
     writeFileSync(join(root, ".github/workflows/quality.yml"), "name: quality\non: pull_request\n");
-    mkdirSync(join(root, "src"), { recursive: true });
-    writeFileSync(join(root, "src", "note.ts"), "export const note = true;\n");
+    mkdirSync(join(root, "src/connectors"), { recursive: true });
+    writeFileSync(join(root, "src/connectors", "note.ts"), "export const note = true;\n");
     git("add", ".");
     git("commit", "-m", "base");
     git("checkout", "-b", "engine-heal/APP-1");
@@ -482,7 +527,7 @@ describe("engine heal release", () => {
     git("checkout", "main");
     git("checkout", "-b", "engine-heal/APP-2");
     writeFileSync(join(root, "package.json"), JSON.stringify({ name: "loop", version: "1.0.1", scripts: { test: "tsx --test" } }));
-    writeFileSync(join(root, "src", "note.ts"), "export const note = false;\n");
+    writeFileSync(join(root, "src/connectors", "note.ts"), "export const note = false;\n");
     git("add", ".");
     git("commit", "-m", "bump only");
     const cleanTip = git("rev-parse", "HEAD");

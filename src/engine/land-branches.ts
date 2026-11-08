@@ -69,12 +69,18 @@ export function confirmLandBranches(input: {
 }
 
 export function lookupRemoteHead(repoUrl: string, branch: string, token = ""): string | null {
-  const credential = token.trim() || process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
+  const credential = token.trim();
   const ask = credential ? gitAskPass(credential) : null;
+  const extra: Record<string, string> = {};
+  if (ask) {
+    extra.GIT_ASKPASS = ask.file;
+    extra.GIT_TERMINAL_PROMPT = "0";
+    extra.DELIVERY_LOOP_GIT_TOKEN = credential;
+  }
   try {
     const result = spawnSync("git", ["ls-remote", repoUrl, `refs/heads/${branch}`], {
       encoding: "utf8",
-      env: ask?.env,
+      env: gitChildEnv(extra),
     });
     if (result.status !== 0) return null;
     const sha = result.stdout.trim().split(/\s+/)[0] ?? "";
@@ -84,20 +90,21 @@ export function lookupRemoteHead(repoUrl: string, branch: string, token = ""): s
   }
 }
 
+/** PATH and HOME only, plus the askpass binding. The process environment is not copied. */
+function gitChildEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  if (process.env.PATH) env.PATH = process.env.PATH;
+  if (process.env.HOME) env.HOME = process.env.HOME;
+  for (const [key, value] of Object.entries(extra)) env[key] = value;
+  return env;
+}
+
 /** A git child reads the token from the environment. The token is not a URL argument. */
-function gitAskPass(token: string): { dir: string; env: NodeJS.ProcessEnv } {
+function gitAskPass(token: string): { dir: string; file: string } {
   const dir = mkdtempSync(join(tmpdir(), "git-askpass-"));
   const file = join(dir, "askpass.sh");
   writeFileSync(file, "#!/bin/sh\nprintf '%s\\n' \"$DELIVERY_LOOP_GIT_TOKEN\"\n", { mode: 0o700 });
-  return {
-    dir,
-    env: {
-      ...process.env,
-      GIT_ASKPASS: file,
-      GIT_TERMINAL_PROMPT: "0",
-      DELIVERY_LOOP_GIT_TOKEN: token,
-    },
-  };
+  return { dir, file };
 }
 
 function sameRepo(a: string, b: string): boolean {

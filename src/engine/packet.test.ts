@@ -71,13 +71,12 @@ describe("journey evidence", () => {
     ]);
   });
 
-  it("accepts not-applicable and a verifier token, and rejects a missing verifier", () => {
+  it("does not treat a verifier token as recorded proof", () => {
     const token = "**Journey proof:** `https://example.test/artifacts/signup.mp4`";
     assert.equal(journeyEvidenceProven("not-applicable", null), true);
-    assert.equal(journeyEvidenceProven("recorded", token), true);
+    assert.equal(journeyEvidenceProven("recorded", token), false);
     assert.equal(journeyEvidenceProven("recorded", null), false);
     assert.equal(journeyEvidenceProven("recorded", "the journey was walked"), false);
-    assert.equal(journeyEvidenceProven("recorded", ""), false);
     assert.equal(journeyEvidenceProven("blocked", token), false);
     assert.equal(journeyEvidenceProven(null, token), false);
   });
@@ -88,7 +87,7 @@ describe("journey evidence", () => {
     assert.equal(journeyEvidenceProven("recorded", "the file exists"), false);
     assert.equal(
       journeyEvidenceProven("recorded", "**Journey proof:** `api/test/signup_route_test.dart`"),
-      true,
+      false,
     );
     assert.equal(parseJourneyProofs(worker).length, 1);
   });

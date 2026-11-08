@@ -237,11 +237,18 @@ function qualityAttempts(repo: string, sha: string): QualityRunProof[] | null {
     const id = integer(run.id);
     const attempt = integer(run.run_attempt);
     if (id === null || attempt === null || attempt <= 0) return null;
-    if (typeof run.created_at !== "string" || run.created_at.length === 0) return null;
+    const started =
+      typeof run.run_started_at === "string" && run.run_started_at.length > 0
+        ? run.run_started_at
+        : typeof run.created_at === "string"
+          ? run.created_at
+          : "";
+    if (!started) return null;
     proofs.push({
       id,
       attempt,
-      createdAt: run.created_at,
+      createdAt: started,
+      runStartedAt: started,
       event: typeof run.event === "string" ? run.event : "",
       status: typeof run.status === "string" ? run.status : "",
       conclusion: typeof run.conclusion === "string" ? run.conclusion : "",
@@ -261,7 +268,7 @@ function qualityProof(repo: string, pullHead: string, triggeringId: string): Qua
   if (!/^[1-9]\d*$/.test(triggeringId)) return null;
   const attempts = qualityAttempts(repo, pullHead);
   if (!attempts || !attempts.some((item) => String(item.id) === triggeringId)) return null;
-  const latest = latestQualityProof(attempts);
+  const latest = latestQualityProof(attempts, Number(triggeringId));
   if (!latest || typeof latest.id !== "number") return null;
   const run = readGhJson(["api", "--method", "GET", `repos/${repo}/actions/runs/${latest.id}`]);
   if (!run || typeof run !== "object") return null;

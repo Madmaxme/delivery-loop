@@ -18,6 +18,10 @@ export type DesignCheckRun = {
   checkSuiteId?: number | null;
   id?: number | null;
   startedAt?: string | null;
+  /** Attempt within one workflow run. Absent on a single check is fine. */
+  attempt?: number | null;
+  /** Workflow run id when the check is tied to one. */
+  runId?: number | null;
 };
 
 export type DesignWorkflowEvidence = {
@@ -197,7 +201,15 @@ export function designChangesAreAllowlisted(
 }
 
 /**
- * pull_request plus an allowlist, or pull_request_target whose run head is the base revision.
+ * Workflows known to run only the base revision and to never check out or execute the pull request.
+ * The list is empty. A top-level workflow blob match does not add to it.
+ * `pull_request_target` stays unverified until a workflow is pinned here.
+ */
+export const TRUSTED_BASE_WORKFLOWS: readonly string[] = [];
+
+/**
+ * A pull_request check is provenance only when every changed path is allowlisted.
+ * pull_request_target is unverified: no pinned workflow is known to avoid the pull request ref.
  * Any other event is not provenance.
  */
 export function designWorkflowProvenance(
@@ -207,6 +219,8 @@ export function designWorkflowProvenance(
 ): boolean {
   const event = (workflow.event ?? "").trim();
   if (event === "pull_request_target") {
+    const path = workflow.path ?? "";
+    if (!TRUSTED_BASE_WORKFLOWS.includes(path)) return false;
     const runHead = sha40(workflow.runHeadSha);
     const base = sha40(workflow.baseSha);
     return Boolean(runHead && base && runHead === base);
@@ -232,7 +246,11 @@ function independentDesignRun(run: DesignCheckRun, evidence: DesignCheckEvidence
   );
 }
 
-/** Newest attempt for one check name. "unordered" when several runs cannot be sorted. */
+/**
+ * Newest run first (`startedAt`, then highest run id), then that run's highest attempt.
+ * An older run with a larger attempt number does not win.
+ * "unordered" when several runs lack a clock or id, or attempts in one run cannot be ranked.
+ */
 export function latestDesignCheck(runs: readonly DesignCheckRun[]): DesignCheckRun | "unordered" | null {
   if (runs.length === 0) return null;
   if (runs.length === 1) return runs[0] ?? null;
@@ -240,11 +258,20 @@ export function latestDesignCheck(runs: readonly DesignCheckRun[]): DesignCheckR
     (run) => typeof run.id === "number" && Number.isInteger(run.id) && typeof run.startedAt === "string" && run.startedAt.length > 0,
   );
   if (!sortable) return "unordered";
-  return [...runs].sort((left, right) => {
-    const time = (left.startedAt ?? "").localeCompare(right.startedAt ?? "");
-    if (time !== 0) return time;
-    return (left.id ?? 0) - (right.id ?? 0);
-  }).at(-1) ?? null;
+  const newest = runs.reduce((best, item) => {
+    const time = (item.startedAt ?? "").localeCompare(best.startedAt ?? "");
+    if (time > 0) return item;
+    if (time < 0) return best;
+    const itemRun = item.runId ?? item.id ?? 0;
+    const bestRun = best.runId ?? best.id ?? 0;
+    return itemRun > bestRun ? item : best;
+  });
+  const runKey = newest.runId ?? newest.id;
+  const group = runs.filter((item) => (item.runId ?? item.id) === runKey);
+  if (group.length > 1 && group.some((item) => typeof item.attempt !== "number" || !Number.isInteger(item.attempt))) {
+    return "unordered";
+  }
+  return group.reduce((best, item) => ((item.attempt ?? 1) >= (best.attempt ?? 1) ? item : best));
 }
 
 /**

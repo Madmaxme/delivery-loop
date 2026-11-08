@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { parse } from "yaml";
@@ -169,11 +170,8 @@ export type ProjectPack = {
    */
   symbolsCommand?: string;
   /**
-   * Verifies a recorded journey from the trunk revision, in a separate worktree.
-   * The engine does not pass the worker handoff on stdin. Stdin is the revision SHA.
-   * The command must observe external state itself. Exit 0 and a `**Journey proof:**`
-   * token are the proof. A missing command keeps a recorded journey in intake.
-   * A nonzero exit, worker text, and a file that exists are not proof.
+   * Kept for installs that still name a command. The engine does not run it as proof.
+   * A recorded journey stays unverified and in intake. Command output is not external state.
    */
   journeyCommand?: string;
   /**
@@ -307,6 +305,28 @@ function loadDesign(design: DesignSpec | undefined, path: string): DesignSpec | 
     return { name, check, checkName, tokenFile, proofPaths };
   });
   return { figmaTokenEnv, repos };
+}
+
+/**
+ * `proofPaths` from the fetched trunk pack. The working tree and the pull request checkout are not read.
+ * Null when that file cannot be read. An empty list is a real answer.
+ */
+export function proofPathsFromTrustedRef(cwd: string, pack: ProjectPack, repoName: string): string[] | null {
+  const trunk = pack.agent?.trunk?.trim() || "main";
+  const shown = spawnSync("git", ["show", `origin/${trunk}:delivery-loop.yaml`], { cwd, encoding: "utf8" });
+  if (shown.status !== 0 || !shown.stdout?.trim()) return null;
+  let parsed: { design?: { repos?: { name?: string; proofPaths?: unknown }[] } };
+  try {
+    parsed = parse(shown.stdout) as { design?: { repos?: { name?: string; proofPaths?: unknown }[] } };
+  } catch {
+    return null;
+  }
+  const repos = parsed.design?.repos;
+  if (!Array.isArray(repos)) return [];
+  const match = repos.find((repo) => repo?.name?.trim() === repoName);
+  if (!match || match.proofPaths == null) return [];
+  if (!Array.isArray(match.proofPaths) || match.proofPaths.some((item) => typeof item !== "string")) return null;
+  return match.proofPaths.map((item) => item.trim()).filter(Boolean);
 }
 
 export function unblockingStates(pack: ProjectPack): string[] {

@@ -132,18 +132,26 @@ export type EngineHealCheck = "success" | "failure" | "pending" | "none";
 
 /** Quality on one commit. The latest attempt wins. An older success does not. */
 export function engineHealQualityState(
-  runs: readonly { status?: string; conclusion?: string; id?: number; attempt?: number; createdAt?: string }[],
+  runs: readonly {
+    status?: string;
+    conclusion?: string;
+    id?: number;
+    attempt?: number;
+    runStartedAt?: string;
+    createdAt?: string;
+  }[],
 ): EngineHealCheck {
   const latest = latestQualityProof(
     runs.map((run) => ({
       id: run.id,
       attempt: run.attempt,
+      runStartedAt: run.runStartedAt ?? run.createdAt,
       createdAt: run.createdAt,
       status: run.status,
       conclusion: run.conclusion,
     })),
   );
-  if (!latest) return runs.length > 1 ? "none" : "none";
+  if (!latest) return "none";
   const status = (latest.status ?? "").toLowerCase();
   if (status.length > 0 && status !== "completed") return "pending";
   const conclusion = (latest.conclusion ?? "").toLowerCase();
@@ -331,16 +339,21 @@ function packageLockNeedsReview(baseText: string | null, headText: string | null
 const AUTO_MERGE_SOURCE_SUFFIXES = [".ts", ".tsx", ".js", ".mjs", ".cjs"] as const;
 
 /**
- * True when this path is product source an engine-heal pull request may auto-merge.
- * Config, tests, workflows, and the heal program are outside the list.
+ * Paths that do not decide a gate. Auto-merge allows only this list.
+ * `src/engine`, `src/adapters`, `src/schema`, and `src/bots` are trust code and are not on it.
+ */
+export const ENGINE_HEAL_NON_TRUST_PREFIXES = ["src/connectors/"] as const;
+
+/**
+ * True when this path is on the explicit non-trust list.
+ * A version-only package.json and package-lock.json change is included.
  */
 export function engineHealAutoMergePath(path: string): boolean {
   const normalized = normalizeRepoPath(path);
   if (!normalized) return false;
   if (normalized === "package.json" || normalized === "package-lock.json") return true;
-  if (!normalized.startsWith("src/")) return false;
-  if (normalized === "src/engine/engine-heal.ts") return false;
   if (/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(normalized)) return false;
+  if (!ENGINE_HEAL_NON_TRUST_PREFIXES.some((prefix) => normalized.startsWith(prefix))) return false;
   return AUTO_MERGE_SOURCE_SUFFIXES.some((suffix) => normalized.endsWith(suffix));
 }
 
@@ -369,6 +382,8 @@ export function engineHealFilesNeedReview(files: readonly EngineHealFile[] | nul
 export type QualityRunProof = {
   id?: number | null;
   attempt?: number | null;
+  /** Preferred clock for which run is newest. `createdAt` is only a fallback. */
+  runStartedAt?: string | null;
   createdAt?: string | null;
   event?: string | null;
   status?: string | null;
@@ -381,28 +396,48 @@ export type QualityRunProof = {
   mainWorkflowBlobSha?: string | null;
 };
 
-/** The newest attempt. Null when more than one run cannot be ordered. */
-export function latestQualityProof(proofs: readonly QualityRunProof[]): QualityRunProof | null {
+function runStamp(proof: QualityRunProof): string {
+  return proof.runStartedAt || proof.createdAt || "";
+}
+
+/**
+ * Newest run first (latest `runStartedAt`, then highest id), then that run's highest attempt.
+ * An older run with a higher attempt number does not win.
+ * When `triggeringId` is set, the newest run must be that id.
+ * Null when the set cannot be ordered or the newest run is not the trigger.
+ */
+export function latestQualityProof(
+  proofs: readonly QualityRunProof[],
+  triggeringId?: number,
+): QualityRunProof | null {
   if (proofs.length === 0) return null;
-  if (proofs.length === 1) return proofs[0] ?? null;
-  const ordered = proofs.every(
-    (proof) =>
-      typeof proof.id === "number" &&
-      Number.isInteger(proof.id) &&
-      typeof proof.attempt === "number" &&
-      Number.isInteger(proof.attempt) &&
-      proof.attempt > 0 &&
-      typeof proof.createdAt === "string" &&
-      proof.createdAt.length > 0,
-  );
-  if (!ordered) return null;
-  return [...proofs].sort((left, right) => {
-    const attempt = (right.attempt ?? 0) - (left.attempt ?? 0);
-    if (attempt !== 0) return attempt;
-    const created = (right.createdAt ?? "").localeCompare(left.createdAt ?? "");
-    if (created !== 0) return created;
-    return (right.id ?? 0) - (left.id ?? 0);
-  })[0] ?? null;
+  let selected: QualityRunProof | null;
+  if (proofs.length === 1) {
+    selected = proofs[0] ?? null;
+  } else {
+    const ordered = proofs.every(
+      (proof) =>
+        typeof proof.id === "number" &&
+        Number.isInteger(proof.id) &&
+        proof.id > 0 &&
+        typeof proof.attempt === "number" &&
+        Number.isInteger(proof.attempt) &&
+        proof.attempt > 0 &&
+        runStamp(proof).length > 0,
+    );
+    if (!ordered) return null;
+    const newest = proofs.reduce((best, item) => {
+      const time = runStamp(item).localeCompare(runStamp(best));
+      if (time > 0) return item;
+      if (time < 0) return best;
+      return (item.id ?? 0) > (best.id ?? 0) ? item : best;
+    });
+    const group = proofs.filter((item) => item.id === newest.id);
+    selected = group.reduce((best, item) => ((item.attempt ?? 0) > (best.attempt ?? 0) ? item : best));
+  }
+  if (!selected) return null;
+  if (triggeringId != null && selected.id !== triggeringId) return null;
+  return selected;
 }
 
 function sha40(value: string | null | undefined): string | null {

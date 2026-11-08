@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -749,10 +749,10 @@ describe("loop", () => {
       return { status: "finished", branch: "delivery/api-1", head: "abc", text };
     };
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "journey-missing");
+    assert.equal(result.outcome, "journey-unverified");
     assert.equal(env.merged(), true);
     assert.equal(env.state(), "Todo");
-    assert.match(env.comments.join("\n"), /journey command/);
+    assert.match(env.comments.join("\n"), /unverified/);
   });
 
   it("does not mark dev-done because a route file exists", async () => {
@@ -776,7 +776,7 @@ describe("loop", () => {
     const env = harness(ground);
     env.deps.cwd = root;
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "journey-missing");
+    assert.equal(result.outcome, "journey-unverified");
     assert.equal(env.merged(), true);
     assert.equal(env.state(), "Todo");
   });
@@ -787,7 +787,7 @@ describe("loop", () => {
     failing.deps.cwd = mkdtempSync(join(tmpdir(), "journey-fail-"));
     failing.deps.pack = { ...pack, journeyCommand: "exit 1" };
     const failed = await runTicket(failing.deps, ticket());
-    assert.equal(failed.outcome, "journey-missing");
+    assert.equal(failed.outcome, "journey-unverified");
     assert.equal(failing.merged(), true);
     assert.equal(failing.state(), "Todo");
 
@@ -795,7 +795,7 @@ describe("loop", () => {
     empty.deps.cwd = mkdtempSync(join(tmpdir(), "journey-empty-"));
     empty.deps.pack = { ...pack, journeyCommand: "node -e \"process.stdout.write('the journey was walked')\"" };
     const quiet = await runTicket(empty.deps, ticket());
-    assert.equal(quiet.outcome, "journey-missing");
+    assert.equal(quiet.outcome, "journey-unverified");
     assert.equal(empty.state(), "Todo");
   });
 
@@ -852,63 +852,26 @@ describe("loop", () => {
     assert.equal(env.state(), "Todo");
   });
 
-  it("marks an already-shipped ticket dev-done when the journey command proves it", async () => {
-    const url = "https://example.test/artifacts/signup.mp4";
+  it("does not mark an already-shipped ticket dev-done from a journey command", async () => {
+    const marker = join(mkdtempSync(join(tmpdir(), "journey-ran-")), "ran");
     const cwd = trunkCheckout("API-1", {
-      "prove.js": `process.stdout.write(${JSON.stringify(`**Journey proof:** \`${url}\``)});\n`,
+      "prove.js": `require("fs").writeFileSync(process.argv[2], "ran"); process.stdout.write("**Journey proof:** \\\`https://example.test/artifacts/signup.mp4\\\`");\n`,
     });
     const text = [
       "**Verdict:** ALREADY SHIPPED",
       "**Repos:** `api`",
       "**Outside grant:** none",
       "**Journey evidence:** recorded",
+      "**Journey proof:** `https://example.test/artifacts/signup.mp4`",
     ].join("\n");
     const env = harness(text);
     env.deps.cwd = cwd;
-    env.deps.pack = { ...pack, journeyCommand: "node prove.js" };
+    env.deps.pack = { ...pack, journeyCommand: `node prove.js ${marker}` };
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "verdict");
-    assert.equal(env.state(), "Dev");
-  });
-
-  it("ignores a worker edit of the journey command", async () => {
-    const log = join(mkdtempSync(join(tmpdir(), "journey-log-")), "stdin.txt");
-    const baseUrl = "https://example.test/artifacts/base.mp4";
-    const cwd = trunkCheckout("API-1", {
-      "prove.js": [
-        'const fs = require("fs");',
-        "const stdin = fs.readFileSync(0, \"utf8\");",
-        "fs.writeFileSync(process.argv[2], stdin);",
-        "if (stdin.includes(\"Journey proof\")) process.exit(3);",
-        `process.stdout.write(${JSON.stringify(`**Journey proof:** \`${baseUrl}\``)});`,
-        "",
-      ].join("\n"),
-    });
-    writeFileSync(
-      join(cwd, "api", "prove.js"),
-      [
-        'const fs = require("fs");',
-        "fs.writeFileSync(process.argv[2], \"EVIL\\n\" + fs.readFileSync(0, \"utf8\"));",
-        "process.stdout.write(\"**Journey proof:** `https://example.test/artifacts/evil.mp4`\");",
-        "",
-      ].join("\n"),
-    );
-    const text = [
-      "**Verdict:** ALREADY SHIPPED",
-      "**Repos:** `api`",
-      "**Outside grant:** none",
-      "**Journey evidence:** recorded",
-      "**Journey proof:** `https://example.test/artifacts/evil.mp4`",
-    ].join("\n");
-    const env = harness(text);
-    env.deps.cwd = cwd;
-    env.deps.pack = { ...pack, journeyCommand: `node prove.js ${log}` };
-    const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "verdict");
-    assert.equal(env.state(), "Dev");
-    const recorded = readFileSync(log, "utf8");
-    assert.equal(recorded.includes("EVIL"), false);
-    assert.equal(recorded.includes("Journey proof"), false);
+    assert.equal(env.state(), "Todo");
+    assert.match(env.comments.join("\n"), /unverified/);
+    assert.equal(existsSync(marker), false);
   });
 
   it("marks an already-shipped ticket dev-done when the journey is not applicable", async () => {
@@ -1452,21 +1415,64 @@ describe("loop", () => {
     assert.equal(env.comments.some((body) => body.includes("BUILD_PACKET")), false);
   });
 
-  it("marks dev-done when the journey command prints a proof token", async () => {
-    const url = "https://example.test/artifacts/signup.mp4";
+  it("does not run a worker journey command or mark dev-done from its token", async () => {
+    const marker = join(mkdtempSync(join(tmpdir(), "journey-land-")), "ran");
     const cwd = trunkCheckout("API-1", {
-      "prove.js": `process.stdout.write(${JSON.stringify(`**Journey proof:** \`${url}\``)});\n`,
+      "prove.js": `require("fs").writeFileSync(${JSON.stringify(marker)}, "worker"); process.stdout.write("**Journey proof:** \`https://example.test/artifacts/signup.mp4\`");\n`,
     });
     const sha = spawnSync("git", ["-C", join(cwd, "api"), "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
-    const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded"));
+    const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded\n**Repos:** `not-landed`"));
     env.deps.cwd = cwd;
     env.deps.lookupHead = (_url, branch) => (branch === "main" ? sha : null);
-    env.deps.forge.squashMerge = async () => sha;
+    const squash = env.deps.forge.squashMerge.bind(env.deps.forge);
+    env.deps.forge.squashMerge = async (input) => {
+      await squash(input);
+      return sha;
+    };
     env.deps.pack = { ...pack, journeyCommand: "node prove.js" };
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "landed");
-    assert.equal(env.state(), "Dev");
-    assert.equal(env.comments.some((body) => body.includes(url)), false);
+    assert.equal(result.outcome, "journey-unverified");
+    assert.equal(env.state(), "Todo");
+    assert.equal(env.merged(), true);
+    const unverified = env.comments.filter((body) => body.includes("unverified"));
+    assert.match(unverified.join("\n"), /Landed repos: api/);
+    assert.equal(unverified.some((body) => body.includes("not-landed")), false);
+    assert.equal(existsSync(marker), false);
+  });
+
+  it("reports every landed repo when a recorded journey is unverified", async () => {
+    const ground = BUILDABLE.replace("**Repos:** `api`", "**Repos:** `api` `web`").replace(
+      "**Journey evidence:** not-applicable",
+      "**Journey evidence:** recorded\n**Repos:** `only-text`",
+    );
+    const env = harness(ground);
+    env.deps.pack = {
+      ...pack,
+      repos: [
+        { name: "api", url: "https://github.com/acme/api", trunk: "main" },
+        { name: "web", url: "https://github.com/acme/web", trunk: "main" },
+      ],
+    };
+    let joins = 0;
+    env.deps.worker.join = async () => {
+      joins += 1;
+      return {
+        status: "finished",
+        branch: "delivery/api-1",
+        head: "abc",
+        text: joins === 1 ? ground : "built",
+        branches: [
+          { repoUrl: "https://github.com/acme/api", branch: "delivery/api-1" },
+          { repoUrl: "https://github.com/acme/web", branch: "delivery/web-1" },
+        ],
+      };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "journey-unverified");
+    assert.equal(env.state(), "Todo");
+    const unverified = env.comments.filter((body) => body.includes("unverified"));
+    assert.match(unverified.join("\n"), /Landed repos: api, web/);
+    assert.equal(unverified.some((body) => body.includes("only-text")), false);
   });
 
   it("keeps dev when ship fails, edits that owner once, and resumes the step", async () => {

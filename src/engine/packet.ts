@@ -219,15 +219,12 @@ export function parseJourneyProofs(text: string): JourneyProof[] {
 }
 
 /**
- * `recorded` is proven only by the verifier command's stdout.
- * That stdout has to contain a `**Journey proof:**` token. Text the worker wrote is not proof.
- * A file that exists is not proof. `not-applicable` is proven. Anything else is not.
+ * `not-applicable` needs no external observer.
+ * `recorded` is never proven by command stdout. This engine cannot check external state,
+ * so a token in that stdout is unverified and is not proof.
  */
-export function journeyEvidenceProven(evidence: JourneyEvidence | null, verifierStdout: string | null): boolean {
-  if (evidence === "not-applicable") return true;
-  if (evidence !== "recorded") return false;
-  if (verifierStdout == null) return false;
-  return parseJourneyProofs(verifierStdout).length > 0;
+export function journeyEvidenceProven(evidence: JourneyEvidence | null, _verifierStdout: string | null): boolean {
+  return evidence === "not-applicable";
 }
 
 /** Status to move to after a non-BUILDABLE verdict. Null stays in intake. */

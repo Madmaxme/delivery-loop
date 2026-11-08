@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -419,7 +420,7 @@ describe("independent design check", () => {
     assert.equal(missingEvent.state, "failure");
   });
 
-  it("accepts a pull_request_target run whose head is the base revision", () => {
+  it("does not treat pull_request_target as proof without a pinned base-only workflow", () => {
     const base = "e".repeat(40);
     const proven = interpretDesignChecks(
       [designRun()],
@@ -441,7 +442,7 @@ describe("independent design check", () => {
         ],
       }),
     );
-    assert.equal(proven.state, "success");
+    assert.equal(proven.state, "failure");
     const wrongHead = interpretDesignChecks(
       [designRun()],
       HEAD,
@@ -465,9 +466,17 @@ describe("independent design check", () => {
   });
 
   it("uses the latest design check and ignores an older success", () => {
-    const older = designRun({ id: 1, startedAt: "2026-01-01T00:00:00Z", conclusion: "success" });
+    const older = designRun({
+      id: 10,
+      runId: 10,
+      attempt: 5,
+      startedAt: "2026-01-01T00:00:00Z",
+      conclusion: "success",
+    });
     const newer = designRun({
-      id: 2,
+      id: 11,
+      runId: 11,
+      attempt: 1,
       startedAt: "2026-01-02T00:00:00Z",
       status: "completed",
       conclusion: "failure",
@@ -577,11 +586,12 @@ describe("independent design check", () => {
     env.deps.figmaFetch = async () => Response.json({ name: "Home" });
     env.deps.lookupHead = () => null;
     let merged = false;
+    env.deps.cwd = packCheckout("admin-web", ["src"]);
     env.deps.pack = {
       ...pack,
       design: {
         ...pack.design!,
-        repos: [{ ...pack.design!.repos[0]!, proofPaths: ["src"] }],
+        repos: [{ ...pack.design!.repos[0]!, proofPaths: ["."] }],
       },
     };
     env.deps.forge = githubForge({
@@ -594,7 +604,51 @@ describe("independent design check", () => {
     assert.equal(merged, true);
     assert.equal(result.outcome, "landed");
   });
+
+  it("reads proof paths from the trunk pack, not the working tree", async () => {
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    env.deps.figmaFetch = async () => Response.json({ name: "Home" });
+    env.deps.lookupHead = () => null;
+    env.deps.cwd = packCheckout("admin-web", ["src/kept"]);
+    env.deps.pack = {
+      ...pack,
+      design: {
+        ...pack.design!,
+        repos: [{ ...pack.design!.repos[0]!, proofPaths: ["src"] }],
+      },
+    };
+    let merged = false;
+    env.deps.forge = githubForge({
+      token: "t",
+      fetch: designFetch({ headBlob: BLOB, baseBlob: BLOB, appId: GITHUB_ACTIONS_APP_ID }, () => {
+        merged = true;
+      }),
+    });
+    const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
+    assert.equal(merged, false);
+    assert.notEqual(result.outcome, "landed");
+    assert.match(env.comments.join("\n"), /not an independent|design check/);
+  });
 });
+
+function packCheckout(repoName: string, proofPaths: string[]): string {
+  const cwd = mkdtempSync(join(tmpdir(), "proof-paths-"));
+  const lines = ["design:", "  repos:", `    - name: ${repoName}`, "      proofPaths:", ...proofPaths.map((path) => `        - ${path}`)];
+  writeFileSync(join(cwd, "delivery-loop.yaml"), `${lines.join("\n")}\n`);
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  git("init", "-b", "main");
+  git("config", "user.email", "dev@example.com");
+  git("config", "user.name", "Dev");
+  git("add", "delivery-loop.yaml");
+  git("commit", "-m", "pack");
+  git("update-ref", "refs/remotes/origin/main", "HEAD");
+  writeFileSync(join(cwd, "delivery-loop.yaml"), "design:\n  repos:\n    - name: admin-web\n      proofPaths:\n        - .\n");
+  return cwd;
+}
 
 function designFetch(
   input: { headBlob: string; baseBlob: string | null; appId: number | null },

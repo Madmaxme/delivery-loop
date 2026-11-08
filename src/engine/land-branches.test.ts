@@ -65,25 +65,36 @@ describe("land branches", () => {
       join(dir, "git"),
       `#!/bin/sh
 printf '%s\\n' "$@" > ${JSON.stringify(argsFile)}
-printf '%s\\n' "$DELIVERY_LOOP_GIT_TOKEN" > ${JSON.stringify(tokenFile)}
+printf '%s\\n' "\${DELIVERY_LOOP_GIT_TOKEN-unset}" > ${JSON.stringify(tokenFile)}
+printf '%s\\n' "\${GH_TOKEN-unset}" > ${JSON.stringify(join(dir, "ambient"))}
 printf '%s\\n' "$GIT_ASKPASS" > ${JSON.stringify(askFile)}
 printf '%s\\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main"
 `,
       { mode: 0o755 },
     );
-    const previous = process.env.PATH;
-    process.env.PATH = `${dir}:${previous ?? ""}`;
+    const previousPath = process.env.PATH;
+    const previousGh = process.env.GH_TOKEN;
+    process.env.PATH = `${dir}:${previousPath ?? ""}`;
+    process.env.GH_TOKEN = "ambient-token";
     try {
       const sha = lookupRemoteHead("https://github.com/acme/api", "main", token);
       assert.equal(sha, "a".repeat(40));
       const args = readFileSync(argsFile, "utf8");
       assert.equal(args.includes(token), false);
+      assert.equal(args.includes("ambient-token"), false);
       assert.match(args, /https:\/\/github.com\/acme\/api/);
       assert.equal(readFileSync(tokenFile, "utf8").trim(), token);
+      assert.equal(readFileSync(join(dir, "ambient"), "utf8").trim(), "unset");
       assert.ok(readFileSync(askFile, "utf8").trim().endsWith("askpass.sh"));
+      const plain = lookupRemoteHead("https://github.com/acme/api", "main");
+      assert.equal(plain, "a".repeat(40));
+      assert.equal(readFileSync(tokenFile, "utf8").trim(), "unset");
+      assert.equal(readFileSync(join(dir, "ambient"), "utf8").trim(), "unset");
     } finally {
-      if (previous === undefined) delete process.env.PATH;
-      else process.env.PATH = previous;
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousGh === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = previousGh;
     }
   });
 });
