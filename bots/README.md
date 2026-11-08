@@ -82,7 +82,7 @@ It takes that task, carries it out with its skills and tools, and returns a stru
 
 The allowed work follows the adapters. `ForgeAdapter.openPullRequest` opens a pull request. `WorkerAdapter` `start` and `join` are how a branch, a commit, and a test run are described. It does not call `ForgeAdapter.squashMerge`, so it does not merge its own pull request (`no-self-merge`). It does not call `ForgeAdapter.dispatch`, and it does not start or run the delivery loop (`engineering-no-dispatch`). It does not call `TrackerAdapter` `setState`, `addLabel`, or `removeLabel` (`engineering-no-status-writes`). It does not relax a quality gate (`engineering-no-relax-gate`). It does not talk to the user or to anyone else except by returning the result to the orchestrator (`engineering-reports-only-to-orchestrator`).
 
-Its `may` allowlist is `engineer-task` and `report-to-orchestrator`. It does not name the delivery agent's tool surface. Stating the work does not start it. The role is optional. When `bots.path` is absent, nothing reads this file.
+Its `may` allowlist is `engineer-task` and `report-to-orchestrator`. It does not name the delivery agent's tool surface. Stating the work does not start it. The role is optional. A manifest may omit `engineering-bot`. The other three roles stay required, and that bundle validates as it did before this role existed. When `bots.path` is absent, nothing reads this file.
 
 ## Routines
 

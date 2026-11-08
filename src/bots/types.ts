@@ -180,7 +180,12 @@ export type BotInventory = {
 export type BotManifest = {
   specversion: "1.0";
   effect: "data-only";
-  roles: Record<BotRole, string>;
+  roles: {
+    orchestrator: string;
+    "verdict-writer": string;
+    "delivery-agent": string;
+    "engineering-bot"?: string;
+  };
   routines: string[];
   inventory: string;
 };

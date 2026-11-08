@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -6,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
 import { CONNECTORS } from "../connectors/catalog.ts";
+import { loadPack } from "../schema/pack.ts";
 import { formatInventory, loadBotBundle } from "./load.ts";
 import { EXECUTION_IDENTITIES, FORGE_OPERATIONS, TRACKER_OPERATIONS, WORKER_OPERATIONS } from "./surface.ts";
 
@@ -214,6 +216,37 @@ describe("bot templates", () => {
       readFileSync(join(badParent, "engineering-bot.yaml"), "utf8").replace("reportsTo: orchestrator", "reportsTo: delivery-agent"),
     );
     assert.throws(() => loadBotBundle(badParent), /reportsTo must be orchestrator/);
+  });
+
+  it("loads an unchanged three-role bundle from v1.0.5", () => {
+    const extracted = mkdtempSync(join(tmpdir(), "bots-v105-"));
+    const archive = execFileSync("git", ["archive", "35789212576d94e00a6220ec9f5d1f7777abe648", "bots/templates"], {
+      cwd: root,
+    });
+    execFileSync("tar", ["-x", "-C", extracted], { input: archive });
+    const bundle = loadBotBundle(join(extracted, "bots/templates"));
+    assert.deepEqual(
+      bundle.definitions.map((definition) => definition.role).sort(),
+      ["delivery-agent", "orchestrator", "verdict-writer"],
+    );
+    const client = mkdtempSync(join(tmpdir(), "pack-v105-"));
+    cpSync(join(extracted, "bots/templates"), join(client, "bots"), { recursive: true });
+    writeFileSync(
+      join(client, "delivery-loop.yaml"),
+      `tracker: linear
+worker: cursor
+repos:
+  - name: api
+    url: https://git.example/acme/api.git
+    trunk: main
+qualityCommand: npm test
+bots:
+  path: bots
+`,
+    );
+    const pack = loadPack(join(client, "delivery-loop.yaml"));
+    assert.deepEqual(pack.bots, { path: "bots" });
+    assert.equal(pack.qualityCommand, "npm test");
   });
 
   it("maps the delivery agent to the adapter interfaces and the connector catalog", () => {
