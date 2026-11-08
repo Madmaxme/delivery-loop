@@ -28,18 +28,4 @@ An integrator reads the artifact, or sets the endpoint in its own repository. Th
 
 ## Bot definitions
 
-`bots/templates/` holds role templates. A client holds instances of those roles, in the directory named by `bots.path` on its pack. The key is optional. When it is absent, the engine does not read a bots directory.
-
-An orchestrator instance and a verdict-writer instance belong to one client. Each business has its own. A client's delivery-agent instance may be shared across clients if it is the same bot everywhere.
-
-The delivery agent is the harness execution agent. It is one of the engine's roles. It thinks, then calls the forge, tracker, worker, and connector adapters. Those interfaces, the loop, and engine-heal are the source of what it can do. A GitHub App or other identity that opens a pull request or merges when checks are green is an execution identity the delivery agent calls. It is not an agent and not a role.
-
-The delivery agent reads check-runs on the exact reviewed head. The merge is a squash of that head, and only when those checks are green. An identity that opened or pushed the head does not merge it. Review is independent of that identity. There is no rebase. There is no force-merge when a check on that head is red.
-
-The orchestrator monitors existing delivery runs and reports evidence. It does not start, dispatch, re-dispatch, resume, or run the delivery loop, including a scheduled sweep and a ground-only compile. It does not write a delivery status or a delivery label. It is the role that talks to the user.
-
-The engineering bot sits under that orchestrator. `reportsTo` is the orchestrator role. The orchestrator hands it a scoped engineering task. It carries the task out with its skills and tools and returns a structured result: the outcome, evidence links, and what is unverified. It does not talk to the user. The work it may describe is a branch, a commit, an opened pull request, and a test run (`ForgeAdapter.openPullRequest`, `WorkerAdapter` start and join). It does not merge its own pull request, start or dispatch the delivery loop, write a tracker status or label, or relax a quality gate. Those bounds are policy ids. This layer does not enforce them at runtime.
-
-The inventory cross-checks the four roles. It does not add a capability. A source that was not read is a coverage gap with status `unreached` or `unverified`, a reason, and a timestamp. The gap is written down. It is not omitted.
-
-The files are data. They do not relax a gate and they do not grant authority. A policy id such as `no-self-merge` or `head-pinned-squash` records the bound. This layer does not install a runtime identity-separation gate. The engine does not read those ids when it merges. `bots.path` must stay inside the client directory that holds the pack file, including through symlinks. `delivery-loop bots validate` and `delivery-loop bots list` only read. They do not schedule a routine.
+A `bots` key on the pack is ignored with a warning.

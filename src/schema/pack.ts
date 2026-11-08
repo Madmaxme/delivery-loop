@@ -1,9 +1,5 @@
 import { readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
 import { parse } from "yaml";
-
-import { loadBotBundle, resolveBotRoot } from "../bots/load.ts";
-import type { BotBundle } from "../bots/types.ts";
 
 /** Writes to `repos` are refused unless the token's GitHub login is `login`. */
 export type CommitActor = {
@@ -190,12 +186,6 @@ export type ProjectPack = {
     maxAttempts?: number;
     caps?: Record<string, number>;
   };
-  /**
-   * Optional directory of bot instances, relative to this file.
-   * Absent means this install has no bot definitions and nothing there is read.
-   * The directory is validated and then dropped. It is not a gate and not a grant.
-   */
-  bots?: { path: string };
 };
 
 export function defaultStatus(): ProjectPack["status"] {
@@ -218,12 +208,12 @@ export function closedStates(pack: ProjectPack): string[] {
   return named.length > 0 ? named : ["Canceled", "Duplicate"];
 }
 
-/** The pack, and the bot bundle when `bots.path` is set. The bundle is not stored on the pack. */
-export function openPack(path: string): { pack: ProjectPack; bots: BotBundle | null } {
+export function loadPack(path: string): ProjectPack {
   const raw = parse(readFileSync(path, "utf8")) as ProjectPack;
   if (!raw || !Array.isArray(raw.repos) || raw.repos.length === 0) {
     throw new Error(`${path} needs at least one repo`);
   }
+  ignoreBots(raw, path);
   if (!TRACKERS.includes(raw.tracker)) {
     throw new Error(`${path} tracker must be linear or github`);
   }
@@ -251,30 +241,14 @@ export function openPack(path: string): { pack: ProjectPack; bots: BotBundle | n
   };
   raw.invariantHeadings = raw.invariantHeadings ?? [];
   raw.design = loadDesign(raw.design, path);
-  const bots = loadBotsField(raw.bots, path);
-  raw.bots = bots ? { path: bots.path } : undefined;
-  return { pack: raw, bots: bots?.bundle ?? null };
+  return raw;
 }
 
-export function loadPack(path: string): ProjectPack {
-  return openPack(path).pack;
-}
-
-/**
- * Validate `bots.path` when the pack sets it.
- * The pack keeps the path only. The bundle cannot change a gate, a status write, or a merge.
- */
-function loadBotsField(
-  bots: { path?: unknown } | undefined,
-  packFile: string,
-): { path: string; bundle: BotBundle } | undefined {
-  if (bots == null) return undefined;
-  if (typeof bots !== "object" || Array.isArray(bots)) throw new Error(`${packFile} bots must be a path`);
-  const rel = typeof bots.path === "string" ? bots.path.trim() : "";
-  if (!rel) throw new Error(`${packFile} bots.path is required when bots is set`);
-  if (isAbsolute(rel)) throw new Error(`${packFile} bots.path must be relative to the pack file`);
-  const bundle = loadBotBundle(resolveBotRoot(packFile, rel));
-  return { path: rel, bundle };
+/** A leftover bots key is ignored with a warning. */
+function ignoreBots(raw: object, packFile: string): void {
+  if (!Object.hasOwn(raw, "bots")) return;
+  console.warn(`${packFile}: bots is ignored`);
+  delete (raw as { bots?: unknown }).bots;
 }
 
 function loadDesign(design: DesignSpec | undefined, path: string): DesignSpec | undefined {

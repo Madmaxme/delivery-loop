@@ -42,13 +42,7 @@ A worker run writes `delivery-loop.run.started` and `delivery-loop.run.finished`
 
 ## Bot definitions
 
-Optional. A client pack may set `bots.path` to a directory of bot instances, relative to `delivery-loop.yaml`. When the key is absent, the engine reads nothing there and the loop is unchanged.
-
-This repository holds role templates in `bots/templates/`. The roles are the orchestrator, the verdict writer, the delivery agent, and the engineering bot. The delivery agent is the harness execution agent. Its tools are the forge, tracker, worker, and connector adapters. A GitHub App that opens a pull request or merges on green is an execution identity that agent calls, not a bot of its own. The engineering bot sits under the orchestrator, does the scoped engineering task it is handed, and returns the result to that orchestrator.
-
-An orchestrator instance and a verdict-writer instance are per client. A delivery-agent instance may be shared across clients when it is the same bot everywhere. The inventory is a cross-check of those roles. A source that was not read is a coverage gap (`unreached` or `unverified`, with a reason and a timestamp), not a missing row.
-
-Definitions are data. They do not relax a gate and they do not grant authority. Policy ids record the role bounds. This layer does not install a runtime identity-separation gate. `bots.path` must stay inside the client directory. `delivery-loop bots validate` checks them. `delivery-loop bots list` prints the inventory. Neither command uses a credential, the network, or a write, and neither dispatches or schedules. See [bots/README.md](bots/README.md).
+A `bots` key on the pack is ignored with a warning.
 
 ## Contribute
 

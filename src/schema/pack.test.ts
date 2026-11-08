@@ -1,13 +1,10 @@
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import { loadPack } from "./pack.ts";
-
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
 function write(body: string): string {
   const dir = mkdtempSync(join(tmpdir(), "pack-"));
@@ -117,58 +114,45 @@ design:
     assert.throws(() => loadPack(write(base.replace("tracker: linear", "tracker: files"))), /tracker/);
   });
 
-  it("does not read a bots directory when the pack omits bots", () => {
-    const dir = mkdtempSync(join(tmpdir(), "pack-"));
-    writeFileSync(join(dir, "delivery-loop.yaml"), base);
-    mkdirSync(join(dir, "bots"));
-    writeFileSync(join(dir, "bots/manifest.yaml"), "token: present\n");
-    const pack = loadPack(join(dir, "delivery-loop.yaml"));
-    assert.equal(pack.bots, undefined);
-    assert.equal(pack.qualityCommand, "npm test");
+  it("stays quiet when the pack omits bots", () => {
+    const warnings = captureWarnings(() => {
+      const pack = loadPack(write(base));
+      assert.equal(Object.hasOwn(pack, "bots"), false);
+      assert.equal(pack.qualityCommand, "npm test");
+    });
+    assert.deepEqual(warnings, []);
   });
 
-  it("validates a bots directory inside the client directory and keeps only the path", () => {
-    const dir = mkdtempSync(join(tmpdir(), "pack-"));
-    cpSync(join(root, "bots/templates"), join(dir, "bots"), { recursive: true });
-    writeFileSync(join(dir, "delivery-loop.yaml"), `${base}\nbots:\n  path: bots\n`);
-    const pack = loadPack(join(dir, "delivery-loop.yaml"));
-    assert.deepEqual(pack.bots, { path: "bots" });
-    assert.equal(pack.qualityCommand, "npm test");
-    assert.equal("definitions" in (pack.bots as object), false);
-  });
-
-  it("accepts a directory whose name starts with two dots", () => {
-    const dir = mkdtempSync(join(tmpdir(), "pack-"));
-    cpSync(join(root, "bots/templates"), join(dir, "..foo"), { recursive: true });
-    writeFileSync(join(dir, "delivery-loop.yaml"), `${base}\nbots:\n  path: ..foo\n`);
-    assert.deepEqual(loadPack(join(dir, "delivery-loop.yaml")).bots, { path: "..foo" });
-  });
-
-  it("refuses a bots path that leaves the client directory", () => {
-    const parent = mkdtempSync(join(tmpdir(), "pack-"));
-    const client = join(parent, "client");
-    mkdirSync(client);
-    cpSync(join(root, "bots/templates"), join(parent, "outside"), { recursive: true });
-    writeFileSync(join(client, "delivery-loop.yaml"), `${base}\nbots:\n  path: ../outside\n`);
-    assert.throws(() => loadPack(join(client, "delivery-loop.yaml")), /escapes the client directory/);
-  });
-
-  it("refuses a bots symlink that points outside the client directory", () => {
-    const dir = mkdtempSync(join(tmpdir(), "pack-"));
-    const outside = join(mkdtempSync(join(tmpdir(), "pack-out-")), "bundle");
-    cpSync(join(root, "bots/templates"), outside, { recursive: true });
-    symlinkSync(outside, join(dir, "linked"));
-    writeFileSync(join(dir, "delivery-loop.yaml"), `${base}\nbots:\n  path: linked\n`);
-    assert.throws(() => loadPack(join(dir, "delivery-loop.yaml")), /symlink escapes the client directory/);
-  });
-
-  it("refuses an absolute bots path outside the client directory", () => {
-    const outside = join(mkdtempSync(join(tmpdir(), "pack-abs-")), "bundle");
-    cpSync(join(root, "bots/templates"), outside, { recursive: true });
-    assert.throws(() => loadPack(write(`${base}\nbots:\n  path: ${outside}\n`)), /relative/);
-  });
-
-  it("refuses bots without a path", () => {
-    assert.throws(() => loadPack(write(`${base}\nbots: {}\n`)), /bots.path/);
+  it("ignores a leftover bots key with a warning", () => {
+    const extras = [
+      "bots:\n  path: bots\n",
+      "bots:\n  path: ../outside\n",
+      "bots:\n  path: /tmp/missing-bots\n",
+      "bots: {}\n",
+      "bots:\n",
+    ];
+    for (const extra of extras) {
+      const warnings = captureWarnings(() => {
+        const pack = loadPack(write(`${base}\n${extra}`));
+        assert.equal(Object.hasOwn(pack, "bots"), false);
+        assert.equal(pack.qualityCommand, "npm test");
+      });
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0] ?? "", /bots is ignored/);
+    }
   });
 });
+
+function captureWarnings(run: () => void): string[] {
+  const warnings: string[] = [];
+  const original = console.warn;
+  console.warn = (message?: unknown) => {
+    warnings.push(String(message));
+  };
+  try {
+    run();
+  } finally {
+    console.warn = original;
+  }
+  return warnings;
+}
