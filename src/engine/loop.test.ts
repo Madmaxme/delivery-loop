@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -36,6 +37,23 @@ function ticket(overrides: Partial<Ticket> = {}): Ticket {
     comments: [],
     ...overrides,
   };
+}
+
+function trunkCheckout(identifier: string): string {
+  const cwd = mkdtempSync(join(tmpdir(), "shipped-trunk-"));
+  const repo = join(cwd, "api");
+  mkdirSync(repo, { recursive: true });
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  git("init", "-b", "main");
+  git("config", "user.email", "dev@example.com");
+  git("config", "user.name", "Dev");
+  writeFileSync(join(repo, "note.txt"), "shipped\n");
+  git("add", ".");
+  git("commit", "-m", `land ${identifier}`);
+  return cwd;
 }
 
 function harness(text: string, opts?: { quality?: "success" | "failure" | "pending"; branch?: string }) {
@@ -711,7 +729,7 @@ describe("loop", () => {
     assert.equal(env.state(), "Todo");
   });
 
-  it("marks dev-done when the recording URL is in the build receipt", async () => {
+  it("does not mark dev-done from a recording URL the worker wrote", async () => {
     const url = "https://example.test/artifacts/signup.mp4";
     const ground = BUILDABLE.replace(
       "**Journey evidence:** not-applicable",
@@ -725,55 +743,54 @@ describe("loop", () => {
       return { status: "finished", branch: "delivery/api-1", head: "abc", text };
     };
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "landed");
+    assert.equal(result.outcome, "journey-missing");
     assert.equal(env.merged(), true);
-    assert.equal(env.state(), "Dev");
+    assert.equal(env.state(), "Todo");
+    assert.match(env.comments.join("\n"), /journey command/);
   });
 
-  it("leaves the ticket in intake when the recording URL never reaches the build receipt", async () => {
-    const url = "https://example.test/artifacts/signup.mp4";
-    const ground = BUILDABLE.replace(
-      "**Journey evidence:** not-applicable",
-      `**Journey evidence:** recorded\n**Journey proof:** \`${url}\``,
-    );
-    const env = harness(ground);
-    let joins = 0;
-    env.deps.worker.join = async () => {
-      joins += 1;
-      const text = joins === 1 ? ground : "**Journey evidence:** recorded\nThe journey was walked.";
-      return { status: "finished", branch: "delivery/api-1", head: "abc", text };
+  it("does not mark dev-done because a route file exists", async () => {
+    const root = mkdtempSync(join(tmpdir(), "journey-file-"));
+    const repo = join(root, "api");
+    mkdirSync(join(repo, "test"), { recursive: true });
+    writeFileSync(join(repo, "test", "signup_route_test.dart"), "void main() {}\n");
+    const git = (...args: string[]) => {
+      const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
     };
-    const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "journey-missing");
-    assert.equal(env.merged(), true);
-    assert.equal(env.state(), "Todo");
-    assert.equal(env.comments.some((body) => /LAND_WAIT/.test(body)), false);
-  });
-
-  it("marks dev-done when the route test is on the merge commit", async () => {
+    git("init", "-b", "main");
+    git("config", "user.email", "dev@example.com");
+    git("config", "user.name", "Dev");
+    git("add", ".");
+    git("commit", "-m", "add route test");
     const ground = BUILDABLE.replace(
       "**Journey evidence:** not-applicable",
       "**Journey evidence:** recorded\n**Journey proof:** `api/test/signup_route_test.dart`",
     );
     const env = harness(ground);
-    env.deps.journeyFileAt = ({ repo, ref, path }) =>
-      repo === "api" && ref === "trunk" && path === "test/signup_route_test.dart";
-    const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "landed");
-    assert.equal(env.state(), "Dev");
-  });
-
-  it("leaves the ticket in intake when the route test is not on the merge commit", async () => {
-    const ground = BUILDABLE.replace(
-      "**Journey evidence:** not-applicable",
-      "**Journey evidence:** recorded\n**Journey proof:** `api/test/signup_route_test.dart`",
-    );
-    const env = harness(ground);
-    env.deps.journeyFileAt = () => false;
+    env.deps.cwd = root;
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "journey-missing");
     assert.equal(env.merged(), true);
     assert.equal(env.state(), "Todo");
+  });
+
+  it("does not mark dev-done when the journey command fails or prints no token", async () => {
+    const ground = BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded");
+    const failing = harness(ground);
+    failing.deps.cwd = mkdtempSync(join(tmpdir(), "journey-fail-"));
+    failing.deps.pack = { ...pack, journeyCommand: "exit 1" };
+    const failed = await runTicket(failing.deps, ticket());
+    assert.equal(failed.outcome, "journey-missing");
+    assert.equal(failing.merged(), true);
+    assert.equal(failing.state(), "Todo");
+
+    const empty = harness(ground);
+    empty.deps.cwd = mkdtempSync(join(tmpdir(), "journey-empty-"));
+    empty.deps.pack = { ...pack, journeyCommand: "node -e \"process.stdout.write('the journey was walked')\"" };
+    const quiet = await runTicket(empty.deps, ticket());
+    assert.equal(quiet.outcome, "journey-missing");
+    assert.equal(empty.state(), "Todo");
   });
 
   it("stays in intake when a buildable handoff omits the outside grant line", async () => {
@@ -792,6 +809,75 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "verdict");
     assert.equal(env.state(), "Hold");
+  });
+
+  it("does not mark an already-shipped ticket dev-done from its own audit", async () => {
+    const url = "https://example.test/artifacts/signup.mp4";
+    const cwd = trunkCheckout("API-1");
+    const text = [
+      "**Verdict:** ALREADY SHIPPED",
+      "**Repos:** `api`",
+      "**Outside grant:** none",
+      "**Journey evidence:** recorded",
+      `**Journey proof:** \`${url}\``,
+    ].join("\n");
+    const env = harness(text);
+    env.deps.cwd = cwd;
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "verdict");
+    assert.equal(env.state(), "Todo");
+    assert.match(env.comments.join("\n"), /journey command/);
+  });
+
+  it("keeps an already-shipped ticket in intake when the journey command fails", async () => {
+    const cwd = trunkCheckout("API-1");
+    const text = [
+      "**Verdict:** ALREADY SHIPPED",
+      "**Repos:** `api`",
+      "**Outside grant:** none",
+      "**Journey evidence:** recorded",
+      "**Journey proof:** `api/test/signup_route_test.dart`",
+    ].join("\n");
+    const env = harness(text);
+    env.deps.cwd = cwd;
+    env.deps.pack = { ...pack, journeyCommand: "exit 1" };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "verdict");
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("marks an already-shipped ticket dev-done when the journey command proves it", async () => {
+    const url = "https://example.test/artifacts/signup.mp4";
+    const cwd = trunkCheckout("API-1");
+    const script = join(cwd, "prove.js");
+    writeFileSync(script, `process.stdout.write(${JSON.stringify(`**Journey proof:** \`${url}\``)});\n`);
+    const text = [
+      "**Verdict:** ALREADY SHIPPED",
+      "**Repos:** `api`",
+      "**Outside grant:** none",
+      "**Journey evidence:** recorded",
+    ].join("\n");
+    const env = harness(text);
+    env.deps.cwd = cwd;
+    env.deps.pack = { ...pack, journeyCommand: `node ${script}` };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "verdict");
+    assert.equal(env.state(), "Dev");
+  });
+
+  it("marks an already-shipped ticket dev-done when the journey is not applicable", async () => {
+    const cwd = trunkCheckout("API-1");
+    const text = [
+      "**Verdict:** ALREADY SHIPPED",
+      "**Repos:** `api`",
+      "**Outside grant:** none",
+      "**Journey evidence:** not-applicable",
+    ].join("\n");
+    const env = harness(text);
+    env.deps.cwd = cwd;
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "verdict");
+    assert.equal(env.state(), "Dev");
   });
 
   it("lands a buildable ticket after quality is green", async () => {
@@ -1320,14 +1406,18 @@ describe("loop", () => {
     assert.equal(env.comments.some((body) => body.includes("BUILD_PACKET")), false);
   });
 
-  it("appends the journey command token and does not require the author to write it", async () => {
+  it("marks dev-done when the journey command prints a proof token", async () => {
     const url = "https://example.test/artifacts/signup.mp4";
+    const cwd = mkdtempSync(join(tmpdir(), "journey-ok-"));
+    const script = join(cwd, "prove.js");
+    writeFileSync(script, `process.stdout.write(${JSON.stringify(`**Journey proof:** \`${url}\``)});\n`);
     const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded"));
-    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
-    env.deps.runPackCommand = () => ({ status: 0, stdout: `**Journey proof:** \`${url}\`` });
+    env.deps.cwd = cwd;
+    env.deps.pack = { ...pack, journeyCommand: `node ${script}` };
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
     assert.equal(env.state(), "Dev");
+    assert.equal(env.comments.some((body) => body.includes(url)), false);
   });
 
   it("keeps dev when ship fails, edits that owner once, and resumes the step", async () => {
@@ -1506,6 +1596,54 @@ describe("loop", () => {
     }
     assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 1);
     assert.equal(env.comments.some((body) => body.includes("OWNER_HEAL")), false);
+  });
+
+  it("gives a minted GitHub token to the ship step and not to the runner", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.worker.join = async () => ({
+      status: "finished",
+      branch: "delivery/api-1",
+      head: "abc",
+      text: "**Heal:** login",
+    });
+    const dir = mkdtempSync(join(tmpdir(), "ship-token-"));
+    const during = join(dir, "during");
+    const seen = join(dir, "seen");
+    const mint = join(dir, "mint.js");
+    const stepFile = join(dir, "step.js");
+    writeFileSync(
+      mint,
+      `const fs = require("fs"); fs.writeFileSync(process.argv[2], process.env.GH_TOKEN || ""); process.stdout.write("minted-for-ship\\n");`,
+    );
+    writeFileSync(
+      stepFile,
+      `const fs = require("fs"); const token = process.env.GH_TOKEN || ""; if (!token) { console.error("HTTP 401"); process.exit(1); } fs.writeFileSync(process.argv[2], token);`,
+    );
+    const previousMint = process.env.DELIVERY_LOOP_GITHUB_MINT;
+    const previousGh = process.env.GH_TOKEN;
+    const previousGithub = process.env.GITHUB_TOKEN;
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    process.env.DELIVERY_LOOP_GITHUB_MINT = `node ${mint} ${during}`;
+    env.deps.pack = { ...pack, ship: { steps: [`node ${stepFile} ${seen}`], markStatus: false } };
+    try {
+      await ship(env.deps, "API-1");
+      const later = spawnSync(process.execPath, ["-e", "process.stdout.write(process.env.GH_TOKEN || '')"], {
+        encoding: "utf8",
+      });
+      assert.equal(later.stdout, "");
+      assert.equal(process.env.GH_TOKEN, undefined);
+      assert.equal(process.env.GITHUB_TOKEN, undefined);
+      assert.equal(readFileSync(during, "utf8"), "");
+      assert.equal(readFileSync(seen, "utf8"), "minted-for-ship");
+    } finally {
+      if (previousMint === undefined) delete process.env.DELIVERY_LOOP_GITHUB_MINT;
+      else process.env.DELIVERY_LOOP_GITHUB_MINT = previousMint;
+      if (previousGh === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = previousGh;
+      if (previousGithub === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = previousGithub;
+    }
   });
 
   it("edits the same ship no again on the next page", async () => {

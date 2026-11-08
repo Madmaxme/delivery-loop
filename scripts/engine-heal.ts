@@ -1,12 +1,17 @@
 import { spawnSync } from "node:child_process";
 
 import {
+  engineHealFilesNeedReview,
   engineHealMergeArgs,
-  engineHealQualityState,
   engineHealReleaseNotes,
+  gitBlobSha,
+  gitChangedFiles,
+  observeQualityRun,
   planEngineHealRelease,
+  QUALITY_WORKFLOW_PATH,
   shouldMergeEngineHeal,
   type EngineHealPlan,
+  type QualityRunProof,
 } from "../src/engine/engine-heal.ts";
 
 type Pull = {
@@ -96,12 +101,6 @@ function qualityRuns(repo: string, branch: string, sha: string): QualityRun[] {
   return runs.filter((item) => (item.headSha ?? "").toLowerCase() === sha.toLowerCase());
 }
 
-/** Branch protection reads the pull_request quality check. A dispatched run does not. */
-function pullRequestQuality(repo: string, branch: string, sha: string): ReturnType<typeof engineHealQualityState> {
-  const runs = qualityRuns(repo, branch, sha).filter((item) => (item.event ?? "") === "pull_request");
-  return engineHealQualityState(runs);
-}
-
 function pullState(state: string): "OPEN" | "MERGED" | "CLOSED" {
   if (state === "OPEN" || state === "MERGED") return state;
   return "CLOSED";
@@ -120,11 +119,11 @@ function inflight(run: QualityRun): boolean {
  * Watch a pull_request quality run that is already in progress.
  * This job does not start a run and does not approve one. The opener's push does that.
  */
-function watchPullRequestQuality(repo: string, branch: string, sha: string): boolean {
+function watchPullRequestQuality(repo: string, branch: string, sha: string): number | null {
   const active = qualityRuns(repo, branch, sha)
     .filter((item) => (item.event ?? "") === "pull_request")
     .find(inflight);
-  if (!active) return false;
+  if (!active || !Number.isInteger(active.databaseId) || active.databaseId <= 0) return null;
   const watched = spawnSync("gh", ["run", "watch", String(active.databaseId), "--repo", repo, "--exit-status"], {
     encoding: "utf8",
     timeout: 20 * 60 * 1000,
@@ -133,7 +132,7 @@ function watchPullRequestQuality(repo: string, branch: string, sha: string): boo
     const detail = `${watched.stderr ?? ""}${watched.stdout ?? ""}`.trim();
     throw new Error(`quality on ${sha} did not pass${detail ? `: ${detail}` : ""}`);
   }
-  return true;
+  return active.databaseId;
 }
 
 function commentOnPull(repo: string, prNumber: number, body: string): void {
@@ -194,18 +193,16 @@ function releasePlan(input: {
   mainVersion: string;
   tipVersion: string;
   prNumber: number;
-  triggeredSha: string;
-  event: string;
-  conclusion: string;
+  runId: string;
 }): EngineHealPlan {
-  const triggered =
-    input.triggeredSha.length > 0 &&
-    input.triggeredSha === input.tip &&
-    input.event === "pull_request" &&
-    input.conclusion === "success";
+  const observed = observeQualityRun(readQualityProof(input.repo, input.runId, input.tip), input.tip);
+  const files = gitChangedFiles(process.cwd(), "refs/remotes/origin/main", input.tip);
   return planEngineHealRelease({
     pullState: input.state,
-    qualityOnTip: input.state === "MERGED" || triggered ? "success" : pullRequestQuality(input.repo, input.branch, input.tip),
+    qualityOnTip: observed.onTip,
+    qualityTrusted: observed.trusted,
+    qualityKnown: observed.known,
+    filesNeedReview: engineHealFilesNeedReview(files),
     mainVersion: input.mainVersion,
     tipVersion: input.tipVersion,
     tagExists: tagExists(input.tipVersion),
@@ -215,8 +212,82 @@ function releasePlan(input: {
   });
 }
 
+/** The pull ref and the branch tip are the same commit, or the head is unknown. */
+function confirmedHead(prNumber: number, branchTip: string): string | null {
+  const pullHead = fetchPullHead(prNumber);
+  if (!pullHead || pullHead !== branchTip.trim().toLowerCase()) return null;
+  return pullHead;
+}
+
+function integer(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
+function readGhJson(args: string[]): unknown | null {
+  const result = spawnSync("gh", args, { encoding: "utf8" });
+  if (result.status !== 0) return null;
+  try {
+    return JSON.parse(result.stdout ?? "") as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function fetchPullHead(prNumber: number): string | null {
+  const ref = `refs/remotes/origin/pr-${prNumber}-head`;
+  const fetched = spawnSync(
+    "git",
+    ["fetch", "origin", `refs/pull/${prNumber}/head:${ref}`],
+    { encoding: "utf8" },
+  );
+  if (fetched.status !== 0) return null;
+  const parsed = spawnSync("git", ["rev-parse", ref], { encoding: "utf8" });
+  if (parsed.status !== 0) return null;
+  const sha = (parsed.stdout ?? "").trim().toLowerCase();
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+}
+
+/** The Actions run, re-read from the API. Event env fields are not the proof. */
+function readQualityProof(repo: string, runId: string, pullHead: string): QualityRunProof | null {
+  if (!/^[1-9]\d*$/.test(runId)) return null;
+  const run = readGhJson(["api", "--method", "GET", `repos/${repo}/actions/runs/${runId}`]);
+  if (!run || typeof run !== "object") return null;
+  const body = run as Record<string, unknown>;
+  if (integer(body.id) !== Number(runId)) return null;
+  const suiteId = integer(body.check_suite_id);
+  if (suiteId === null) return null;
+  const suite = readGhJson(["api", "--method", "GET", `repos/${repo}/check-suites/${suiteId}`]);
+  if (!suite || typeof suite !== "object") return null;
+  const app = (suite as Record<string, unknown>).app;
+  if (!app || typeof app !== "object") return null;
+  const appId = integer((app as Record<string, unknown>).id);
+  const slugValue = (app as Record<string, unknown>).slug;
+  if (slugValue != null && typeof slugValue !== "string") return null;
+  const path = typeof body.path === "string" ? body.path : "";
+  const headSha = typeof body.head_sha === "string" ? body.head_sha : "";
+  const event = typeof body.event === "string" ? body.event : "";
+  const status = typeof body.status === "string" ? body.status : "";
+  const conclusion = typeof body.conclusion === "string" ? body.conclusion : "";
+  const proof: QualityRunProof = {
+    id: Number(runId),
+    event,
+    status,
+    conclusion,
+    headSha,
+    path,
+    appId,
+    appSlug: typeof slugValue === "string" ? slugValue : null,
+    workflowBlobSha: null,
+    mainWorkflowBlobSha: null,
+  };
+  if (path !== QUALITY_WORKFLOW_PATH || headSha.toLowerCase() !== pullHead.toLowerCase()) return proof;
+  proof.workflowBlobSha = gitBlobSha(process.cwd(), headSha, path);
+  proof.mainWorkflowBlobSha = gitBlobSha(process.cwd(), "refs/remotes/origin/main", path);
+  return proof;
+}
+
 function finish(repo: string, prNumber: number, plan: EngineHealPlan): void {
-  if (plan.action === "comment") {
+  if (plan.action === "comment" || plan.action === "review") {
     commentOnPull(repo, prNumber, plan.body);
     return;
   }
@@ -234,7 +305,7 @@ function main(): void {
   const branch = process.env.HEAL_BRANCH ?? "";
   const headRepo = process.env.HEAL_HEAD_REPO ?? "";
   const baseRepo = process.env.HEAL_BASE_REPO ?? "";
-  const triggeredSha = (process.env.HEAL_SHA ?? "").trim();
+  const runId = (process.env.HEAL_RUN_ID ?? "").trim();
   if (!branch || !baseRepo) {
     process.stdout.write("No engine-heal pull request context.\n");
     return;
@@ -263,18 +334,33 @@ function main(): void {
     if (!sha) throw new Error(`no merge commit for #${pull.number}`);
     fetchMain();
     const version = readVersionAt(sha);
-    const plan = planEngineHealRelease({
-      pullState: "MERGED",
-      qualityOnTip: "success",
-      mainVersion: version,
-      tipVersion: version,
-      tagExists: tagExists(version),
-      branch,
-      branchTip: sha,
-      prNumber: pull.number,
-    });
+    const head = fetchPullHead(pull.number);
+    const plan = head
+      ? releasePlan({
+          state,
+          repo: baseRepo,
+          branch,
+          tip: head,
+          mainVersion: version,
+          tipVersion: version,
+          prNumber: pull.number,
+          runId,
+        })
+      : planEngineHealRelease({
+          pullState: "MERGED",
+          qualityOnTip: "none",
+          qualityTrusted: false,
+          qualityKnown: false,
+          filesNeedReview: null,
+          mainVersion: version,
+          tipVersion: version,
+          tagExists: tagExists(version),
+          branch,
+          branchTip: "",
+          prNumber: pull.number,
+        });
     if (plan.action === "tag-merged") publishTagAt(pull.number, plan.version, sha);
-    else process.stdout.write(`${plan.action === "skip" ? plan.reason : plan.action}.\n`);
+    else finish(baseRepo, pull.number, plan);
     return;
   }
   if (state !== "OPEN") {
@@ -284,21 +370,34 @@ function main(): void {
 
   fetchBranch(branch);
   const tip = run("git", ["rev-parse", `refs/remotes/origin/${branch}`]).trim();
+  const head = confirmedHead(pull.number, tip);
   const mainVersion = readVersionAt("refs/remotes/origin/main");
-  const tipVersion = readVersionAt(tip);
-  let greenSha = tip;
-  let plan = releasePlan({
-    state,
-    repo: baseRepo,
-    branch,
-    tip,
-    mainVersion,
-    tipVersion,
-    prNumber: pull.number,
-    triggeredSha,
-    event,
-    conclusion,
-  });
+  const tipVersion = head ? readVersionAt(head) : readVersionAt(tip);
+  let greenSha = head ?? "";
+  let plan = head
+    ? releasePlan({
+        state,
+        repo: baseRepo,
+        branch,
+        tip: head,
+        mainVersion,
+        tipVersion,
+        prNumber: pull.number,
+        runId,
+      })
+    : planEngineHealRelease({
+        pullState: "OPEN",
+        qualityOnTip: "none",
+        qualityTrusted: false,
+        qualityKnown: false,
+        filesNeedReview: null,
+        mainVersion,
+        tipVersion,
+        tagExists: false,
+        branch,
+        branchTip: "",
+        prNumber: pull.number,
+      });
 
   if (plan.action === "wait-for-quality") {
     const watched = watchPullRequestQuality(baseRepo, plan.branch, plan.sha);
@@ -308,16 +407,18 @@ function main(): void {
     }
     const checked = run("git", ["rev-parse", `refs/remotes/origin/${branch}`]).trim();
     if (checked !== plan.sha) throw new Error(`branch tip moved from ${plan.sha} to ${checked}`);
-    greenSha = checked;
-    plan = planEngineHealRelease({
-      pullState: "OPEN",
-      qualityOnTip: "success",
-      mainVersion,
-      tipVersion: readVersionAt(checked),
-      tagExists: tagExists(readVersionAt(checked)),
+    const checkedHead = confirmedHead(pull.number, checked);
+    if (!checkedHead) throw new Error(`pull head does not match ${checked}`);
+    greenSha = checkedHead;
+    plan = releasePlan({
+      state,
+      repo: baseRepo,
       branch,
-      branchTip: checked,
+      tip: checkedHead,
+      mainVersion,
+      tipVersion: readVersionAt(checkedHead),
       prNumber: pull.number,
+      runId: String(watched),
     });
   }
 

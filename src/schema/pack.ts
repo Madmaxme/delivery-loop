@@ -19,7 +19,7 @@ export type RepoSpec = {
   packages?: string[];
 };
 
-/** A UI repo whose check is required when a ticket has no Figma frame. */
+/** A UI repo. The check run is required on the pull request head, with or without a Figma frame. */
 export type DesignRepo = {
   name: string;
   /** Exact command the work order Validation must include. */
@@ -163,8 +163,9 @@ export type ProjectPack = {
    */
   symbolsCommand?: string;
   /**
-   * Prints `**Journey proof:**` tokens on stdout. The engine appends that
-   * stdout to the build receipt. The author does not write the token.
+   * Verifies a recorded journey. The engine runs it and reads stdout.
+   * Exit 0 and a `**Journey proof:**` token are the proof. A missing command,
+   * a nonzero exit, worker text, and a file that exists are not proof.
    */
   journeyCommand?: string;
   /**

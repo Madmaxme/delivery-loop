@@ -71,20 +71,26 @@ describe("journey evidence", () => {
     ]);
   });
 
-  it("accepts not-applicable and a receipt that contains the recording", () => {
-    const declared = "**Journey evidence:** recorded\n**Journey proof:** `https://example.test/walk.png`";
-    assert.equal(journeyEvidenceProven("**Journey evidence:** not-applicable", "", () => false), true);
-    assert.equal(journeyEvidenceProven(declared, declared, () => false), true);
-    assert.equal(journeyEvidenceProven(declared, "walked the journey", () => false), false);
+  it("accepts not-applicable and a verifier token, and rejects a missing verifier", () => {
+    const token = "**Journey proof:** `https://example.test/artifacts/signup.mp4`";
+    assert.equal(journeyEvidenceProven("not-applicable", null), true);
+    assert.equal(journeyEvidenceProven("recorded", token), true);
+    assert.equal(journeyEvidenceProven("recorded", null), false);
+    assert.equal(journeyEvidenceProven("recorded", "the journey was walked"), false);
+    assert.equal(journeyEvidenceProven("recorded", ""), false);
+    assert.equal(journeyEvidenceProven("blocked", token), false);
+    assert.equal(journeyEvidenceProven(null, token), false);
   });
 
-  it("accepts a route test only when the file is on the commit", () => {
-    const declared = "**Journey evidence:** recorded\n**Journey proof:** `api/test/signup_route_test.dart`";
+  it("does not treat a route path in the worker text as proof", () => {
+    const worker = "**Journey evidence:** recorded\n**Journey proof:** `api/test/signup_route_test.dart`";
+    assert.equal(journeyEvidenceProven("recorded", null), false);
+    assert.equal(journeyEvidenceProven("recorded", "the file exists"), false);
     assert.equal(
-      journeyEvidenceProven(declared, "", (repo, path) => repo === "api" && path === "test/signup_route_test.dart"),
+      journeyEvidenceProven("recorded", "**Journey proof:** `api/test/signup_route_test.dart`"),
       true,
     );
-    assert.equal(journeyEvidenceProven(declared, declared, () => false), false);
+    assert.equal(parseJourneyProofs(worker).length, 1);
   });
 
   it("keeps an already-shipped journey in intake until the proof is real", () => {

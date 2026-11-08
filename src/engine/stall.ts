@@ -174,7 +174,7 @@ export function ownerHealPrompt(input: {
     "When the owner is the package that executes this loop, open a pull request. Do not merge it to main.",
     `Name the branch \`${branch}\` and label the pull request \`engine-heal\`.`,
     bumped,
-    "The pull_request quality check gates that head. The engine-heal workflow does not push a commit. It waits until that check is green, squash-merges, reads the version from the merged package.json, and tags that commit. A pull request without the bump gets a comment and stops. Clients install the tag. They do not install main.",
+    "The pull_request quality check gates that head. The engine-heal workflow does not push a commit. It squash-merges only when that branch and label are both set, the changed files are not workflows, CI scripts, the heal program, or tests, and the green run is a GitHub Actions pull_request run of .github/workflows/quality.yml on that exact head whose file matches main. Anything else gets a comment and a normal review. The workflow does not merge or tag it. It reads the version from the merged package.json when it does tag. A pull request without the bump gets a comment and stops. Clients install the tag. They do not install main.",
     "When the owner is anything else, land that owner's trunk before you finish.",
     "This step runs again when you return.",
     "An open pull request is not landed.",

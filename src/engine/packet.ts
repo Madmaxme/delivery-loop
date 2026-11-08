@@ -219,24 +219,15 @@ export function parseJourneyProofs(text: string): JourneyProof[] {
 }
 
 /**
- * `recorded` is proven only when every cited proof is real.
- * A recording URL has to be in the build receipt. A route test has to be on the commit.
- * `not-applicable` is proven. Anything else is not.
+ * `recorded` is proven only by the verifier command's stdout.
+ * That stdout has to contain a `**Journey proof:**` token. Text the worker wrote is not proof.
+ * A file that exists is not proof. `not-applicable` is proven. Anything else is not.
  */
-export function journeyEvidenceProven(
-  declared: string,
-  receipt: string,
-  fileOnCommit: (repo: string, path: string) => boolean,
-): boolean {
-  const evidence = parseJourneyEvidence(declared);
+export function journeyEvidenceProven(evidence: JourneyEvidence | null, verifierStdout: string | null): boolean {
   if (evidence === "not-applicable") return true;
   if (evidence !== "recorded") return false;
-  const proofs = parseJourneyProofs(`${declared}\n${receipt}`);
-  if (proofs.length === 0) return false;
-  return proofs.every((proof) => {
-    if (proof.kind === "recording") return receipt.includes(proof.url);
-    return fileOnCommit(proof.repo, proof.path);
-  });
+  if (verifierStdout == null) return false;
+  return parseJourneyProofs(verifierStdout).length > 0;
 }
 
 /** Status to move to after a non-BUILDABLE verdict. Null stays in intake. */
@@ -249,7 +240,7 @@ export function parkStateForVerdict(input: {
   holdStatus?: string;
   /** True when this ticket's commits are already on the named trunks. */
   trunkCommit?: boolean | null;
-  /** True when recorded journey proof is already on the trunk or in the audit receipt. */
+  /** True when the journey command proved a recorded journey, or the journey is not applicable. */
   journeyProven?: boolean | null;
 }): string | null {
   const hold = input.holdStatus?.trim() || "Hold";

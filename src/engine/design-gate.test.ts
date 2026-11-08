@@ -8,6 +8,8 @@ import { githubForge } from "../adapters/forge-github.ts";
 import { linearTracker } from "../adapters/trackers.ts";
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
+import { GITHUB_ACTIONS_APP_ID } from "./github-actions.ts";
+import { interpretDesignChecks, type DesignCheckEvidence, type DesignCheckRun } from "./design-gate.ts";
 import { runTicket } from "./loop.ts";
 
 const FRAME = "https://www.figma.com/design/ABC123/Home?node-id=1-2";
@@ -325,4 +327,228 @@ describe("design gate", () => {
     assert.match(repair, /Home frame/);
     assert.equal(repair.includes("fixture-token"), false);
   });
+
+  it("does not treat a Design source line as proof of the frame", async () => {
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    env.deps.figmaFetch = async () =>
+      Response.json({ nodes: { "1:2": { document: { id: "1:2", name: "Home frame", type: "FRAME" } } } });
+    env.deps.lookupHead = () => null;
+    const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
+    assert.notEqual(result.outcome, "landed");
+    assert.equal(env.merged(), false);
+    assert.match(env.comments.join("\n"), /Design check/);
+  });
 });
+
+const BLOB = "b".repeat(40);
+
+function designRun(overrides: Partial<DesignCheckRun> = {}): DesignCheckRun {
+  return {
+    name: "ui-primitives",
+    status: "completed",
+    conclusion: "success",
+    headSha: HEAD,
+    appId: GITHUB_ACTIONS_APP_ID,
+    appSlug: "github-actions",
+    checkSuiteId: 77,
+    ...overrides,
+  };
+}
+
+function designEvidence(overrides: Partial<DesignCheckEvidence> = {}): DesignCheckEvidence {
+  return {
+    complete: true,
+    workflows: [
+      {
+        path: ".github/workflows/ui.yml",
+        headSha: HEAD,
+        checkSuiteId: 77,
+        headBlobSha: BLOB,
+        baseBlobSha: BLOB,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+describe("independent design check", () => {
+  it("accepts a GitHub Actions check whose workflow file matches the base branch", () => {
+    const result = interpretDesignChecks([designRun()], HEAD, "ui-primitives", designEvidence());
+    assert.equal(result.state, "success");
+    assert.equal(result.headSha, HEAD);
+  });
+
+  it("rejects a check the pull request can forge", () => {
+    const cases: { runs: DesignCheckRun[]; evidence: DesignCheckEvidence }[] = [
+      { runs: [designRun({ appId: null })], evidence: designEvidence() },
+      { runs: [designRun({ appId: 1 })], evidence: designEvidence() },
+      { runs: [designRun({ appSlug: "other" })], evidence: designEvidence() },
+      { runs: [designRun({ checkSuiteId: null })], evidence: designEvidence() },
+      {
+        runs: [designRun()],
+        evidence: designEvidence({
+          workflows: [
+            {
+              path: ".github/workflows/ui.yml",
+              headSha: HEAD,
+              checkSuiteId: 77,
+              headBlobSha: "c".repeat(40),
+              baseBlobSha: BLOB,
+            },
+          ],
+        }),
+      },
+      {
+        runs: [designRun()],
+        evidence: designEvidence({
+          workflows: [
+            {
+              path: ".github/workflows/ui.yml",
+              headSha: HEAD,
+              checkSuiteId: 77,
+              headBlobSha: BLOB,
+              baseBlobSha: null,
+            },
+          ],
+        }),
+      },
+      {
+        runs: [designRun()],
+        evidence: designEvidence({
+          workflows: [
+            {
+              path: "scripts/ui.yml",
+              headSha: HEAD,
+              checkSuiteId: 77,
+              headBlobSha: BLOB,
+              baseBlobSha: BLOB,
+            },
+          ],
+        }),
+      },
+      { runs: [designRun()], evidence: designEvidence({ complete: false }) },
+      { runs: [designRun({ headSha: "d".repeat(40) })], evidence: designEvidence() },
+    ];
+    for (const item of cases) {
+      const result = interpretDesignChecks(item.runs, HEAD, "ui-primitives", item.evidence);
+      assert.notEqual(result.state, "success");
+    }
+    const stale = interpretDesignChecks(
+      [designRun({ headSha: "d".repeat(40) })],
+      HEAD,
+      "ui-primitives",
+      designEvidence(),
+    );
+    assert.equal(stale.state, "missing");
+    assert.match(stale.detail, /ignored/);
+  });
+
+  it("does not merge when the UI workflow on the pull request head differs from the base", async () => {
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    env.deps.figmaFetch = async () => Response.json({ name: "Home" });
+    env.deps.lookupHead = () => null;
+    let merged = false;
+    env.deps.forge = githubForge({
+      token: "t",
+      fetch: designFetch({ headBlob: "c".repeat(40), baseBlob: BLOB, appId: GITHUB_ACTIONS_APP_ID }, () => {
+        merged = true;
+      }),
+    });
+    const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
+    assert.equal(merged, false);
+    assert.notEqual(result.outcome, "landed");
+  });
+
+  it("merges when the UI check is GitHub Actions and the workflow file matches the base", async () => {
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    env.deps.figmaFetch = async () => Response.json({ name: "Home" });
+    env.deps.lookupHead = () => null;
+    let merged = false;
+    env.deps.forge = githubForge({
+      token: "t",
+      fetch: designFetch({ headBlob: BLOB, baseBlob: BLOB, appId: GITHUB_ACTIONS_APP_ID }, () => {
+        merged = true;
+      }),
+    });
+    const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
+    assert.equal(merged, true);
+    assert.equal(result.outcome, "landed");
+  });
+});
+
+function designFetch(
+  input: { headBlob: string; baseBlob: string | null; appId: number | null },
+  onMerge: () => void,
+): (url: string | URL, init?: RequestInit) => Promise<Response> {
+  return async (url, init) => {
+    const href = String(url);
+    if (href.includes(`/commits/${HEAD}/check-runs`)) {
+      return Response.json({
+        total_count: 1,
+        check_runs: [
+          {
+            name: "ui-primitives",
+            status: "completed",
+            conclusion: "success",
+            head_sha: HEAD,
+            app: input.appId === null ? null : { id: input.appId, slug: "github-actions" },
+            check_suite: { id: 77 },
+          },
+        ],
+      });
+    }
+    if (href.includes("/contents/")) {
+      const ref = new URL(href).searchParams.get("ref");
+      const sha = ref === HEAD ? input.headBlob : ref === "development" ? input.baseBlob : null;
+      if (!sha) return new Response("missing", { status: 404 });
+      return Response.json({ type: "file", sha });
+    }
+    if (href.includes("/actions/runs")) {
+      const requested = new URL(href).searchParams.get("head_sha") ?? HEAD;
+      return Response.json({
+        total_count: 2,
+        workflow_runs: [
+          {
+            name: "quality",
+            path: ".github/workflows/quality.yml",
+            status: "completed",
+            conclusion: "success",
+            head_sha: requested,
+            check_suite_id: 11,
+            html_url: "https://example.test/quality",
+            created_at: "2026-01-01T00:00:00Z",
+          },
+          {
+            name: "ui",
+            path: ".github/workflows/ui.yml",
+            status: "completed",
+            conclusion: "success",
+            head_sha: requested,
+            check_suite_id: 77,
+            html_url: "https://example.test/ui",
+            created_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+      });
+    }
+    if (href.endsWith("/pulls") && init?.method === "POST") {
+      return Response.json({
+        number: 4,
+        html_url: "https://github.com/acme/admin-web/pull/4",
+        head: { sha: HEAD, ref: "delivery/qui-1" },
+      });
+    }
+    if (href.includes("/compare/")) return Response.json({ status: "ahead" });
+    if (href.endsWith("/pulls/4") && (init?.method ?? "GET") === "GET") {
+      return Response.json({ mergeable_state: "clean", mergeable: true, head: { sha: HEAD } });
+    }
+    if (href.endsWith("/pulls/4/merge")) {
+      onMerge();
+      return Response.json({ sha: "c".repeat(40) });
+    }
+    return Response.json({});
+  };
+}

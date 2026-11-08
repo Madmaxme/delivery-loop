@@ -6,6 +6,35 @@ import {
 } from "./github-actor.js";
 import type { CompareStatus, FetchLike, ForgeAdapter, PullMerge, PullRequest } from "./types.js";
 import { githubRepoFromUrl } from "./types.js";
+import {
+  interpretDesignChecks,
+  isActionsWorkflowPath,
+  type DesignCheckEvidence,
+  type DesignCheckRun,
+  type DesignWorkflowEvidence,
+} from "../engine/design-gate.ts";
+
+/** File blob sha. Null when the path is absent. Undefined when the response is unusable. */
+async function contentBlob(
+  fetchImpl: FetchLike,
+  headers: Record<string, string>,
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string,
+): Promise<string | null | undefined> {
+  if (!ref.trim()) return undefined;
+  const encoded = path.split("/").map((part) => encodeURIComponent(part)).join("/");
+  const response = await fetchImpl(
+    `https://api.github.com/repos/${owner}/${repo}/contents/${encoded}?ref=${encodeURIComponent(ref)}`,
+    { headers },
+  );
+  if (response.status === 404) return null;
+  if (!response.ok) return undefined;
+  const json = (await response.json()) as { type?: string; sha?: string };
+  if (json.type !== "file" || !json.sha || !/^[0-9a-f]{40}$/i.test(json.sha)) return undefined;
+  return json.sha;
+}
 
 async function readCommit(
   fetchImpl: FetchLike,
@@ -30,7 +59,6 @@ async function readCommit(
     committedAt: json.commit?.committer?.date ?? "",
   };
 }
-import { interpretDesignChecks } from "../engine/design-gate.ts";
 import {
   interpretQualityActions,
   qualityRunUnscheduled,
@@ -151,27 +179,76 @@ export function githubForge(opts: {
     },
     async designCheck(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
+      const baseRef = input.baseRef?.trim() ?? "";
       const response = await api(
         `/repos/${owner}/${repo}/commits/${input.headSha}/check-runs?per_page=100`,
       );
       const json = (await response.json()) as {
+        total_count?: number;
         check_runs?: {
           name?: string;
           status?: string;
           conclusion?: string | null;
           head_sha?: string;
+          app?: { id?: number; slug?: string } | null;
+          check_suite?: { id?: number } | null;
         }[];
       };
-      return interpretDesignChecks(
-        (json.check_runs ?? []).map((run) => ({
-          name: run.name ?? "",
-          status: run.status ?? "",
-          conclusion: run.conclusion ?? null,
-          headSha: run.head_sha ?? "",
-        })),
-        input.headSha,
-        input.name,
+      const runsResponse = await api(
+        `/repos/${owner}/${repo}/actions/runs?head_sha=${encodeURIComponent(input.headSha)}&per_page=100`,
       );
+      const runsJson = (await runsResponse.json()) as {
+        total_count?: number;
+        workflow_runs?: {
+          path?: string | null;
+          head_sha?: string | null;
+          check_suite_id?: number | null;
+        }[];
+      };
+      const runs: DesignCheckRun[] = (json.check_runs ?? []).map((run) => ({
+        name: run.name ?? "",
+        status: run.status ?? "",
+        conclusion: run.conclusion ?? null,
+        headSha: run.head_sha ?? "",
+        appId: typeof run.app?.id === "number" && Number.isInteger(run.app.id) ? run.app.id : null,
+        appSlug: typeof run.app?.slug === "string" ? run.app.slug : null,
+        checkSuiteId:
+          typeof run.check_suite?.id === "number" && Number.isInteger(run.check_suite.id)
+            ? run.check_suite.id
+            : null,
+      }));
+      const workflows: DesignWorkflowEvidence[] = (runsJson.workflow_runs ?? []).map((run) => ({
+        path: run.path ?? "",
+        headSha: run.head_sha ?? "",
+        checkSuiteId:
+          typeof run.check_suite_id === "number" && Number.isInteger(run.check_suite_id)
+            ? run.check_suite_id
+            : null,
+      }));
+      const checksComplete =
+        typeof json.total_count === "number" && json.total_count === (json.check_runs ?? []).length;
+      const runsComplete =
+        typeof runsJson.total_count === "number" &&
+        runsJson.total_count === (runsJson.workflow_runs ?? []).length;
+      let complete = checksComplete && runsComplete && baseRef.length > 0;
+      const paths = [
+        ...new Set(workflows.map((run) => run.path ?? "").filter((path) => isActionsWorkflowPath(path))),
+      ];
+      for (const path of paths) {
+        const headBlob = await contentBlob(fetchImpl, headers, owner, repo, path, input.headSha);
+        const baseBlob = await contentBlob(fetchImpl, headers, owner, repo, path, baseRef);
+        if (headBlob === undefined || baseBlob === undefined) {
+          complete = false;
+          continue;
+        }
+        for (const workflow of workflows) {
+          if (workflow.path !== path) continue;
+          workflow.headBlobSha = headBlob;
+          workflow.baseBlobSha = baseBlob;
+        }
+      }
+      const evidence: DesignCheckEvidence = { complete, workflows };
+      return interpretDesignChecks(runs, input.headSha, input.name, evidence);
     },
     async quality(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);

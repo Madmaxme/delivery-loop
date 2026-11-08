@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import type { DesignCheckProbe, FetchLike, Ticket } from "../adapters/types.ts";
 import type { DesignRepo, DesignSpec } from "../schema/pack.ts";
+import { GITHUB_ACTIONS_APP_ID, GITHUB_ACTIONS_APP_SLUG } from "./github-actions.ts";
 
 const FIGMA_URL_RE =
   /https?:\/\/(?:www\.)?figma\.com\/(?:file|design|proto|board|slides)\/[A-Za-z0-9]+[^\s)<>"'`]*/gi;
@@ -12,7 +13,29 @@ export type DesignCheckRun = {
   status: string;
   conclusion: string | null;
   headSha: string;
+  appId?: number | null;
+  appSlug?: string | null;
+  checkSuiteId?: number | null;
 };
+
+export type DesignWorkflowEvidence = {
+  path?: string | null;
+  headSha?: string | null;
+  checkSuiteId?: number | null;
+  headBlobSha?: string | null;
+  baseBlobSha?: string | null;
+};
+
+/** `complete` is false when a list was truncated or a blob could not be read. */
+export type DesignCheckEvidence = {
+  complete: boolean;
+  workflows: readonly DesignWorkflowEvidence[];
+};
+
+/** A workflow file under .github/workflows. Nested paths and `..` are rejected. */
+export function isActionsWorkflowPath(path: string): boolean {
+  return /^\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml$/.test(path);
+}
 
 /** One Figma URL, comparable across description, comments, and attachments. */
 export function normalizeFigmaUrl(raw: string): string {
@@ -95,8 +118,9 @@ export type DesignWorkStop =
   | { ok: false; detail: "design-source" | "design-check"; comment: string };
 
 /**
- * Present frame: the work order names one captured URL.
+ * Present frame: the work order names one captured URL. That line is not proof.
  * No frame and a UI land repo: Validation names that repo's check command.
+ * The land reads a check run either way.
  */
 export function designWorkOrderStop(input: {
   ticket: Ticket;
@@ -130,36 +154,84 @@ export function designRepo(design: DesignSpec | undefined, name: string): Design
   return design?.repos.find((repo) => repo.name === name);
 }
 
-/** A check run whose sha is not the pull request head is not a result. */
+function sha40(value: string | null | undefined): string | null {
+  const sha = (value ?? "").trim().toLowerCase();
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+}
+
+function workflowIsBase(workflow: DesignWorkflowEvidence, suiteId: number, head: string): boolean {
+  if (workflow.checkSuiteId !== suiteId) return false;
+  if (sha40(workflow.headSha) !== head) return false;
+  const path = workflow.path ?? "";
+  if (!isActionsWorkflowPath(path)) return false;
+  const headBlob = sha40(workflow.headBlobSha);
+  const baseBlob = sha40(workflow.baseBlobSha);
+  return Boolean(headBlob && baseBlob && headBlob === baseBlob);
+}
+
+/** A success the pull request cannot forge by editing the workflow. */
+function independentDesignRun(run: DesignCheckRun, evidence: DesignCheckEvidence, head: string): boolean {
+  if (run.status !== "completed" || run.conclusion !== "success") return false;
+  if (sha40(run.headSha) !== head) return false;
+  if (run.appId !== GITHUB_ACTIONS_APP_ID) return false;
+  if (run.appSlug != null && run.appSlug !== "" && run.appSlug !== GITHUB_ACTIONS_APP_SLUG) return false;
+  if (typeof run.checkSuiteId !== "number" || !Number.isInteger(run.checkSuiteId) || run.checkSuiteId <= 0) {
+    return false;
+  }
+  return evidence.workflows.some((workflow) => workflowIsBase(workflow, run.checkSuiteId as number, head));
+}
+
+/**
+ * A check run whose sha is not the pull request head is not a result.
+ * A success also has to be GitHub Actions, tied to a workflow file that matches the base branch.
+ * A missing app, suite, path, or blob is not a success.
+ */
 export function interpretDesignChecks(
   runs: readonly DesignCheckRun[],
   headSha: string,
   name: string,
+  evidence: DesignCheckEvidence,
 ): DesignCheckProbe {
-  const named = runs.filter((run) => run.name === name);
-  const fresh = named.filter((run) => run.headSha === headSha);
+  const expected = name.trim();
+  const head = sha40(headSha);
+  if (!expected || !head) {
+    return { state: "missing", detail: "design check evidence is incomplete", headSha: null };
+  }
+  const named = runs.filter((run) => run.name === expected);
+  const fresh = named.filter((run) => sha40(run.headSha) === head);
   if (fresh.length === 0) {
-    const stale = named.find((run) => run.headSha && run.headSha !== headSha);
+    const stale = named.find((run) => run.headSha && sha40(run.headSha) !== head);
     return {
       state: "missing",
       detail: stale
-        ? `stale design check ${name} at ${stale.headSha} ignored`
-        : `design check ${name} missing on ${headSha}`,
+        ? `stale design check ${expected} at ${stale.headSha} ignored`
+        : `design check ${expected} missing on ${headSha}`,
       headSha: null,
     };
   }
-  const completed = fresh.filter((run) => run.status === "completed");
-  const success = completed.find((run) => run.conclusion === "success");
-  if (success) return { state: "success", detail: `${name} success`, headSha };
-  const failure = completed.find((run) => run.conclusion && run.conclusion !== "success");
-  if (failure) {
+  if (!evidence.complete) {
     return {
       state: "failure",
-      detail: `${name} ${failure.conclusion}`,
-      headSha,
+      detail: `design check ${expected} evidence is incomplete on ${head}`,
+      headSha: null,
     };
   }
-  return { state: "pending", detail: `${name} ${fresh[0]?.status ?? "pending"}`, headSha };
+  if (fresh.some((run) => independentDesignRun(run, evidence, head))) {
+    return { state: "success", detail: `${expected} success`, headSha: head };
+  }
+  const pending = fresh.find((run) => run.status !== "completed");
+  if (pending) {
+    return { state: "pending", detail: `${expected} ${pending.status || "pending"}`, headSha: head };
+  }
+  const failure = fresh.find((run) => run.status === "completed" && run.conclusion && run.conclusion !== "success");
+  if (failure && fresh.every((run) => run.conclusion !== "success")) {
+    return { state: "failure", detail: `${expected} ${failure.conclusion}`, headSha: head };
+  }
+  return {
+    state: "failure",
+    detail: `design check ${expected} is not an independent GitHub Actions result on ${head}`,
+    headSha: null,
+  };
 }
 
 export function figmaTokenValue(input: {

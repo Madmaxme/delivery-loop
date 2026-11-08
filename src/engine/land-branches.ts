@@ -65,11 +65,11 @@ export function confirmLandBranches(input: {
   return confirmed.length ? confirmed : null;
 }
 
-export function lookupRemoteHead(repoUrl: string, branch: string): string | null {
-  const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
+export function lookupRemoteHead(repoUrl: string, branch: string, token = ""): string | null {
+  const credential = token.trim() || process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
   const remote =
-    token && repoUrl.startsWith("https://")
-      ? repoUrl.replace("https://", `https://x-access-token:${token}@`)
+    credential && repoUrl.startsWith("https://")
+      ? repoUrl.replace("https://", `https://x-access-token:${credential}@`)
       : repoUrl;
   const result = spawnSync("git", ["ls-remote", remote, `refs/heads/${branch}`], {
     encoding: "utf8",

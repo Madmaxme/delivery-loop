@@ -2,27 +2,65 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { GITHUB_ACTIONS_APP_ID } from "./github-actions.ts";
 import {
   engineHealBumpInstruction,
+  engineHealFilesNeedReview,
   engineHealMergeArgs,
   engineHealBumpVersion,
+  engineHealFileNeedsReview,
   engineHealQualityState,
   engineHealTag,
+  gitBlobSha,
+  gitChangedFiles,
   highestReleaseVersion,
   isEngineHealPull,
   nextPatchVersion,
+  observeQualityRun,
   planEngineHealRelease,
+  QUALITY_WORKFLOW_PATH,
+  qualityRunIsBaseWorkflow,
   releaseTagExists,
   shouldMergeEngineHeal,
+  type EngineHealFile,
+  type QualityRunProof,
 } from "./engine-heal.ts";
+
+const head = "a".repeat(40);
+const blob = "b".repeat(40);
 
 const open = {
   pullState: "OPEN" as const,
   tagExists: false,
   branch: "engine-heal/APP-1",
-  branchTip: "abc111",
+  branchTip: head,
   prNumber: 41,
+  qualityOnTip: "success" as const,
+  qualityTrusted: true,
+  qualityKnown: true,
+  filesNeedReview: false as boolean | null,
 };
+
+function proof(overrides: Partial<QualityRunProof> = {}): QualityRunProof {
+  return {
+    id: 9,
+    event: "pull_request",
+    status: "completed",
+    conclusion: "success",
+    headSha: head,
+    path: QUALITY_WORKFLOW_PATH,
+    appId: GITHUB_ACTIONS_APP_ID,
+    appSlug: "github-actions",
+    workflowBlobSha: blob,
+    mainWorkflowBlobSha: blob,
+    ...overrides,
+  };
+}
 
 describe("engine heal release", () => {
   it("merges only a green pull request that targets this package", () => {
@@ -32,27 +70,43 @@ describe("engine heal release", () => {
       headRepo: "Madmaxme/delivery-loop",
       baseRepo: "Madmaxme/delivery-loop",
     };
-    assert.equal(shouldMergeEngineHeal({ ...base, branch: "engine-heal/APP-1", labels: [] }), true);
-    assert.equal(shouldMergeEngineHeal({ ...base, branch: "feature", labels: ["engine-heal"] }), true);
-    assert.equal(shouldMergeEngineHeal({ ...base, branch: "cursor/methodology", labels: [] }), false);
-    assert.equal(shouldMergeEngineHeal({ ...base, branch: "engine-heal-notes", labels: [] }), false);
     assert.equal(
-      shouldMergeEngineHeal({ ...base, conclusion: "failure", branch: "engine-heal/APP-1" }),
+      shouldMergeEngineHeal({ ...base, branch: "engine-heal/APP-1", labels: ["engine-heal"] }),
+      true,
+    );
+    assert.equal(shouldMergeEngineHeal({ ...base, branch: "engine-heal/APP-1", labels: [] }), false);
+    assert.equal(shouldMergeEngineHeal({ ...base, branch: "feature", labels: ["engine-heal"] }), false);
+    assert.equal(
+      shouldMergeEngineHeal({ ...base, branch: "engine-heal/APP-1", labels: ["Engine-Heal"] }),
+      true,
+    );
+    assert.equal(shouldMergeEngineHeal({ ...base, branch: "cursor/methodology", labels: [] }), false);
+    assert.equal(shouldMergeEngineHeal({ ...base, branch: "engine-heal-notes", labels: ["engine-heal"] }), false);
+    assert.equal(
+      shouldMergeEngineHeal({
+        ...base,
+        conclusion: "failure",
+        branch: "engine-heal/APP-1",
+        labels: ["engine-heal"],
+      }),
       false,
     );
     assert.equal(
-      shouldMergeEngineHeal({ ...base, event: "push", branch: "engine-heal/APP-1" }),
+      shouldMergeEngineHeal({ ...base, event: "push", branch: "engine-heal/APP-1", labels: ["engine-heal"] }),
       false,
     );
     assert.equal(
       shouldMergeEngineHeal({
         ...base,
         branch: "engine-heal/APP-1",
+        labels: ["engine-heal"],
         headRepo: "other/delivery-loop",
       }),
       false,
     );
-    assert.equal(isEngineHealPull({ branch: "engine-heal/APP-1" }), true);
+    assert.equal(isEngineHealPull({ branch: "engine-heal/APP-1", labels: ["engine-heal"] }), true);
+    assert.equal(isEngineHealPull({ branch: "engine-heal/APP-1" }), false);
+    assert.equal(isEngineHealPull({ branch: "feature", labels: ["engine-heal"] }), false);
   });
 
   it("takes the next patch after the highest tag and stops when that tag exists", () => {
@@ -101,15 +155,15 @@ describe("engine heal release", () => {
       qualityOnTip: "none",
       mainVersion: "1.0.0",
       tipVersion: "1.0.1",
-      branchTip: "def222",
+      branchTip: head,
     });
-    assert.deepEqual(waiting, { action: "wait-for-quality", branch: "engine-heal/APP-1", sha: "def222" });
+    assert.deepEqual(waiting, { action: "wait-for-quality", branch: "engine-heal/APP-1", sha: head });
     const pending = planEngineHealRelease({
       ...open,
       qualityOnTip: "pending",
       mainVersion: "1.0.0",
       tipVersion: "1.0.1",
-      branchTip: "def222",
+      branchTip: head,
     });
     assert.equal(pending.action, "wait-for-quality");
     const failed = planEngineHealRelease({
@@ -192,7 +246,8 @@ describe("engine heal release", () => {
     assert.equal(workflow.includes("workflow_dispatch"), false);
     assert.match(script, /refs\/tags\//);
     assert.match(script, /pr", "comment"/);
-    assert.match(script, /event === "pull_request"/);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ event: "push" }), head), false);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ event: "pull_request" }), head), true);
   });
 
   it("reads the quality check on the tip", () => {
@@ -208,5 +263,205 @@ describe("engine heal release", () => {
     assert.equal(engineHealQualityState([{ status: "in_progress", conclusion: "" }]), "pending");
     assert.equal(engineHealQualityState([{ status: "action_required", conclusion: "" }]), "pending");
     assert.equal(engineHealQualityState([{ status: "completed", conclusion: "failure" }]), "failure");
+  });
+
+  it("trusts a quality run only when the base workflow matches this head", () => {
+    assert.equal(qualityRunIsBaseWorkflow(proof(), head), true);
+    assert.equal(observeQualityRun(proof(), head).trusted, true);
+    const other = "c".repeat(40);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ headSha: other }), head), false);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ workflowBlobSha: other }), head), false);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ mainWorkflowBlobSha: null }), head), false);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ path: ".github/workflows/other.yml" }), head), false);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ appId: 1 }), head), false);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ appId: null }), head), false);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ appSlug: "not-actions" }), head), false);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ event: "workflow_dispatch" }), head), false);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ event: "push" }), head), false);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ id: null }), head), false);
+    assert.equal(qualityRunIsBaseWorkflow(proof({ status: "in_progress" }), head), false);
+    assert.equal(qualityRunIsBaseWorkflow(null, head), false);
+    assert.equal(qualityRunIsBaseWorkflow(proof(), "abc"), false);
+    const unread = observeQualityRun(null, head);
+    assert.equal(unread.known, false);
+    assert.equal(unread.trusted, false);
+  });
+
+  it("routes a self-certified or sensitive pull request to review", () => {
+    const bumped = { mainVersion: "1.0.0", tipVersion: "1.0.1" };
+    const workflow = planEngineHealRelease({
+      ...open,
+      ...bumped,
+      filesNeedReview: true,
+    });
+    assert.equal(workflow.action, "review");
+    if (workflow.action !== "review") return;
+    assert.match(workflow.body, /normal review/);
+    assert.match(workflow.body, /will not squash-merge or tag/);
+    const scripts = planEngineHealRelease({
+      ...open,
+      ...bumped,
+      qualityTrusted: true,
+      filesNeedReview: true,
+    });
+    assert.equal(scripts.action, "review");
+    const unknownFiles = planEngineHealRelease({
+      ...open,
+      ...bumped,
+      filesNeedReview: null,
+    });
+    assert.equal(unknownFiles.action, "review");
+    const untrusted = planEngineHealRelease({
+      ...open,
+      ...bumped,
+      qualityTrusted: false,
+    });
+    assert.equal(untrusted.action, "review");
+    const unreadable = planEngineHealRelease({
+      ...open,
+      ...bumped,
+      qualityOnTip: "none",
+      qualityKnown: false,
+      qualityTrusted: false,
+    });
+    assert.equal(unreadable.action, "review");
+    const sensitiveMerged = planEngineHealRelease({
+      ...open,
+      ...bumped,
+      pullState: "MERGED",
+      filesNeedReview: true,
+    });
+    assert.equal(sensitiveMerged.action, "review");
+    const manifest: EngineHealFile = {
+      path: "package.json",
+      baseText: JSON.stringify({ name: "loop", version: "1.0.0", scripts: { test: "tsx --test" } }),
+      headText: JSON.stringify({ name: "loop", version: "1.0.1", scripts: { test: "exit 0" } }),
+    };
+    assert.equal(engineHealFileNeedsReview(manifest), true);
+    const versionOnly: EngineHealFile = {
+      path: "package.json",
+      baseText: JSON.stringify({ name: "loop", version: "1.0.0", scripts: { test: "tsx --test" } }),
+      headText: JSON.stringify({ scripts: { test: "tsx --test" }, version: "1.0.1", name: "loop" }),
+    };
+    assert.equal(engineHealFileNeedsReview(versionOnly), false);
+    const lock = {
+      name: "loop",
+      version: "1.0.0",
+      packages: { "": { version: "1.0.0", dependencies: { tsx: "^4.0.0" } } },
+    };
+    const lockBump = {
+      ...lock,
+      version: "1.0.1",
+      packages: { "": { version: "1.0.1", dependencies: { tsx: "^4.0.0" } } },
+    };
+    assert.equal(
+      engineHealFileNeedsReview({
+        path: "package-lock.json",
+        baseText: JSON.stringify(lock),
+        headText: JSON.stringify(lockBump),
+      }),
+      false,
+    );
+    const lockDep = {
+      ...lockBump,
+      packages: { "": { version: "1.0.1", dependencies: { tsx: "^9.0.0" } } },
+    };
+    assert.equal(
+      engineHealFileNeedsReview({
+        path: "package-lock.json",
+        baseText: JSON.stringify(lock),
+        headText: JSON.stringify(lockDep),
+      }),
+      true,
+    );
+    assert.equal(engineHealFileNeedsReview({ path: ".github/workflows/quality.yml", baseText: null, headText: null }), true);
+    assert.equal(engineHealFileNeedsReview({ path: "scripts/engine-heal.ts", baseText: null, headText: null }), true);
+    assert.equal(engineHealFileNeedsReview({ path: "src/engine/engine-heal.ts", baseText: null, headText: null }), true);
+    assert.equal(engineHealFileNeedsReview({ path: "src/engine/loop.test.ts", baseText: null, headText: null }), true);
+    assert.equal(engineHealFileNeedsReview({ path: "src/engine/loop.ts", baseText: null, headText: null }), false);
+    assert.equal(engineHealFileNeedsReview({ path: "../quality.yml", baseText: null, headText: null }), true);
+    assert.equal(engineHealFileNeedsReview({ path: "package.json", baseText: null, headText: "{}" }), true);
+    assert.equal(engineHealFilesNeedReview(null), null);
+    assert.equal(
+      engineHealFilesNeedReview([{ path: "src/engine/loop.ts", baseText: null, headText: null }]),
+      false,
+    );
+  });
+
+  it("reads a real git diff and refuses a rewritten quality workflow", () => {
+    const root = mkdtempSync(join(tmpdir(), "heal-gate-"));
+    const git = (...args: string[]) => {
+      const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    git("init", "-b", "main");
+    git("config", "user.email", "dev@example.com");
+    git("config", "user.name", "Dev");
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "loop", version: "1.0.0", scripts: { test: "tsx --test" } }));
+    mkdirSync(join(root, ".github/workflows"), { recursive: true });
+    writeFileSync(join(root, ".github/workflows/quality.yml"), "name: quality\non: pull_request\n");
+    writeFileSync(join(root, "src-note.txt"), "ok\n");
+    git("add", ".");
+    git("commit", "-m", "base");
+    git("checkout", "-b", "engine-heal/APP-1");
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "loop", version: "1.0.1", scripts: { test: "tsx --test" } }));
+    writeFileSync(join(root, ".github/workflows/quality.yml"), "name: quality\non: pull_request\n# exit 0\n");
+    git("add", ".");
+    git("commit", "-m", "weaken quality");
+    const tip = git("rev-parse", "HEAD");
+    const files = gitChangedFiles(root, "main", tip);
+    assert.equal(engineHealFilesNeedReview(files), true);
+    const mainBlob = gitBlobSha(root, "main", QUALITY_WORKFLOW_PATH);
+    const headBlob = gitBlobSha(root, tip, QUALITY_WORKFLOW_PATH);
+    assert.ok(mainBlob);
+    assert.ok(headBlob);
+    assert.notEqual(mainBlob, headBlob);
+    const seen = observeQualityRun(
+      proof({ headSha: tip, workflowBlobSha: headBlob, mainWorkflowBlobSha: mainBlob }),
+      tip,
+    );
+    assert.equal(seen.trusted, false);
+    assert.equal(seen.onTip, "success");
+    const plan = planEngineHealRelease({
+      ...open,
+      branchTip: tip,
+      mainVersion: "1.0.0",
+      tipVersion: "1.0.1",
+      qualityOnTip: seen.onTip,
+      qualityTrusted: seen.trusted,
+      qualityKnown: seen.known,
+      filesNeedReview: engineHealFilesNeedReview(files),
+    });
+    assert.equal(plan.action, "review");
+
+    git("checkout", "main");
+    git("checkout", "-b", "engine-heal/APP-2");
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "loop", version: "1.0.1", scripts: { test: "tsx --test" } }));
+    writeFileSync(join(root, "src-note.txt"), "changed\n");
+    git("add", ".");
+    git("commit", "-m", "bump only");
+    const cleanTip = git("rev-parse", "HEAD");
+    const cleanFiles = gitChangedFiles(root, "main", cleanTip);
+    assert.equal(engineHealFilesNeedReview(cleanFiles), false);
+    const sameBlob = gitBlobSha(root, cleanTip, QUALITY_WORKFLOW_PATH);
+    assert.equal(sameBlob, mainBlob);
+    const clean = observeQualityRun(
+      proof({ headSha: cleanTip, workflowBlobSha: sameBlob, mainWorkflowBlobSha: mainBlob }),
+      cleanTip,
+    );
+    assert.equal(clean.trusted, true);
+    const merge = planEngineHealRelease({
+      ...open,
+      branch: "engine-heal/APP-2",
+      branchTip: cleanTip,
+      mainVersion: "1.0.0",
+      tipVersion: "1.0.1",
+      qualityOnTip: clean.onTip,
+      qualityTrusted: clean.trusted,
+      qualityKnown: clean.known,
+      filesNeedReview: engineHealFilesNeedReview(cleanFiles),
+    });
+    assert.equal(merge.action, "merge-and-tag");
   });
 });

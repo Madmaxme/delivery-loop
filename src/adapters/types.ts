@@ -110,7 +110,13 @@ export type ForgeAdapter = {
    * One check run on `headSha`. A run recorded on another sha is not a result.
    * Forges that have no check API omit this.
    */
-  designCheck?(input: { repoUrl: string; headSha: string; name: string }): Promise<DesignCheckProbe>;
+  designCheck?(input: {
+    repoUrl: string;
+    headSha: string;
+    name: string;
+    /** Base branch. The workflow file on the head has to match this ref. */
+    baseRef: string;
+  }): Promise<DesignCheckProbe>;
   /**
    * One empty commit on an existing head so a pull_request workflow can start.
    * Returns the new SHA, or null when this head already requested that run.

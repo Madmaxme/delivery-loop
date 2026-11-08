@@ -89,6 +89,11 @@ export type LoopDeps = {
   githubRunActive?: (runId: string | null) => boolean | null;
   /** Override for tests. Default is `git ls-remote` for refs/heads/<branch>. */
   lookupHead?: (repoUrl: string, branch: string) => string | null;
+  /**
+   * GitHub token minted for a rejected login.
+   * Ship steps and `git ls-remote` read it. It is not written onto `process.env`.
+   */
+  githubCredential?: string;
   /** Override for tests. Default waits 30s between quality checks. */
   sleep?: (ms: number) => Promise<void>;
   qualityPollMs?: number;
@@ -121,7 +126,7 @@ export type LoopDeps = {
   figmaGroundBlock?: string;
   /**
    * Runs a pack command with stdin. Default is a shell in the checkout.
-   * Symbol and journey commands use this.
+   * Symbol checks and the journey verifier use this.
    */
   runPackCommand?: (
     command: string,
@@ -142,11 +147,6 @@ export type LoopDeps = {
     trunk: QualitySample | null;
     commandMatchesWorkflow: boolean | null;
   }>;
-  /**
-   * True when a route-test proof is on `ref`. Default reads the checkout with git.
-   * A recording URL is not a file.
-   */
-  journeyFileAt?: (input: { repo: string; ref: string; path: string }) => boolean;
   /**
    * Receives one event when a ticket enters ground, build, or land, and one
    * when that ticket finishes. Default writes a single line to stdout.
@@ -344,7 +344,7 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "A missing line stays in intake. Reading a vendor's documentation is not the grant.",
     "Every BUILDABLE handoff includes **Journey evidence:** recorded | not-applicable | blocked.",
     "not-applicable means the done-state is not a journey a person walks.",
-    "recorded means it is. Web proof is **Journey proof:** an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. Mobile proof is **Journey proof:** a route test on the merged commit, `repo/path_test.dart` or `repo/path.test.ts`. A sentence that names no token is not proof.",
+    "recorded means it is. The install's journey command is the proof. It has to exit 0 and print a **Journey proof:** token. A URL in this handoff is not proof. A file that exists is not proof. A sentence that names no token is not proof.",
     "blocked means that proof cannot be produced in this run. A missing line or blocked stays in intake and does not mark dev-done.",
     `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
     landRepoLine(deps.pack),
@@ -356,8 +356,8 @@ function designPromptLines(ticket: Ticket, deps: LoopDeps): string {
   const frames = ticketFigmaUrls(ticket);
   const repos = deps.pack.design?.repos ?? [];
   const lines = [
-    "When a Figma frame is listed below, the work order includes **Design source:** naming that URL. The runner stops when the line is missing.",
-    "When no Figma frame is listed and a land repo is a UI repo, Validation includes that repo's UI check command. The runner reads the check on the pull request head and stops when it is missing or red.",
+    "When a Figma frame is listed below, the work order includes **Design source:** naming that URL. That line is not proof. The runner reads the UI check on the pull request head. The check has to be GitHub Actions, and the workflow file on that head has to match the base branch. A missing, red, or unproven check stops the land.",
+    "When no Figma frame is listed and a land repo is a UI repo, Validation includes that repo's UI check command. The same check-run rule applies.",
   ];
   if (repos.length > 0) {
     lines.push(repos.map((repo) => `${repo.name}: \`${repo.check}\` (check \`${repo.checkName}\`)`).join("\n"));
@@ -390,7 +390,7 @@ function buildPrompt(
       ? `Push these branches from each repo trunk: ${branches.join(", ")}. Include repo and branch in the handoff. Do not merge.`
       : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
     "Stay inside the allowlist. Run the validation commands.",
-    "When the handoff says **Journey evidence:** recorded, the pack journey command prints **Journey proof:**. A web token is an https recording or screenshot URL. A mobile token is the route test on the commit. The author does not write that token. The runner does not mark dev-done without it.",
+    "When the handoff says **Journey evidence:** recorded, the install's journey command is the proof. It has to exit 0 and print **Journey proof:**. Do not write that token. A URL in the handoff is not proof. A file that exists is not proof. The runner does not mark dev-done without the command.",
     retry,
   ].filter((part) => part.length > 0).join("\n\n");
 }
@@ -721,14 +721,15 @@ async function runHeldTicket(
           verdict === "ALREADY SHIPPED"
             ? trunkHasTicketCommit(deps, ticket.identifier, ground.text)
             : null,
-        journeyProven:
-          verdict === "ALREADY SHIPPED"
-            ? journeyEvidenceProven(ground.text, ground.text, (repo, path) =>
-                journeyFileInCheckout(deps, repo, repoByName(deps.pack, repo)?.trunk ?? "", path),
-              )
-            : null,
+        journeyProven: verdict === "ALREADY SHIPPED" ? alreadyShippedJourney(deps, ground.text) : null,
       });
       if (parked) await deps.tracker.setState(ticket.identifier, parked);
+      else if (verdict === "ALREADY SHIPPED" && parseJourneyEvidence(ground.text) === "recorded") {
+        await deps.tracker.comment(
+          ticket.identifier,
+          "Journey evidence is recorded. The journey command did not prove it. The ticket stays in intake.",
+        );
+      }
     }
     return {
       identifier: ticket.identifier,
@@ -858,7 +859,7 @@ async function runHeldTicket(
   }
 
   const target = repoByName(deps.pack, order.repos[0])!;
-  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const lookup = remoteHead(deps);
   let landings: { repo: RepoSpec; branch: string; sha?: string }[] | null = deps.pack.branchTemplate
     ? confirmLandBranches({
         issue: ticket.identifier,
@@ -955,7 +956,7 @@ async function runHeldTicket(
       compared = "unknown";
     }
     if (compared === "identical" || compared === "behind") {
-      const lookup = deps.lookupHead ?? lookupRemoteHead;
+      const lookup = remoteHead(deps);
       const sha = landing.sha || lookup(landing.repo.url, landing.branch) || head;
       empty.push({ repo: landing.repo.name, sha });
       continue;
@@ -988,7 +989,7 @@ async function runHeldTicket(
   const merged: MergedHead[] = [];
   for (const pr of opened) {
     try {
-      const landed = await landPull(deps, ticket, pr, ground.text);
+      const landed = await landPull(deps, ticket, pr);
       if ("outcome" in landed) return landed;
       merged.push({ repo: pr.repo, sha: landed.mergedSha, url: pr.url });
     } catch (error) {
@@ -1152,17 +1153,21 @@ async function healShipStep(
   return applyOwnerHeal(deps, ticket, key, reason);
 }
 
-function refreshShipGithubToken(env: NodeJS.ProcessEnv): boolean {
-  const command = env.DELIVERY_LOOP_GITHUB_MINT?.trim();
+function refreshShipGithubToken(deps: LoopDeps, env: NodeJS.ProcessEnv): boolean {
+  const command = (env.DELIVERY_LOOP_GITHUB_MINT ?? process.env.DELIVERY_LOOP_GITHUB_MINT ?? "").trim();
   if (!command) return false;
   const result = spawnSync(command, { shell: true, encoding: "utf8" });
   const token = (result.stdout ?? "").trim().split(/\n/).at(-1)?.trim() ?? "";
   if (result.status !== 0 || !token) return false;
+  deps.githubCredential = token;
   env.GH_TOKEN = token;
   env.GITHUB_TOKEN = token;
-  process.env.GH_TOKEN = token;
-  process.env.GITHUB_TOKEN = token;
   return true;
+}
+
+function remoteHead(deps: LoopDeps): (repoUrl: string, branch: string) => string | null {
+  if (deps.lookupHead) return deps.lookupHead;
+  return (repoUrl, branch) => lookupRemoteHead(repoUrl, branch, deps.githubCredential);
 }
 
 function runShipStep(
@@ -1224,17 +1229,25 @@ async function symbolsResolve(deps: LoopDeps, symbols: string[]): Promise<boolea
 }
 
 /**
- * The pack command prints the proof token. Empty or unparsed stdout is not proof.
- * Returns the stdout to append, or null when the command failed.
+ * Stdout of the configured journey command when it exits 0 and prints a proof token.
+ * Null when the command is missing, exits nonzero, or prints no token.
+ * The worker's text is not a result.
  */
-function journeyCommandProof(deps: LoopDeps, stdin: string): string | null {
+function journeyVerifierStdout(deps: LoopDeps, stdin: string): string | null {
   const command = deps.pack.journeyCommand?.trim();
-  if (!command) return "";
+  if (!command) return null;
   const run = deps.runPackCommand ?? defaultRunPackCommand;
   const result = run(command, deps.cwd ?? process.cwd(), stdin);
   if (result.status !== 0) return null;
   if (parseJourneyProofs(result.stdout).length === 0) return null;
   return result.stdout;
+}
+
+function alreadyShippedJourney(deps: LoopDeps, text: string): boolean {
+  const evidence = parseJourneyEvidence(text);
+  if (evidence === "not-applicable") return true;
+  if (evidence !== "recorded") return false;
+  return journeyEvidenceProven(evidence, journeyVerifierStdout(deps, text));
 }
 
 async function trunkQuality(
@@ -1259,7 +1272,7 @@ async function trunkTip(
   repo: RepoSpec,
   mergeSha: string,
 ): Promise<string> {
-  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const lookup = remoteHead(deps);
   const tip = lookup(repo.url, repo.trunk) || mergeSha;
   if (tip === mergeSha) return tip;
   try {
@@ -1275,19 +1288,13 @@ async function trunkTip(
   return mergeSha;
 }
 
-function journeyFileInCheckout(deps: LoopDeps, repo: string, ref: string, path: string): boolean {
-  if (deps.journeyFileAt) return deps.journeyFileAt({ repo, ref, path });
-  const spec = repoByName(deps.pack, repo);
-  if (!spec || !ref) return false;
-  const dir = repoCheckoutDir(deps.cwd ?? process.cwd(), spec, deps.pack);
-  if (!existsSync(join(dir, ".git")) || !ref) return false;
-  const present = (at: string) =>
-    spawnSync("git", ["-C", dir, "cat-file", "-e", `${at}:${path}`], { encoding: "utf8" }).status === 0;
-  if (present(ref)) return true;
-  spawnSync("git", ["-C", dir, "fetch", "--depth=1", "origin", ref], { encoding: "utf8" });
-  if (present(ref)) return true;
-  spawnSync("git", ["-C", dir, "fetch", "origin", spec.trunk], { encoding: "utf8" });
-  return present(ref);
+function landJourneyEvidence(declared: string, receipt: string): ReturnType<typeof parseJourneyEvidence> {
+  const left = parseJourneyEvidence(declared);
+  const right = parseJourneyEvidence(receipt);
+  if (left === "recorded" || right === "recorded") return "recorded";
+  if (left === "blocked" || right === "blocked") return "blocked";
+  if (left === "not-applicable" || right === "not-applicable") return "not-applicable";
+  return null;
 }
 
 async function settleTrunk(
@@ -1330,35 +1337,19 @@ async function settleTrunk(
       detail: `dev step failed: ${failed}`,
     };
   }
-  let proofReceipt = receipt;
-  if (parseJourneyEvidence(declared) === "recorded" || parseJourneyEvidence(receipt) === "recorded") {
-    const printed = journeyCommandProof(deps, `${declared}\n${receipt}`);
-    if (printed === null) {
+  const journeyEvidence = landJourneyEvidence(declared, receipt);
+  if (journeyEvidence === "recorded" || journeyEvidence === "blocked") {
+    const stdout =
+      journeyEvidence === "recorded" ? journeyVerifierStdout(deps, `${declared}\n${receipt}`) : null;
+    if (!journeyEvidenceProven(journeyEvidence, stdout)) {
       await deps.tracker.comment(
         ticket.identifier,
-        "The journey command did not print a **Journey proof:** token. The ticket stays in intake.",
+        "Journey evidence is recorded. The journey command is missing, failed, or did not print a **Journey proof:** token. Text in the handoff is not proof. A file that exists is not proof. The ticket stays in intake.",
       );
       return {
         identifier: ticket.identifier,
         outcome: "journey-missing",
         detail: "journey command",
-      };
-    }
-    proofReceipt = `${receipt}\n${printed}`;
-    const proven = journeyEvidenceProven(`${declared}\n${proofReceipt}`, proofReceipt, (repo, path) => {
-      const row = rows.find((item) => item.repo.name === repo);
-      const ref = row?.sha || repoByName(deps.pack, repo)?.trunk || "";
-      return journeyFileInCheckout(deps, repo, ref, path);
-    });
-    if (!proven) {
-      await deps.tracker.comment(
-        ticket.identifier,
-        "Journey evidence is recorded, and the proof is not on this merge. A web journey needs the recording URL in the build receipt. A mobile journey needs the route test on the commit. The ticket stays in intake.",
-      );
-      return {
-        identifier: ticket.identifier,
-        outcome: "journey-missing",
-        detail: "recorded proof missing",
       };
     }
   }
@@ -1421,7 +1412,7 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
   if (marker.kind === "empty") {
     const template = deps.pack.branchTemplate;
     if (!template || marker.rows.length === 0) return null;
-    const lookup = deps.lookupHead ?? lookupRemoteHead;
+    const lookup = remoteHead(deps);
     for (const row of marker.rows) {
       const spec = repoByName(deps.pack, row.repo);
       if (!spec) return null;
@@ -1656,7 +1647,7 @@ async function spendFix(
     );
     return { fixes: fixes + 1, headSha: current.headSha, hypothesis: previousHypothesis };
   }
-  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const lookup = remoteHead(deps);
   const next = lookup(current.repo.url, current.branch);
   return {
     fixes: fixes + 1,
@@ -1697,7 +1688,8 @@ async function healNo(
     return paused;
   }
   if (verdict === "login") {
-    if (tries.login || !refreshShipGithubToken(process.env)) {
+    const credentialEnv: NodeJS.ProcessEnv = { ...process.env };
+    if (tries.login || !refreshShipGithubToken(deps, credentialEnv)) {
       const paused = pauseLand(
         ticket.identifier,
         current.url,
@@ -1761,19 +1753,19 @@ async function repairContext(deps: LoopDeps, ticket: Ticket, pr: OpenPull): Prom
   return text ? `\n${text}` : "";
 }
 
-/** UI check on this head when the ticket has no Figma frame. Null means the check does not apply. */
+/** UI check on this head. A Figma URL in the work order is not this check. Null means the check does not apply. */
 async function readDesignCheck(
   deps: LoopDeps,
   ticket: Ticket,
   pr: OpenPull,
 ): Promise<DesignCheckProbe | null> {
-  if (ticketFigmaUrls(ticket).length > 0) return null;
+  const frames = ticketFigmaUrls(ticket);
   const spec = designRepo(deps.pack.design, pr.repo.name);
-  if (!spec) return null;
-  if (!deps.forge.designCheck) {
+  if (frames.length === 0 && !spec) return null;
+  if (!spec || !deps.forge.designCheck) {
     return {
       state: "missing",
-      detail: `design check ${spec.checkName} missing on ${pr.headSha}`,
+      detail: `design check ${spec?.checkName ?? "missing"} missing on ${pr.headSha}`,
       headSha: null,
     };
   }
@@ -1781,8 +1773,9 @@ async function readDesignCheck(
     repoUrl: pr.repo.url,
     headSha: pr.headSha,
     name: spec.checkName,
+    baseRef: pr.repo.trunk,
   });
-  if (probe.headSha !== pr.headSha) {
+  if ((probe.headSha ?? "").toLowerCase() !== pr.headSha.toLowerCase()) {
     return {
       state: "missing",
       detail: probe.detail || `stale design check ${spec.checkName} ignored`,
@@ -1792,13 +1785,7 @@ async function readDesignCheck(
   return probe;
 }
 
-async function landPull(
-  deps: LoopDeps,
-  ticket: Ticket,
-  pr: OpenPull,
-  orderText: string,
-): Promise<LandPullResult> {
-  void orderText;
+async function landPull(deps: LoopDeps, ticket: Ticket, pr: OpenPull): Promise<LandPullResult> {
   let current = pr;
   let updates = 0;
   let unknown = 0;
@@ -2129,11 +2116,15 @@ export async function ship(
 ): Promise<void> {
   const steps = mode === "continue" ? (deps.pack.ship?.continue ?? []) : (deps.pack.ship?.steps ?? []);
   if (mode === "continue" && steps.length === 0) throw new Error("ship continue has no steps");
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     DELIVERY_LOOP_ISSUE: identifier ?? "",
     DELIVERY_LOOP_SHIP_ARGS: extraArgs ?? "",
   };
+  if (deps.githubCredential) {
+    env.GH_TOKEN = deps.githubCredential;
+    env.GITHUB_TOKEN = deps.githubCredential;
+  }
   async function loadTicket(): Promise<Ticket | null> {
     if (!identifier) return null;
     try {
@@ -2188,7 +2179,7 @@ export async function ship(
         continue;
       }
       if (verdict === "login") {
-        if (refreshedLogin || !refreshShipGithubToken(env)) throw new Error(`ship step failed: ${step}`);
+        if (refreshedLogin || !refreshShipGithubToken(deps, env)) throw new Error(`ship step failed: ${step}`);
         refreshedLogin = true;
         result = await runShipStep(step, cwd, env);
         continue;

@@ -1,7 +1,9 @@
 # Waits until pull_request quality is green on an engine-heal pull request,
 # squash-merges, and tags the merge commit. The opener already committed the
 # patch. This workflow does not push a commit. A missing bump gets a comment.
-# No review and no manual approval. See METHODOLOGY.md.
+# A pull request that changes a workflow, a CI script, the heal program, or a
+# test is not merged. An unknown or rewritten quality run is not merged.
+# Those pull requests get a comment and a normal review. See METHODOLOGY.md.
 # It also writes a run event file at the start and at the finish and uploads
 # those files. It does not post them.
 
@@ -14,6 +16,7 @@ on:
 
 permissions:
   actions: write
+  checks: read
   contents: write
   pull-requests: write
 
@@ -41,7 +44,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAL_EVENT: ${{ github.event.workflow_run.event }}
           HEAL_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-          HEAL_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAL_RUN_ID: ${{ github.event.workflow_run.id }}
           HEAL_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAL_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           HEAL_BASE_REPO: ${{ github.repository }}
