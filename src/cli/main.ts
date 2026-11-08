@@ -11,11 +11,10 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse, stringify } from "yaml";
 
-import { prepareDispatchCredentials, type PreparedCredentials } from "../adapters/canonical-path.ts";
+import { allowlistedEnv, legacyCredential, prepareDispatchCredentials, type PreparedCredentials } from "../adapters/canonical-path.ts";
 import { gitForge } from "../adapters/forge-git.js";
 import { githubForge } from "../adapters/forge-github.js";
 import { runGh } from "../adapters/gh.js";
-import { commitActorLogin } from "../adapters/github-actor.ts";
 import { githubIssuesTracker, linearTracker } from "../adapters/trackers.js";
 import {
   claudeWorker,
@@ -109,9 +108,15 @@ export function installConnector(dir: string, name: string): void {
   writeFileSync(mcpPath, `${JSON.stringify(mcp, null, 2)}\n`);
 }
 
-function commandSpawn(command: string): { status: number | null; stdout: string } {
-  const result = spawnSync(command, { shell: true, encoding: "utf8" });
+function commandSpawn(command: string, env: NodeJS.ProcessEnv = allowlistedEnv(process.env)): { status: number | null; stdout: string } {
+  const result = spawnSync(command, { shell: true, encoding: "utf8", env });
   return { status: result.status, stdout: result.stdout ?? "" };
+}
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`${name} is required`);
+  return value;
 }
 
 function extensionApi(worker: ProjectPack["worker"]): string | null {
@@ -120,11 +125,6 @@ function extensionApi(worker: ProjectPack["worker"]): string | null {
   if (worker === "codex") return "openai";
   if (worker === "http") return "http";
   return null;
-}
-
-function expectedLogin(pack: ProjectPack): string | null {
-  const logins = new Set((pack.commitActors ?? []).map((actor) => actor.login));
-  return logins.size === 1 ? [...logins][0] : null;
 }
 
 /** Named owners come from the fetched trunk file. The working copy is not the allowlist. */
@@ -139,52 +139,55 @@ export function commitActorsFromTrustedRef(pack: ProjectPack): ProjectPack["comm
   return parsed.commitActors ?? [];
 }
 
-export async function preparePackCredentials(pack: ProjectPack, bots: BotBundle | null): Promise<PreparedCredentials> {
+export async function preparePackCredentials(pack: ProjectPack, bots: BotBundle | null): Promise<PreparedCredentials | null> {
+  if (!bots) return null;
+  const actors = commitActorsFromTrustedRef(pack);
   const extension = extensionApi(pack.worker);
+  const github = pack.forge !== "git" || pack.tracker === "github" || pack.worker === "copilot";
   return prepareDispatchCredentials({
-    paths: bots?.inventory.canonicalPaths ?? [],
+    paths: bots.inventory.canonicalPaths ?? [],
     env: process.env,
     fetch,
     spawn: commandSpawn,
+    actors,
     linear: pack.tracker === "linear",
-    github: true,
+    github,
     extensions: extension ? [extension] : [],
-    expectedLogin: expectedLogin(pack) ?? commitActorLogin(pack.commitActors, pack.repos[0]?.url ?? "") ,
   });
 }
 
-export async function adaptersFor(pack: ProjectPack, prepared: PreparedCredentials): Promise<{
+export async function adaptersFor(pack: ProjectPack, prepared: PreparedCredentials | null): Promise<{
   tracker: TrackerAdapter;
   worker: WorkerAdapter;
   forge: ForgeAdapter;
 }> {
-  if (!prepared.opener || !prepared.merger) {
-    throw new Error("missing canonical path for github");
-  }
+  const opener = prepared?.opener ?? legacyCredential("github", requireEnv("GH_TOKEN"));
+  const merger = prepared?.merger ?? legacyCredential("github", requireEnv("GH_TOKEN"));
   const repo =
     pack.githubRepo ??
     githubRepoFromUrl(pack.repos[0].url).owner + "/" + githubRepoFromUrl(pack.repos[0].url).repo;
   const forge =
     pack.forge === "git"
-      ? gitForge({ cwd: process.cwd(), credential: prepared.opener })
+      ? gitForge({ cwd: process.cwd(), credential: prepared?.opener })
       : githubForge({
-          opener: prepared.opener,
-          merger: prepared.merger,
+          opener,
+          merger,
           repo,
-          commitActors: commitActorsFromTrustedRef(pack),
+          commitActors: prepared?.actors ?? commitActorsFromTrustedRef(pack),
         });
-  if (pack.tracker === "linear" && !prepared.linear) {
+  if (pack.tracker === "linear" && prepared && !prepared.linear) {
     throw new Error("missing canonical path for linear");
   }
+  const linearCredential = prepared?.linear ?? legacyCredential("linear", requireEnv("LINEAR_API_KEY"));
   const tracker =
     pack.tracker === "linear"
       ? linearTracker({
-          credential: prepared.linear!,
+          credential: linearCredential,
           team: pack.linearTeam ?? "",
           intakeState: pack.status.intake,
         })
       : githubIssuesTracker({
-          credential: prepared.opener,
+          credential: opener,
           repo: pack.githubRepo ?? "",
           intakeLabel: pack.status.intake,
         });
@@ -192,30 +195,26 @@ export async function adaptersFor(pack: ProjectPack, prepared: PreparedCredentia
   return { tracker, worker, forge };
 }
 
-function workerFor(pack: ProjectPack, prepared: PreparedCredentials): WorkerAdapter {
+function workerFor(pack: ProjectPack, prepared: PreparedCredentials | null): WorkerAdapter {
   if (pack.worker === "cursor") {
-    const credential = prepared.extensions.cursor;
-    if (!credential) throw new Error("missing canonical path for cursor");
+    const credential = prepared?.extensions.cursor ?? legacyCredential("cursor", requireEnv("CURSOR_API_KEY"));
     return cursorWorker({ credential });
   }
   if (pack.worker === "claude") {
-    const credential = prepared.extensions.anthropic;
-    if (!credential) throw new Error("missing canonical path for anthropic");
+    const credential = prepared?.extensions.anthropic ?? legacyCredential("anthropic", requireEnv("ANTHROPIC_API_KEY"));
     return claudeWorker({ credential });
   }
   if (pack.worker === "codex") {
-    const credential = prepared.extensions.openai;
-    if (!credential) throw new Error("missing canonical path for openai");
+    const credential = prepared?.extensions.openai ?? legacyCredential("openai", requireEnv("OPENAI_API_KEY"));
     return codexWorker({ credential });
   }
   if (pack.worker === "copilot") {
     const repo = pack.githubRepo ?? "";
     const [owner, name] = repo.split("/");
-    if (!prepared.opener) throw new Error("missing canonical path for github opener");
-    return copilotWorker({ credential: prepared.opener, owner, repo: name });
+    const credential = prepared?.opener ?? legacyCredential("github", requireEnv("GH_TOKEN"));
+    return copilotWorker({ credential, owner, repo: name });
   }
-  const credential = prepared.extensions.http;
-  if (!credential) throw new Error("missing canonical path for http");
+  const credential = prepared?.extensions.http ?? legacyCredential("http", process.env.WORKER_HTTP_TOKEN || "local");
   return httpWorker({
     startUrl: pack.workerHttp?.startUrl ?? "",
     statusUrl: pack.workerHttp?.statusUrl ?? "",
@@ -226,8 +225,8 @@ function workerFor(pack: ProjectPack, prepared: PreparedCredentials): WorkerAdap
 async function dispatchGh(args: string[]): Promise<number | null> {
   const opened = openPack(packPath(process.cwd()));
   const prepared = await preparePackCredentials(opened.pack, opened.bots);
-  if (!prepared.opener) throw new Error("missing canonical path for github opener");
-  return runGh(prepared.opener, args).status;
+  const credential = prepared?.opener ?? legacyCredential("github", requireEnv("GH_TOKEN"));
+  return runGh(credential, args).status;
 }
 
 async function dispatchOrRun(mode: string, argv: string[]): Promise<void> {
@@ -310,7 +309,7 @@ async function dispatchOrRun(mode: string, argv: string[]): Promise<void> {
     cwd: process.cwd(),
     project: plan.project,
     pageStartedAtMs: Number.isFinite(started) && started > 0 ? started : null,
-    lookupHead: (repoUrl: string, branch: string) => lookupRemoteHead(repoUrl, branch, prepared.opener ?? null),
+    lookupHead: (repoUrl: string, branch: string) => lookupRemoteHead(repoUrl, branch, prepared?.opener ?? null),
   };
   if (mode === "sweep") {
     sweep(deps)

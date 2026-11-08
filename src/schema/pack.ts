@@ -8,6 +8,8 @@ import type { BotBundle } from "../bots/types.ts";
 /** Writes to `repos` are refused unless the token's GitHub login is `login`. */
 export type CommitActor = {
   login: string;
+  /** GitHub user id. Required when a bot inventory enforces canonical paths. */
+  id?: string;
   repos: string[];
 };
 

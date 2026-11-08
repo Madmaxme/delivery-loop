@@ -32,7 +32,6 @@ import {
   type CompileProgramResult,
   type DeliveryLeaseStamp,
 } from "./linear-harness-policy.js";
-import { resolveMintedCredential } from "../adapters/canonical-path.ts";
 import { confirmLandBranches, lookupRemoteHead, renderBranch } from "./land-branches.js";
 import {
   invariantExists,
@@ -1156,34 +1155,14 @@ async function healShipStep(
 function refreshShipGithubToken(env: NodeJS.ProcessEnv): boolean {
   const command = env.DELIVERY_LOOP_GITHUB_MINT?.trim();
   if (!command) return false;
-  try {
-    const credential = resolveMintedCredential(
-      {
-        api: "github",
-        role: "opener",
-        identityKind: "user",
-        source: "ref:github-opener",
-        acquisition: "mint-per-process",
-        refresh: "per-process",
-        mintCommand: command,
-        actorRef: "ref:commit-actor",
-      },
-      {
-        env,
-        spawn: (cmd) => {
-          const result = spawnSync(cmd, { shell: true, encoding: "utf8" });
-          return { status: result.status, stdout: result.stdout ?? "" };
-        },
-      },
-    );
-    env.GH_TOKEN = credential.token;
-    env.GITHUB_TOKEN = credential.token;
-    process.env.GH_TOKEN = credential.token;
-    process.env.GITHUB_TOKEN = credential.token;
-    return true;
-  } catch {
-    return false;
-  }
+  const result = spawnSync(command, { shell: true, encoding: "utf8" });
+  const token = (result.stdout ?? "").trim().split(/\n/).at(-1)?.trim() ?? "";
+  if (result.status !== 0 || !token) return false;
+  env.GH_TOKEN = token;
+  env.GITHUB_TOKEN = token;
+  process.env.GH_TOKEN = token;
+  process.env.GITHUB_TOKEN = token;
+  return true;
 }
 
 function runShipStep(

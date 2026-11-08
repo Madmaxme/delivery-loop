@@ -56,11 +56,11 @@
           "api": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
           "source": { "type": "string", "pattern": "^ref:[a-z0-9][a-z0-9-]*$" },
           "acquisition": {
-            "enum": ["mint-per-process", "oauth-client-credentials", "workflow-token", "stored-static"]
+            "enum": ["mint-per-process", "oauth-client-credentials", "stored-static"]
           },
           "refresh": { "enum": ["per-process", "static"] },
           "role": { "enum": ["opener", "merger"] },
-          "identityKind": { "enum": ["user", "installation", "workflow"] },
+          "identityKind": { "enum": ["user", "installation"] },
           "callerClass": { "enum": ["agent", "actions", "runtime"] },
           "mintCommand": { "type": "string", "minLength": 1 },
           "envRefs": {
@@ -70,7 +70,20 @@
           "oauthUrl": { "type": "string", "minLength": 1 },
           "scope": { "type": "string", "minLength": 1 },
           "expectedIdentity": { "type": "string", "minLength": 1 },
+          "viewerId": { "type": "string", "minLength": 1 },
+          "organizationId": { "type": "string", "minLength": 1 },
           "actorRef": { "type": "string", "pattern": "^ref:[a-z0-9][a-z0-9-]*$" },
+          "allowedPrincipalIds": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^[0-9]+$" }
+          },
+          "appId": { "type": "string", "pattern": "^[0-9]+$" },
+          "installation": { "type": "string", "pattern": "^[0-9]+$" },
+          "repository": { "type": "string", "minLength": 1 },
+          "accountId": { "type": "string", "pattern": "^[0-9]{12}$" },
+          "expectedArn": { "type": "string", "minLength": 1 },
+          "vaultCommand": { "type": "string", "minLength": 1 },
+          "expiresAt": { "type": "string", "minLength": 1 },
           "healthCommand": { "type": "string", "minLength": 1 }
         }
       }

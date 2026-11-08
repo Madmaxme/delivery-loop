@@ -1,9 +1,19 @@
 import {
   assertCanonicalCredential,
+  assertHealthy,
   authorizationHeader,
   CanonicalPathError,
+  credentialRole,
+  credentialSecret,
+  isLegacyCredential,
   type CanonicalCredential,
 } from "./canonical-path.ts";
+
+function issued(credential: CanonicalCredential, api: string): string {
+  assertCanonicalCredential(credential, api);
+  assertHealthy(credential);
+  return credentialSecret(credential);
+}
 import type { FetchLike, WorkerAdapter, WorkerResult, WorkerStart } from "./types.js";
 
 async function poll(
@@ -29,7 +39,7 @@ export function httpWorker(opts: {
   const fetchImpl = opts.fetch ?? fetch;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    Authorization: authorizationHeader(opts.credential.token),
+    Authorization: authorizationHeader(issued(opts.credential, "http")),
   };
   return {
     kind: "http",
@@ -62,12 +72,12 @@ export function copilotWorker(opts: {
   fetch?: FetchLike;
 }): WorkerAdapter {
   assertCanonicalCredential(opts.credential, "github");
-  if (opts.credential.role !== "opener") {
+  if (!isLegacyCredential(opts.credential) && credentialRole(opts.credential) !== "opener") {
     throw new CanonicalPathError("non-canonical-credential", "github", "copilot uses the github opener credential");
   }
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    Authorization: authorizationHeader(opts.credential.token),
+    Authorization: authorizationHeader(issued(opts.credential, "github")),
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2026-03-10",
     "Content-Type": "application/json",
@@ -121,7 +131,7 @@ export function codexWorker(opts: { credential: CanonicalCredential; fetch?: Fet
   assertCanonicalCredential(opts.credential, "openai");
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    Authorization: authorizationHeader(opts.credential.token),
+    Authorization: authorizationHeader(issued(opts.credential, "openai")),
     "Content-Type": "application/json",
     "OpenAI-Beta": "agents=v1",
   };
@@ -178,7 +188,7 @@ export function claudeWorker(opts: { credential: CanonicalCredential; fetch?: Fe
   assertCanonicalCredential(opts.credential, "anthropic");
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    "x-api-key": opts.credential.token,
+    "x-api-key": issued(opts.credential, "anthropic"),
     "anthropic-version": "2023-06-01",
     "Content-Type": "application/json",
   };
@@ -328,7 +338,7 @@ export function cursorWorker(opts: {
         opts.sdk ??
         ((await import("@cursor/sdk")) as { Agent: CursorSdk }).Agent;
       const agent = await sdk.create({
-        apiKey: opts.credential.token,
+        apiKey: issued(opts.credential, "cursor"),
         cloud: {
           repos: [{ url: input.repoUrl, startingRef: input.baseRef }],
           autoCreatePR: false,

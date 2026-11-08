@@ -1,12 +1,15 @@
 import {
   assertCanonicalCredential,
-  authorizationHeader,
+  assertDistinctPrincipals,
+  assertHealthy,
   CanonicalPathError,
-  isHealthy,
-  probeGithub,
+  authorizationHeader,
+  authorizeOpenerRepo,
+  credentialSecret,
+  isLegacyCredential,
   type CanonicalCredential,
 } from "./canonical-path.ts";
-import { commitActorLogin, type CommitActor } from "./github-actor.js";
+import { assertCommitActor, commitActorLogin, githubUserLogin, type CommitActor } from "./github-actor.js";
 import type { CompareStatus, FetchLike, ForgeAdapter, PullMerge, PullRequest } from "./types.js";
 import { githubRepoFromUrl } from "./types.js";
 
@@ -65,7 +68,7 @@ export function interpretCompare(status: string | null | undefined): CompareStat
 
 function headersFor(credential: CanonicalCredential): Record<string, string> {
   return {
-    Authorization: authorizationHeader(credential.token),
+    Authorization: authorizationHeader(credentialSecret(credential)),
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
     "Content-Type": "application/json",
@@ -82,30 +85,25 @@ export function githubForge(opts: {
 }): ForgeAdapter {
   assertCanonicalCredential(opts.opener, "github");
   assertCanonicalCredential(opts.merger, "github");
-  if (opts.opener.role !== "opener" || opts.merger.role !== "merger" || opts.opener.source === opts.merger.source) {
-    throw new CanonicalPathError(
-      "non-canonical-credential",
-      "github",
-      "github opener and merger credentials are different identities",
-    );
-  }
   const fetchImpl = opts.fetch ?? fetch;
   const openerHeaders = headersFor(opts.opener);
   const mergerHeaders = headersFor(opts.merger);
-  let openerReady: Promise<void> | null = null;
-  let mergerReady: Promise<void> | null = null;
 
-  async function gateOpener(repoUrl?: string): Promise<void> {
-    if (isHealthy(opts.opener)) return;
-    const expected = repoUrl ? commitActorLogin(opts.commitActors, repoUrl) : null;
-    openerReady ??= probeGithub(opts.opener, fetchImpl, { expectedLogin: expected });
-    await openerReady;
+  async function gateOpener(repoUrl: string): Promise<void> {
+    assertHealthy(opts.opener);
+    if (isLegacyCredential(opts.opener)) {
+      const expected = commitActorLogin(opts.commitActors, repoUrl);
+      if (!expected) return;
+      assertCommitActor(repoUrl, await githubUserLogin(fetchImpl, opts.opener), expected);
+      return;
+    }
+    authorizeOpenerRepo(opts.opener, repoUrl, opts.commitActors ?? []);
   }
 
   async function gateMerger(): Promise<void> {
-    if (isHealthy(opts.merger)) return;
-    mergerReady ??= probeGithub(opts.merger, fetchImpl, {});
-    await mergerReady;
+    assertHealthy(opts.merger);
+    if (isLegacyCredential(opts.merger)) return;
+    assertDistinctPrincipals(opts.opener, opts.merger);
   }
 
   async function api(path: string, init?: RequestInit, headers: Record<string, string> = openerHeaders): Promise<Response> {
@@ -341,12 +339,11 @@ export async function githubGraphql(
   query: string,
   fetchImpl: FetchLike,
 ): Promise<unknown> {
-  assertCanonicalCredential(credential, "github");
-  if (!isHealthy(credential)) await probeGithub(credential, fetchImpl, {});
+  assertHealthy(credential);
   const response = await fetchImpl("https://api.github.com/graphql", {
     method: "POST",
     headers: {
-      Authorization: authorizationHeader(credential.token),
+      Authorization: authorizationHeader(credentialSecret(credential)),
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ query }),

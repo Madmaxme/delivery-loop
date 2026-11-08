@@ -2,12 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import {
-  assertCanonicalCredential,
-  CanonicalPathError,
-  scopedChildEnv,
-  type CanonicalCredential,
-} from "./canonical-path.ts";
+import { allowlistedEnv, assertCanonicalCredential, type CanonicalCredential } from "./canonical-path.ts";
 import type { CompareStatus, ForgeAdapter } from "./types.js";
 
 export type GitRun = (args: string[], cwd: string, env: NodeJS.ProcessEnv) => { status: number | null; stdout?: string };
@@ -44,15 +39,8 @@ export function gitForge(opts: {
   checkoutDir?: (repoUrl: string) => string;
 }): ForgeAdapter {
   if (opts.credential) assertCanonicalCredential(opts.credential, "github");
-  const env = opts.credential ? scopedChildEnv(process.env, opts.credential) : scopedChildEnv(process.env, null);
-  const run =
-    opts.run ??
-    ((args: string[], cwd: string) => {
-      if (!opts.credential && (process.env.GH_TOKEN || process.env.GITHUB_TOKEN)) {
-        throw new CanonicalPathError("non-canonical-credential", "github", "git refuses an ambient GitHub token");
-      }
-      return defaultGit(args, cwd, env);
-    });
+  const env = allowlistedEnv(process.env);
+  const run = opts.run ?? ((args: string[], cwd: string) => defaultGit(args, cwd, env));
   const dirFor = opts.checkoutDir ?? ((repoUrl: string) => gitCheckoutDir(opts.cwd, repoUrl));
   return {
     async openPullRequest(input) {
@@ -113,14 +101,6 @@ export function gitForge(opts: {
   };
 }
 
-export function rejectRawCredential(): Promise<unknown> {
-  const previous = process.env.GH_TOKEN;
-  process.env.GH_TOKEN = "stored";
-  const forge = gitForge({ cwd: process.cwd() });
-  return forge
-    .compare({ repoUrl: "https://example.test/acme/api.git", base: "main", head: "feature" })
-    .finally(() => {
-      if (previous === undefined) delete process.env.GH_TOKEN;
-      else process.env.GH_TOKEN = previous;
-    });
+export function rejectRawCredential(): void {
+  gitForge({ cwd: process.cwd(), credential: { token: "stored" } as CanonicalCredential });
 }

@@ -2,10 +2,9 @@ import { figmaUrlsFromText } from "../engine/design-gate.ts";
 import type { IssueBlocker, LinearProgramSnapshot } from "../engine/linear-harness-policy.js";
 import {
   assertCanonicalCredential,
+  assertHealthy,
   authorizationHeader,
-  isHealthy,
-  probeGithub,
-  probeLinearViewer,
+  credentialSecret,
   type CanonicalCredential,
 } from "./canonical-path.ts";
 import type { FetchLike, Ticket, TrackerAdapter } from "./types.js";
@@ -36,20 +35,13 @@ export function linearTracker(opts: {
 }): TrackerAdapter {
   assertCanonicalCredential(opts.credential, "linear");
   const fetchImpl = opts.fetch ?? fetch;
-  let ready: Promise<void> | null = null;
-
-  async function gate(): Promise<void> {
-    if (isHealthy(opts.credential)) return;
-    ready ??= probeLinearViewer(opts.credential, fetchImpl);
-    await ready;
-  }
 
   async function gql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
-    await gate();
+    assertHealthy(opts.credential);
     const response = await fetchImpl("https://api.linear.app/graphql", {
       method: "POST",
       headers: {
-        Authorization: authorizationHeader(opts.credential.token),
+        Authorization: authorizationHeader(credentialSecret(opts.credential)),
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ query, variables }),
@@ -340,21 +332,14 @@ export function githubIssuesTracker(opts: {
   assertCanonicalCredential(opts.credential, "github");
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    Authorization: authorizationHeader(opts.credential.token),
+    Authorization: authorizationHeader(credentialSecret(opts.credential)),
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
     "Content-Type": "application/json",
   };
-  let ready: Promise<void> | null = null;
-
-  async function gate(): Promise<void> {
-    if (isHealthy(opts.credential)) return;
-    ready ??= probeGithub(opts.credential, fetchImpl, {});
-    await ready;
-  }
 
   async function api(path: string, init?: RequestInit): Promise<unknown> {
-    await gate();
+    assertHealthy(opts.credential);
     const response = await fetchImpl(`https://api.github.com${path}`, {
       ...init,
       headers: { ...headers, ...(init?.headers ?? {}) },

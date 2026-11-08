@@ -1,6 +1,12 @@
 import { spawnSync } from "node:child_process";
 
-import { assertCanonicalCredential, assertHealthy, scopedChildEnv, type CanonicalCredential } from "./canonical-path.ts";
+import {
+  allowlistedEnv,
+  assertCanonicalCredential,
+  assertHealthy,
+  credentialSecret,
+  type CanonicalCredential,
+} from "./canonical-path.ts";
 
 type GhSpawn = (
   command: string,
@@ -8,7 +14,7 @@ type GhSpawn = (
   opts: { env: NodeJS.ProcessEnv; stdio: "inherit" },
 ) => { status: number | null };
 
-/** `gh` uses the issued GitHub credential and no ambient token. The health check has already passed. */
+/** `gh` receives the issued credential in an allowlisted env. Ambient tokens are not copied. */
 export function runGh(
   credential: CanonicalCredential,
   args: string[],
@@ -16,10 +22,11 @@ export function runGh(
 ): { status: number | null } {
   assertCanonicalCredential(credential, "github");
   assertHealthy(credential);
-  const env = scopedChildEnv(process.env, credential);
+  const token = credentialSecret(credential);
+  const env = allowlistedEnv(process.env, { GH_TOKEN: token, GITHUB_TOKEN: token });
   return spawn("gh", args, { env, stdio: "inherit" });
 }
 
 export function rejectRawCredential(): void {
-  runGh({ token: "stored", api: "github" } as CanonicalCredential, ["api", "user"]);
+  runGh({ token: "stored" } as CanonicalCredential, ["api", "user"]);
 }

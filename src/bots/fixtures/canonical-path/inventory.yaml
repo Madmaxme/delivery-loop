@@ -52,6 +52,8 @@ canonicalPaths:
     oauthUrl: https://api.linear.app/oauth/token
     scope: read,write
     expectedIdentity: Example Delivery
+    viewerId: "00000000-0000-4000-8000-000000000001"
+    organizationId: "00000000-0000-4000-8000-000000000002"
   - api: github
     role: opener
     source: ref:github-opener
@@ -60,6 +62,8 @@ canonicalPaths:
     mintCommand: mint-github-opener
     identityKind: user
     actorRef: ref:commit-actor
+    allowedPrincipalIds:
+      - "1001"
   - api: github
     role: merger
     source: ref:github-merger
@@ -67,18 +71,25 @@ canonicalPaths:
     refresh: per-process
     mintCommand: mint-github-merger
     identityKind: installation
+    appId: "2001"
+    installation: "2002"
+    repository: example/app
   - api: aws
     callerClass: agent
     source: ref:aws-agent
     acquisition: mint-per-process
     refresh: per-process
     mintCommand: mint-aws-agent
+    accountId: "123456789012"
+    expectedArn: arn:aws:iam::123456789012:user/example-agent
   - api: aws
     callerClass: actions
     source: ref:aws-actions
     acquisition: mint-per-process
     refresh: per-process
     mintCommand: mint-aws-actions
+    accountId: "123456789012"
+    expectedArn: arn:aws:iam::123456789012:role/example-actions
   - api: aws
     callerClass: runtime
     source: ref:aws-runtime
@@ -87,6 +98,9 @@ canonicalPaths:
     envRefs:
       - AWS_ACCESS_KEY_ID
       - AWS_SECRET_ACCESS_KEY
+    accountId: "123456789012"
+    expectedArn: arn:aws:iam::123456789012:user/example-runtime
+    expiresAt: "2099-01-01T00:00:00Z"
   - api: cursor
     source: ref:cursor-mint
     acquisition: mint-per-process

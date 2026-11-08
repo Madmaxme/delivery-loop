@@ -1,69 +1,33 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { mintCredential } from "./canonical-path.ts";
+import { probeGithub, probeLinearViewer } from "./canonical-path.ts";
 import { githubForge } from "./forge-github.ts";
 import { githubIssuesTracker, linearTracker } from "./trackers.ts";
 import type { FetchLike } from "./types.ts";
+import { actors, healthFetch, issue, linearPath, mergerPath, openerPath, readyExtension, readyOpener } from "../testing/canonical-fixtures.ts";
 import { copilotWorker, cursorReceiptText, cursorWorker, httpWorker } from "./workers.ts";
 
 function opener(token = "t") {
-  return mintCredential(
-    {
-      api: "github",
-      role: "opener",
-      identityKind: "user",
-      source: "ref:github-opener",
-      acquisition: "mint-per-process",
-      refresh: "per-process",
-      mintCommand: "mint-github-opener",
-      actorRef: "ref:commit-actor",
-    },
-    token,
-  );
+  return issue(openerPath, token);
 }
 
 function merger(token = "merger-token") {
-  return mintCredential(
-    {
-      api: "github",
-      role: "merger",
-      identityKind: "installation",
-      source: "ref:github-merger",
-      acquisition: "mint-per-process",
-      refresh: "per-process",
-      mintCommand: "mint-github-merger",
-    },
-    token,
-  );
+  return issue(mergerPath, token);
 }
 
-function linearCredential(token = "k") {
-  return mintCredential(
-    {
-      api: "linear",
-      source: "ref:linear-oauth",
-      acquisition: "mint-per-process",
-      refresh: "per-process",
-      mintCommand: "mint-linear",
-      expectedIdentity: "Example Delivery",
-    },
-    token,
-  );
+async function linearCredential(token = "k") {
+  const credential = issue(linearPath, token);
+  await probeLinearViewer(credential, healthFetch);
+  return credential;
 }
 
-function extension(api: string, token = "k") {
-  return mintCredential(
-    {
-      api,
-      source: `ref:${api}-mint`,
-      acquisition: "mint-per-process",
-      refresh: "per-process",
-      mintCommand: `mint-${api}`,
-      healthCommand: `probe-${api}`,
-    },
-    token,
-  );
+async function openedForge(fetch: FetchLike, commitActors = actors) {
+  const open = opener();
+  const merge = merger();
+  await probeGithub(open, healthFetch);
+  await probeGithub(merge, healthFetch);
+  return githubForge({ opener: open, merger: merge, fetch, commitActors });
 }
 
 function withGithubHealth(fetchImpl: FetchLike, login = "example-owner"): FetchLike {
@@ -91,13 +55,16 @@ function jsonResponse(body: unknown, status = 200): Response {
 describe("adapters", () => {
   it("refuses a pull request when the token is not the commit actor", async () => {
     const calls: string[] = [];
+    const open = opener("app");
+    const merge = merger();
+    await probeGithub(open, healthFetch);
+    await probeGithub(merge, healthFetch);
     const forge = githubForge({
-      opener: opener("app"),
-      merger: merger(),
-      commitActors: [{ login: "Madmaxme", repos: ["https://github.com/Madmaxme/delivery-loop"] }],
+      opener: open,
+      merger: merge,
+      commitActors: [{ login: "Madmaxme", id: "9999", repos: ["https://github.com/Madmaxme/delivery-loop"] }],
       fetch: async (url, init) => {
         calls.push(`${init?.method ?? "GET"} ${url}`);
-        if (String(url).endsWith("/user")) return jsonResponse({ login: "someone-else" });
         return jsonResponse({});
       },
     });
@@ -110,16 +77,20 @@ describe("adapters", () => {
           head: "feature",
           base: "main",
         }),
-      /commit actor is Madmaxme/,
+      /commit actor id/,
     );
     assert.equal(calls.some((call) => call.includes("/pulls")), false);
   });
 
   it("opens a pull request when the token login is the commit actor", async () => {
+    const open = opener("user");
+    const merge = merger();
+    await probeGithub(open, healthFetch);
+    await probeGithub(merge, healthFetch);
     const forge = githubForge({
-      opener: opener("user"),
-      merger: merger(),
-      commitActors: [{ login: "Madmaxme", repos: ["Madmaxme/delivery-loop"] }],
+      opener: open,
+      merger: merge,
+      commitActors: [{ login: "Madmaxme", id: "1001", repos: ["Madmaxme/delivery-loop"] }],
       fetch: async (url, init) => {
         if (String(url).endsWith("/user")) return jsonResponse({ login: "Madmaxme" });
         if (String(url).endsWith("/pulls") && init?.method === "POST") {
@@ -144,10 +115,7 @@ describe("adapters", () => {
 
   it("opens a pull request and reads a green quality run", async () => {
     const calls: string[] = [];
-    const forge = githubForge({
-      opener: opener(),
-      merger: merger(),
-      fetch: withGithubHealth(async (url, init) => {
+    const forge = await openedForge(async (url, init) => {
         calls.push(`${init?.method ?? "GET"} ${url}`);
         if (String(url).endsWith("/pulls")) {
           return jsonResponse({
@@ -171,7 +139,6 @@ describe("adapters", () => {
           });
         }
         return jsonResponse({});
-      }),
     });
     const pr = await forge.openPullRequest({
       repoUrl: "https://github.com/acme/api",
@@ -181,10 +148,7 @@ describe("adapters", () => {
       base: "main",
     });
     assert.equal(pr.number, 9);
-    const again = githubForge({
-      opener: opener(),
-      merger: merger(),
-      fetch: withGithubHealth(async (url, init) => {
+    const again = await openedForge(async (url, init) => {
         if (String(url).endsWith("/pulls") && init?.method === "POST") {
           return jsonResponse({ message: "exists" }, 422);
         }
@@ -194,7 +158,6 @@ describe("adapters", () => {
           ]);
         }
         return jsonResponse({});
-      }),
     });
     const adopted = await again.openPullRequest({
       repoUrl: "https://github.com/acme/api",
@@ -219,10 +182,7 @@ describe("adapters", () => {
 
   it("requests one empty commit when quality never started", async () => {
     const calls: string[] = [];
-    const forge = githubForge({
-      opener: opener(),
-      merger: merger(),
-      fetch: withGithubHealth(async (url, init) => {
+    const forge = await openedForge(async (url, init) => {
         const method = init?.method ?? "GET";
         calls.push(`${method} ${url}`);
         if (String(url).includes("/actions/runs")) return jsonResponse({ workflow_runs: [] });
@@ -242,7 +202,6 @@ describe("adapters", () => {
           return jsonResponse({ ref: "refs/heads/cursor/qui-1-api" });
         }
         return jsonResponse({}, 404);
-      }),
     });
     const probe = await forge.quality({
       repoUrl: "https://github.com/acme/api",
@@ -260,10 +219,7 @@ describe("adapters", () => {
     });
     assert.equal(next, "def");
     assert.ok(calls.some((call) => call.startsWith("POST ") && call.endsWith("/git/commits")));
-    const again = githubForge({
-      opener: opener(),
-      merger: merger(),
-      fetch: withGithubHealth(async (url) => {
+    const again = await openedForge(async (url) => {
         if (String(url).includes("/commits/def")) {
           return jsonResponse({
             commit: {
@@ -274,7 +230,6 @@ describe("adapters", () => {
           });
         }
         return jsonResponse({}, 404);
-      }),
     });
     assert.equal(
       await again.requestQualityRun({
@@ -289,7 +244,7 @@ describe("adapters", () => {
 
   it("starts and joins a self-hosted worker", async () => {
     const worker = httpWorker({
-      credential: extension("http"),
+      credential: await readyExtension("http"),
       startUrl: "https://host.example/start",
       statusUrl: "https://host.example/status",
       fetch: async (url) => {
@@ -309,7 +264,7 @@ describe("adapters", () => {
 
   it("starts a Copilot cloud task", async () => {
     const worker = copilotWorker({
-      credential: opener(),
+      credential: await readyOpener(),
       owner: "acme",
       repo: "api",
       fetch: async (url, init) => {
@@ -326,7 +281,7 @@ describe("adapters", () => {
 
   it("lists Linear intake and GitHub issues", async () => {
     const linear = linearTracker({
-      credential: linearCredential(),
+      credential: await linearCredential(),
       team: "APP",
       intakeState: "Todo",
       fetch: withViewer(async () =>
@@ -354,7 +309,7 @@ describe("adapters", () => {
     assert.equal(tickets[0]?.identifier, "APP-3");
 
     const snapshotTracker = linearTracker({
-      credential: linearCredential(),
+      credential: await linearCredential(),
       team: "APP",
       intakeState: "Todo",
       fetch: withViewer(async (_url, init) => {
@@ -398,7 +353,7 @@ describe("adapters", () => {
     assert.equal(snapshot?.milestones[0]?.name, "Stage 1");
 
     const github = githubIssuesTracker({
-      credential: opener(),
+      credential: await readyOpener(),
       repo: "acme/api",
       intakeLabel: "todo",
       fetch: withGithubHealth(async (url) => {
@@ -415,7 +370,7 @@ describe("adapters", () => {
   it("adds a Linear label and keeps labels already on the issue", async () => {
     const calls: { query: string; variables: Record<string, unknown> }[] = [];
     const linear = linearTracker({
-      credential: linearCredential(),
+      credential: await linearCredential(),
       team: "APP",
       intakeState: "Todo",
       fetch: withViewer(async (_url, init) => {
@@ -478,7 +433,7 @@ describe("adapters", () => {
       receipt,
     );
     const worker = cursorWorker({
-      credential: extension("cursor"),
+      credential: await readyExtension("cursor"),
       sdk: {
         async create() {
           return {

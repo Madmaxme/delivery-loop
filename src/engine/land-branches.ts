@@ -1,6 +1,14 @@
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { scopedChildEnv, type CanonicalCredential } from "../adapters/canonical-path.ts";
+import {
+  allowlistedEnv,
+  assertHealthy,
+  credentialSecret,
+  type CanonicalCredential,
+} from "../adapters/canonical-path.ts";
 import type { RepoSpec } from "../schema/pack.ts";
 
 export function renderBranch(template: string, issue: string, repo: string): string {
@@ -66,24 +74,47 @@ export function confirmLandBranches(input: {
   return confirmed.length ? confirmed : null;
 }
 
+/**
+ * Git reads the token from askpass. The remote URL and the argv do not contain it.
+ * A stamped credential wins. Otherwise the process token is used, still outside argv.
+ */
 export function lookupRemoteHead(
   repoUrl: string,
   branch: string,
   credential?: CanonicalCredential | null,
   spawn: typeof spawnSync = spawnSync,
 ): string | null {
-  const env = scopedChildEnv(process.env, credential ?? null);
-  const remote =
-    credential && repoUrl.startsWith("https://")
-      ? repoUrl.replace("https://", `https://x-access-token:${credential.token}@`)
-      : repoUrl;
-  const result = spawn("git", ["ls-remote", remote, `refs/heads/${branch}`], {
-    encoding: "utf8",
-    env,
-  });
-  if (result.status !== 0) return null;
-  const sha = result.stdout.trim().split(/\s+/)[0] ?? "";
-  return /^[0-9a-f]{7,40}$/i.test(sha) ? sha : null;
+  if (credential) assertHealthy(credential);
+  const token = credential
+    ? credentialSecret(credential)
+    : process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
+  const ask = token ? gitAskPass(token) : null;
+  try {
+    const result = spawn("git", ["ls-remote", repoUrl, `refs/heads/${branch}`], {
+      encoding: "utf8",
+      env: ask?.env ?? allowlistedEnv(process.env),
+    });
+    if (result.status !== 0) return null;
+    const sha = result.stdout.trim().split(/\s+/)[0] ?? "";
+    return /^[0-9a-f]{7,40}$/i.test(sha) ? sha : null;
+  } finally {
+    if (ask) rmSync(ask.dir, { recursive: true, force: true });
+  }
+}
+
+/** A git child reads the token from the environment. The token is not a URL argument. */
+function gitAskPass(token: string): { dir: string; env: NodeJS.ProcessEnv } {
+  const dir = mkdtempSync(join(tmpdir(), "git-askpass-"));
+  const file = join(dir, "askpass.sh");
+  writeFileSync(file, "#!/bin/sh\nprintf '%s\\n' \"$DELIVERY_LOOP_GIT_TOKEN\"\n", { mode: 0o700 });
+  return {
+    dir,
+    env: allowlistedEnv(process.env, {
+      GIT_ASKPASS: file,
+      GIT_TERMINAL_PROMPT: "0",
+      DELIVERY_LOOP_GIT_TOKEN: token,
+    }),
+  };
 }
 
 function sameRepo(a: string, b: string): boolean {

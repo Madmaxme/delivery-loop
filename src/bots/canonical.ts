@@ -6,12 +6,7 @@ import type { BotDefinition } from "./types.ts";
  * AWS runtime may declare it. An extension API may declare it.
  * A mint or OAuth path must not read the stored key.
  */
-export const ACQUISITIONS = [
-  "mint-per-process",
-  "oauth-client-credentials",
-  "workflow-token",
-  "stored-static",
-] as const;
+export const ACQUISITIONS = ["mint-per-process", "oauth-client-credentials", "stored-static"] as const;
 
 export type Acquisition = (typeof ACQUISITIONS)[number];
 
@@ -23,8 +18,8 @@ export const GITHUB_ROLES = ["opener", "merger"] as const;
 
 export type GithubRole = (typeof GITHUB_ROLES)[number];
 
-/** `user` calls GET /user. `installation` calls GET /installation/repositories. `workflow` calls GET /rate_limit. */
-export const IDENTITY_KINDS = ["user", "installation", "workflow"] as const;
+/** `user` is GET /user. `installation` is the installation token. A workflow token is not a merger. */
+export const IDENTITY_KINDS = ["user", "installation"] as const;
 
 export type IdentityKind = (typeof IDENTITY_KINDS)[number];
 
@@ -44,9 +39,6 @@ export const STORED_ENV: Record<string, readonly string[]> = {
   aws: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"],
 };
 
-/** GitHub login that is neither an opener nor a merger. */
-export const REJECTED_GITHUB_LOGINS = ["cursor[bot]"] as const;
-
 export type CanonicalPath = {
   api: string;
   source: string;
@@ -59,8 +51,21 @@ export type CanonicalPath = {
   envRefs?: string[];
   oauthUrl?: string;
   scope?: string;
+  /** Display only. The health check matches viewerId and organizationId. */
   expectedIdentity?: string;
+  viewerId?: string;
+  organizationId?: string;
   actorRef?: string;
+  /** GitHub user ids the opener token is allowed to be. Immutable config, not a login blacklist. */
+  allowedPrincipalIds?: string[];
+  appId?: string;
+  installation?: string;
+  repository?: string;
+  accountId?: string;
+  expectedArn?: string;
+  /** Prints the stored copy to stdout. Absent means an env value that is unset is not compared. */
+  vaultCommand?: string;
+  expiresAt?: string;
   healthCommand?: string;
 };
 
@@ -157,7 +162,10 @@ export function assertCanonicalPath(path: CanonicalPath, at: string): void {
       fail(at, "non-canonical direct path for linear");
     }
     if (path.refresh !== "per-process") fail(at, "linear refresh must be per-process");
-    if (!IDENTITY.test(path.expectedIdentity ?? "")) fail(at, "linear expectedIdentity is required");
+    if (!path.viewerId?.trim() || !path.organizationId?.trim()) fail(at, "linear viewerId and organizationId are required");
+    if (path.expectedIdentity !== undefined && !IDENTITY.test(path.expectedIdentity)) {
+      fail(at, "linear expectedIdentity is invalid");
+    }
     if (path.acquisition === "oauth-client-credentials") {
       if (!path.oauthUrl || !/^https:\/\//.test(path.oauthUrl)) fail(at, "linear oauthUrl must be https");
       if ((path.envRefs ?? []).length !== 2) fail(at, "linear oauth client env refs are required");
@@ -179,25 +187,22 @@ export function assertCanonicalPath(path: CanonicalPath, at: string): void {
       if (path.acquisition !== "mint-per-process") fail(at, "non-canonical direct path for github opener");
       if (!path.mintCommand?.trim()) fail(at, "github opener mintCommand is required");
       if (!REF.test(path.actorRef ?? "")) fail(at, "github opener actorRef is required");
+      const ids = path.allowedPrincipalIds ?? [];
+      if (ids.length < 1 || ids.some((id) => !/^[0-9]+$/.test(id))) {
+        fail(at, "github opener allowedPrincipalIds must be numeric user ids");
+      }
     }
-    if (path.role === "merger" && path.identityKind === "installation") {
+    if (path.role === "merger") {
+      if (path.identityKind !== "installation") fail(at, "github merger must be an installation token");
       if (path.acquisition !== "mint-per-process") fail(at, "non-canonical direct path for github merger");
       if (!path.mintCommand?.trim()) fail(at, "github merger mintCommand is required");
-    }
-    if (path.role === "merger" && path.identityKind === "workflow") {
-      if (path.acquisition !== "workflow-token") fail(at, "non-canonical direct path for github merger");
-      if ((path.envRefs ?? []).join(",") !== "GITHUB_TOKEN") fail(at, "github workflow token reads GITHUB_TOKEN");
-    }
-    if (path.role === "merger" && path.identityKind === "user") {
-      fail(at, "non-canonical direct path for github merger");
-    }
-    if (path.role === "opener" && path.identityKind !== "user") {
-      fail(at, "non-canonical direct path for github opener");
+      if (!/^[0-9]+$/.test(path.appId ?? "") || !/^[0-9]+$/.test(path.installation ?? "")) {
+        fail(at, "github merger appId and installation are required");
+      }
+      if (!/^[^/\s]+\/[^/\s]+$/.test(path.repository ?? "")) fail(at, "github merger repository is required");
     }
     for (const name of path.envRefs ?? []) {
-      if (path.acquisition !== "workflow-token" && isDirectStoredInput("github", name)) {
-        fail(at, "non-canonical direct path for github");
-      }
+      if (isDirectStoredInput("github", name)) fail(at, "non-canonical direct path for github");
     }
     return;
   }
@@ -216,6 +221,8 @@ export function assertCanonicalPath(path: CanonicalPath, at: string): void {
     } else if (path.acquisition !== "mint-per-process") {
       fail(at, `non-canonical direct path for aws ${path.callerClass}`);
     }
+    if (!/^[0-9]{12}$/.test(path.accountId ?? "")) fail(at, "aws accountId is required");
+    if (!path.expectedArn?.startsWith("arn:aws:")) fail(at, "aws expectedArn is required");
     if (path.acquisition === "mint-per-process") {
       if (path.refresh !== "per-process") fail(at, "aws mint refresh must be per-process");
       if (!path.mintCommand?.trim()) fail(at, "aws mintCommand is required");
@@ -225,7 +232,6 @@ export function assertCanonicalPath(path: CanonicalPath, at: string): void {
     }
     return;
   }
-  if (path.acquisition === "workflow-token") fail(at, `non-canonical direct path for ${path.api}`);
   if (!path.healthCommand?.trim() || path.healthCommand.includes("\n")) {
     fail(at, `${path.api} healthCommand is required`);
   }

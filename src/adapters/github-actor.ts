@@ -1,5 +1,11 @@
 import type { CommitActor } from "../schema/pack.js";
-import { assertCanonicalCredential, assertHealthy, authorizationHeader, type CanonicalCredential } from "./canonical-path.ts";
+import {
+  assertCanonicalCredential,
+  assertHealthy,
+  authorizationHeader,
+  credentialSecret,
+  type CanonicalCredential,
+} from "./canonical-path.ts";
 import type { FetchLike } from "./types.js";
 
 export type { CommitActor };
@@ -28,7 +34,7 @@ export async function githubUserLogin(fetchImpl: FetchLike, credential: Canonica
   assertHealthy(credential);
   const response = await fetchImpl("https://api.github.com/user", {
     headers: {
-      Authorization: authorizationHeader(credential.token),
+      Authorization: authorizationHeader(credentialSecret(credential)),
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
     },

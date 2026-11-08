@@ -49,10 +49,10 @@ The inventory declares one path per API the bundle uses. The field is `canonical
 
 | API | What the path declares | Health check before dispatch |
 | --- | --- | --- |
-| `linear` | OAuth client credentials or a mint command, refreshed per process. `expectedIdentity` is the viewer name. A stored static key is rejected. | `POST https://api.linear.app/graphql` with `{ viewer { id name } }`. HTTP 200 and that name. |
-| `github` opener | A different source from the merger. Mint per process. `identityKind: user`. `actorRef` points at the commit actor. | `GET /user`. The login must match the declared commit actor when one is set. `cursor[bot]` is refused. |
-| `github` merger | Installation mint, or the workflow token in `GITHUB_TOKEN`. | Installation: `GET /installation/repositories`. Workflow: `GET /rate_limit`. `GET /user` is not the installation check. |
-| `aws` | One source for each caller class in use: `agent`, `actions`, `runtime`. Agent and actions mint. Runtime may be a stored key. | `aws sts get-caller-identity`. |
+| `linear` | OAuth client credentials or a mint command, refreshed per process. `viewerId` and `organizationId` are the check. `expectedIdentity` is display only. A stored static key is rejected. | `POST https://api.linear.app/graphql` with `{ viewer { id name organization { id } } }`. Status must be 200. |
+| `github` opener | Mint per process. `identityKind: user`. `allowedPrincipalIds` are numeric GitHub user ids. | `GET /user`. The numeric id must be one of those ids. The trusted commit-actor id for the repo is checked on every call. |
+| `github` merger | An installation token, a different principal from the opener. `appId`, `installation`, and `repository` are required. | `GET /repos/{repository}/installation`. The installation id and app id must match. |
+| `aws` | One source for each caller class in use: `agent`, `actions`, `runtime`. The account id and ARN are required. | `aws sts get-caller-identity` with the issued key, secret, and session token. Provider fallbacks are disabled. |
 | any other api | An extension. It names a `healthCommand`. | That command must exit 0. |
 
 The CLI order before dispatch is: mint, the Linear viewer check, then each GitHub identity's check. A mint that returns the same value as the stored copy is refused. The comparison stays in memory and the value is not logged. Adapters take only a credential the resolver stamped. Git, `gh`, and AWS child processes drop ambient tokens and receive the stamped credential. The `Authorization` header is exactly one `Bearer` scheme.

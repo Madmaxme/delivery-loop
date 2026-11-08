@@ -11,15 +11,19 @@ import { parse } from "yaml";
 import { assertCanonicalPath, assertCanonicalPaths, type CanonicalPath } from "../bots/canonical.ts";
 import { loadBotBundle } from "../bots/load.ts";
 import type { BotDefinition } from "../bots/types.ts";
+import { OUTBOUND_ADAPTERS, adapterAttempts } from "./registry.ts";
 import { awsCaller } from "./aws.ts";
 import {
   authorizationHeader,
   CanonicalPathError,
-  mintCredential,
+  credentialSecret,
   prepareDispatchCredentials,
+  probeGithub,
+  probeLinearViewer,
   resolveCredential,
   type CommandSpawn,
 } from "./canonical-path.ts";
+import { healthFetch, issue, linearPath, mergerPath, openerPath, organizationId, viewerId } from "../testing/canonical-fixtures.ts";
 import { githubForge, githubGraphql } from "./forge-github.ts";
 import { gitForge } from "./forge-git.ts";
 import { githubUserLogin } from "./github-actor.ts";
@@ -30,44 +34,21 @@ import { runGh } from "./gh.ts";
 const here = dirname(fileURLToPath(import.meta.url));
 const support = new Set(["canonical-path.ts", "github-actor.ts", "types.ts"]);
 
-const linearPath: CanonicalPath = {
-  api: "linear",
-  source: "ref:linear-oauth",
+const oauthLinearPath: CanonicalPath = {
+  ...linearPath,
   acquisition: "oauth-client-credentials",
-  refresh: "per-process",
+  mintCommand: undefined,
   envRefs: ["LINEAR_OAUTH_CLIENT_ID", "LINEAR_OAUTH_CLIENT_SECRET"],
   oauthUrl: "https://api.linear.app/oauth/token",
   scope: "read,write",
-  expectedIdentity: "Example Delivery",
-};
-
-const openerPath: CanonicalPath = {
-  api: "github",
-  role: "opener",
-  source: "ref:github-opener",
-  acquisition: "mint-per-process",
-  refresh: "per-process",
-  mintCommand: "mint-github-opener",
-  identityKind: "user",
-  actorRef: "ref:commit-actor",
-};
-
-const mergerPath: CanonicalPath = {
-  api: "github",
-  role: "merger",
-  source: "ref:github-merger",
-  acquisition: "mint-per-process",
-  refresh: "per-process",
-  mintCommand: "mint-github-merger",
-  identityKind: "installation",
 };
 
 function opener(token = "opener-token") {
-  return mintCredential(openerPath, token);
+  return issue(openerPath, token);
 }
 
 function merger(token = "merger-token") {
-  return mintCredential(mergerPath, token);
+  return issue(mergerPath, token);
 }
 
 function json(body: unknown, status = 200): Response {
@@ -86,7 +67,7 @@ describe("canonical call path", () => {
     const calls: string[] = [];
     await assert.rejects(
       () =>
-        resolveCredential(linearPath, {
+        resolveCredential(oauthLinearPath, {
           env: {
             LINEAR_OAUTH_CLIENT_ID: "id",
             LINEAR_OAUTH_CLIENT_SECRET: "secret",
@@ -103,7 +84,7 @@ describe("canonical call path", () => {
     );
     assert.deepEqual(calls, ["https://api.linear.app/oauth/token"]);
 
-    const minted = await resolveCredential(linearPath, {
+    const minted = await resolveCredential(oauthLinearPath, {
       env: {
         LINEAR_OAUTH_CLIENT_ID: "id",
         LINEAR_OAUTH_CLIENT_SECRET: "secret",
@@ -113,9 +94,8 @@ describe("canonical call path", () => {
       spawn: () => ({ status: 1, stdout: "" }),
       fetch: async () => json({ access_token: "minted-access", expires_in: 2591999, token_type: "Bearer" }),
     });
-    assert.equal(minted.token, "minted-access");
-    assert.equal(minted.expiresIn, 2591999);
-    assert.notEqual(minted.token, "stored-key");
+    assert.equal(credentialSecret(minted), "minted-access");
+    assert.notEqual(credentialSecret(minted), "stored-key");
 
     const headers: string[] = [];
     await assert.rejects(
@@ -138,35 +118,32 @@ describe("canonical call path", () => {
 
   it("fails the viewer health check on 401 before the ticket query", async () => {
     const calls: string[] = [];
-    const credential = mintCredential(
-      {
-        api: "linear",
-        source: "ref:linear-oauth",
-        acquisition: "mint-per-process",
-        refresh: "per-process",
-        mintCommand: "mint-linear",
-        expectedIdentity: "Example Delivery",
-      },
-      "Bearer minted-access",
+    const credential = issue(linearPath, "Bearer minted-access");
+    await assert.rejects(
+      () =>
+        probeLinearViewer(credential, async (_url, init) => {
+          const body = JSON.parse(String(init?.body)) as { query: string };
+          calls.push(body.query);
+          headersSeen(init);
+          return json({ errors: [{ message: "Authentication required" }] }, 401);
+        }),
+      (error: unknown) =>
+        error instanceof CanonicalPathError && error.errorClass === "credential-unhealthy" && error.status === 401,
     );
+    assert.equal(calls.length, 1);
+    assert.match(calls[0] ?? "", /viewer/);
+    assert.equal(seenHeader, "Bearer minted-access");
     const tracker = linearTracker({
       credential,
       team: "APP",
       intakeState: "Todo",
-      fetch: async (_url, init) => {
-        const body = JSON.parse(String(init?.body)) as { query: string };
-        calls.push(body.query);
-        headersSeen(init);
-        return json({ errors: [{ message: "Authentication required" }] }, 401);
+      fetch: async () => {
+        calls.push("ticket");
+        return json({ data: {} });
       },
     });
-    await assert.rejects(
-      () => tracker.listIntake(),
-      (error: unknown) =>
-        error instanceof CanonicalPathError && error.errorClass === "credential-unhealthy" && error.status === 401,
-    );
-    assert.deepEqual(calls, ["{ viewer { id name } }"]);
-    assert.equal(seenHeader, "Bearer minted-access");
+    await assert.rejects(() => tracker.listIntake(), /has not passed the health check/);
+    assert.equal(calls.includes("ticket"), false);
   });
 
   it("probes mint, then the linear viewer, then each github identity", async () => {
@@ -178,7 +155,7 @@ describe("canonical call path", () => {
       return { status: 1, stdout: "" };
     };
     const prepared = await prepareDispatchCredentials({
-      paths: [linearPath, openerPath, mergerPath],
+      paths: [oauthLinearPath, openerPath, mergerPath],
       env: {
         LINEAR_OAUTH_CLIENT_ID: "id",
         LINEAR_OAUTH_CLIENT_SECRET: "secret",
@@ -188,28 +165,30 @@ describe("canonical call path", () => {
       spawn,
       linear: true,
       github: true,
-      expectedLogin: "example-owner",
+      actors: [{ login: "example-owner", id: "1001", repos: ["https://github.com/example/app"] }],
       fetch: async (url, init) => {
         const href = String(url);
         const body = typeof init?.body === "string" ? init.body : "";
         calls.push(`${init?.method ?? "GET"} ${href}${body.includes("viewer") ? " viewer" : ""}`);
         if (href.endsWith("/oauth/token")) return json({ access_token: "minted-access", expires_in: 100, token_type: "Bearer" });
-        if (body.includes("viewer")) return json({ data: { viewer: { id: "v1", name: "Example Delivery" } } });
-        if (href.endsWith("/user")) return json({ login: "example-owner" });
-        if (href.includes("/installation/repositories")) return json({ repositories: [] });
+        if (body.includes("viewer")) {
+          return json({ data: { viewer: { id: viewerId, name: "Example Delivery", organization: { id: organizationId } } } });
+        }
+        if (href.endsWith("/user")) return json({ id: 1001, login: "example-owner" });
+        if (href.endsWith("/installation")) return json({ id: 2002, app_id: 2001 });
         return json({}, 500);
       },
     });
-    assert.equal(prepared.linear?.token, "minted-access");
-    assert.equal(prepared.opener?.token, "opener-token");
-    assert.equal(prepared.merger?.token, "merger-token");
+    assert.equal(credentialSecret(prepared.linear!), "minted-access");
+    assert.equal(credentialSecret(prepared.opener!), "opener-token");
+    assert.equal(credentialSecret(prepared.merger!), "merger-token");
     assert.deepEqual(calls, [
       "POST https://api.linear.app/oauth/token",
       "POST https://api.linear.app/graphql viewer",
       "spawn mint-github-opener",
       "GET https://api.github.com/user",
       "spawn mint-github-merger",
-      "GET https://api.github.com/installation/repositories?per_page=1",
+      "GET https://api.github.com/repos/example/app/installation",
     ]);
   });
 
@@ -218,7 +197,7 @@ describe("canonical call path", () => {
     await assert.rejects(
       () =>
         prepareDispatchCredentials({
-          paths: [linearPath, openerPath, mergerPath],
+          paths: [oauthLinearPath, openerPath, mergerPath],
           env: { LINEAR_OAUTH_CLIENT_ID: "id", LINEAR_OAUTH_CLIENT_SECRET: "secret" },
           spawn: (command) => {
             calls.push(command);
@@ -239,16 +218,18 @@ describe("canonical call path", () => {
     assert.equal(calls.some((call) => call.startsWith("mint-github")), false);
   });
 
-  it("uses the installation read for a merger and rejects cursor[bot] as an opener", async () => {
+  it("binds the installation and rejects a user id that is not allowed", async () => {
     const calls: string[] = [];
+    const open = opener();
+    const merge = merger();
+    await probeGithub(open, healthFetch);
+    await probeGithub(merge, healthFetch);
     const forge = githubForge({
-      opener: opener(),
-      merger: merger(),
-      commitActors: [{ login: "example-owner", repos: ["https://github.com/example/app"] }],
+      opener: open,
+      merger: merge,
+      commitActors: [{ login: "example-owner", id: "1001", repos: ["https://github.com/example/app"] }],
       fetch: async (url) => {
         calls.push(String(url));
-        if (String(url).endsWith("/user")) return json({ login: "example-owner" });
-        if (String(url).includes("/installation/repositories")) return json({ repositories: [{ id: 1 }] });
         if (String(url).endsWith("/merge")) return json({ sha: "abc" });
         return json({}, 404);
       },
@@ -262,37 +243,33 @@ describe("canonical call path", () => {
       "abc",
     );
     assert.equal(calls.some((call) => call.endsWith("/user")), false);
-    assert.equal(calls.some((call) => call.includes("/installation/repositories")), true);
-
-    const denied = githubForge({
-      opener: opener("cursor-token"),
-      merger: merger("other-merger"),
-      fetch: async (url) => {
-        if (String(url).endsWith("/user")) return json({ login: "cursor[bot]" });
-        return json({}, 404);
-      },
-    });
+    assert.equal(calls.some((call) => call.includes("/installation")), false);
     await assert.rejects(
       () =>
-        denied.openPullRequest({
-          repoUrl: "https://github.com/example/app",
-          title: "t",
-          body: "b",
-          head: "feature",
-          base: "main",
+        probeGithub(opener("other"), async (url) => {
+          calls.push(String(url));
+          if (String(url).endsWith("/user")) return json({ id: 404, login: "other" });
+          return json({}, 404);
         }),
-      (error: unknown) =>
-        error instanceof CanonicalPathError &&
-        error.errorClass === "non-canonical-credential" &&
-        /cursor\[bot\]/.test(error.message),
+      /not an allowed principal/,
     );
   });
 
   it("fails a github user health check on 401 before graphql", async () => {
     const calls: string[] = [];
+    const credential = opener();
     await assert.rejects(
       () =>
-        githubGraphql(opener(), "{ viewer { login } }", async (url) => {
+        githubGraphql(credential, "{ viewer { login } }", async (url) => {
+          calls.push(String(url));
+          return json({ message: "Bad credentials" }, 401);
+        }),
+      /has not passed the health check/,
+    );
+    assert.deepEqual(calls, []);
+    await assert.rejects(
+      () =>
+        probeGithub(credential, async (url) => {
           calls.push(String(url));
           return json({ message: "Bad credentials" }, 401);
         }),
@@ -305,28 +282,22 @@ describe("canonical call path", () => {
     const previous = process.env.GH_TOKEN;
     process.env.GH_TOKEN = "stored-github";
     try {
-      let gitError: unknown;
-      try {
-        await gitForge({ cwd: process.cwd() }).compare({
-          repoUrl: "https://example.test/acme/api.git",
-          base: "main",
-          head: "feature",
-        });
-      } catch (error) {
-        gitError = error;
-      }
-      assert.equal(errorClass(gitError), "non-canonical-credential");
+      const open = opener();
+      await probeGithub(open, healthFetch);
       let remote = "";
+      let askToken = "";
       let sawStored = false;
-      lookupRemoteHead("https://github.com/example/app.git", "main", null, ((...args: unknown[]) => {
+      lookupRemoteHead("https://github.com/example/app.git", "main", open, ((...args: unknown[]) => {
         const command = args[1] as string[];
         remote = command?.[1] ?? "";
         const opts = args[2] as { env?: NodeJS.ProcessEnv };
+        askToken = opts?.env?.DELIVERY_LOOP_GIT_TOKEN ?? "";
         sawStored = opts?.env?.GH_TOKEN === "stored-github" || opts?.env?.GITHUB_TOKEN === "stored-github";
         return { status: 0, stdout: "abc1234\trefs/heads/main\n" };
       }) as typeof spawnSync);
-      assert.equal(remote.startsWith("https://github.com/example/app.git"), true);
-      assert.equal(remote.includes("stored-github"), false);
+      assert.equal(remote, "https://github.com/example/app.git");
+      assert.equal(remote.includes("opener-token"), false);
+      assert.equal(askToken, "opener-token");
       assert.equal(sawStored, false);
       let spawned = false;
       assert.throws(
@@ -392,6 +363,8 @@ describe("canonical call path", () => {
             acquisition: "mint-per-process",
             refresh: "per-process",
             mintCommand: "mint-aws-agent",
+            accountId: "123456789012",
+            expectedArn: "arn:aws:iam::123456789012:user/example",
           },
           {
             api: "aws",
@@ -400,6 +373,8 @@ describe("canonical call path", () => {
             acquisition: "mint-per-process",
             refresh: "per-process",
             mintCommand: "mint-aws-actions",
+            accountId: "123456789012",
+            expectedArn: "arn:aws:iam::123456789012:role/example",
           },
         ], "inventory.yaml"),
       /aws caller classes must use different sources/,
@@ -412,9 +387,16 @@ describe("canonical call path", () => {
         acquisition: "stored-static",
         refresh: "static",
         envRefs: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+        accountId: "123456789012",
+        expectedArn: "arn:aws:iam::123456789012:user/example",
+        expiresAt: "2099-01-01T00:00:00Z",
       },
       {
-        env: { AWS_ACCESS_KEY_ID: "AKIA_EXAMPLE", AWS_SECRET_ACCESS_KEY: "runtime-secret" },
+        env: {
+          AWS_ACCESS_KEY_ID: "AKIA_EXAMPLE",
+          AWS_SECRET_ACCESS_KEY: "runtime-secret",
+          AWS_SESSION_TOKEN: "session",
+        },
         spawn: () => ({ status: 1, stdout: "" }),
         fetch: async () => json({}),
       },
@@ -467,23 +449,57 @@ describe("canonical call path", () => {
     );
   });
 
-  it("every adapter module rejects a raw credential", async () => {
-    const files = readdirSync(here).filter((file) => file.endsWith(".ts") && !file.endsWith(".test.ts"));
-    assert.ok(files.length > support.size);
-    for (const file of files) {
-      if (support.has(file)) continue;
-      const mod = (await import(pathToFileURL(join(here, file)).href)) as {
-        rejectRawCredential?: () => unknown;
-      };
-      assert.equal(typeof mod.rejectRawCredential, "function", `${file} has no canonical-path enforcement`);
-      await assert.rejects(
-        async () => {
-          await mod.rejectRawCredential?.();
-        },
-        (error: unknown) => errorClass(error) === "non-canonical-credential",
-        file,
-      );
+  it("every registered adapter rejects raw, copied, and unprobed credentials before any call", async () => {
+    const files = new Set(readdirSync(here).filter((file) => file.endsWith(".ts") && !file.endsWith(".test.ts")));
+    for (const name of OUTBOUND_ADAPTERS) {
+      if (name === "land-branches.ts") continue;
+      assert.equal(files.has(name), true, name);
     }
+    const calls: string[] = [];
+    const fetch: FetchLike = async (url) => {
+      calls.push(String(url));
+      return json({}, 500);
+    };
+    const unprobed = {
+      linear: issue(linearPath, "linear-token"),
+      opener: opener(),
+      merger: merger(),
+      cursor: issue(
+        {
+          api: "cursor",
+          source: "ref:cursor-mint",
+          acquisition: "mint-per-process",
+          refresh: "per-process",
+          mintCommand: "mint-cursor",
+          healthCommand: "probe-cursor",
+        },
+        "cursor-token",
+      ),
+      http: issue(
+        {
+          api: "http",
+          source: "ref:http-mint",
+          acquisition: "mint-per-process",
+          refresh: "per-process",
+          mintCommand: "mint-http",
+          healthCommand: "probe-http",
+        },
+        "http-token",
+      ),
+    };
+    const raw = { token: "stored", api: "linear" };
+    const copied = { ...unprobed.opener, token: "copied" };
+    for (const attempt of adapterAttempts(unprobed)) {
+      await assert.rejects(async () => {
+        await attempt.run({ raw, copied, unprobed: unprobed.linear, fetch });
+      }, undefined, attempt.name);
+    }
+    assert.deepEqual(calls, []);
+    assert.throws(() => {
+      const handle = unprobed.opener as { token?: string };
+      handle.token = "mutated";
+    });
+    assert.equal(credentialSecret(unprobed.opener), "opener-token");
   });
 });
 

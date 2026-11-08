@@ -52,6 +52,8 @@ canonicalPaths:
     oauthUrl: https://api.linear.app/oauth/token
     scope: read,write
     expectedIdentity: Example Delivery
+    viewerId: "00000000-0000-4000-8000-000000000001"
+    organizationId: "00000000-0000-4000-8000-000000000002"
   - api: github
     role: opener
     source: ref:github-opener
@@ -60,6 +62,8 @@ canonicalPaths:
     mintCommand: mint-github-opener
     identityKind: user
     actorRef: ref:commit-actor
+    allowedPrincipalIds:
+      - "1001"
   - api: github
     role: merger
     source: ref:github-merger
@@ -67,6 +71,9 @@ canonicalPaths:
     refresh: per-process
     mintCommand: mint-github-merger
     identityKind: installation
+    appId: "2001"
+    installation: "2002"
+    repository: example/app
   - api: cursor
     source: ref:cursor-mint
     acquisition: mint-per-process
