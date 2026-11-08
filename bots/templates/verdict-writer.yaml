@@ -1,0 +1,15 @@
+specversion: "1.0"
+role: verdict-writer
+effect: data-only
+identityRef: ref:verdict-writer
+purpose: Records a ground verdict and the evidence that verdict cites.
+authority:
+  may:
+    - Record a ground verdict
+    - Record the evidence that verdict cites
+  mustNot:
+    - Write a delivery status
+    - Write a delivery label
+    - Start, dispatch, resume, or run the delivery loop
+    - Relax a quality gate
+    - Grant authority

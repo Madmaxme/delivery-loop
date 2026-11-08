@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Madmaxme/delivery-loop/schemas/bot-definition-1.0.schema.json",
+  "title": "delivery-loop bot definition",
+  "description": "A role template, or a client instance of that role. specversion 1.0. The file is data. It names no credential and no platform id. An identity is a reference. effect is data-only and cannot grant authority or relax a gate.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["specversion", "role", "effect", "purpose", "authority"],
+  "properties": {
+    "specversion": { "type": "string", "const": "1.0" },
+    "role": { "enum": ["orchestrator", "verdict-writer", "delivery-agent"] },
+    "effect": { "const": "data-only" },
+    "purpose": { "type": "string", "minLength": 1 },
+    "identityRef": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^ref:[a-z0-9][a-z0-9-]*$"
+    },
+    "tools": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ref", "adapter", "operation"],
+        "properties": {
+          "ref": { "type": "string", "pattern": "^ref:[a-z0-9][a-z0-9-]*$" },
+          "adapter": { "enum": ["forge", "tracker", "worker", "connector"] },
+          "operation": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9]*$" }
+        }
+      }
+    },
+    "identities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ref", "kind", "adapter", "purpose"],
+        "properties": {
+          "ref": { "type": "string", "pattern": "^ref:[a-z0-9][a-z0-9-]*$" },
+          "kind": { "enum": ["execution", "commit-actor", "review", "worker", "runner"] },
+          "adapter": { "enum": ["forge", "tracker", "worker", "connector", "runner"] },
+          "purpose": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["may", "mustNot"],
+      "properties": {
+        "may": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "mustNot": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

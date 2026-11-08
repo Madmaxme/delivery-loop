@@ -1,5 +1,8 @@
 import { readFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { parse } from "yaml";
+
+import { loadBotBundle, resolveBotRoot } from "../bots/load.ts";
 
 /** Writes to `repos` are refused unless the token's GitHub login is `login`. */
 export type CommitActor = {
@@ -186,6 +189,12 @@ export type ProjectPack = {
     maxAttempts?: number;
     caps?: Record<string, number>;
   };
+  /**
+   * Optional directory of bot instances, relative to this file.
+   * Absent means this install has no bot definitions and nothing there is read.
+   * The directory is validated and then dropped. It is not a gate and not a grant.
+   */
+  bots?: { path: string };
 };
 
 export function defaultStatus(): ProjectPack["status"] {
@@ -240,7 +249,22 @@ export function loadPack(path: string): ProjectPack {
   };
   raw.invariantHeadings = raw.invariantHeadings ?? [];
   raw.design = loadDesign(raw.design, path);
+  raw.bots = loadBotsField(raw.bots, path);
   return raw;
+}
+
+/**
+ * Validate `bots.path` when the pack sets it. The bundle is not kept.
+ * Definitions cannot change a gate, a status write, or a merge.
+ */
+function loadBotsField(bots: { path?: unknown } | undefined, packFile: string): { path: string } | undefined {
+  if (bots == null) return undefined;
+  if (typeof bots !== "object" || Array.isArray(bots)) throw new Error(`${packFile} bots must be a path`);
+  const rel = typeof bots.path === "string" ? bots.path.trim() : "";
+  if (!rel) throw new Error(`${packFile} bots.path is required when bots is set`);
+  if (isAbsolute(rel)) throw new Error(`${packFile} bots.path must be relative to the pack file`);
+  loadBotBundle(resolveBotRoot(packFile, rel));
+  return { path: rel };
 }
 
 function loadDesign(design: DesignSpec | undefined, path: string): DesignSpec | undefined {

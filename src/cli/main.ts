@@ -27,6 +27,7 @@ import { findConnector } from "../connectors/catalog.js";
 import { deliver, ship, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
 import { shipInvocationDeps } from "./ship-deps.js";
 import { ghaDispatchFields, planDeliveryInvocation } from "../engine/delivery-runtime.js";
+import { formatInventory, loadBotBundle, resolveBotRoot } from "../bots/load.ts";
 import { defaultStatus, loadPack, type ProjectPack } from "../schema/pack.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -317,6 +318,40 @@ function init(argv: string[]): void {
   console.log(`Installed delivery-loop in ${dir}`);
 }
 
+/**
+ * Read-only. No credential, no network, no write, no dispatch, no schedule.
+ * Returns a process status.
+ */
+export function botsCommand(argv: string[]): number {
+  const sub = argv[0];
+  if (sub !== "validate" && sub !== "list") {
+    console.error("Usage: delivery-loop bots validate|list [--dir <project>]");
+    return 1;
+  }
+  const dir = arg("--dir", argv) ?? process.cwd();
+  const file = packPath(dir);
+  let pack: ProjectPack;
+  try {
+    pack = loadPack(file);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    return 1;
+  }
+  if (!pack.bots) {
+    console.error("bots.path is not set");
+    return 1;
+  }
+  try {
+    const bundle = loadBotBundle(resolveBotRoot(file, pack.bots.path));
+    if (sub === "list") process.stdout.write(formatInventory(bundle.inventory));
+    else process.stdout.write("valid\n");
+    return 0;
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    return 1;
+  }
+}
+
 export function update(argv: string[]): void {
   const dir = arg("--dir", argv) ?? process.cwd();
   const yaml = readFileSync(packPath(dir), "utf8");
@@ -338,6 +373,7 @@ const command = argv[0];
 const isCli = (process.argv[1] ?? "").endsWith("main.ts") || (process.argv[1] ?? "").endsWith("delivery-loop.js");
 if (isCli) {
   if (command === "init") init(argv.slice(1));
+  else if (command === "bots") process.exit(botsCommand(argv.slice(1)));
   else if (command === "update") update(argv.slice(1));
   else if (command === "connector" && argv[1] === "add") {
     installConnector(arg("--dir", argv) ?? process.cwd(), argv[2]);
@@ -345,7 +381,9 @@ if (isCli) {
   } else if (command === "sweep" || command === "deliver" || command === "ground" || command === "ship") {
     dispatchOrRun(command === "deliver" ? "pipeline" : command, argv.slice(1));
   } else {
-    console.error("Usage: delivery-loop init|update|connector add <name>|sweep|deliver <id>|ground <id>|ship [continue] [id]");
+    console.error(
+      "Usage: delivery-loop init|update|connector add <name>|bots validate|bots list|sweep|deliver <id>|ground <id>|ship [continue] [id]",
+    );
     process.exit(command ? 1 : 0);
   }
 }

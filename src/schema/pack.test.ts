@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
 import { loadPack } from "./pack.ts";
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
 function write(body: string): string {
   const dir = mkdtempSync(join(tmpdir(), "pack-"));
@@ -112,5 +115,40 @@ design:
 
   it("refuses a tracker that is not a real queue", () => {
     assert.throws(() => loadPack(write(base.replace("tracker: linear", "tracker: files"))), /tracker/);
+  });
+
+  it("does not read a bots directory when the pack omits bots", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pack-"));
+    writeFileSync(join(dir, "delivery-loop.yaml"), base);
+    mkdirSync(join(dir, "bots"));
+    writeFileSync(join(dir, "bots/manifest.yaml"), "token: present\n");
+    const pack = loadPack(join(dir, "delivery-loop.yaml"));
+    assert.equal(pack.bots, undefined);
+    assert.equal(pack.qualityCommand, "npm test");
+  });
+
+  it("validates a relative bots directory and keeps only the path", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pack-"));
+    const rel = relative(dir, join(root, "bots/templates"));
+    writeFileSync(join(dir, "delivery-loop.yaml"), `${base}\nbots:\n  path: ${rel}\n`);
+    const pack = loadPack(join(dir, "delivery-loop.yaml"));
+    assert.deepEqual(pack.bots, { path: rel });
+    assert.equal(pack.qualityCommand, "npm test");
+    assert.equal("definitions" in (pack.bots as object), false);
+  });
+
+  it("follows a bots directory symlink and still confines reads to that directory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pack-"));
+    symlinkSync(join(root, "bots/templates"), join(dir, "linked"));
+    writeFileSync(join(dir, "delivery-loop.yaml"), `${base}\nbots:\n  path: linked\n`);
+    assert.deepEqual(loadPack(join(dir, "delivery-loop.yaml")).bots, { path: "linked" });
+  });
+
+  it("refuses an absolute bots path", () => {
+    assert.throws(() => loadPack(write(`${base}\nbots:\n  path: /tmp/bots\n`)), /relative/);
+  });
+
+  it("refuses bots without a path", () => {
+    assert.throws(() => loadPack(write(`${base}\nbots: {}\n`)), /bots.path/);
   });
 });

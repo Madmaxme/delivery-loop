@@ -1,0 +1,17 @@
+specversion: "1.0"
+role: orchestrator
+effect: data-only
+identityRef: ref:orchestrator
+purpose: Monitors existing delivery runs and reports evidence.
+authority:
+  may:
+    - Monitor existing delivery runs
+    - Report evidence from those runs
+  mustNot:
+    - Start the delivery loop
+    - Dispatch the delivery loop
+    - Re-dispatch the delivery loop
+    - Resume the delivery loop
+    - Run the delivery loop, including a scheduled sweep and a ground-only compile
+    - Write a delivery status
+    - Write a delivery label
