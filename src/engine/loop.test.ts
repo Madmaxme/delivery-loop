@@ -1330,6 +1330,46 @@ describe("loop", () => {
     assert.equal(env.state(), "Dev");
   });
 
+  it("posts the validated proof receipt before dev and reuses it on resume", async () => {
+    const url = "https://example.test/artifacts/signup.mp4";
+    const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded"));
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => ({ status: 0, stdout: `**Journey proof:** \`${url}\`` });
+    env.deps.lookupHead = () => "trunk";
+    const order: string[] = [];
+    const comment = env.deps.tracker.comment.bind(env.deps.tracker);
+    const setState = env.deps.tracker.setState.bind(env.deps.tracker);
+    env.deps.tracker.comment = async (id, body) => {
+      if (body.includes("<!-- PROOF_RECEIPT -->")) order.push("proof");
+      await comment(id, body);
+    };
+    env.deps.tracker.setState = async (id, next) => {
+      order.push(`state:${next}`);
+      await setState(id, next);
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+    const proof = env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->"));
+    assert.equal(proof.length, 1);
+    assert.match(proof[0], new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(proof[0], /trunk https:\/\/github\.com\/acme\/api\/pull\/4/);
+    assert.ok(order.indexOf("proof") >= 0);
+    assert.ok(order.indexOf("proof") < order.indexOf("state:Dev"));
+    const again = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          { body: proof[0] },
+          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
+        ],
+      }),
+    );
+    assert.equal(again.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+    assert.equal(env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->")).length, 1);
+  });
+
   it("keeps dev when ship fails, edits that owner once, and resumes the step", async () => {
     const env = harness(BUILDABLE);
     let runs = 0;
