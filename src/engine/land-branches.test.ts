@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { confirmLandBranches, renderBranch } from "./land-branches.ts";
+import { confirmLandBranches, lookupRemoteHead, renderBranch } from "./land-branches.ts";
 
 const repos = [{ name: "api", url: "https://github.com/acme/api", trunk: "main" }];
 
@@ -50,5 +53,54 @@ describe("land branches", () => {
       }),
       null,
     );
+  });
+
+  it("passes a legacy GitHub token through askpass and keeps proxy settings", () => {
+    const dir = mkdtempSync(join(tmpdir(), "git-ask-"));
+    const argsFile = join(dir, "args");
+    const tokenFile = join(dir, "token");
+    const askFile = join(dir, "ask");
+    const token = "secret-token-value";
+    writeFileSync(
+      join(dir, "git"),
+      `#!/bin/sh
+printf '%s\\n' "$@" > ${JSON.stringify(argsFile)}
+printf '%s\\n' "\${DELIVERY_LOOP_GIT_TOKEN-unset}" > ${JSON.stringify(tokenFile)}
+printf '%s\\n' "\${GH_TOKEN-unset}" > ${JSON.stringify(join(dir, "ambient"))}
+printf '%s\\n' "\${HTTPS_PROXY-unset}" > ${JSON.stringify(join(dir, "proxy"))}
+printf '%s\\n' "$GIT_ASKPASS" > ${JSON.stringify(askFile)}
+printf '%s\\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main"
+`,
+      { mode: 0o755 },
+    );
+    const previousPath = process.env.PATH;
+    const previousGh = process.env.GH_TOKEN;
+    const previousProxy = process.env.HTTPS_PROXY;
+    process.env.PATH = `${dir}:${previousPath ?? ""}`;
+    process.env.GH_TOKEN = "ambient-token";
+    process.env.HTTPS_PROXY = "http://proxy.example";
+    try {
+      const sha = lookupRemoteHead("https://github.com/acme/api", "main", token);
+      assert.equal(sha, "a".repeat(40));
+      const args = readFileSync(argsFile, "utf8");
+      assert.equal(args.includes(token), false);
+      assert.equal(args.includes("ambient-token"), false);
+      assert.match(args, /https:\/\/github.com\/acme\/api/);
+      assert.equal(readFileSync(tokenFile, "utf8").trim(), token);
+      assert.equal(readFileSync(join(dir, "ambient"), "utf8").trim(), "unset");
+      assert.equal(readFileSync(join(dir, "proxy"), "utf8").trim(), "http://proxy.example");
+      assert.ok(readFileSync(askFile, "utf8").trim().endsWith("askpass.sh"));
+      const plain = lookupRemoteHead("https://github.com/acme/api", "main");
+      assert.equal(plain, "a".repeat(40));
+      assert.equal(readFileSync(tokenFile, "utf8").trim(), "unset");
+      assert.equal(readFileSync(join(dir, "ambient"), "utf8").trim(), "unset");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousGh === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = previousGh;
+      if (previousProxy === undefined) delete process.env.HTTPS_PROXY;
+      else process.env.HTTPS_PROXY = previousProxy;
+    }
   });
 });

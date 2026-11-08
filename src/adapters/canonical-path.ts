@@ -71,7 +71,23 @@ type HealthMark = {
 const secrets = new WeakMap<CanonicalCredential, SecretRecord>();
 const health = new WeakMap<CanonicalCredential, HealthMark>();
 
-const ENV_ALLOW = ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"];
+/** Names a child may inherit. Proxy and CA names match the git child env in #39. Tokens are not in this list. */
+const ENV_ALLOW = [
+  "PATH",
+  "HOME",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "NO_PROXY",
+  "no_proxy",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "GIT_SSL_CAINFO",
+];
 
 export class CanonicalPathError extends Error {
   readonly errorClass: CanonicalErrorClass;

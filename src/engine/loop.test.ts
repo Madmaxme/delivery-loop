@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1498,6 +1499,81 @@ describe("loop", () => {
     process.env.DELIVERY_LOOP_GITHUB_MINT = `echo minted > ${marker}; echo replacement-token`;
     const step = `if [ ! -s ${marker} ]; then echo 'HTTP 401: Bad credentials' >&2; exit 1; fi`;
     env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
+    try {
+      await ship(env.deps, "API-1");
+    } finally {
+      if (previous === undefined) delete process.env.DELIVERY_LOOP_GITHUB_MINT;
+      else process.env.DELIVERY_LOOP_GITHUB_MINT = previous;
+    }
+    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 1);
+    assert.equal(env.comments.some((body) => body.includes("OWNER_HEAL")), false);
+  });
+
+  it("gives a minted GitHub token to the ship step and not to the runner", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.worker.join = async () => ({
+      status: "finished",
+      branch: "delivery/api-1",
+      head: "abc",
+      text: "**Heal:** login",
+    });
+    const dir = mkdtempSync(join(tmpdir(), "ship-token-"));
+    const during = join(dir, "during");
+    const seen = join(dir, "seen");
+    const mint = join(dir, "mint.js");
+    const stepFile = join(dir, "step.js");
+    writeFileSync(
+      mint,
+      `const fs = require("fs"); fs.writeFileSync(process.argv[2], process.env.GH_TOKEN || ""); process.stdout.write("minted-for-ship\\n");`,
+    );
+    writeFileSync(
+      stepFile,
+      `const fs = require("fs"); const token = process.env.GH_TOKEN || ""; if (!token) { console.error("HTTP 401"); process.exit(1); } fs.writeFileSync(process.argv[2], token); process.stdout.write(token + "\\n");`,
+    );
+    const previousMint = process.env.DELIVERY_LOOP_GITHUB_MINT;
+    const previousGh = process.env.GH_TOKEN;
+    const previousGithub = process.env.GITHUB_TOKEN;
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    process.env.DELIVERY_LOOP_GITHUB_MINT = `node ${mint} ${during}`;
+    env.deps.pack = { ...pack, ship: { steps: [`node ${stepFile} ${seen}`], markStatus: false } };
+    const echoed: string[] = [];
+    const write = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array, enc?: BufferEncoding, cb?: (error?: Error | null) => void) => {
+      echoed.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return write(chunk, enc as BufferEncoding, cb);
+    }) as typeof process.stdout.write;
+    try {
+      await ship(env.deps, "API-1");
+      const later = spawnSync(process.execPath, ["-e", "process.stdout.write(process.env.GH_TOKEN || '')"], {
+        encoding: "utf8",
+      });
+      assert.equal(later.stdout, "");
+      assert.equal(process.env.GH_TOKEN, undefined);
+      assert.equal(process.env.GITHUB_TOKEN, undefined);
+      assert.equal(readFileSync(during, "utf8"), "");
+      assert.equal(readFileSync(seen, "utf8"), "minted-for-ship");
+      assert.equal(echoed.join("").includes("minted-for-ship"), false);
+      assert.match(echoed.join(""), /\[redacted\]/);
+    } finally {
+      process.stdout.write = write;
+      if (previousMint === undefined) delete process.env.DELIVERY_LOOP_GITHUB_MINT;
+      else process.env.DELIVERY_LOOP_GITHUB_MINT = previousMint;
+      if (previousGh === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = previousGh;
+      if (previousGithub === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = previousGithub;
+    }
+  });
+
+  it("does not run the legacy login mint in canonical mode", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.credentialMode = "canonical";
+    env.deps.worker.join = async () => ({ status: "finished", branch: "delivery/api-1", head: "abc", text: "**Heal:** login" });
+    const marker = join(mkdtempSync(join(tmpdir(), "ship-canonical-")), "minted");
+    const previous = process.env.DELIVERY_LOOP_GITHUB_MINT;
+    process.env.DELIVERY_LOOP_GITHUB_MINT = `echo minted > ${marker}; echo replacement-token`;
+    env.deps.pack = { ...pack, ship: { steps: ["echo 'HTTP 401' >&2; exit 1"], markStatus: false } };
     try {
       await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed/);
     } finally {

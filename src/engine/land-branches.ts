@@ -3,13 +3,13 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { lockedGitEnv } from "../adapters/forge-git.ts";
 import {
   allowlistedEnv,
   assertHealthy,
   credentialSecret,
   type CanonicalCredential,
 } from "../adapters/canonical-path.ts";
+import { registerSecret } from "./redact.ts";
 import type { RepoSpec } from "../schema/pack.ts";
 
 export function renderBranch(template: string, issue: string, repo: string): string {
@@ -77,23 +77,21 @@ export function confirmLandBranches(input: {
 
 /**
  * Git reads the token from askpass. The remote URL and the argv do not contain it.
- * A stamped credential wins. Otherwise the process token is used, still outside argv.
+ * A canonical handle is checked before the secret is released. A string is #39's
+ * legacy ship token: it is not a healthy handle and is not read from the ambient env.
  */
 export function lookupRemoteHead(
   repoUrl: string,
   branch: string,
-  credential?: CanonicalCredential | null,
+  credential: CanonicalCredential | string | null = null,
   spawn: typeof spawnSync = spawnSync,
 ): string | null {
-  if (credential) assertHealthy(credential);
-  const token = credential
-    ? credentialSecret(credential, { api: "github", operation: "git", role: "opener", destination: repoUrl })
-    : "";
+  const token = gitToken(credential, repoUrl);
   const ask = token ? gitAskPass(token) : null;
   try {
     const result = spawn("git", ["-c", "credential.helper=", "ls-remote", repoUrl, `refs/heads/${branch}`], {
       encoding: "utf8",
-      env: ask?.env ?? lockedGitEnv(),
+      env: gitChildEnv(ask?.extra ?? {}),
     });
     if (result.status !== 0) return null;
     const sha = result.stdout.trim().split(/\s+/)[0] ?? "";
@@ -103,15 +101,40 @@ export function lookupRemoteHead(
   }
 }
 
+function gitToken(credential: CanonicalCredential | string | null, repoUrl: string): string {
+  if (typeof credential === "string") {
+    const token = credential.trim();
+    if (token) registerSecret(token);
+    return token;
+  }
+  if (!credential) return "";
+  assertHealthy(credential);
+  return credentialSecret(credential, {
+    api: "github",
+    operation: "git",
+    role: "opener",
+    destination: repoUrl,
+  });
+}
+
+/** Proxy and CA settings only, plus the askpass binding. No other tokens are copied. */
+function gitChildEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
+  return allowlistedEnv(process.env, {
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    ...extra,
+  });
+}
+
 /** A git child reads the token from the environment. The token is not a URL argument. */
-function gitAskPass(token: string): { dir: string; env: NodeJS.ProcessEnv } {
+function gitAskPass(token: string): { dir: string; extra: Record<string, string> } {
   const dir = mkdtempSync(join(tmpdir(), "git-askpass-"));
   const file = join(dir, "askpass.sh");
   writeFileSync(file, "#!/bin/sh\nprintf '%s\\n' \"$DELIVERY_LOOP_GIT_TOKEN\"\n", { mode: 0o700 });
   return {
     dir,
-    env: {
-      ...lockedGitEnv(),
+    extra: {
       GIT_ASKPASS: file,
       GIT_TERMINAL_PROMPT: "0",
       DELIVERY_LOOP_GIT_TOKEN: token,

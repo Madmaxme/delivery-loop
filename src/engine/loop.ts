@@ -35,6 +35,7 @@ import {
 import { allowlistedEnv, credentialSecret, type CanonicalCredential } from "../adapters/canonical-path.ts";
 import { lockedGitEnv } from "../adapters/forge-git.ts";
 import { confirmLandBranches, lookupRemoteHead, renderBranch } from "./land-branches.js";
+import { createStreamRedactor, redactSecrets, registerLoadedSecrets, registerSecret, registeredSecrets } from "./redact.ts";
 import {
   invariantExists,
   journeyEvidenceBlocksBuild,
@@ -91,8 +92,14 @@ export type LoopDeps = {
   githubRunActive?: (runId: string | null) => boolean | null;
   /** Override for tests. Default is `git ls-remote` for refs/heads/<branch>. */
   lookupHead?: (repoUrl: string, branch: string) => string | null;
-  /** Opaque GitHub opener handle. `remoteHead` passes it to `lookupRemoteHead`. */
+  /** Opaque GitHub opener handle. Canonical `remoteHead` passes it to `lookupRemoteHead`. */
   githubHandle?: CanonicalCredential | null;
+  /**
+   * GitHub token minted for a rejected login on the legacy path.
+   * Ship steps and `git ls-remote` read it. It is not written onto `process.env`.
+   * Canonical mode does not use this field.
+   */
+  githubCredential?: string;
   /** Override for tests. Default waits 30s between quality checks. */
   sleep?: (ms: number) => Promise<void>;
   qualityPollMs?: number;
@@ -1164,8 +1171,18 @@ async function healShipStep(
   return applyOwnerHeal(deps, ticket, key, reason);
 }
 
-function refreshShipGithubToken(_env: NodeJS.ProcessEnv): boolean {
-  return false;
+function refreshShipGithubToken(deps: LoopDeps, env: NodeJS.ProcessEnv): boolean {
+  if (deps.credentialMode === "canonical") return false;
+  const command = (env.DELIVERY_LOOP_GITHUB_MINT ?? process.env.DELIVERY_LOOP_GITHUB_MINT ?? "").trim();
+  if (!command) return false;
+  const result = spawnSync(command, { shell: true, encoding: "utf8" });
+  const token = (result.stdout ?? "").trim().split(/\n/).at(-1)?.trim() ?? "";
+  if (result.status !== 0 || !token) return false;
+  registerSecret(token);
+  deps.githubCredential = token;
+  env.GH_TOKEN = token;
+  env.GITHUB_TOKEN = token;
+  return true;
 }
 
 function githubStatusEnv(deps: LoopDeps): NodeJS.ProcessEnv {
@@ -1181,7 +1198,12 @@ function githubStatusEnv(deps: LoopDeps): NodeJS.ProcessEnv {
 
 function remoteHead(deps: LoopDeps): (repoUrl: string, branch: string) => string | null {
   if (deps.lookupHead) return deps.lookupHead;
-  return (repoUrl, branch) => lookupRemoteHead(repoUrl, branch, deps.githubHandle ?? null);
+  return (repoUrl, branch) => {
+    if (deps.credentialMode === "canonical" || deps.githubHandle) {
+      return lookupRemoteHead(repoUrl, branch, deps.githubHandle ?? null);
+    }
+    return lookupRemoteHead(repoUrl, branch, deps.githubCredential ?? "");
+  };
 }
 
 function runShipStep(
@@ -1190,11 +1212,14 @@ function runShipStep(
   env: NodeJS.ProcessEnv,
 ): Promise<{ status: number | null; tail: string }> {
   return new Promise((resolve) => {
+    registerLoadedSecrets(env);
     const child = spawn(step, { shell: true, cwd, env, stdio: ["inherit", "pipe", "pipe"] });
     const lines: string[] = [];
+    const redactor = createStreamRedactor(registeredSecrets());
     const take = (chunk: Buffer, dest: NodeJS.WriteStream) => {
-      dest.write(chunk);
-      for (const piece of chunk.toString("utf8").split(/\n/)) {
+      const redacted = redactor.push(chunk.toString("utf8"));
+      if (redacted) dest.write(redacted);
+      for (const piece of redacted.split(/\n/)) {
         const trimmed = piece.trim();
         if (!trimmed) continue;
         lines.push(trimmed);
@@ -1204,7 +1229,15 @@ function runShipStep(
     child.stdout?.on("data", (chunk: Buffer) => take(chunk, process.stdout));
     child.stderr?.on("data", (chunk: Buffer) => take(chunk, process.stderr));
     child.on("error", () => resolve({ status: 1, tail: lines.slice(-8).join("\n") }));
-    child.on("close", (code) => resolve({ status: code, tail: lines.slice(-8).join("\n") }));
+    child.on("close", (code) => {
+      const rest = redactor.flush();
+      if (rest) {
+        process.stdout.write(rest);
+        const trimmed = rest.trim();
+        if (trimmed) lines.push(trimmed);
+      }
+      resolve({ status: code, tail: redactSecrets(lines.slice(-8).join("\n"), registeredSecrets()) });
+    });
   });
 }
 
@@ -1720,7 +1753,7 @@ async function healNo(
     return paused;
   }
   if (verdict === "login") {
-    if (tries.login || !refreshShipGithubToken(process.env)) {
+    if (tries.login || !refreshShipGithubToken(deps, {})) {
       const paused = pauseLand(
         ticket.identifier,
         current.url,
@@ -2161,16 +2194,28 @@ export async function ship(
 ): Promise<void> {
   const steps = mode === "continue" ? (deps.pack.ship?.continue ?? []) : (deps.pack.ship?.steps ?? []);
   if (mode === "continue" && steps.length === 0) throw new Error("ship continue has no steps");
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     DELIVERY_LOOP_ISSUE: identifier ?? "",
     DELIVERY_LOOP_SHIP_ARGS: extraArgs ?? "",
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: "/dev/null",
   };
-  delete env.GH_TOKEN;
-  delete env.GITHUB_TOKEN;
-  delete env.LINEAR_API_KEY;
+  if (deps.credentialMode === "canonical") {
+    delete env.GH_TOKEN;
+    delete env.GITHUB_TOKEN;
+    delete env.LINEAR_API_KEY;
+    if (deps.githubHandle) {
+      const token = credentialSecret(deps.githubHandle, {
+        api: "github",
+        operation: "gh",
+        role: "opener",
+        destination: "https://api.github.com",
+      });
+      env.GH_TOKEN = token;
+      env.GITHUB_TOKEN = token;
+    }
+  }
   async function loadTicket(): Promise<Ticket | null> {
     if (!identifier) return null;
     try {
@@ -2225,7 +2270,7 @@ export async function ship(
         continue;
       }
       if (verdict === "login") {
-        if (refreshedLogin || !refreshShipGithubToken(env)) throw new Error(`ship step failed: ${step}`);
+        if (refreshedLogin || !refreshShipGithubToken(deps, env)) throw new Error(`ship step failed: ${step}`);
         refreshedLogin = true;
         result = await runShipStep(step, cwd, env);
         continue;

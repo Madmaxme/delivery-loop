@@ -85,12 +85,15 @@ export function githubForge(opts: {
   merger?: CanonicalCredential;
   /** Set only when the trusted base selected legacy mode. Not a canonical credential. */
   legacyToken?: string;
+  /** #39's name for the legacy token. Canonical calls pass opener and merger instead. */
+  token?: string;
   fetch?: FetchLike;
   repo?: string;
   /** Writes by the opener require the trusted commit-actor id. */
   commitActors?: CommitActor[];
 }): ForgeAdapter {
-  const legacy = Boolean(opts.legacyToken);
+  const legacyToken = opts.legacyToken ?? opts.token;
+  const legacy = Boolean(legacyToken);
   if (legacy === Boolean(opts.opener || opts.merger)) {
     throw new CanonicalPathError("invalid-policy", "github", "legacy mode is distinct from a canonical credential");
   }
@@ -111,8 +114,8 @@ export function githubForge(opts: {
     "X-GitHub-Api-Version": "2022-11-28",
     "Content-Type": "application/json",
   });
-  const openerHeaders = legacy ? bearer(opts.legacyToken ?? "") : headersFor(opts.opener as CanonicalCredential, "opener");
-  const mergerHeaders = legacy ? bearer(opts.legacyToken ?? "") : headersFor(opts.merger as CanonicalCredential, "merger");
+  const openerHeaders = legacy ? bearer(legacyToken ?? "") : headersFor(opts.opener as CanonicalCredential, "opener");
+  const mergerHeaders = legacy ? bearer(legacyToken ?? "") : headersFor(opts.merger as CanonicalCredential, "merger");
 
   async function gateOpener(repoUrl: string): Promise<void> {
     if (legacy) {
