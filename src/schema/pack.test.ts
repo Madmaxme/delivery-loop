@@ -48,8 +48,16 @@ describe("pack requirements", () => {
   });
 
   it("keeps optional symbol, journey, and ship-after-dev commands", () => {
-    const pack = loadPack(
-      write(`${base}
+    const lines: string[] = [];
+    const writeErr = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      lines.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    }) as typeof process.stderr.write;
+    let pack;
+    try {
+      pack = loadPack(
+        write(`${base}
 symbolsCommand: node scripts/code-graph.mjs --check
 journeyCommand: node scripts/journey-proof.mjs
 ship:
@@ -58,12 +66,16 @@ ship:
   steps:
     - ./scripts/ship.sh
 `),
-    );
+      );
+    } finally {
+      process.stderr.write = writeErr;
+    }
     assert.equal(pack.symbolsCommand, "node scripts/code-graph.mjs --check");
     assert.equal(pack.journeyCommand, "node scripts/journey-proof.mjs");
     assert.equal(pack.ship?.afterDev, true);
     assert.equal(pack.ship?.markStatus, false);
     assert.deepEqual(pack.ship?.steps, ["./scripts/ship.sh"]);
+    assert.match(lines.join(""), /journeyCommand is ignored/);
   });
 
   it("keeps a scoped promote command on the dev block", () => {
@@ -104,6 +116,27 @@ design:
     assert.equal(pack.design?.figmaTokenEnv, "FIGMA_ACCESS_TOKEN");
     assert.equal(pack.design?.repos[0]?.checkName, "ui-primitives");
     assert.equal(pack.design?.repos[0]?.tokenFile, "src/tokens.scss");
+    const lines: string[] = [];
+    const writeErr = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      lines.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      loadPack(
+        write(`${base}
+design:
+  repos:
+    - name: admin-web
+      check: npm run check:ui-primitives
+      checkName: ui-primitives
+      tokenFile: src/tokens.scss
+`),
+      );
+    } finally {
+      process.stderr.write = writeErr;
+    }
+    assert.match(lines.join(""), /admin-web has no proofPaths/);
   });
 
   it("refuses a design repo that omits its check", () => {

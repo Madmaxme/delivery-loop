@@ -273,6 +273,8 @@ export type EngineHealFile = {
   /** Null when the file is not package metadata, or the base blob could not be read. */
   baseText: string | null;
   headText: string | null;
+  /** A symlink (mode 120000) or a git type change. Those cannot auto-merge. */
+  symlinkOrTypeChange?: boolean;
 };
 
 /** A repository path. `..`, absolute paths, and empty segments are unknown. */
@@ -336,25 +338,21 @@ function packageLockNeedsReview(baseText: string | null, headText: string | null
   return JSON.stringify(sortKeys(stripLockVersion(base))) !== JSON.stringify(sortKeys(stripLockVersion(head)));
 }
 
-const AUTO_MERGE_SOURCE_SUFFIXES = [".ts", ".tsx", ".js", ".mjs", ".cjs"] as const;
-
 /**
- * Paths that do not decide a gate. Auto-merge allows only this list.
- * `src/engine`, `src/adapters`, `src/schema`, and `src/bots` are trust code and are not on it.
+ * Code paths that may auto-merge. Empty: every code change goes to review.
+ * A version-only package.json and package-lock.json change is allowed separately.
  */
-export const ENGINE_HEAL_NON_TRUST_PREFIXES = ["src/connectors/"] as const;
+export const ENGINE_HEAL_NON_TRUST_PREFIXES: readonly string[] = [];
 
 /**
- * True when this path is on the explicit non-trust list.
- * A version-only package.json and package-lock.json change is included.
+ * True only for the package manifest and the lockfile.
+ * Those still need a version-only content check. Every other path, including
+ * `src/connectors/catalog.ts`, goes to review.
  */
 export function engineHealAutoMergePath(path: string): boolean {
   const normalized = normalizeRepoPath(path);
   if (!normalized) return false;
-  if (normalized === "package.json" || normalized === "package-lock.json") return true;
-  if (/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(normalized)) return false;
-  if (!ENGINE_HEAL_NON_TRUST_PREFIXES.some((prefix) => normalized.startsWith(prefix))) return false;
-  return AUTO_MERGE_SOURCE_SUFFIXES.some((suffix) => normalized.endsWith(suffix));
+  return normalized === "package.json" || normalized === "package-lock.json";
 }
 
 /**
@@ -363,6 +361,7 @@ export function engineHealAutoMergePath(path: string): boolean {
  * Anything else, including .npmrc, tsconfig, and test or tool config, needs a normal review.
  */
 export function engineHealFileNeedsReview(file: EngineHealFile): boolean {
+  if (file.symlinkOrTypeChange) return true;
   const path = normalizeRepoPath(file.path);
   if (!path || !engineHealAutoMergePath(path)) return true;
   if (path === "package.json") return packageManifestNeedsReview(file.baseText, file.headText);
@@ -509,24 +508,52 @@ export function gitBlobSha(cwd: string, rev: string, path: string): string | nul
  */
 export function gitChangedFiles(cwd: string, baseRev: string, headRev: string): EngineHealFile[] | null {
   if (!baseRev.trim() || !headRev.trim() || baseRev.includes("\0") || headRev.includes("\0")) return null;
-  const listed = gitText(cwd, [
-    "diff",
-    "-z",
-    "--name-only",
-    "--diff-filter=ACDMRTUXB",
-    `${baseRev}...${headRev}`,
-  ]);
+  const listed = gitText(cwd, ["diff", "-z", "--raw", `${baseRev}...${headRev}`]);
   if (listed === null) return null;
-  const paths = listed.split("\0").filter((path) => path.length > 0);
+  const parsed = parseRawDiff(listed);
+  if (parsed === null) return null;
   const files: EngineHealFile[] = [];
-  for (const path of paths) {
-    if (path === "package.json" || path === "package-lock.json") {
-      const baseText = gitText(cwd, ["show", `${baseRev}:${path}`]);
-      const headText = gitText(cwd, ["show", `${headRev}:${path}`]);
-      files.push({ path, baseText, headText });
+  for (const item of parsed) {
+    if (item.symlinkOrTypeChange || (item.path !== "package.json" && item.path !== "package-lock.json")) {
+      files.push({ path: item.path, baseText: null, headText: null, symlinkOrTypeChange: item.symlinkOrTypeChange });
       continue;
     }
-    files.push({ path, baseText: null, headText: null });
+    const baseText = gitText(cwd, ["show", `${baseRev}:${item.path}`]);
+    const headText = gitText(cwd, ["show", `${headRev}:${item.path}`]);
+    files.push({ path: item.path, baseText, headText, symlinkOrTypeChange: false });
+  }
+  return files;
+}
+
+/** Null when the raw diff is malformed. A symlink or a type change is flagged. */
+function parseRawDiff(raw: string): { path: string; symlinkOrTypeChange: boolean }[] | null {
+  const parts = raw.split("\0");
+  const files: { path: string; symlinkOrTypeChange: boolean }[] = [];
+  let index = 0;
+  while (index < parts.length) {
+    const meta = parts[index];
+    if (!meta) {
+      index += 1;
+      continue;
+    }
+    if (!meta.startsWith(":")) return null;
+    const fields = meta.slice(1).trim().split(/\s+/);
+    if (fields.length < 5) return null;
+    const status = fields[4] ?? "";
+    const path = parts[index + 1];
+    if (path === undefined) return null;
+    index += 2;
+    let name = path;
+    if (status.startsWith("R") || status.startsWith("C")) {
+      const renamed = parts[index];
+      if (renamed === undefined) return null;
+      name = renamed;
+      index += 1;
+    }
+    files.push({
+      path: name,
+      symlinkOrTypeChange: fields[0] === "120000" || fields[1] === "120000" || status.startsWith("T"),
+    });
   }
   return files;
 }

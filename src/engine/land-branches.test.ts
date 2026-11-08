@@ -67,6 +67,7 @@ describe("land branches", () => {
 printf '%s\\n' "$@" > ${JSON.stringify(argsFile)}
 printf '%s\\n' "\${DELIVERY_LOOP_GIT_TOKEN-unset}" > ${JSON.stringify(tokenFile)}
 printf '%s\\n' "\${GH_TOKEN-unset}" > ${JSON.stringify(join(dir, "ambient"))}
+printf '%s\\n' "\${HTTPS_PROXY-unset}" > ${JSON.stringify(join(dir, "proxy"))}
 printf '%s\\n' "$GIT_ASKPASS" > ${JSON.stringify(askFile)}
 printf '%s\\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main"
 `,
@@ -74,8 +75,10 @@ printf '%s\\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main"
     );
     const previousPath = process.env.PATH;
     const previousGh = process.env.GH_TOKEN;
+    const previousProxy = process.env.HTTPS_PROXY;
     process.env.PATH = `${dir}:${previousPath ?? ""}`;
     process.env.GH_TOKEN = "ambient-token";
+    process.env.HTTPS_PROXY = "http://proxy.example";
     try {
       const sha = lookupRemoteHead("https://github.com/acme/api", "main", token);
       assert.equal(sha, "a".repeat(40));
@@ -85,6 +88,7 @@ printf '%s\\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main"
       assert.match(args, /https:\/\/github.com\/acme\/api/);
       assert.equal(readFileSync(tokenFile, "utf8").trim(), token);
       assert.equal(readFileSync(join(dir, "ambient"), "utf8").trim(), "unset");
+      assert.equal(readFileSync(join(dir, "proxy"), "utf8").trim(), "http://proxy.example");
       assert.ok(readFileSync(askFile, "utf8").trim().endsWith("askpass.sh"));
       const plain = lookupRemoteHead("https://github.com/acme/api", "main");
       assert.equal(plain, "a".repeat(40));
@@ -95,6 +99,8 @@ printf '%s\\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main"
       else process.env.PATH = previousPath;
       if (previousGh === undefined) delete process.env.GH_TOKEN;
       else process.env.GH_TOKEN = previousGh;
+      if (previousProxy === undefined) delete process.env.HTTPS_PROXY;
+      else process.env.HTTPS_PROXY = previousProxy;
     }
   });
 });

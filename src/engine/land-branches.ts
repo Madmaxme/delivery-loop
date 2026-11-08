@@ -90,11 +90,27 @@ export function lookupRemoteHead(repoUrl: string, branch: string, token = ""): s
   }
 }
 
-/** PATH and HOME only, plus the askpass binding. The process environment is not copied. */
+const GIT_ENV_PASSTHROUGH = [
+  "PATH",
+  "HOME",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "NO_PROXY",
+  "no_proxy",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "GIT_SSL_CAINFO",
+] as const;
+
+/** Proxy and CA settings only, plus the askpass binding. No other tokens are copied. */
 function gitChildEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  if (process.env.PATH) env.PATH = process.env.PATH;
-  if (process.env.HOME) env.HOME = process.env.HOME;
+  for (const name of GIT_ENV_PASSTHROUGH) {
+    const value = process.env[name];
+    if (value) env[name] = value;
+  }
   for (const [key, value] of Object.entries(extra)) env[key] = value;
   return env;
 }

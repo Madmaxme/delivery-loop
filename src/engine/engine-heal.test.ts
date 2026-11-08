@@ -448,7 +448,18 @@ describe("engine heal release", () => {
     assert.equal(engineHealFileNeedsReview({ path: "src/adapters/forge-github.ts", baseText: null, headText: null }), true);
     assert.equal(engineHealFileNeedsReview({ path: "src/schema/pack.ts", baseText: null, headText: null }), true);
     assert.equal(engineHealFileNeedsReview({ path: "src/bots/load.ts", baseText: null, headText: null }), true);
-    assert.equal(engineHealFileNeedsReview({ path: "src/connectors/catalog.ts", baseText: null, headText: null }), false);
+    assert.equal(engineHealFileNeedsReview({ path: "src/connectors/catalog.ts", baseText: null, headText: null }), true);
+    const catalog = planEngineHealRelease({
+      ...open,
+      mainVersion: "1.0.0",
+      tipVersion: "1.0.1",
+      filesNeedReview: engineHealFileNeedsReview({
+        path: "src/connectors/catalog.ts",
+        baseText: null,
+        headText: null,
+      }),
+    });
+    assert.equal(catalog.action, "review");
     assert.equal(engineHealAutoMergePath(".npmrc"), false);
     assert.equal(engineHealAutoMergePath("tsconfig.json"), false);
     assert.equal(engineHealAutoMergePath("vitest.config.ts"), false);
@@ -471,7 +482,7 @@ describe("engine heal release", () => {
     assert.equal(engineHealFileNeedsReview({ path: "package.json", baseText: null, headText: "{}" }), true);
     assert.equal(engineHealFilesNeedReview(null), null);
     assert.equal(
-      engineHealFilesNeedReview([{ path: "src/connectors/catalog.ts", baseText: null, headText: null }]),
+      engineHealFilesNeedReview([{ path: "package.json", baseText: "{\"version\":\"1.0.0\"}", headText: "{\"version\":\"1.0.1\"}" }]),
       false,
     );
   });
@@ -527,7 +538,6 @@ describe("engine heal release", () => {
     git("checkout", "main");
     git("checkout", "-b", "engine-heal/APP-2");
     writeFileSync(join(root, "package.json"), JSON.stringify({ name: "loop", version: "1.0.1", scripts: { test: "tsx --test" } }));
-    writeFileSync(join(root, "src/connectors", "note.ts"), "export const note = false;\n");
     git("add", ".");
     git("commit", "-m", "bump only");
     const cleanTip = git("rev-parse", "HEAD");
@@ -552,6 +562,27 @@ describe("engine heal release", () => {
       filesNeedReview: engineHealFilesNeedReview(cleanFiles),
     });
     assert.equal(merge.action, "merge-and-tag");
+
+    git("checkout", "main");
+    git("checkout", "-b", "engine-heal/catalog");
+    mkdirSync(join(root, "src/connectors"), { recursive: true });
+    writeFileSync(join(root, "src/connectors/catalog.ts"), "export const mcp = \"changed\";\n");
+    git("add", ".");
+    git("commit", "-m", "edit the connector catalog");
+    assert.equal(engineHealFilesNeedReview(gitChangedFiles(root, "main", git("rev-parse", "HEAD"))), true);
+
+    git("checkout", "main");
+    git("checkout", "-b", "engine-heal/symlink");
+    writeFileSync(join(root, "target.txt"), "target\n");
+    git("add", "target.txt");
+    git("commit", "-m", "target");
+    spawnSync("git", ["rm", "-f", "package.json"], { cwd: root, encoding: "utf8" });
+    spawnSync("ln", ["-s", "target.txt", "package.json"], { cwd: root, encoding: "utf8" });
+    git("add", "package.json");
+    git("commit", "-m", "package.json becomes a symlink");
+    const linkFiles = gitChangedFiles(root, "main", git("rev-parse", "HEAD"));
+    assert.equal(linkFiles?.some((file) => file.path === "package.json" && file.symlinkOrTypeChange), true);
+    assert.equal(engineHealFilesNeedReview(linkFiles), true);
 
     git("checkout", "main");
     git("checkout", "-b", "engine-heal/APP-3");

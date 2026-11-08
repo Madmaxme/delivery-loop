@@ -263,8 +263,28 @@ export function openPack(path: string): { pack: ProjectPack; bots: BotBundle | n
   return { pack: raw, bots: bots?.bundle ?? null };
 }
 
+/** Warnings for installs after the recorded-journey and design-check changes. */
+export function packMigrationWarnings(pack: ProjectPack): string[] {
+  const warnings: string[] = [];
+  if (pack.journeyCommand?.trim()) {
+    warnings.push(
+      "journeyCommand is ignored. A recorded journey stays unverified and in intake. Command output is not proof.",
+    );
+  }
+  for (const repo of pack.design?.repos ?? []) {
+    if (!repo.proofPaths || repo.proofPaths.length === 0) {
+      warnings.push(
+        `UI repo ${repo.name} has no proofPaths. A pull_request design check stays unverified until the trunk pack lists them. pull_request_target stays unverified.`,
+      );
+    }
+  }
+  return warnings;
+}
+
 export function loadPack(path: string): ProjectPack {
-  return openPack(path).pack;
+  const pack = openPack(path).pack;
+  for (const warning of packMigrationWarnings(pack)) process.stderr.write(`delivery-loop: ${warning}\n`);
+  return pack;
 }
 
 /**
@@ -313,7 +333,17 @@ function loadDesign(design: DesignSpec | undefined, path: string): DesignSpec | 
  */
 export function proofPathsFromTrustedRef(cwd: string, pack: ProjectPack, repoName: string): string[] | null {
   const trunk = pack.agent?.trunk?.trim() || "main";
-  const shown = spawnSync("git", ["show", `origin/${trunk}:delivery-loop.yaml`], { cwd, encoding: "utf8" });
+  if (!/^[A-Za-z0-9._/-]+$/.test(trunk) || trunk.includes("..")) return null;
+  const fetched = spawnSync(
+    "git",
+    ["fetch", "origin", `refs/heads/${trunk}:refs/remotes/origin/${trunk}`],
+    { cwd, encoding: "utf8" },
+  );
+  if (fetched.status !== 0) return null;
+  const shown = spawnSync("git", ["show", `refs/remotes/origin/${trunk}:delivery-loop.yaml`], {
+    cwd,
+    encoding: "utf8",
+  });
   if (shown.status !== 0 || !shown.stdout?.trim()) return null;
   let parsed: { design?: { repos?: { name?: string; proofPaths?: unknown }[] } };
   try {

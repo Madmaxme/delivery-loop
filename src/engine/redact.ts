@@ -20,13 +20,30 @@ function remember(value: string): void {
   registered.add(value);
 }
 
-/** Record a secret and the forms a log line is likely to contain. */
+/**
+ * Base64 of the secret at each byte alignment.
+ * A secret embedded in a larger base64 blob can start at offset 0, 1, or 2.
+ */
+export function base64OffsetVariants(secret: string): string[] {
+  const raw = Buffer.from(secret);
+  const variants: string[] = [];
+  for (let offset = 0; offset < 3; offset += 1) {
+    const padded = Buffer.concat([Buffer.alloc(offset), raw]).toString("base64").replace(/=+$/g, "");
+    const skip = [0, 2, 3][offset] ?? 0;
+    let body = padded.slice(skip);
+    if ((raw.length + offset) % 3 !== 0) body = body.slice(0, -1);
+    if (body.length >= 4) variants.push(body);
+  }
+  return variants;
+}
+
+/** Record a secret and the forms a log line is likely to contain. Call this when a token is minted. */
 export function registerSecret(value: string | null | undefined): void {
   const secret = value?.trim() ?? "";
   if (secret.length < 4) return;
   remember(secret);
-  remember(Buffer.from(secret).toString("base64"));
   remember(encodeURIComponent(secret));
+  for (const variant of base64OffsetVariants(secret)) remember(variant);
 }
 
 export function registerLoadedSecrets(env: NodeJS.ProcessEnv = process.env): void {

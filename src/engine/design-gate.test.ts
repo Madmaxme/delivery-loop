@@ -645,7 +645,11 @@ function packCheckout(repoName: string, proofPaths: string[]): string {
   git("config", "user.name", "Dev");
   git("add", "delivery-loop.yaml");
   git("commit", "-m", "pack");
-  git("update-ref", "refs/remotes/origin/main", "HEAD");
+  const bare = join(cwd, "remote.git");
+  const initBare = spawnSync("git", ["init", "--bare", "-b", "main", bare], { encoding: "utf8" });
+  assert.equal(initBare.status, 0, initBare.stderr);
+  git("remote", "add", "origin", bare);
+  git("push", "origin", "HEAD:refs/heads/main");
   writeFileSync(join(cwd, "delivery-loop.yaml"), "design:\n  repos:\n    - name: admin-web\n      proofPaths:\n        - .\n");
   return cwd;
 }
