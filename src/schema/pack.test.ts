@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
-import { loadPack, proofPathsFromTrustedRef } from "./pack.ts";
+import { loadPack, packMigrationWarnings, proofPathsFromTrustedRef, trustedPackHome, type ProjectPack } from "./pack.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -246,11 +246,34 @@ design:
     const previous = process.cwd();
     process.chdir(cwd);
     try {
-      const paths = await proofPathsFromTrustedRef(forge, "https://github.com/acme/workspace", "main", "admin-web");
-      assert.deepEqual(paths, ["src/kept"]);
-      assert.equal(sawRef, trunkTip);
+      const read = await proofPathsFromTrustedRef(forge, "https://github.com/acme/workspace", "main", "admin-web");
+      assert.deepEqual(read.paths, ["src/kept"]);
+      assert.equal(read.trunkSha, trunkTip);
     } finally {
       process.chdir(previous);
     }
+  });
+
+  it("leaves the design check unverified when the agent repo is missing", () => {
+    const pack = {
+      tracker: "linear",
+      worker: "cursor",
+      repos: [{ name: "admin-web", url: "https://github.com/acme/admin-web", trunk: "development" }],
+      qualityCommand: "npm test",
+      qualityWorkflow: "quality",
+      invariantsFile: "invariants.md",
+      status: { intake: "Todo", dev: "Dev", prod: "Prod" },
+      connectors: [],
+      design: {
+        figmaTokenEnv: "FIGMA_ACCESS_TOKEN",
+        repos: [{ name: "admin-web", check: "npm test", checkName: "ui", tokenFile: "src/tokens.scss", proofPaths: ["src"] }],
+      },
+    } as ProjectPack;
+    assert.equal(trustedPackHome(pack), null);
+    assert.match(packMigrationWarnings(pack).join("\n"), /unverified/);
+    const same = { ...pack, agent: { url: "https://github.com/acme/admin-web.git", trunk: "development" } };
+    assert.equal(trustedPackHome(same), null);
+    const separate = { ...pack, agent: { url: "https://github.com/acme/workspace", trunk: "main" } };
+    assert.deepEqual(trustedPackHome(separate), { url: "https://github.com/acme/workspace", trunk: "main" });
   });
 });

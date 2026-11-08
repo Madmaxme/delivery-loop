@@ -242,6 +242,14 @@ describe("design gate", () => {
 
   it("ignores a green UI check recorded on a different sha", async () => {
     const env = harness(order(`**Validation:** \`${UI_CHECK}\``));
+    env.deps.pack = {
+      ...pack,
+      agent: { url: WORKSPACE, trunk: "main" },
+      design: {
+        ...pack.design!,
+        repos: [{ ...pack.design!.repos[0]!, proofPaths: ["src"] }],
+      },
+    };
     let merged = false;
     const forge = githubForge({
       token: "t",
@@ -278,6 +286,14 @@ describe("design gate", () => {
                 created_at: "2026-01-01T00:00:00Z",
               },
             ],
+          });
+        }
+        if (href.includes("/repos/acme/workspace/commits/")) return Response.json({ sha: TRUNK });
+        if (href.includes("/contents/delivery-loop.yaml")) {
+          return Response.json({
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(packYaml("admin-web", ["src"])).toString("base64"),
           });
         }
         if (href.includes("/compare/")) return Response.json({ status: "ahead" });
@@ -682,6 +698,101 @@ describe("independent design check", () => {
     assert.equal(merged, false);
     assert.notEqual(result.outcome, "landed");
   });
+
+  it("leaves the design check unverified when the agent repo is missing", async () => {
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    env.deps.figmaFetch = async () => Response.json({ name: "Home" });
+    env.deps.lookupHead = () => null;
+    const productPack: string[] = [];
+    let merged = false;
+    env.deps.forge = githubForge({
+      token: "t",
+      fetch: designFetch({
+        headBlob: BLOB,
+        baseBlob: BLOB,
+        appId: GITHUB_ACTIONS_APP_ID,
+        packText: packYaml("admin-web", ["."]),
+        productPack,
+      }, () => {
+        merged = true;
+      }),
+    });
+    const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
+    assert.equal(merged, false);
+    assert.notEqual(result.outcome, "landed");
+    assert.deepEqual(productPack, []);
+    assert.match(`${result.detail}\n${env.comments.join("\n")}`, /unverified/);
+  });
+
+  it("refuses the merge when the pack trunk moves after the design verdict", async () => {
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    env.deps.figmaFetch = async () => Response.json({ name: "Home" });
+    env.deps.lookupHead = () => null;
+    let reads = 0;
+    let merged = false;
+    env.deps.pack = {
+      ...pack,
+      agent: { url: WORKSPACE, trunk: "main" },
+      design: {
+        ...pack.design!,
+        repos: [{ ...pack.design!.repos[0]!, proofPaths: ["src"] }],
+      },
+    };
+    env.deps.forge = githubForge({
+      token: "t",
+      fetch: designFetch({
+        headBlob: BLOB,
+        baseBlob: BLOB,
+        appId: GITHUB_ACTIONS_APP_ID,
+        packText: packYaml("admin-web", ["src"]),
+        nextTrunk: () => {
+          reads += 1;
+          return reads === 1 ? TRUNK : "1".repeat(40);
+        },
+      }, () => {
+        merged = true;
+      }),
+    });
+    const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
+    assert.equal(merged, false);
+    assert.notEqual(result.outcome, "landed");
+    assert.ok(reads >= 2);
+    assert.match(`${result.detail}\n${env.comments.join("\n")}`, /pack trunk moved/);
+  });
+
+  it("refuses the merge when the head moves after the design verdict", async () => {
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    env.deps.figmaFetch = async () => Response.json({ name: "Home" });
+    env.deps.lookupHead = () => null;
+    let merged = false;
+    env.deps.pack = {
+      ...pack,
+      agent: { url: WORKSPACE, trunk: "main" },
+      design: {
+        ...pack.design!,
+        repos: [{ ...pack.design!.repos[0]!, proofPaths: ["src"] }],
+      },
+    };
+    env.deps.forge = githubForge({
+      token: "t",
+      fetch: designFetch({
+        headBlob: BLOB,
+        baseBlob: BLOB,
+        appId: GITHUB_ACTIONS_APP_ID,
+        packText: packYaml("admin-web", ["src"]),
+        movingHead: true,
+      }, () => {
+        merged = true;
+      }),
+    });
+    const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
+    assert.equal(merged, false);
+    assert.notEqual(result.outcome, "landed");
+    assert.match(`${result.detail}\n${env.comments.join("\n")}`, /head moved/);
+  });
 });
 
 function packYaml(repoName: string, proofPaths: string[]): string {
@@ -727,9 +838,12 @@ function designFetch(
     packText?: string;
     changedFiles?: string[];
     productPack?: string[];
+    nextTrunk?: () => string;
+    movingHead?: boolean;
   },
   onMerge: () => void,
 ): (url: string | URL, init?: RequestInit) => Promise<Response> {
+  let pullReads = 0;
   return async (url, init) => {
     const href = String(url);
     if (href.includes(`/commits/${HEAD}/check-runs`)) {
@@ -748,7 +862,7 @@ function designFetch(
       });
     }
     if (href.includes("/repos/acme/workspace/commits/")) {
-      return Response.json({ sha: TRUNK });
+      return Response.json({ sha: input.nextTrunk ? input.nextTrunk() : TRUNK });
     }
     if (href.includes("/pulls/") && href.includes("/files")) {
       const page = Number(new URL(href).searchParams.get("page") ?? "1");
@@ -832,7 +946,9 @@ function designFetch(
       });
     }
     if (href.endsWith("/pulls/4") && (init?.method ?? "GET") === "GET") {
-      return Response.json({ mergeable_state: "clean", mergeable: true, head: { sha: HEAD } });
+      pullReads += 1;
+      const sha = input.movingHead && pullReads > 1 ? "b".repeat(40) : HEAD;
+      return Response.json({ mergeable_state: "clean", mergeable: true, head: { sha } });
     }
     if (href.endsWith("/pulls/4/merge")) {
       onMerge();

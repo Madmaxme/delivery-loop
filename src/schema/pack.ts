@@ -279,6 +279,11 @@ export function packMigrationWarnings(pack: ProjectPack): string[] {
       );
     }
   }
+  if ((pack.design?.repos?.length ?? 0) > 0 && !trustedPackHome(pack)) {
+    warnings.push(
+      "The design check is unverified. agent.url and agent.trunk must both be set, and agent.url must not be a product repo.",
+    );
+  }
   return warnings;
 }
 
@@ -348,25 +353,32 @@ export function proofPathsFromPackText(text: string, repoName: string): string[]
   return match.proofPaths.map((item) => item.trim()).filter(Boolean);
 }
 
+/** Paths from the workspace pack, and the trunk commit they were read from. */
+export type TrustedProofPaths = {
+  paths: string[] | null;
+  trunkSha: string | null;
+};
+
 /**
  * `proofPaths` from `delivery-loop.yaml` at the workspace trunk, read through the forge.
- * `repoUrl` and `trunk` come from engine config (`agent`, or the first repo when that is unset).
- * The product pull request repo, the workspace checkout, its `origin`, and the working tree are not read.
- * Null when the forge cannot show that file. An empty list is a real answer.
+ * `repoUrl` and `trunk` come from `trustedPackHome`. The product repo is not a fallback.
+ * The workspace checkout, its `origin`, and the working tree are not read.
+ * `paths` null means the file could not be read. An empty list is a real answer.
  */
 export async function proofPathsFromTrustedRef(
   forge: Partial<ForgeTreeReader>,
   repoUrl: string,
   trunk: string,
   repoName: string,
-): Promise<string[] | null> {
-  if (!forge.trunkSha || !forge.readTextFile) return null;
-  if (!repoUrl.trim() || !trunk.trim()) return null;
+): Promise<TrustedProofPaths> {
+  if (!forge.trunkSha || !forge.readTextFile || !repoUrl.trim() || !trunk.trim()) {
+    return { paths: null, trunkSha: null };
+  }
   const trunkSha = (await forge.trunkSha({ repoUrl, trunk }))?.trim().toLowerCase() ?? "";
-  if (!/^[0-9a-f]{40}$/.test(trunkSha)) return null;
+  if (!/^[0-9a-f]{40}$/.test(trunkSha)) return { paths: null, trunkSha: null };
   const text = await forge.readTextFile({ repoUrl, path: "delivery-loop.yaml", ref: trunkSha });
-  if (text == null) return null;
-  return proofPathsFromPackText(text, repoName);
+  if (text == null) return { paths: null, trunkSha };
+  return { paths: proofPathsFromPackText(text, repoName), trunkSha };
 }
 
 export function unblockingStates(pack: ProjectPack): string[] {
@@ -375,6 +387,25 @@ export function unblockingStates(pack: ProjectPack): string[] {
 
 export function repoByName(pack: ProjectPack, name: string): RepoSpec | undefined {
   return pack.repos.find((r) => r.name === name);
+}
+
+function repoIdentity(url: string): string {
+  return url.trim().replace(/\.git$/i, "").replace(/\/+$/, "").toLowerCase();
+}
+
+/**
+ * Workspace repo for a trust read.
+ * Null unless `agent.url` and `agent.trunk` are both set and `agent.url` is not a product repo.
+ * There is no fallback to `repos[0]`.
+ */
+export function trustedPackHome(pack: ProjectPack): { url: string; trunk: string } | null {
+  const url = pack.agent?.url?.trim() ?? "";
+  const trunk = pack.agent?.trunk?.trim() ?? "";
+  if (!url || !trunk) return null;
+  const home = repoIdentity(url);
+  if (!home) return null;
+  if ((pack.repos ?? []).some((repo) => repoIdentity(repo.url ?? "") === home)) return null;
+  return { url, trunk };
 }
 
 /** Where the coding agent checks out. Product pull requests stay on `repos`. */

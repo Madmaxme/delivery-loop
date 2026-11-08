@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { CompareStatus, DesignCheckProbe, FetchLike, ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
-import { agentHome, holdStatus, proofPathsFromTrustedRef, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
+import { agentHome, holdStatus, proofPathsFromTrustedRef, repoByName, trustedPackHome, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
 import {
   designRepairText,
   designRepo,
@@ -1760,12 +1760,15 @@ async function repairContext(deps: LoopDeps, ticket: Ticket, pr: OpenPull): Prom
   return text ? `\n${text}` : "";
 }
 
+/** A design verdict bound to the pack trunk it was read from. Null means the check does not apply. */
+type DesignVerdict = DesignCheckProbe & { trunkSha: string | null };
+
 /** UI check on this head. A Figma URL in the work order is not this check. Null means the check does not apply. */
 async function readDesignCheck(
   deps: LoopDeps,
   ticket: Ticket,
   pr: OpenPull,
-): Promise<DesignCheckProbe | null> {
+): Promise<DesignVerdict | null> {
   const frames = ticketFigmaUrls(ticket);
   const spec = designRepo(deps.pack.design, pr.repo.name);
   if (frames.length === 0 && !spec) return null;
@@ -1774,26 +1777,45 @@ async function readDesignCheck(
       state: "missing",
       detail: `design check ${spec?.checkName ?? "missing"} missing on ${pr.headSha}`,
       headSha: null,
+      trunkSha: null,
     };
   }
-  const home = agentHome(deps.pack);
-  const proofPaths = (await proofPathsFromTrustedRef(deps.forge, home.url, home.trunk, pr.repo.name)) ?? [];
+  const home = trustedPackHome(deps.pack);
+  if (!home) {
+    return {
+      state: "failure",
+      detail: `design check unverified on ${pr.headSha}: agent.url and agent.trunk must name a repo that is not a product repo`,
+      headSha: null,
+      trunkSha: null,
+    };
+  }
+  const read = await proofPathsFromTrustedRef(deps.forge, home.url, home.trunk, pr.repo.name);
+  if (read.paths == null || !read.trunkSha) {
+    return {
+      state: "failure",
+      detail: `design check unverified on ${pr.headSha}: the workspace trunk pack could not be read`,
+      headSha: null,
+      trunkSha: read.trunkSha,
+    };
+  }
   const probe = await deps.forge.designCheck({
     repoUrl: pr.repo.url,
     headSha: pr.headSha,
     name: spec.checkName,
     number: pr.number,
     baseRef: pr.repo.trunk,
-    proofPaths,
+    proofPaths: read.paths,
   });
   if ((probe.headSha ?? "").toLowerCase() !== pr.headSha.toLowerCase()) {
     return {
       state: "missing",
       detail: probe.detail || `stale design check ${spec.checkName} ignored`,
       headSha: null,
+      trunkSha: read.trunkSha,
     };
   }
-  return probe;
+  const detail = probe.state === "success" ? `${probe.detail} pack trunk ${read.trunkSha}` : probe.detail;
+  return { ...probe, detail, trunkSha: read.trunkSha };
 }
 
 async function landPull(deps: LoopDeps, ticket: Ticket, pr: OpenPull): Promise<LandPullResult> {
@@ -1802,6 +1824,7 @@ async function landPull(deps: LoopDeps, ticket: Ticket, pr: OpenPull): Promise<L
   let unknown = 0;
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
   const tries = { waits: 0, login: false };
+  let reviewed: { headSha: string; trunkSha: string } | null = null;
   for (let step = 0; step < 48; step++) {
     const quality = await waitForQuality(deps, current);
     if (quality.state === "failure") {
@@ -1820,6 +1843,11 @@ async function landPull(deps: LoopDeps, ticket: Ticket, pr: OpenPull): Promise<L
       continue;
     }
     const design = await readDesignCheck(deps, ticket, current);
+    if (design?.state === "success" && design.trunkSha) {
+      reviewed = { headSha: current.headSha, trunkSha: design.trunkSha };
+    } else if (design) {
+      reviewed = null;
+    }
     if (design && design.state !== "success") {
       if (design.state === "pending") {
         const earlyDesign = await explainQuality(deps, ticket, current, {
@@ -1881,6 +1909,32 @@ async function landPull(deps: LoopDeps, ticket: Ticket, pr: OpenPull): Promise<L
       unknown += 1;
       await sleep(MERGE_SETTLE_MS);
       continue;
+    }
+    const pinned = await deps.forge.mergeability({
+      repoUrl: current.repo.url,
+      number: current.number,
+    });
+    const liveHead = pinned.headSha || head;
+    if (liveHead !== head || (reviewed != null && liveHead !== reviewed.headSha)) {
+      const paused = pauseLand(
+        ticket.identifier,
+        current.url,
+        `Design check refused. The head moved from \`${reviewed?.headSha ?? head}\` to \`${liveHead}\`.`,
+      );
+      await deps.tracker.comment(ticket.identifier, paused.detail);
+      return paused;
+    }
+    if (reviewed) {
+      const again = await readDesignCheck(deps, ticket, current);
+      if (!again || again.state !== "success" || again.trunkSha !== reviewed.trunkSha) {
+        const paused = pauseLand(
+          ticket.identifier,
+          current.url,
+          `Design check refused on \`${head}\`. The pack trunk moved from \`${reviewed.trunkSha}\` to \`${again?.trunkSha ?? "unknown"}\`.`,
+        );
+        await deps.tracker.comment(ticket.identifier, paused.detail);
+        return paused;
+      }
     }
     try {
       const mergedSha = await deps.forge.squashMerge({
