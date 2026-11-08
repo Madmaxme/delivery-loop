@@ -1,0 +1,19 @@
+specversion: "1.0"
+role: verdict-writer
+effect: data-only
+identityRef: ref:verdict-writer
+purpose: Records a ground verdict and the evidence that verdict cites.
+policies:
+  - verdict-no-status-writes
+  - verdict-no-relax-gate
+authority:
+  may:
+    - id: record-verdict
+      statement: Record a ground verdict
+    - id: record-evidence
+      statement: Record the evidence that verdict cites
+  mustNot:
+    - id: verdict-no-status-writes
+      statement: Write a delivery status or a delivery label
+    - id: verdict-no-relax-gate
+      statement: Start the delivery loop, relax a quality gate, or grant authority

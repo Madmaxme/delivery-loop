@@ -1,0 +1,20 @@
+specversion: "1.0"
+id: inactivity-check
+effect: data-only
+purpose: Describes a report of runs that have had no new evidence for a described interval.
+trigger:
+  kind: schedule
+  spec: Described as a periodic read. This file does not register a schedule and does not resume a run.
+inputs:
+  - name: runs
+    source: ref:open-runs
+  - name: quiet-for
+    source: ref:quiet-interval
+output:
+  event: bot.routine.inactivity-check.reported
+  contract: Each quiet run and the time of its last evidence. No status is written.
+idempotency: One report per run and quiet interval.
+overlap: skip
+approval:
+  boundary: A report. No resume, no dispatch, and no status write.
+  requires: A person approves any live schedule. This file does not register one.

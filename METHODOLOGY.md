@@ -25,3 +25,19 @@ The script writes `.delivery-loop/events/<type>.json` under `GITHUB_WORKSPACE`, 
 `templates/runner.yml` is what a client copies. It calls the same script after the package clone and before `npm install`, and again after the loop. It uploads the same artifact. A post is optional and belongs to the client. The client sets the repository variable `DELIVERY_LOOP_EVENT_URL` to an http(s) endpoint. `DELIVERY_LOOP_EVENT_HEADER` is an optional single header line, taken from the client's own store. `DELIVERY_LOOP_EVENT_REQUIRED` defaults to false. When it is `true` or `1`, a failed post fails the run. Otherwise a failed post leaves the run's own exit code. When the started post fails and the flag is set, the runner still writes `finished` with status `failure` and does not start the loop. When the URL is empty, the script only writes the file. The script never prints the URL or the header.
 
 An integrator reads the artifact, or sets the endpoint in its own repository. This package does not name an endpoint and does not ship one.
+
+## Bot definitions
+
+`bots/templates/` holds role templates. A client holds instances of those roles, in the directory named by `bots.path` on its pack. The key is optional. When it is absent, the engine does not read a bots directory.
+
+An orchestrator instance and a verdict-writer instance belong to one client. Each business has its own. A client's delivery-agent instance may be shared across clients if it is the same bot everywhere.
+
+The delivery agent is the harness execution agent. It is one of the engine's roles. It thinks, then calls the forge, tracker, worker, and connector adapters. Those interfaces, the loop, and engine-heal are the source of what it can do. A GitHub App or other identity that opens a pull request or merges when checks are green is an execution identity the delivery agent calls. It is not an agent and not a role.
+
+The delivery agent reads check-runs on the exact reviewed head. The merge is a squash of that head, and only when those checks are green. An identity that opened or pushed the head does not merge it. Review is independent of that identity. There is no rebase. There is no force-merge when a check on that head is red.
+
+The orchestrator monitors existing delivery runs and reports evidence. It does not start, dispatch, re-dispatch, resume, or run the delivery loop, including a scheduled sweep and a ground-only compile. It does not write a delivery status or a delivery label.
+
+The inventory cross-checks the three roles. It does not add a capability. A source that was not read is a coverage gap with status `unreached` or `unverified`, a reason, and a timestamp. The gap is written down. It is not omitted.
+
+The files are data. They do not relax a gate and they do not grant authority. A policy id such as `no-self-merge` or `head-pinned-squash` records the bound. This layer does not install a runtime identity-separation gate. The engine does not read those ids when it merges. `bots.path` must stay inside the client directory that holds the pack file, including through symlinks. `delivery-loop bots validate` and `delivery-loop bots list` only read. They do not schedule a routine.

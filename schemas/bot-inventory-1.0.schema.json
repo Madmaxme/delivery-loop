@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Madmaxme/delivery-loop/schemas/bot-inventory-1.0.schema.json",
+  "title": "delivery-loop bot inventory",
+  "description": "A cross-check of role instances, plus sources that were not reached. specversion 1.0. The adapters are the source of what execution can do. This file does not add a role. identityRef is a reference, not a platform id and not a credential. A source that was not read is a coverage gap with a status, a reason, and a timestamp. The engine does not open evidence and does not dereference identityRef.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["specversion", "items", "coverageGaps"],
+  "properties": {
+    "specversion": { "type": "string", "const": "1.0" },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "platform", "purpose", "identityRef", "verification", "evidence", "observedAt"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
+          "platform": { "type": "string", "minLength": 1 },
+          "purpose": { "type": "string", "minLength": 1 },
+          "identityRef": { "type": "string", "pattern": "^ref:[a-z0-9][a-z0-9-]*$" },
+          "verification": { "enum": ["verified", "unverified"] },
+          "evidence": { "type": "string", "minLength": 1 },
+          "observedAt": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          }
+        }
+      }
+    },
+    "coverageGaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "status", "reason", "observedAt"],
+        "properties": {
+          "source": { "type": "string", "pattern": "^ref:[a-z0-9][a-z0-9-]*$" },
+          "status": { "enum": ["unreached", "unverified"] },
+          "reason": { "type": "string", "minLength": 1 },
+          "observedAt": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          }
+        }
+      }
+    }
+  }
+}
