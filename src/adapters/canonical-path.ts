@@ -1,6 +1,7 @@
-import { timingSafeEqual } from "node:crypto";
+import { createSign, timingSafeEqual } from "node:crypto";
 
 import { assertCanonicalPath, STORED_ENV } from "../bots/canonical.ts";
+import { registerSecret } from "../engine/redact.ts";
 import type { AwsCallerClass, CanonicalPath, GithubRole } from "../bots/canonical.ts";
 import type { CommitActor } from "../schema/pack.ts";
 import type { FetchLike } from "./types.ts";
@@ -48,7 +49,17 @@ type SecretRecord = {
   readonly expectedArn: string;
   readonly oauthUrl: string;
   readonly healthCommand: string;
+  readonly operations: readonly string[];
+  readonly destinations: readonly string[];
+  readonly expectedExtensionId: string;
   readonly legacy: boolean;
+};
+
+export type CredentialUse = {
+  api: string;
+  operation: string;
+  destination: string;
+  role?: GithubRole;
 };
 
 type HealthMark = {
@@ -128,8 +139,35 @@ export function assertCanonicalCredential(value: unknown, api: string): asserts 
   recordOf(value, api);
 }
 
-export function credentialSecret(value: CanonicalCredential): string {
-  return recordOf(value).token;
+function scopesFor(path: CanonicalPath): { operations: string[]; destinations: string[] } {
+  if (path.api === "linear") return { operations: ["graphql"], destinations: ["api.linear.app"] };
+  if (path.api === "github" && path.role === "merger") return { operations: ["rest"], destinations: ["api.github.com"] };
+  if (path.api === "github") return { operations: ["rest", "graphql", "git", "gh"], destinations: ["api.github.com", "github.com"] };
+  if (path.api === "aws") return { operations: ["sts"], destinations: ["sts.amazonaws.com"] };
+  if (path.api === "figma") return { operations: ["rest"], destinations: ["api.figma.com"] };
+  const host = path.destinationHost?.trim() || `${path.api}.invalid`;
+  return { operations: ["call"], destinations: [host] };
+}
+
+export function credentialSecret(value: CanonicalCredential, use: CredentialUse): string {
+  const record = recordOf(value, use.api);
+  if (record.legacy) {
+    throw new CanonicalPathError("non-canonical-credential", use.api, `${use.api} rejects a legacy credential`);
+  }
+  if (!isHealthy(value)) {
+    throw new CanonicalPathError("credential-unhealthy", use.api, `${use.api} credential has not passed the health check`);
+  }
+  if (use.role && record.role && record.role !== use.role) {
+    throw new CanonicalPathError("non-canonical-credential", use.api, `${use.api} ${use.role} credential is required`);
+  }
+  if (!record.operations.includes(use.operation)) {
+    throw new CanonicalPathError("non-canonical-credential", use.api, `${use.api} ${use.operation} is not allowed for this credential`);
+  }
+  const dest = use.destination.toLowerCase();
+  if (!record.destinations.some((allowed) => dest === allowed || dest.includes(allowed))) {
+    throw new CanonicalPathError("non-canonical-credential", use.api, `${use.api} destination is not authorized`);
+  }
+  return record.token;
 }
 
 export function credentialRole(value: CanonicalCredential): GithubRole | undefined {
@@ -138,6 +176,10 @@ export function credentialRole(value: CanonicalCredential): GithubRole | undefin
 
 export function credentialCallerClass(value: CanonicalCredential): AwsCallerClass | undefined {
   return recordOf(value).callerClass;
+}
+
+export function credentialPrimaryDestination(value: CanonicalCredential): string {
+  return recordOf(value).destinations[0] ?? "";
 }
 
 export function credentialAws(value: CanonicalCredential): {
@@ -256,7 +298,7 @@ function stamp(
   extras?: { accessKeyId?: string; sessionToken?: string; expiresAt?: string },
 ): CanonicalCredential {
   if (!token.trim()) throw new CanonicalPathError("mint-failed", path.api, `${path.api} credential is empty`);
-  return seal({
+  const handle = seal({
     api: path.api,
     token: token.trim(),
     accessKeyId: extras?.accessKeyId ?? "",
@@ -276,33 +318,64 @@ function stamp(
     expectedArn: path.expectedArn ?? "",
     oauthUrl: path.oauthUrl ?? "",
     healthCommand: path.healthCommand ?? "",
+    operations: Object.freeze(scopesFor(path).operations),
+    destinations: Object.freeze(scopesFor(path).destinations),
+    expectedExtensionId: path.expectedIdentity ?? "",
     legacy: false,
   });
+  registerSecret(token);
+  return handle;
 }
 
-/** Compatibility credential for a process that has not declared a bot inventory. It is not a canonical path. */
-export function legacyCredential(api: string, token: string): CanonicalCredential {
-  const handle = seal({
-    api,
-    token,
-    accessKeyId: "",
-    sessionToken: "",
-    expiresAt: "",
-    policyKey: "legacy",
-    viewerId: "",
-    organizationId: "",
-    allowedPrincipalIds: Object.freeze([]),
-    appId: "",
-    installationId: "",
-    repository: "",
-    accountId: "",
-    expectedArn: "",
-    oauthUrl: "",
-    healthCommand: "",
-    legacy: true,
+function signAppJwt(appId: string, pem: string): string {
+  const now = Math.floor(Date.now() / 1000);
+  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ iat: now - 60, exp: now + 540, iss: appId })).toString("base64url");
+  const data = `${header}.${payload}`;
+  const sign = createSign("RSA-SHA256");
+  sign.update(data);
+  return `${data}.${sign.sign(pem).toString("base64url")}`;
+}
+
+async function mintInstallation(path: CanonicalPath, deps: ResolveDeps, copies: Record<string, string>): Promise<CanonicalCredential> {
+  const pemName = path.signingKeyEnv ?? "";
+  const pem = deps.env[pemName]?.trim() ?? "";
+  if (!pem || !path.appId || !path.installation) {
+    throw new CanonicalPathError("mint-failed", "github", "github installation mint is missing the app key");
+  }
+  const jwt = signAppJwt(path.appId, pem);
+  const minted = await deps.fetch(`https://api.github.com/app/installations/${path.installation}/access_tokens`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      Accept: "application/vnd.github+json",
+    },
   });
-  health.set(handle, Object.freeze({ token, policyKey: "legacy", principalId: "legacy" }));
-  return handle;
+  if (minted.status !== 201 && minted.status !== 200) {
+    throw new CanonicalPathError("mint-failed", "github", "github installation mint failed", minted.status);
+  }
+  const body = (await minted.json()) as { token?: string };
+  const token = body.token?.trim() ?? "";
+  if (!token) throw new CanonicalPathError("mint-failed", "github", "github installation mint returned no token");
+  uncheckedStoredNames(path, token, deps.env, copies);
+  const credential = stamp(path, token);
+  const listed = await deps.fetch("https://api.github.com/installation/repositories?per_page=100", {
+    headers: {
+      Authorization: authorizationHeader(token),
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (listed.status !== 200) {
+    throw new CanonicalPathError("credential-unhealthy", "github", "github installation health check failed", listed.status);
+  }
+  const repos = (await listed.json()) as { repositories?: { full_name?: string }[] };
+  const names = (repos.repositories ?? []).map((repo) => repo.full_name?.toLowerCase() ?? "");
+  if (!path.repository || !names.includes(path.repository.toLowerCase())) {
+    throw new CanonicalPathError("credential-unhealthy", "github", "github installation does not include the declared repository");
+  }
+  markHealthy(credential, `installation:${path.installation}`);
+  return credential;
 }
 
 function lastLine(stdout: string): string {
@@ -336,10 +409,14 @@ export type ResolveDeps = {
   vaultCopies?: Readonly<Record<string, string>>;
 };
 
+function parseJson(stdout: string): unknown {
+  return JSON.parse(stdout.trim());
+}
+
 function parseAwsMint(stdout: string, path: CanonicalPath): { token: string; accessKeyId: string; sessionToken: string; expiresAt: string } {
   let json: { AccessKeyId?: string; SecretAccessKey?: string; SessionToken?: string; Expiration?: string };
   try {
-    json = JSON.parse(lastLine(stdout) || stdout) as typeof json;
+    json = parseJson(stdout) as typeof json;
   } catch {
     throw new CanonicalPathError("mint-failed", path.api, `${path.api} mint did not return STS credentials`);
   }
@@ -392,6 +469,7 @@ async function mintedFromOAuth(path: CanonicalPath, deps: ResolveDeps, copies: R
   const json = (await response.json()) as { access_token?: string; expires_in?: number };
   const token = json.access_token?.trim() ?? "";
   if (!token) throw new CanonicalPathError("mint-failed", path.api, `${path.api} oauth mint returned no access token`);
+  registerSecret(deps.env[secretName]);
   uncheckedStoredNames(path, token, deps.env, copies);
   return stamp(path, token, { expiresAt: json.expires_in ? String(json.expires_in) : "" });
 }
@@ -414,6 +492,7 @@ export async function resolveCredential(path: CanonicalPath, deps: ResolveDeps):
     throw new CanonicalPathError("invalid-policy", path.api, message);
   }
   const copies = await vaultCopiesFor(path, deps);
+  if (path.api === "github" && path.identityKind === "installation") return mintInstallation(path, deps, copies);
   if (path.acquisition === "oauth-client-credentials") return mintedFromOAuth(path, deps, copies);
   if (path.acquisition === "mint-per-process") return mintedFromCommand(path, deps, copies);
   if (path.acquisition === "stored-static") return readDeclared(path, deps);
@@ -429,6 +508,9 @@ export function resolveMintedCredential(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new CanonicalPathError("invalid-policy", path.api, message);
+  }
+  if (path.identityKind === "installation") {
+    throw new CanonicalPathError("invalid-policy", "github", "github installation credentials are minted with the app key");
   }
   if (path.acquisition !== "mint-per-process") {
     throw new CanonicalPathError("invalid-policy", path.api, `non-canonical direct path for ${path.api}`);
@@ -470,6 +552,7 @@ export async function probeLinearViewer(credential: CanonicalCredential, fetchIm
 }
 
 export async function probeGithub(credential: CanonicalCredential, fetchImpl: FetchLike): Promise<void> {
+  if (isHealthy(credential)) return;
   const record = recordOf(credential, "github");
   const headers = {
     Authorization: authorizationHeader(record.token),
@@ -548,14 +631,14 @@ export async function probeExtension(credential: CanonicalCredential, spawn: Com
   }
   let json: { id?: string };
   try {
-    json = JSON.parse(lastLine(result.stdout ?? "") || "{}") as { id?: string };
+    json = parseJson(result.stdout ?? "") as { id?: string };
   } catch {
     json = {};
   }
-  if (!json.id?.trim()) {
-    throw new CanonicalPathError("credential-unhealthy", record.api, `${record.api} identity evidence is absent`);
+  if (!json.id?.trim() || json.id.trim() !== record.expectedExtensionId) {
+    throw new CanonicalPathError("credential-unhealthy", record.api, `${record.api} identity does not match the canonical path`);
   }
-  markHealthy(credential, `${record.api}:${json.id.trim()}`);
+  markHealthy(credential, `${record.api}:${record.expectedExtensionId}`);
 }
 
 export function awsChildEnv(credential: CanonicalCredential, base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -577,7 +660,7 @@ export async function probeAws(credential: CanonicalCredential, spawn: CommandSp
   }
   let json: { Account?: string; Arn?: string };
   try {
-    json = JSON.parse(lastLine(result.stdout ?? "") || "{}") as { Account?: string; Arn?: string };
+    json = parseJson(result.stdout ?? "") as { Account?: string; Arn?: string };
   } catch {
     json = {};
   }

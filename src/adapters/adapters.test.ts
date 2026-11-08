@@ -5,15 +5,15 @@ import { probeGithub, probeLinearViewer } from "./canonical-path.ts";
 import { githubForge } from "./forge-github.ts";
 import { githubIssuesTracker, linearTracker } from "./trackers.ts";
 import type { FetchLike } from "./types.ts";
-import { actors, healthFetch, issue, linearPath, mergerPath, openerPath, readyExtension, readyOpener } from "../testing/canonical-fixtures.ts";
+import { actors, healthFetch, issue, linearPath, openerPath, readyExtension, readyMerger, readyOpener } from "../testing/canonical-fixtures.ts";
 import { copilotWorker, cursorReceiptText, cursorWorker, httpWorker } from "./workers.ts";
 
 function opener(token = "t") {
   return issue(openerPath, token);
 }
 
-function merger(token = "merger-token") {
-  return issue(mergerPath, token);
+function merger() {
+  return readyMerger();
 }
 
 async function linearCredential(token = "k") {
@@ -24,7 +24,7 @@ async function linearCredential(token = "k") {
 
 async function openedForge(fetch: FetchLike, commitActors = actors) {
   const open = opener();
-  const merge = merger();
+  const merge = await merger();
   await probeGithub(open, healthFetch);
   await probeGithub(merge, healthFetch);
   return githubForge({ opener: open, merger: merge, fetch, commitActors });
@@ -56,7 +56,7 @@ describe("adapters", () => {
   it("refuses a pull request when the token is not the commit actor", async () => {
     const calls: string[] = [];
     const open = opener("app");
-    const merge = merger();
+    const merge = await merger();
     await probeGithub(open, healthFetch);
     await probeGithub(merge, healthFetch);
     const forge = githubForge({
@@ -84,7 +84,7 @@ describe("adapters", () => {
 
   it("opens a pull request when the token login is the commit actor", async () => {
     const open = opener("user");
-    const merge = merger();
+    const merge = await merger();
     await probeGithub(open, healthFetch);
     await probeGithub(merge, healthFetch);
     const forge = githubForge({

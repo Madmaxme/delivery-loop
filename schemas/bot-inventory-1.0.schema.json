@@ -84,7 +84,9 @@
           "expectedArn": { "type": "string", "minLength": 1 },
           "vaultCommand": { "type": "string", "minLength": 1 },
           "expiresAt": { "type": "string", "minLength": 1 },
-          "healthCommand": { "type": "string", "minLength": 1 }
+          "healthCommand": { "type": "string", "minLength": 1 },
+          "signingKeyEnv": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+          "destinationHost": { "type": "string", "minLength": 1 }
         }
       }
     }

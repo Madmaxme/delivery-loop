@@ -1,4 +1,6 @@
-import { probeExtension, probeGithub, probeLinearViewer, resolveMintedCredential, type CanonicalCredential } from "../adapters/canonical-path.ts";
+import { generateKeyPairSync } from "node:crypto";
+
+import { probeExtension, probeGithub, probeLinearViewer, resolveCredential, resolveMintedCredential, type CanonicalCredential } from "../adapters/canonical-path.ts";
 import type { CanonicalPath } from "../bots/canonical.ts";
 import type { CommitActor } from "../schema/pack.ts";
 import type { FetchLike } from "../adapters/types.ts";
@@ -40,6 +42,7 @@ export const mergerPath: CanonicalPath = {
   appId: "2001",
   installation: "2002",
   repository: "example/app",
+  signingKeyEnv: "GITHUB_APP_PRIVATE_KEY",
 };
 
 export const actors: CommitActor[] = [
@@ -95,10 +98,19 @@ export async function readyOpener(token = "opener-token"): Promise<CanonicalCred
   return credential;
 }
 
-export async function readyMerger(token = "merger-token"): Promise<CanonicalCredential> {
-  const credential = issue(mergerPath, token);
-  await probeGithub(credential, healthFetch);
-  return credential;
+export async function readyMerger(): Promise<CanonicalCredential> {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pem = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
+  return resolveCredential(mergerPath, {
+    env: { GITHUB_APP_PRIVATE_KEY: pem },
+    spawn: () => ({ status: 1, stdout: "" }),
+    fetch: async (url) => {
+      const href = String(url);
+      if (href.includes("/access_tokens")) return json({ token: "merger-token" }, 201);
+      if (href.includes("/installation/repositories")) return json({ repositories: [{ full_name: "example/app" }] });
+      return json({}, 404);
+    },
+  });
 }
 
 export async function readyExtension(api: string, token = "k"): Promise<CanonicalCredential> {
@@ -110,9 +122,11 @@ export async function readyExtension(api: string, token = "k"): Promise<Canonica
       refresh: "per-process",
       mintCommand: `mint-${api}`,
       healthCommand: `probe-${api}`,
+      expectedIdentity: `example-${api}`,
+      destinationHost: `${api}.example`,
     },
     token,
   );
-  await probeExtension(credential, () => ({ status: 0, stdout: '{"id":"worker-1"}\n' }), {});
+  await probeExtension(credential, () => ({ status: 0, stdout: `{"id":"example-${api}"}\n` }), {});
   return credential;
 }

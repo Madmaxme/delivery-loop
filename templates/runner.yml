@@ -42,7 +42,8 @@ jobs:
           GITHUB_ACTIONS: "true"
           DELIVERY_LOOP_RUNTIME: local
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          # Linear is minted per process from the OAuth client. A stored key is not injected.
+          # Both are present so the step can keep only the one the trusted commit selected.
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           LINEAR_OAUTH_CLIENT_ID: ${{ secrets.LINEAR_OAUTH_CLIENT_ID }}
           LINEAR_OAUTH_CLIENT_SECRET: ${{ secrets.LINEAR_OAUTH_CLIENT_SECRET }}
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
@@ -70,6 +71,12 @@ jobs:
               code=$?
             fi
             if [ "$code" -eq 0 ]; then
+              pack="$(git show HEAD:delivery-loop.yaml 2>/dev/null || true)"
+              if printf '%s\n' "$pack" | awk 'BEGIN{p=0} /^bots:/{p=1} p && /^[^ ]/{if(!/^bots:/) p=0} p && /path:/{found=1} END{exit found?0:1}'; then
+                unset LINEAR_API_KEY
+              else
+                unset LINEAR_OAUTH_CLIENT_ID LINEAR_OAUTH_CLIENT_SECRET
+              fi
               if [ "${{ inputs.mode }}" = "sweep" ]; then
                 delivery-loop sweep
               elif [ "${{ inputs.mode }}" = "ship" ]; then

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { credentialSecret } from "../adapters/canonical-path.ts";
-import { issue, linearPath } from "../testing/canonical-fixtures.ts";
+import { credentialSecret, probeLinearViewer } from "../adapters/canonical-path.ts";
+import { healthFetch, issue, linearPath } from "../testing/canonical-fixtures.ts";
 import { shipInvocationDeps } from "./ship-deps.js";
 import type { ProjectPack } from "../schema/pack.js";
 
@@ -30,7 +30,7 @@ describe("shipInvocationDeps", () => {
     }
   });
 
-  it("still skips the worker when the CLI must set prod status", () => {
+  it("still skips the worker when the CLI must set prod status", async () => {
     const prevCursor = process.env.CURSOR_API_KEY;
     const prevGh = process.env.GH_TOKEN;
     const prevLinear = process.env.LINEAR_API_KEY;
@@ -41,10 +41,14 @@ describe("shipInvocationDeps", () => {
       const legacy = shipInvocationDeps(pack(true), "/tmp");
       assert.equal(legacy.tracker.kind, "linear");
       const minted = issue(linearPath, "minted-linear", { LINEAR_API_KEY: "stored-linear" });
-      const deps = shipInvocationDeps(pack(true), "/tmp", { linear: minted, extensions: {}, aws: {} });
+      const deps = shipInvocationDeps(pack(true), "/tmp", { enforced: true, linear: minted, extensions: {}, aws: {}, actors: [] });
       assert.equal(deps.worker.kind, "ship-idle");
       assert.equal(deps.tracker.kind, "linear");
-      assert.notEqual(credentialSecret(minted), "stored-linear");
+      await probeLinearViewer(minted, healthFetch);
+      assert.notEqual(
+        credentialSecret(minted, { api: "linear", operation: "graphql", destination: "https://api.linear.app" }),
+        "stored-linear",
+      );
     } finally {
       if (prevCursor !== undefined) process.env.CURSOR_API_KEY = prevCursor;
       else delete process.env.CURSOR_API_KEY;

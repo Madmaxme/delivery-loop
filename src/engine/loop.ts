@@ -32,6 +32,8 @@ import {
   type CompileProgramResult,
   type DeliveryLeaseStamp,
 } from "./linear-harness-policy.js";
+import type { CanonicalCredential } from "../adapters/canonical-path.ts";
+import { lockedGitEnv } from "../adapters/forge-git.ts";
 import { confirmLandBranches, lookupRemoteHead, renderBranch } from "./land-branches.js";
 import {
   invariantExists,
@@ -89,6 +91,8 @@ export type LoopDeps = {
   githubRunActive?: (runId: string | null) => boolean | null;
   /** Override for tests. Default is `git ls-remote` for refs/heads/<branch>. */
   lookupHead?: (repoUrl: string, branch: string) => string | null;
+  /** Opaque GitHub opener handle. `remoteHead` passes it to `lookupRemoteHead`. */
+  githubHandle?: CanonicalCredential | null;
   /** Override for tests. Default waits 30s between quality checks. */
   sleep?: (ms: number) => Promise<void>;
   qualityPollMs?: number;
@@ -858,7 +862,7 @@ async function runHeldTicket(
   }
 
   const target = repoByName(deps.pack, order.repos[0])!;
-  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const lookup = remoteHead(deps);
   let landings: { repo: RepoSpec; branch: string; sha?: string }[] | null = deps.pack.branchTemplate
     ? confirmLandBranches({
         issue: ticket.identifier,
@@ -955,7 +959,7 @@ async function runHeldTicket(
       compared = "unknown";
     }
     if (compared === "identical" || compared === "behind") {
-      const lookup = deps.lookupHead ?? lookupRemoteHead;
+      const lookup = remoteHead(deps);
       const sha = landing.sha || lookup(landing.repo.url, landing.branch) || head;
       empty.push({ repo: landing.repo.name, sha });
       continue;
@@ -1152,17 +1156,13 @@ async function healShipStep(
   return applyOwnerHeal(deps, ticket, key, reason);
 }
 
-function refreshShipGithubToken(env: NodeJS.ProcessEnv): boolean {
-  const command = env.DELIVERY_LOOP_GITHUB_MINT?.trim();
-  if (!command) return false;
-  const result = spawnSync(command, { shell: true, encoding: "utf8" });
-  const token = (result.stdout ?? "").trim().split(/\n/).at(-1)?.trim() ?? "";
-  if (result.status !== 0 || !token) return false;
-  env.GH_TOKEN = token;
-  env.GITHUB_TOKEN = token;
-  process.env.GH_TOKEN = token;
-  process.env.GITHUB_TOKEN = token;
-  return true;
+function refreshShipGithubToken(_env: NodeJS.ProcessEnv): boolean {
+  return false;
+}
+
+function remoteHead(deps: LoopDeps): (repoUrl: string, branch: string) => string | null {
+  if (deps.lookupHead) return deps.lookupHead;
+  return (repoUrl, branch) => lookupRemoteHead(repoUrl, branch, deps.githubHandle ?? null);
 }
 
 function runShipStep(
@@ -1259,7 +1259,7 @@ async function trunkTip(
   repo: RepoSpec,
   mergeSha: string,
 ): Promise<string> {
-  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const lookup = remoteHead(deps);
   const tip = lookup(repo.url, repo.trunk) || mergeSha;
   if (tip === mergeSha) return tip;
   try {
@@ -1281,12 +1281,16 @@ function journeyFileInCheckout(deps: LoopDeps, repo: string, ref: string, path: 
   if (!spec || !ref) return false;
   const dir = repoCheckoutDir(deps.cwd ?? process.cwd(), spec, deps.pack);
   if (!existsSync(join(dir, ".git")) || !ref) return false;
+  const gitEnv = lockedGitEnv();
   const present = (at: string) =>
-    spawnSync("git", ["-C", dir, "cat-file", "-e", `${at}:${path}`], { encoding: "utf8" }).status === 0;
+    spawnSync("git", ["-C", dir, "-c", "credential.helper=", "cat-file", "-e", `${at}:${path}`], {
+      encoding: "utf8",
+      env: gitEnv,
+    }).status === 0;
   if (present(ref)) return true;
-  spawnSync("git", ["-C", dir, "fetch", "--depth=1", "origin", ref], { encoding: "utf8" });
+  spawnSync("git", ["-C", dir, "-c", "credential.helper=", "fetch", "--depth=1", "origin", ref], { encoding: "utf8", env: gitEnv });
   if (present(ref)) return true;
-  spawnSync("git", ["-C", dir, "fetch", "origin", spec.trunk], { encoding: "utf8" });
+  spawnSync("git", ["-C", dir, "-c", "credential.helper=", "fetch", "origin", spec.trunk], { encoding: "utf8", env: gitEnv });
   return present(ref);
 }
 
@@ -1421,7 +1425,7 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
   if (marker.kind === "empty") {
     const template = deps.pack.branchTemplate;
     if (!template || marker.rows.length === 0) return null;
-    const lookup = deps.lookupHead ?? lookupRemoteHead;
+    const lookup = remoteHead(deps);
     for (const row of marker.rows) {
       const spec = repoByName(deps.pack, row.repo);
       if (!spec) return null;
@@ -1656,7 +1660,7 @@ async function spendFix(
     );
     return { fixes: fixes + 1, headSha: current.headSha, hypothesis: previousHypothesis };
   }
-  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const lookup = remoteHead(deps);
   const next = lookup(current.repo.url, current.branch);
   return {
     fixes: fixes + 1,
@@ -2133,7 +2137,12 @@ export async function ship(
     ...process.env,
     DELIVERY_LOOP_ISSUE: identifier ?? "",
     DELIVERY_LOOP_SHIP_ARGS: extraArgs ?? "",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
   };
+  delete env.GH_TOKEN;
+  delete env.GITHUB_TOKEN;
+  delete env.LINEAR_API_KEY;
   async function loadTicket(): Promise<Ticket | null> {
     if (!identifier) return null;
     try {

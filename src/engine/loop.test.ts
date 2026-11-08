@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -1499,13 +1499,12 @@ describe("loop", () => {
     const step = `if [ ! -s ${marker} ]; then echo 'HTTP 401: Bad credentials' >&2; exit 1; fi`;
     env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
     try {
-      await ship(env.deps, "API-1");
+      await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed/);
     } finally {
       if (previous === undefined) delete process.env.DELIVERY_LOOP_GITHUB_MINT;
       else process.env.DELIVERY_LOOP_GITHUB_MINT = previous;
     }
-    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 1);
-    assert.equal(env.comments.some((body) => body.includes("OWNER_HEAL")), false);
+    assert.equal(existsSync(marker), false);
   });
 
   it("edits the same ship no again on the next page", async () => {

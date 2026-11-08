@@ -11,7 +11,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse, stringify } from "yaml";
 
-import { allowlistedEnv, legacyCredential, prepareDispatchCredentials, type PreparedCredentials } from "../adapters/canonical-path.ts";
+import { allowlistedEnv, CanonicalPathError, prepareDispatchCredentials, type PreparedCredentials } from "../adapters/canonical-path.ts";
+import { decideCredentialMode } from "./trusted-config.ts";
 import { gitForge } from "../adapters/forge-git.js";
 import { githubForge } from "../adapters/forge-github.js";
 import { runGh } from "../adapters/gh.js";
@@ -139,13 +140,53 @@ export function commitActorsFromTrustedRef(pack: ProjectPack): ProjectPack["comm
   return parsed.commitActors ?? [];
 }
 
-export async function preparePackCredentials(pack: ProjectPack, bots: BotBundle | null): Promise<PreparedCredentials | null> {
-  if (!bots) return null;
+function gitShow(ref: string, cwd: string): string | null {
+  const shown = spawnSync("git", ["show", ref], { cwd, encoding: "utf8" });
+  if (shown.status !== 0 || !shown.stdout) return null;
+  return shown.stdout;
+}
+
+export function trustedDecision(cwd: string, workPackYaml: string) {
+  const head = spawnSync("git", ["rev-parse", "--abbrev-ref", "origin/HEAD"], { cwd, encoding: "utf8" });
+  const base = head.status === 0 && head.stdout.trim().startsWith("origin/") ? head.stdout.trim().slice("origin/".length) : "main";
+  let trusted = gitShow(`origin/${base}:delivery-loop.yaml`, cwd);
+  let trunk = base;
+  if (trusted) {
+    const named = decideCredentialMode({
+      workPackYaml,
+      trustedPackYaml: trusted,
+      workInventoryYaml: null,
+      trustedInventoryYaml: null,
+    }).trunk;
+    if (named !== base) {
+      const again = gitShow(`origin/${named}:delivery-loop.yaml`, cwd);
+      if (!again) return decideCredentialMode({ workPackYaml, trustedPackYaml: null, workInventoryYaml: null, trustedInventoryYaml: null });
+      trusted = again;
+      trunk = named;
+    }
+  }
+  const trustedBots = trusted ? decideCredentialMode({ workPackYaml, trustedPackYaml: trusted, workInventoryYaml: "", trustedInventoryYaml: "" }) : null;
+  const rel = trusted && /bots:\s*\n(?:[ \t].*\n)*?[ \t]*path:\s*(\S+)/.exec(trusted)?.[1];
+  const trustedInventory = rel ? gitShow(`origin/${trunk}:${rel.replace(/\/$/, "")}/inventory.yaml`, cwd) : null;
+  const workInventory = rel && existsSync(resolve(cwd, rel, "inventory.yaml")) ? readFileSync(resolve(cwd, rel, "inventory.yaml"), "utf8") : null;
+  void trustedBots;
+  return decideCredentialMode({
+    workPackYaml,
+    trustedPackYaml: trusted,
+    workInventoryYaml: workInventory,
+    trustedInventoryYaml: trustedInventory,
+  });
+}
+
+export async function preparePackCredentials(pack: ProjectPack, workPackYaml: string, cwd: string): Promise<PreparedCredentials | null> {
+  const decision = trustedDecision(cwd, workPackYaml);
+  if (decision.mode === "refused") throw new CanonicalPathError("invalid-policy", "credential", decision.reason);
+  if (decision.mode === "legacy") return null;
   const actors = commitActorsFromTrustedRef(pack);
   const extension = extensionApi(pack.worker);
   const github = pack.forge !== "git" || pack.tracker === "github" || pack.worker === "copilot";
   return prepareDispatchCredentials({
-    paths: bots.inventory.canonicalPaths ?? [],
+    paths: decision.paths,
     env: process.env,
     fetch,
     spawn: commandSpawn,
@@ -161,60 +202,75 @@ export async function adaptersFor(pack: ProjectPack, prepared: PreparedCredentia
   worker: WorkerAdapter;
   forge: ForgeAdapter;
 }> {
-  const opener = prepared?.opener ?? legacyCredential("github", requireEnv("GH_TOKEN"));
-  const merger = prepared?.merger ?? legacyCredential("github", requireEnv("GH_TOKEN"));
+  const legacy = prepared == null;
   const repo =
     pack.githubRepo ??
     githubRepoFromUrl(pack.repos[0].url).owner + "/" + githubRepoFromUrl(pack.repos[0].url).repo;
+  const actors = prepared?.actors ?? (legacy ? [] : commitActorsFromTrustedRef(pack));
   const forge =
     pack.forge === "git"
-      ? gitForge({ cwd: process.cwd(), credential: prepared?.opener })
-      : githubForge({
-          opener,
-          merger,
-          repo,
-          commitActors: prepared?.actors ?? commitActorsFromTrustedRef(pack),
-        });
-  if (pack.tracker === "linear" && prepared && !prepared.linear) {
-    throw new Error("missing canonical path for linear");
-  }
-  const linearCredential = prepared?.linear ?? legacyCredential("linear", requireEnv("LINEAR_API_KEY"));
+      ? gitForge({ cwd: process.cwd(), mode: legacy ? "legacy" : "canonical", credential: prepared?.opener })
+      : legacy
+        ? githubForge({ legacyToken: requireEnv("GH_TOKEN"), repo, commitActors: actors })
+        : githubForge({
+            opener: prepared.opener,
+            merger: prepared.merger,
+            repo,
+            commitActors: actors,
+          });
   const tracker =
     pack.tracker === "linear"
-      ? linearTracker({
-          credential: linearCredential,
-          team: pack.linearTeam ?? "",
-          intakeState: pack.status.intake,
-        })
-      : githubIssuesTracker({
-          credential: opener,
-          repo: pack.githubRepo ?? "",
-          intakeLabel: pack.status.intake,
-        });
+      ? legacy
+        ? linearTracker({
+            legacyKey: requireEnv("LINEAR_API_KEY"),
+            team: pack.linearTeam ?? "",
+            intakeState: pack.status.intake,
+          })
+        : linearTracker({
+            credential: prepared.linear,
+            team: pack.linearTeam ?? "",
+            intakeState: pack.status.intake,
+          })
+      : legacy
+        ? githubIssuesTracker({
+            legacyToken: requireEnv("GH_TOKEN"),
+            repo: pack.githubRepo ?? "",
+            intakeLabel: pack.status.intake,
+          })
+        : githubIssuesTracker({
+            credential: prepared.opener,
+            repo: pack.githubRepo ?? "",
+            intakeLabel: pack.status.intake,
+          });
   const worker = workerFor(pack, prepared);
   return { tracker, worker, forge };
 }
 
 function workerFor(pack: ProjectPack, prepared: PreparedCredentials | null): WorkerAdapter {
+  if (!prepared) throw new CanonicalPathError("missing-policy", pack.worker, "missing canonical credential");
   if (pack.worker === "cursor") {
-    const credential = prepared?.extensions.cursor ?? legacyCredential("cursor", requireEnv("CURSOR_API_KEY"));
+    const credential = prepared.extensions.cursor;
+    if (!credential) throw new CanonicalPathError("missing-policy", "cursor", "missing canonical credential");
     return cursorWorker({ credential });
   }
   if (pack.worker === "claude") {
-    const credential = prepared?.extensions.anthropic ?? legacyCredential("anthropic", requireEnv("ANTHROPIC_API_KEY"));
+    const credential = prepared.extensions.anthropic;
+    if (!credential) throw new CanonicalPathError("missing-policy", "anthropic", "missing canonical credential");
     return claudeWorker({ credential });
   }
   if (pack.worker === "codex") {
-    const credential = prepared?.extensions.openai ?? legacyCredential("openai", requireEnv("OPENAI_API_KEY"));
+    const credential = prepared.extensions.openai;
+    if (!credential) throw new CanonicalPathError("missing-policy", "openai", "missing canonical credential");
     return codexWorker({ credential });
   }
   if (pack.worker === "copilot") {
     const repo = pack.githubRepo ?? "";
     const [owner, name] = repo.split("/");
-    const credential = prepared?.opener ?? legacyCredential("github", requireEnv("GH_TOKEN"));
-    return copilotWorker({ credential, owner, repo: name });
+    if (!prepared.opener) throw new CanonicalPathError("missing-policy", "github", "missing canonical credential");
+    return copilotWorker({ credential: prepared.opener, owner, repo: name });
   }
-  const credential = prepared?.extensions.http ?? legacyCredential("http", process.env.WORKER_HTTP_TOKEN || "local");
+  const credential = prepared.extensions.http;
+  if (!credential) throw new CanonicalPathError("missing-policy", "http", "missing canonical credential");
   return httpWorker({
     startUrl: pack.workerHttp?.startUrl ?? "",
     statusUrl: pack.workerHttp?.statusUrl ?? "",
@@ -224,8 +280,9 @@ function workerFor(pack: ProjectPack, prepared: PreparedCredentials | null): Wor
 
 async function dispatchGh(args: string[]): Promise<number | null> {
   const opened = openPack(packPath(process.cwd()));
-  const prepared = await preparePackCredentials(opened.pack, opened.bots);
-  const credential = prepared?.opener ?? legacyCredential("github", requireEnv("GH_TOKEN"));
+  const prepared = await preparePackCredentials(opened.pack, readFileSync(packPath(process.cwd()), "utf8"), process.cwd());
+  const credential = prepared?.opener;
+  if (!credential) throw new CanonicalPathError("missing-policy", "github", "missing canonical credential");
   return runGh(credential, args).status;
 }
 
@@ -249,7 +306,7 @@ async function dispatchOrRun(mode: string, argv: string[]): Promise<void> {
       return;
     }
     const opened = openPack(packPath(process.cwd()));
-    const prepared = await preparePackCredentials(opened.pack, opened.bots);
+    const prepared = await preparePackCredentials(opened.pack, readFileSync(packPath(process.cwd()), "utf8"), process.cwd());
     const continueMode = argv.includes("continue");
     const rest = argv.filter((item) => item !== "continue");
     const issue = rest.find((a) => /^[A-Z][A-Z0-9]*-\d+$/i.test(a));
@@ -299,7 +356,7 @@ async function dispatchOrRun(mode: string, argv: string[]): Promise<void> {
     return;
   }
   const opened = openPack(packPath(process.cwd()));
-  const prepared = await preparePackCredentials(opened.pack, opened.bots);
+  const prepared = await preparePackCredentials(opened.pack, readFileSync(packPath(process.cwd()), "utf8"), process.cwd());
   const started = Number(
     process.env.DELIVERY_LOOP_PAGE_STARTED_MS || "",
   );

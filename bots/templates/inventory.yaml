@@ -74,57 +74,76 @@ canonicalPaths:
     appId: "2001"
     installation: "2002"
     repository: example/app
+    signingKeyEnv: GITHUB_APP_PRIVATE_KEY
   - api: cursor
     source: ref:cursor-mint
     acquisition: mint-per-process
     refresh: per-process
     mintCommand: mint-cursor
     healthCommand: probe-cursor
+    expectedIdentity: example-cursor
+    destinationHost: api.cursor.com
   - api: anthropic
     source: ref:anthropic-mint
     acquisition: mint-per-process
     refresh: per-process
     mintCommand: mint-anthropic
     healthCommand: probe-anthropic
+    expectedIdentity: example-anthropic
+    destinationHost: api.anthropic.com
   - api: openai
     source: ref:openai-mint
     acquisition: mint-per-process
     refresh: per-process
     mintCommand: mint-openai
     healthCommand: probe-openai
+    expectedIdentity: example-openai
+    destinationHost: api.openai.com
   - api: http
     source: ref:http-mint
     acquisition: mint-per-process
     refresh: per-process
     mintCommand: mint-http
     healthCommand: probe-http
+    expectedIdentity: example-http
+    destinationHost: worker.example
   - api: sentry
     source: ref:sentry-mint
     acquisition: mint-per-process
     refresh: per-process
     mintCommand: mint-sentry
     healthCommand: probe-sentry
+    expectedIdentity: example-sentry
+    destinationHost: sentry.io
   - api: posthog
     source: ref:posthog-mint
     acquisition: mint-per-process
     refresh: per-process
     mintCommand: mint-posthog
     healthCommand: probe-posthog
+    expectedIdentity: example-posthog
+    destinationHost: us.posthog.com
   - api: stripe
     source: ref:stripe-mint
     acquisition: mint-per-process
     refresh: per-process
     mintCommand: mint-stripe
     healthCommand: probe-stripe
+    expectedIdentity: example-stripe
+    destinationHost: api.stripe.com
   - api: figma
     source: ref:figma-mint
     acquisition: mint-per-process
     refresh: per-process
     mintCommand: mint-figma
     healthCommand: probe-figma
+    expectedIdentity: example-figma
+    destinationHost: api.figma.com
   - api: database
     source: ref:database-mint
     acquisition: mint-per-process
     refresh: per-process
     mintCommand: mint-database
     healthCommand: probe-database
+    expectedIdentity: example-database
+    destinationHost: database.example

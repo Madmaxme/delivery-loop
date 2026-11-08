@@ -39,7 +39,8 @@ describe("installer", () => {
     assert.match(workflow, new RegExp(`--branch v${version.replaceAll(".", "\\.")}`));
     assert.match(workflow, /https:\/\/github.com\/Madmaxme\/delivery-loop.git/);
     assert.doesNotMatch(workflow, /__DELIVERY_LOOP_REF__/);
-    assert.doesNotMatch(workflow, /LINEAR_API_KEY/);
+    assert.match(workflow, /LINEAR_API_KEY/);
+    assert.match(workflow, /unset LINEAR_API_KEY/);
     assert.match(workflow, /LINEAR_OAUTH_CLIENT_ID/);
     assert.match(workflow, /LINEAR_OAUTH_CLIENT_SECRET/);
     assert.match(workflow, /npm install --omit=dev/);

@@ -67,6 +67,8 @@ export type CanonicalPath = {
   vaultCommand?: string;
   expiresAt?: string;
   healthCommand?: string;
+  signingKeyEnv?: string;
+  destinationHost?: string;
 };
 
 const REF = /^ref:[a-z0-9][a-z0-9-]*$/;
@@ -200,6 +202,7 @@ export function assertCanonicalPath(path: CanonicalPath, at: string): void {
         fail(at, "github merger appId and installation are required");
       }
       if (!/^[^/\s]+\/[^/\s]+$/.test(path.repository ?? "")) fail(at, "github merger repository is required");
+      if (!/^[A-Z][A-Z0-9_]*$/.test(path.signingKeyEnv ?? "")) fail(at, "github merger signingKeyEnv is required");
     }
     for (const name of path.envRefs ?? []) {
       if (isDirectStoredInput("github", name)) fail(at, "non-canonical direct path for github");
@@ -235,6 +238,8 @@ export function assertCanonicalPath(path: CanonicalPath, at: string): void {
   if (!path.healthCommand?.trim() || path.healthCommand.includes("\n")) {
     fail(at, `${path.api} healthCommand is required`);
   }
+  if (!path.expectedIdentity?.trim()) fail(at, `${path.api} expectedIdentity is required`);
+  if (!path.destinationHost?.trim()) fail(at, `${path.api} destinationHost is required`);
   if (path.acquisition === "stored-static") {
     if (path.refresh !== "static") fail(at, `${path.api} stored refresh must be static`);
     if ((path.envRefs ?? []).length !== 1) fail(at, `${path.api} stored env ref is required`);

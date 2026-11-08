@@ -34,7 +34,12 @@ export async function githubUserLogin(fetchImpl: FetchLike, credential: Canonica
   assertHealthy(credential);
   const response = await fetchImpl("https://api.github.com/user", {
     headers: {
-      Authorization: authorizationHeader(credentialSecret(credential)),
+      Authorization: authorizationHeader(credentialSecret(credential, {
+        api: "github",
+        operation: "rest",
+        role: "opener",
+        destination: "https://api.github.com/user",
+      })),
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
     },

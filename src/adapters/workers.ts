@@ -3,6 +3,7 @@ import {
   assertHealthy,
   authorizationHeader,
   CanonicalPathError,
+  credentialPrimaryDestination,
   credentialRole,
   credentialSecret,
   isLegacyCredential,
@@ -12,7 +13,12 @@ import {
 function issued(credential: CanonicalCredential, api: string): string {
   assertCanonicalCredential(credential, api);
   assertHealthy(credential);
-  return credentialSecret(credential);
+  return credentialSecret(credential, {
+    api,
+    operation: api === "github" ? "rest" : "call",
+    role: api === "github" ? "opener" : undefined,
+    destination: credentialPrimaryDestination(credential),
+  });
 }
 import type { FetchLike, WorkerAdapter, WorkerResult, WorkerStart } from "./types.js";
 

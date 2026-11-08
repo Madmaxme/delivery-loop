@@ -22,7 +22,7 @@ export function runGh(
 ): { status: number | null } {
   assertCanonicalCredential(credential, "github");
   assertHealthy(credential);
-  const token = credentialSecret(credential);
+  const token = credentialSecret(credential, { api: "github", operation: "gh", role: "opener", destination: "https://api.github.com" });
   const env = allowlistedEnv(process.env, { GH_TOKEN: token, GITHUB_TOKEN: token });
   return spawn("gh", args, { env, stdio: "inherit" });
 }

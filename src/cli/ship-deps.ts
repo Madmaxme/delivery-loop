@@ -1,4 +1,4 @@
-import { legacyCredential, type PreparedCredentials } from "../adapters/canonical-path.ts";
+import type { PreparedCredentials } from "../adapters/canonical-path.ts";
 import type { ForgeAdapter, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { githubIssuesTracker, linearTracker } from "../adapters/trackers.js";
 import { lookupRemoteHead } from "../engine/land-branches.ts";
@@ -79,14 +79,28 @@ function envToken(name: string): string {
 
 function trackerFor(pack: ProjectPack, prepared: PreparedCredentials | null): TrackerAdapter {
   if (pack.tracker === "linear") {
+    if (prepared?.linear) {
+      return linearTracker({
+        credential: prepared.linear,
+        team: pack.linearTeam ?? "",
+        intakeState: pack.status.intake,
+      });
+    }
     return linearTracker({
-      credential: prepared?.linear ?? legacyCredential("linear", envToken("LINEAR_API_KEY")),
+      legacyKey: envToken("LINEAR_API_KEY"),
       team: pack.linearTeam ?? "",
       intakeState: pack.status.intake,
     });
   }
+  if (prepared?.opener) {
+    return githubIssuesTracker({
+      credential: prepared.opener,
+      repo: pack.githubRepo ?? "",
+      intakeLabel: pack.status.intake,
+    });
+  }
   return githubIssuesTracker({
-    credential: prepared?.opener ?? legacyCredential("github", envToken("GH_TOKEN")),
+    legacyToken: envToken("GH_TOKEN"),
     repo: pack.githubRepo ?? "",
     intakeLabel: pack.status.intake,
   });

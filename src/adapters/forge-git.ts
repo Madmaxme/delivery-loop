@@ -2,7 +2,14 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import { allowlistedEnv, assertCanonicalCredential, type CanonicalCredential } from "./canonical-path.ts";
+import {
+  allowlistedEnv,
+  assertCanonicalCredential,
+  assertHealthy,
+  CanonicalPathError,
+  credentialSecret,
+  type CanonicalCredential,
+} from "./canonical-path.ts";
 import type { CompareStatus, ForgeAdapter } from "./types.js";
 
 export type GitRun = (args: string[], cwd: string, env: NodeJS.ProcessEnv) => { status: number | null; stdout?: string };
@@ -32,15 +39,37 @@ export function gitCheckoutDir(cwd: string, repoUrl: string): string {
  * Code host for any git remote. There is no pull-request API.
  * The runner merges the branch. A workflow check is refused by the pack.
  */
+export function lockedGitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return allowlistedEnv(base, {
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+  });
+}
+
 export function gitForge(opts: {
   cwd: string;
   credential?: CanonicalCredential | null;
+  /** Canonical mode refuses to run without a healthy credential and ignores ambient helpers. */
+  mode?: "legacy" | "canonical";
   run?: GitRun;
   checkoutDir?: (repoUrl: string) => string;
 }): ForgeAdapter {
+  const canonical = opts.mode === "canonical";
+  if (canonical && !opts.credential) {
+    throw new CanonicalPathError("missing-policy", "github", "missing canonical credential");
+  }
   if (opts.credential) assertCanonicalCredential(opts.credential, "github");
-  const env = allowlistedEnv(process.env);
-  const run = opts.run ?? ((args: string[], cwd: string) => defaultGit(args, cwd, env));
+  const env = lockedGitEnv();
+  const run =
+    opts.run ??
+    ((args: string[], cwd: string) => {
+      if (canonical && opts.credential) {
+        assertHealthy(opts.credential);
+        credentialSecret(opts.credential, { api: "github", operation: "git", role: "opener", destination: "https://github.com" });
+      }
+      return defaultGit(["-c", "credential.helper=", ...args], cwd, env);
+    });
   const dirFor = opts.checkoutDir ?? ((repoUrl: string) => gitCheckoutDir(opts.cwd, repoUrl));
   return {
     async openPullRequest(input) {

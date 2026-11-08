@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { credentialSecret, type CanonicalCredential } from "../adapters/canonical-path.ts";
 import type { DesignCheckProbe, FetchLike, Ticket } from "../adapters/types.ts";
 import type { DesignRepo, DesignSpec } from "../schema/pack.ts";
 
@@ -165,9 +166,15 @@ export function interpretDesignChecks(
 export function figmaTokenValue(input: {
   figmaToken?: string | null;
   design: DesignSpec | undefined;
+  credential?: CanonicalCredential | null;
+  mode?: "legacy" | "canonical";
 }): string | null {
   if (input.figmaToken === null) return null;
   if (typeof input.figmaToken === "string" && input.figmaToken.trim()) return input.figmaToken.trim();
+  if (input.credential) {
+    return credentialSecret(input.credential, { api: "figma", operation: "rest", destination: "https://api.figma.com" });
+  }
+  if (input.mode === "canonical") return null;
   const name = input.design?.figmaTokenEnv?.trim() || "FIGMA_ACCESS_TOKEN";
   const value = process.env[name]?.trim();
   return value || null;

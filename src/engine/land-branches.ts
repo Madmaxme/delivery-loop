@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { lockedGitEnv } from "../adapters/forge-git.ts";
 import {
   allowlistedEnv,
   assertHealthy,
@@ -86,13 +87,13 @@ export function lookupRemoteHead(
 ): string | null {
   if (credential) assertHealthy(credential);
   const token = credential
-    ? credentialSecret(credential)
-    : process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
+    ? credentialSecret(credential, { api: "github", operation: "git", role: "opener", destination: repoUrl })
+    : "";
   const ask = token ? gitAskPass(token) : null;
   try {
-    const result = spawn("git", ["ls-remote", repoUrl, `refs/heads/${branch}`], {
+    const result = spawn("git", ["-c", "credential.helper=", "ls-remote", repoUrl, `refs/heads/${branch}`], {
       encoding: "utf8",
-      env: ask?.env ?? allowlistedEnv(process.env),
+      env: ask?.env ?? lockedGitEnv(),
     });
     if (result.status !== 0) return null;
     const sha = result.stdout.trim().split(/\s+/)[0] ?? "";
@@ -109,11 +110,12 @@ function gitAskPass(token: string): { dir: string; env: NodeJS.ProcessEnv } {
   writeFileSync(file, "#!/bin/sh\nprintf '%s\\n' \"$DELIVERY_LOOP_GIT_TOKEN\"\n", { mode: 0o700 });
   return {
     dir,
-    env: allowlistedEnv(process.env, {
+    env: {
+      ...lockedGitEnv(),
       GIT_ASKPASS: file,
       GIT_TERMINAL_PROMPT: "0",
       DELIVERY_LOOP_GIT_TOKEN: token,
-    }),
+    },
   };
 }
 

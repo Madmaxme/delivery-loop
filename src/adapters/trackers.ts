@@ -4,6 +4,7 @@ import {
   assertCanonicalCredential,
   assertHealthy,
   authorizationHeader,
+  CanonicalPathError,
   credentialSecret,
   type CanonicalCredential,
 } from "./canonical-path.ts";
@@ -28,20 +29,33 @@ type LinearIssue = {
 };
 
 export function linearTracker(opts: {
-  credential: CanonicalCredential;
+  credential?: CanonicalCredential;
+  legacyKey?: string;
   team: string;
   intakeState: string;
   fetch?: FetchLike;
 }): TrackerAdapter {
-  assertCanonicalCredential(opts.credential, "linear");
+  const legacy = Boolean(opts.legacyKey);
+  if (legacy === Boolean(opts.credential)) {
+    throw new CanonicalPathError("invalid-policy", "linear", "legacy mode is distinct from a canonical credential");
+  }
+  if (!legacy && opts.credential) assertCanonicalCredential(opts.credential, "linear");
   const fetchImpl = opts.fetch ?? fetch;
+  const authorization = () =>
+    legacy
+      ? authorizationHeader(opts.legacyKey ?? "")
+      : authorizationHeader(credentialSecret(opts.credential as CanonicalCredential, {
+          api: "linear",
+          operation: "graphql",
+          destination: "https://api.linear.app/graphql",
+        }));
 
   async function gql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
-    assertHealthy(opts.credential);
+    if (!legacy) assertHealthy(opts.credential as CanonicalCredential);
     const response = await fetchImpl("https://api.linear.app/graphql", {
       method: "POST",
       headers: {
-        Authorization: authorizationHeader(credentialSecret(opts.credential)),
+        Authorization: authorization(),
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ query, variables }),
@@ -324,22 +338,29 @@ function blockersFrom(
 }
 
 export function githubIssuesTracker(opts: {
-  credential: CanonicalCredential;
+  credential?: CanonicalCredential;
+  legacyToken?: string;
   repo: string;
   intakeLabel: string;
   fetch?: FetchLike;
 }): TrackerAdapter {
-  assertCanonicalCredential(opts.credential, "github");
+  const legacy = Boolean(opts.legacyToken);
+  if (legacy === Boolean(opts.credential)) {
+    throw new CanonicalPathError("invalid-policy", "github", "legacy mode is distinct from a canonical credential");
+  }
+  if (!legacy && opts.credential) assertCanonicalCredential(opts.credential, "github");
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    Authorization: authorizationHeader(credentialSecret(opts.credential)),
+    Authorization: legacy
+      ? authorizationHeader(opts.legacyToken ?? "")
+      : authorizationHeader(credentialSecret(opts.credential as CanonicalCredential, { api: "github", operation: "rest", role: "opener", destination: "https://api.github.com" })),
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
     "Content-Type": "application/json",
   };
 
   async function api(path: string, init?: RequestInit): Promise<unknown> {
-    assertHealthy(opts.credential);
+    if (!legacy) assertHealthy(opts.credential as CanonicalCredential);
     const response = await fetchImpl(`https://api.github.com${path}`, {
       ...init,
       headers: { ...headers, ...(init?.headers ?? {}) },
