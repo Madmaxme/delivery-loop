@@ -4,6 +4,7 @@ roles:
   orchestrator: orchestrator.yaml
   verdict-writer: verdict-writer.yaml
   delivery-agent: delivery-agent.yaml
+  engineering-bot: engineering-bot.yaml
 routines:
   - routines/github-events.yaml
   - routines/ledger-reconcile.yaml

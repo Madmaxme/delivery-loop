@@ -1,0 +1,20 @@
+specversion: "1.0"
+id: github-events
+effect: data-only
+purpose: Describes how a client would notice forge events that already happened. Nothing subscribes.
+trigger:
+  kind: event
+  spec: A pull request or check-run event on a head the client already records. This file does not register a listener.
+inputs:
+  - name: event
+    source: ref:forge-event
+  - name: head
+    source: ref:reviewed-head
+output:
+  event: bot.routine.github-events.reported
+  contract: The event name, the head it names, and whether the payload was accepted as a duplicate.
+idempotency: One result per forge delivery id. A repeated delivery is the same result.
+overlap: skip
+approval:
+  boundary: Recording an observation. No merge, no status write, and no dispatch.
+  requires: A person approves any live subscription. This file does not create one.

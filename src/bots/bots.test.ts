@@ -6,11 +6,13 @@ import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
 import { CONNECTORS } from "../connectors/catalog.ts";
+import { loadPack } from "../schema/pack.ts";
 import { formatInventory, loadBotBundle } from "./load.ts";
 import { EXECUTION_IDENTITIES, FORGE_OPERATIONS, TRACKER_OPERATIONS, WORKER_OPERATIONS } from "./surface.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const templates = join(root, "bots/templates");
+const threeRoleFixture = join(root, "src/bots/fixtures/v1.0.5");
 
 function copyTemplates(): string {
   const dir = join(mkdtempSync(join(tmpdir(), "bots-")), "defs");
@@ -58,7 +60,7 @@ describe("bot templates", () => {
     const bundle = loadBotBundle(templates);
     assert.deepEqual(
       bundle.definitions.map((definition) => definition.role).sort(),
-      ["delivery-agent", "orchestrator", "verdict-writer"],
+      ["delivery-agent", "engineering-bot", "orchestrator", "verdict-writer"],
     );
     assert.equal(bundle.routines.length, 5);
     assert.equal(existsTemplate("merge-agent.yaml"), false);
@@ -171,6 +173,85 @@ describe("bot templates", () => {
       loadBotBundle(reworded).definitions.find((definition) => definition.role === "delivery-agent")?.policies.includes("head-pinned-squash"),
       true,
     );
+  });
+
+  it("validates the engineering bot and rejects a broken bound or parent", () => {
+    const loaded = loadBotBundle(templates).definitions.find((definition) => definition.role === "engineering-bot");
+    assert.equal(loaded?.reportsTo, "orchestrator");
+    assert.deepEqual(
+      [...(loaded?.policies ?? [])].sort(),
+      [
+        "engineering-no-dispatch",
+        "engineering-no-relax-gate",
+        "engineering-no-status-writes",
+        "engineering-reports-only-to-orchestrator",
+        "no-self-merge",
+      ],
+    );
+
+    for (const id of [
+      "no-self-merge",
+      "engineering-no-dispatch",
+      "engineering-no-status-writes",
+      "engineering-no-relax-gate",
+      "engineering-reports-only-to-orchestrator",
+    ]) {
+      const dropped = copyTemplates();
+      writeFileSync(join(dropped, "engineering-bot.yaml"), dropPolicy(readFileSync(join(dropped, "engineering-bot.yaml"), "utf8"), id));
+      assert.throws(() => loadBotBundle(dropped), new RegExp(`missing policy ${id}`));
+    }
+
+    for (const id of ["merge-pr", "self-merge", "dispatch-delivery-loop", "write-tracker-status", "relax-quality-gate"]) {
+      const denied = copyTemplates();
+      writeFileSync(
+        join(denied, "engineering-bot.yaml"),
+        readFileSync(join(denied, "engineering-bot.yaml"), "utf8").replace("id: engineer-task", `id: ${id}`),
+      );
+      assert.throws(() => loadBotBundle(denied), new RegExp(`may ${id} is not allowed for engineering-bot`));
+    }
+
+    const badParent = copyTemplates();
+    writeFileSync(
+      join(badParent, "engineering-bot.yaml"),
+      readFileSync(join(badParent, "engineering-bot.yaml"), "utf8").replace("reportsTo: orchestrator", "reportsTo: delivery-agent"),
+    );
+    assert.throws(() => loadBotBundle(badParent), /reportsTo must be orchestrator/);
+
+    const blank = copyTemplates();
+    writeFileSync(
+      join(blank, "manifest.yaml"),
+      readFileSync(join(blank, "manifest.yaml"), "utf8").replace(
+        "engineering-bot: engineering-bot.yaml",
+        'engineering-bot: "   "',
+      ),
+    );
+    assert.throws(() => loadBotBundle(blank), /engineering-bot/);
+  });
+
+  it("loads the committed v1.0.5 three-role bundle", () => {
+    const bundle = loadBotBundle(threeRoleFixture);
+    assert.deepEqual(
+      bundle.definitions.map((definition) => definition.role).sort(),
+      ["delivery-agent", "orchestrator", "verdict-writer"],
+    );
+    const client = mkdtempSync(join(tmpdir(), "pack-v105-"));
+    cpSync(threeRoleFixture, join(client, "bots"), { recursive: true });
+    writeFileSync(
+      join(client, "delivery-loop.yaml"),
+      `tracker: linear
+worker: cursor
+repos:
+  - name: api
+    url: https://git.example/acme/api.git
+    trunk: main
+qualityCommand: npm test
+bots:
+  path: bots
+`,
+    );
+    const pack = loadPack(join(client, "delivery-loop.yaml"));
+    assert.deepEqual(pack.bots, { path: "bots" });
+    assert.equal(pack.qualityCommand, "npm test");
   });
 
   it("maps the delivery agent to the adapter interfaces and the connector catalog", () => {

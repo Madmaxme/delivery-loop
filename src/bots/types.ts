@@ -1,5 +1,5 @@
 /** A role. The engine ships the template. A client ships the instance. */
-export type BotRole = "orchestrator" | "verdict-writer" | "delivery-agent";
+export type BotRole = "orchestrator" | "verdict-writer" | "delivery-agent" | "engineering-bot";
 
 export type BotAdapterName = "forge" | "tracker" | "worker" | "connector" | "runner";
 
@@ -33,6 +33,10 @@ export const POLICY_IDS = [
   "orchestrator-no-status-writes",
   "verdict-no-status-writes",
   "verdict-no-relax-gate",
+  "engineering-no-dispatch",
+  "engineering-no-status-writes",
+  "engineering-no-relax-gate",
+  "engineering-reports-only-to-orchestrator",
 ] as const;
 
 export type PolicyId = (typeof POLICY_IDS)[number];
@@ -59,6 +63,11 @@ export const MAY_IDS = [
   "rebase-head",
   "force-merge-on-red",
   "relax-quality-gate",
+  "engineer-task",
+  "report-to-orchestrator",
+  "merge-pr",
+  "self-merge",
+  "write-tracker-status",
 ] as const;
 
 export type MayId = (typeof MAY_IDS)[number];
@@ -74,6 +83,13 @@ export const REQUIRED_POLICIES: Record<BotRole, readonly PolicyId[]> = {
     "no-rebase",
     "no-merge-on-red",
   ],
+  "engineering-bot": [
+    "no-self-merge",
+    "engineering-no-dispatch",
+    "engineering-no-status-writes",
+    "engineering-no-relax-gate",
+    "engineering-reports-only-to-orchestrator",
+  ],
 };
 
 /** The only may ids a role may list. Anything else is rejected. */
@@ -81,6 +97,7 @@ export const ALLOWED_MAY: Record<BotRole, readonly MayId[]> = {
   orchestrator: ["monitor-runs", "report-evidence"],
   "verdict-writer": ["record-verdict", "record-evidence"],
   "delivery-agent": ["call-adapters", "review-independently", "read-checks-on-exact-head", "squash-exact-green-head"],
+  "engineering-bot": ["engineer-task", "report-to-orchestrator"],
 };
 
 export type BotStatement = {
@@ -106,6 +123,11 @@ export type BotDefinition = {
   tools?: BotTool[];
   identities?: BotIdentity[];
   policies: PolicyId[];
+  /**
+   * The role this definition reports to.
+   * Only the engineering bot sets it, and the value must be the orchestrator role.
+   */
+  reportsTo?: BotRole;
   authority: BotAuthority;
 };
 
@@ -158,7 +180,12 @@ export type BotInventory = {
 export type BotManifest = {
   specversion: "1.0";
   effect: "data-only";
-  roles: Record<BotRole, string>;
+  roles: {
+    orchestrator: string;
+    "verdict-writer": string;
+    "delivery-agent": string;
+    "engineering-bot"?: string;
+  };
   routines: string[];
   inventory: string;
 };

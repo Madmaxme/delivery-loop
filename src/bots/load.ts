@@ -15,7 +15,19 @@ import {
   validateSchema,
 } from "./validate.ts";
 
-const ROLES: readonly BotRole[] = ["orchestrator", "verdict-writer", "delivery-agent"];
+const REQUIRED_ROLES: readonly BotRole[] = ["orchestrator", "verdict-writer", "delivery-agent"];
+const OPTIONAL_ROLES: readonly BotRole[] = ["engineering-bot"];
+
+function declaredRoles(manifest: BotManifest): BotRole[] {
+  const roles: BotRole[] = [...REQUIRED_ROLES];
+  for (const role of OPTIONAL_ROLES) {
+    if (!Object.hasOwn(manifest.roles, role)) continue;
+    const rel = manifest.roles[role];
+    if (typeof rel !== "string" || rel.trim() === "") throw new Error(`manifest ${role} path is blank`);
+    roles.push(role);
+  }
+  return roles;
+}
 
 function readDocument(path: string): unknown {
   return parse(readFileSync(path, "utf8"));
@@ -94,8 +106,10 @@ export function loadBotBundle(root: string): BotBundle {
   validateSchema(loadBotSchema(BOT_SCHEMA_FILES.manifest), manifestDoc, "manifest.yaml");
   const manifest = manifestDoc as BotManifest;
 
-  const definitions = ROLES.map((role) => {
+  const roles = declaredRoles(manifest);
+  const definitions = roles.map((role) => {
     const rel = manifest.roles[role];
+    if (!rel) throw new Error(`manifest is missing ${role}`);
     const path = resolveInside(rootReal, rel);
     const doc = readDocument(path);
     assertNoCredentialFields(doc, rel);
@@ -106,6 +120,10 @@ export function loadBotBundle(root: string): BotBundle {
     assertDeliverySurface(definition, CONNECTORS.map((connector) => connector.name), rel);
     return definition;
   });
+  const engineering = definitions.find((definition) => definition.role === "engineering-bot");
+  if (engineering && !definitions.some((definition) => definition.role === engineering.reportsTo)) {
+    throw new Error(`engineering-bot reportsTo ${engineering.reportsTo ?? "nothing"}, and that role is not in this bundle`);
+  }
 
   const routines = manifest.routines.map((rel) => {
     const path = resolveInside(rootReal, rel);
@@ -128,12 +146,12 @@ export function loadBotBundle(root: string): BotBundle {
   inventory.coverageGaps.forEach((gap, index) => assertRealTimestamp(gap.observedAt, `${inventoryRel}/coverageGaps/${index}/observedAt`));
   unique(inventory.items.map((item) => item.id), "inventory id");
   unique(inventory.items.map((item) => item.identityRef), "identityRef");
-  for (const role of ROLES) {
+  for (const role of roles) {
     const item = inventory.items.find((row) => row.id === role);
     if (!item) throw new Error(`inventory is missing the ${role} cross-check`);
   }
   for (const item of inventory.items) {
-    if (!ROLES.includes(item.id as BotRole)) {
+    if (!roles.includes(item.id as BotRole)) {
       throw new Error(`inventory cannot add ${item.id}; it cross-checks the role templates`);
     }
   }
