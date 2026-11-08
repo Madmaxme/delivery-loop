@@ -39,9 +39,48 @@ export const OUTBOUND_MODULES = [
   "src/engine/github-run-status.ts",
   "src/engine/land-branches.ts",
   "src/engine/loop.ts",
+  "src/schema/trusted-ref.ts",
 ] as const;
 
-const OUTBOUND_TEXT = /\bfetchImpl\s*\(|\bspawnSync\s*\(|\bexecFileSync\s*\(|\bspawn\s*\(/;
+const OUTBOUND_SPEC = /^(node:)?(child_process|http|https|net|tls)$|octokit|undici/;
+
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:\\])\/\/.*$/gm, "$1");
+}
+
+function importedSpecifiers(source: string): { spec: string; locals: string[] }[] {
+  const text = stripComments(source);
+  const found: { spec: string; locals: string[] }[] = [];
+  const from = /import\s+(type\s+)?([\s\S]*?)\s+from\s+["']([^"']+)["']/g;
+  for (const match of text.matchAll(from)) {
+    const clause = match[2] ?? "";
+    const locals = [...clause.matchAll(/\bas\s+([A-Za-z_$][\w$]*)|\b([A-Za-z_$][\w$]*)/g)]
+      .map((item) => item[1] || item[2])
+      .filter((name) => name && name !== "type" && name !== "from");
+    found.push({ spec: match[3], locals });
+  }
+  const dynamic = /import\(\s*["']([^"']+)["']\s*\)/g;
+  for (const match of text.matchAll(dynamic)) found.push({ spec: match[1], locals: [] });
+  return found;
+}
+
+function callsLocal(source: string, name: string): boolean {
+  const text = stripComments(source);
+  return new RegExp(`\\b${name}\\s*\\(`).test(text) || new RegExp(`\\b${name}\\s*\\.\\s*[A-Za-z_$]`).test(text);
+}
+
+function isDirectOutbound(source: string): boolean {
+  const plain = stripComments(source);
+  for (const item of importedSpecifiers(source)) {
+    if (!OUTBOUND_SPEC.test(item.spec)) continue;
+    if (item.locals.length === 0 || item.locals.some((name) => new RegExp(`\\b${name}\\b`).test(plain))) return true;
+  }
+  const code = plain
+    .replace(/"(?:\\.|[^"\n])*"|'(?:\\.|[^'\n])*'|`(?:\\.|[^`])*`/g, "\"\"")
+    .replace(/\/(?:\\.|[^/\n])+\/[dgimsuy]*/g, "\"\"");
+  const fetchCall = new RegExp(`\\bfetch\\s*\\(|\\bfetchImpl\\s*\\(`);
+  return fetchCall.test(code);
+}
 
 export function detectOutboundModules(root: string): string[] {
   const found: string[] = [];
@@ -54,8 +93,7 @@ export function detectOutboundModules(root: string): string[] {
         continue;
       }
       if (!name.endsWith(".ts") || name.endsWith(".test.ts")) continue;
-      const text = readFileSync(abs, "utf8");
-      if (!OUTBOUND_TEXT.test(text)) continue;
+      if (!isDirectOutbound(readFileSync(abs, "utf8"))) continue;
       found.push(relative(root, abs).split("\\").join("/"));
     }
   };
@@ -146,7 +184,7 @@ export function adapterAttempts(unprobed: {
           prompt: "x",
           repoUrl: "https://github.com/example/app",
           baseRef: "main",
-        }).then(() => fetch("https://example.invalid")),
+        }),
     },
     {
       name: "claude-worker",

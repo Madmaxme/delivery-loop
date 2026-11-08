@@ -41,6 +41,8 @@ describe("installer", () => {
     assert.doesNotMatch(workflow, /__DELIVERY_LOOP_REF__/);
     assert.match(workflow, /LINEAR_API_KEY/);
     assert.match(workflow, /unset LINEAR_API_KEY/);
+    assert.match(workflow, /botsPathFromPackYaml/);
+    assert.doesNotMatch(workflow, /awk /);
     assert.match(workflow, /LINEAR_OAUTH_CLIENT_ID/);
     assert.match(workflow, /LINEAR_OAUTH_CLIENT_SECRET/);
     assert.match(workflow, /npm install --omit=dev/);

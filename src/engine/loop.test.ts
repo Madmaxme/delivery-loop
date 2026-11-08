@@ -15,6 +15,7 @@ import { ownerHealPrompt } from "./stall.ts";
 const pack: ProjectPack = {
   tracker: "github",
   worker: "http",
+  agent: { url: "https://github.com/acme/workspace", trunk: "main" },
   repos: [{ name: "api", url: "https://github.com/acme/api", trunk: "main" }],
   qualityCommand: "npm test",
   qualityWorkflow: "quality",

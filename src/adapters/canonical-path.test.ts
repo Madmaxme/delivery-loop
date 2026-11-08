@@ -20,11 +20,13 @@ import {
   credentialAws,
   credentialSecret,
   prepareDispatchCredentials,
+  sameAuthorizedDestination,
   probeGithub,
   probeLinearViewer,
   resolveCredential,
   type CommandSpawn,
 } from "./canonical-path.ts";
+import { canonicalGithubRepo } from "../schema/pack.ts";
 import { healthFetch, issue, linearPath, mergerPath, openerPath, organizationId, readyMerger, readyOpener, viewerId } from "../testing/canonical-fixtures.ts";
 import { githubForge, githubGraphql } from "./forge-github.ts";
 import { gitForge } from "./forge-git.ts";
@@ -523,6 +525,32 @@ describe("canonical call path", () => {
     );
     assert.equal(credentialAws(credential).accessKeyId, "AKIAEXAMPLE");
     assert.equal(credentialAws(credential).sessionToken, "session");
+  });
+
+  it("rejects a lookalike host and pages through installation repositories", async () => {
+    assert.equal(canonicalGithubRepo("https://github.com.evil.example/acme/api"), null);
+    assert.equal(canonicalGithubRepo("https://github.com/acme/api.git"), "acme/api");
+    assert.equal(sameAuthorizedDestination("https://github.com.evil.example/acme/api", "https://github.com"), false);
+    assert.equal(sameAuthorizedDestination("https://github.com/acme/api.git", "https://github.com"), true);
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const pem = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
+    const seen: string[] = [];
+    const credential = await resolveCredential(mergerPath, {
+      env: { GITHUB_APP_PRIVATE_KEY: pem },
+      spawn: () => ({ status: 1, stdout: "" }),
+      fetch: async (url) => {
+        const href = String(url);
+        seen.push(href);
+        if (href.includes("/access_tokens")) return json({ token: "merger-token" }, 201);
+        if (href.includes("page=2")) return json({ repositories: [{ full_name: "example/app" }] });
+        return new Response(JSON.stringify({ repositories: [{ full_name: "example/other" }] }), {
+          status: 200,
+          headers: { link: '<https://api.github.com/installation/repositories?per_page=100&page=2>; rel="next"' },
+        });
+      },
+    });
+    assert.equal(seen.some((url) => url.includes("page=2")), true);
+    assert.equal(credentialSecret(credential, { api: "github", operation: "rest", role: "merger", destination: "https://api.github.com" }).length > 0, true);
   });
 
   it("every registered adapter rejects raw, copied, and unprobed credentials before any call", async () => {

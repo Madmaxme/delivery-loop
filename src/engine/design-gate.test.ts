@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
+import { issueLegacyCapability } from "../cli/trusted-config.ts";
 import { actors, readyLinear, readyMerger, readyOpener } from "../testing/canonical-fixtures.ts";
 import { githubForge } from "../adapters/forge-github.ts";
 import { linearTracker } from "../adapters/trackers.ts";
@@ -39,6 +40,7 @@ function withGithubHealth(fetchImpl: FetchLike): FetchLike {
 const pack: ProjectPack = {
   tracker: "linear",
   worker: "http",
+  agent: { url: "https://github.com/acme/workspace", trunk: "main" },
   repos: [{ name: "admin-web", url: "https://github.com/acme/admin-web", trunk: "development" }],
   qualityCommand: "npm test",
   qualityWorkflow: "quality",
@@ -219,6 +221,7 @@ describe("design gate", () => {
   it("stops a ticket that names a Figma frame and omits Design source", async () => {
     const env = harness(order(""));
     env.deps.figmaToken = "fixture-token";
+    env.deps.legacy = issueLegacyCapability();
     env.deps.figmaFetch = async () =>
       Response.json({ nodes: { "1:2": { document: { id: "1:2", name: "Home frame", type: "FRAME" } } } });
     const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
@@ -336,6 +339,7 @@ describe("design gate", () => {
   it("puts the Figma frame and the read output in the repair prompt", async () => {
     const env = harness(order(`**Design source:** \`${FRAME}\`\n**Validation:** \`${UI_CHECK}\``));
     env.deps.figmaToken = "fixture-token";
+    env.deps.legacy = issueLegacyCapability();
     env.deps.figmaFetch = async () =>
       Response.json({
         nodes: { "1:2": { document: { id: "1:2", name: "Home frame", type: "FRAME" } } },

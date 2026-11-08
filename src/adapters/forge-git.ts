@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -60,16 +61,31 @@ export function gitForge(opts: {
     throw new CanonicalPathError("missing-policy", "github", "missing canonical credential");
   }
   if (opts.credential) assertCanonicalCredential(opts.credential, "github");
-  const env = lockedGitEnv();
-  const run =
-    opts.run ??
-    ((args: string[], cwd: string) => {
-      if (canonical && opts.credential) {
-        assertHealthy(opts.credential);
-        credentialSecret(opts.credential, { api: "github", operation: "git", role: "opener", destination: "https://github.com" });
-      }
-      return defaultGit(["-c", "credential.helper=", ...args], cwd, env);
-    });
+  const runFor = (repoUrl: string): GitRun => {
+    if (canonical && !opts.credential) {
+      throw new CanonicalPathError("missing-policy", "github", "missing canonical credential");
+    }
+    let askDir: string | null = null;
+    const env = lockedGitEnv();
+    if (opts.credential) {
+      assertHealthy(opts.credential);
+      const token = credentialSecret(opts.credential, {
+        api: "github",
+        operation: "git",
+        role: "opener",
+        destination: repoUrl,
+      });
+      askDir = mkdtempSync(join(tmpdir(), "git-askpass-"));
+      const file = join(askDir, "askpass.sh");
+      writeFileSync(file, "#!/bin/sh\nprintf '%s\\n' \"$DELIVERY_LOOP_GIT_TOKEN\"\n", { mode: 0o700 });
+      env.GIT_ASKPASS = file;
+      env.GIT_TERMINAL_PROMPT = "0";
+      env.DELIVERY_LOOP_GIT_TOKEN = token;
+    }
+    const run = opts.run ?? ((args: string[], cwd: string, childEnv: NodeJS.ProcessEnv) => defaultGit(["-c", "credential.helper=", ...args], cwd, childEnv));
+    return (args, cwd) => run(args, cwd, env);
+  };
+  const run = (args: string[], cwd: string) => runFor("https://github.com")(args, cwd);
   const dirFor = opts.checkoutDir ?? ((repoUrl: string) => gitCheckoutDir(opts.cwd, repoUrl));
   return {
     async openPullRequest(input) {
@@ -95,6 +111,7 @@ export function gitForge(opts: {
     },
     async updateBranch() {},
     async compare(input): Promise<CompareStatus> {
+      const run = runFor(input.repoUrl);
       const cwd = dirFor(input.repoUrl);
       const base = run(["rev-parse", input.base], cwd);
       const head = run(["rev-parse", input.head], cwd);
@@ -112,6 +129,10 @@ export function gitForge(opts: {
       const branch = input.branch?.trim();
       const base = input.base?.trim();
       if (!branch || !base) throw new Error("git merge needs the branch and the trunk");
+      if (!input.headSha || !/^[0-9a-f]{40}$/i.test(input.headSha)) {
+        throw new Error("refusing to merge without the pull request head sha");
+      }
+      const run = runFor(input.repoUrl);
       const cwd = dirFor(input.repoUrl);
       const fetch = run(["fetch", "origin", branch], cwd);
       if (fetch.status !== 0) throw new Error(`git fetch failed for ${branch}`);

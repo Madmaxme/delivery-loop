@@ -1,67 +1,151 @@
 import { parse } from "yaml";
 
 import type { CanonicalPath } from "../bots/canonical.ts";
-import type { BotInventory } from "../bots/types.ts";
+import type { ForgeTreeReader } from "../adapters/types.ts";
+import {
+  canonicalGithubRepo,
+  trustedPackHome,
+  type CommitActor,
+  type ProjectPack,
+  type TrustedProofPaths,
+} from "../schema/pack.ts";
+import { readAtTrustedSha, textFromTrustedRef } from "../schema/trusted-ref.ts";
 
 export type CredentialMode = "legacy" | "canonical" | "refused";
+
+export type LegacyCapability = object;
+
+const legacyCaps = new WeakSet<object>();
+
+/** Only a verified legacy decision can mint this. Object literals are not capabilities. */
+export function issueLegacyCapability(): LegacyCapability {
+  const cap = Object.freeze(Object.create(null));
+  legacyCaps.add(cap);
+  return cap;
+}
+
+export function hasLegacyCapability(value: unknown): value is LegacyCapability {
+  return !!value && typeof value === "object" && legacyCaps.has(value);
+}
 
 export type CredentialDecision = {
   mode: CredentialMode;
   reason: string;
   paths: CanonicalPath[];
   trunk: string;
+  proof: TrustedProofPaths;
+  actors: CommitActor[];
+  legacy: LegacyCapability | null;
 };
 
-function botsPath(yaml: string): string | null {
-  const doc = parse(yaml) as { bots?: { path?: unknown } } | null;
-  const rel = doc?.bots && typeof doc.bots === "object" ? doc.bots.path : undefined;
-  if (typeof rel !== "string" || !rel.trim()) return null;
-  return rel.trim();
+function refused(reason: string): CredentialDecision {
+  return {
+    mode: "refused",
+    reason,
+    paths: [],
+    trunk: "",
+    proof: { paths: null, trunkSha: null },
+    actors: [],
+    legacy: null,
+  };
 }
 
-function trunkOf(yaml: string): string {
-  const doc = parse(yaml) as { agent?: { trunk?: unknown } } | null;
-  const named = doc?.agent?.trunk;
-  if (typeof named === "string" && named.trim()) return named.trim();
-  return "main";
+function botsPathOf(doc: { bots?: { path?: unknown } } | null): string | null {
+  const rel = doc?.bots && typeof doc.bots === "object" ? doc.bots.path : undefined;
+  if (typeof rel !== "string" || !rel.trim()) return null;
+  return rel.trim().replace(/\/$/, "");
 }
 
 /**
- * Enforcement comes from the trusted base text. A working-tree removal or a different inventory is refused.
- * Legacy mode is returned only when the trusted base has no bots path.
+ * Enforcement comes from one pinned SHA. A missing home, a missing SHA, or a
+ * working-tree replacement is refused. There is no default trunk.
  */
-export function decideCredentialMode(input: {
-  workPackYaml: string;
-  trustedPackYaml: string | null;
-  workInventoryYaml: string | null;
-  trustedInventoryYaml: string | null;
-}): CredentialDecision {
-  if (!input.trustedPackYaml?.trim()) {
-    return { mode: "refused", reason: "trusted base is absent", paths: [], trunk: "main" };
+export async function trustedDecision(
+  workPackYaml: string,
+  forge: ForgeTreeReader,
+  readWorkInventory: (rel: string) => string | null = () => null,
+): Promise<CredentialDecision> {
+  let work: ProjectPack;
+  try {
+    work = parse(workPackYaml) as ProjectPack;
+  } catch {
+    return refused("working pack is not valid YAML");
   }
-  const trunk = trunkOf(input.trustedPackYaml);
-  const trustedBots = botsPath(input.trustedPackYaml);
-  const workBots = botsPath(input.workPackYaml);
+  if (!trustedPackHome(work)) return refused("trusted home is missing or ambiguous");
+  let pinned: { text: string; trunkSha: string };
+  try {
+    pinned = await textFromTrustedRef(forge, work, "delivery-loop.yaml");
+  } catch (error) {
+    return refused(error instanceof Error ? error.message : "trusted read failed");
+  }
+  let trusted: ProjectPack;
+  try {
+    trusted = parse(pinned.text) as ProjectPack;
+  } catch {
+    return refused("trusted pack is not valid YAML");
+  }
+  const home = trustedPackHome(trusted);
+  const workHome = trustedPackHome(work);
+  if (!home || !workHome) return refused("trusted home is missing or ambiguous");
+  if (
+    canonicalGithubRepo(home.url) !== canonicalGithubRepo(workHome.url) ||
+    home.trunk !== workHome.trunk
+  ) {
+    return refused("working tree replaced the trusted home");
+  }
+  const trustedBots = botsPathOf(trusted);
+  const workBots = botsPathOf(work);
   if (trustedBots !== workBots) {
     return {
-      mode: "refused",
-      reason: trustedBots ? "working tree removed the trusted bots path" : "working tree replaced the trusted bots path",
-      paths: [],
-      trunk,
+      ...refused(trustedBots ? "working tree removed the trusted bots path" : "working tree replaced the trusted bots path"),
+      trunk: home.trunk,
+      proof: { paths: null, trunkSha: pinned.trunkSha },
     };
   }
-  if (!trustedBots) return { mode: "legacy", reason: "trusted base has no bots path", paths: [], trunk };
-  if (input.trustedInventoryYaml == null) {
-    return { mode: "refused", reason: "trusted inventory is absent", paths: [], trunk };
+  const actors = Array.isArray(trusted.commitActors) ? trusted.commitActors : [];
+  if (!trustedBots) {
+    return {
+      mode: "legacy",
+      reason: "trusted base has no bots path",
+      paths: [],
+      trunk: home.trunk,
+      proof: { paths: null, trunkSha: pinned.trunkSha },
+      actors,
+      legacy: issueLegacyCapability(),
+    };
   }
-  if ((input.workInventoryYaml ?? "").trim() !== input.trustedInventoryYaml.trim()) {
-    return { mode: "refused", reason: "working tree replaced the trusted inventory", paths: [], trunk };
+  let inventoryText: string;
+  try {
+    inventoryText = await readAtTrustedSha(forge, trusted, `${trustedBots}/inventory.yaml`, pinned.trunkSha);
+  } catch (error) {
+    return refused(error instanceof Error ? error.message : "trusted inventory is absent");
   }
-  const inventory = parse(input.trustedInventoryYaml) as BotInventory;
+  const workInventory = readWorkInventory(trustedBots);
+  if (workInventory == null || workInventory.trim() !== inventoryText.trim()) {
+    return refused("working tree replaced the trusted inventory");
+  }
+  let inventory: { canonicalPaths?: CanonicalPath[] };
+  try {
+    inventory = parse(inventoryText) as { canonicalPaths?: CanonicalPath[] };
+  } catch {
+    return refused("trusted inventory is not valid YAML");
+  }
   return {
     mode: "canonical",
     reason: "trusted base declares bots",
     paths: inventory.canonicalPaths ?? [],
-    trunk,
+    trunk: home.trunk,
+    proof: { paths: null, trunkSha: pinned.trunkSha },
+    actors,
+    legacy: null,
   };
+}
+
+/** Bots path from one YAML document. Callers do not re-scan the text. */
+export function botsPathFromPackYaml(text: string): string | null {
+  try {
+    return botsPathOf(parse(text) as { bots?: { path?: unknown } });
+  } catch {
+    return null;
+  }
 }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { issueLegacyCapability } from "./trusted-config.ts";
 import { credentialSecret, probeLinearViewer } from "../adapters/canonical-path.ts";
 import { healthFetch, issue, linearPath } from "../testing/canonical-fixtures.ts";
 import { shipInvocationDeps } from "./ship-deps.js";
@@ -38,7 +39,7 @@ describe("shipInvocationDeps", () => {
     process.env.GH_TOKEN = "stored-github";
     process.env.LINEAR_API_KEY = "stored-linear";
     try {
-      const legacy = shipInvocationDeps(pack(true), "/tmp");
+      const legacy = shipInvocationDeps(pack(true), "/tmp", null, issueLegacyCapability());
       assert.equal(legacy.tracker.kind, "linear");
       const minted = issue(linearPath, "minted-linear", { LINEAR_API_KEY: "stored-linear" });
       const deps = shipInvocationDeps(pack(true), "/tmp", { enforced: true, linear: minted, extensions: {}, aws: {}, actors: [] });

@@ -1,3 +1,5 @@
+import type { LegacyCapability } from "../cli/trusted-config.ts";
+import { hasLegacyCapability } from "../cli/trusted-config.ts";
 import {
   assertCanonicalCredential,
   assertDistinctPrincipals,
@@ -10,7 +12,9 @@ import {
   type CanonicalCredential,
 } from "./canonical-path.ts";
 import { assertCommitActor, commitActorLogin, githubUserLogin, type CommitActor } from "./github-actor.js";
-import type { CompareStatus, FetchLike, ForgeAdapter, PullMerge, PullRequest } from "./types.js";
+import type { CompareStatus, FetchLike, ForgeAdapter, ForgeTreeReader, PullMerge, PullRequest } from "./types.js";
+
+export type { ForgeTreeReader };
 import { githubRepoFromUrl } from "./types.js";
 
 async function readCommit(
@@ -87,6 +91,8 @@ export function githubForge(opts: {
   legacyToken?: string;
   /** #39's name for the legacy token. Canonical calls pass opener and merger instead. */
   token?: string;
+  /** Opaque capability from the trusted config. A raw token without it is refused. */
+  legacy?: LegacyCapability | null;
   fetch?: FetchLike;
   repo?: string;
   /** Writes by the opener require the trusted commit-actor id. */
@@ -94,6 +100,9 @@ export function githubForge(opts: {
 }): ForgeAdapter {
   const legacyToken = opts.legacyToken ?? opts.token;
   const legacy = Boolean(legacyToken);
+  if (legacy && !hasLegacyCapability(opts.legacy)) {
+    throw new CanonicalPathError("non-canonical-credential", "github", "github rejects a raw token");
+  }
   if (legacy === Boolean(opts.opener || opts.merger)) {
     throw new CanonicalPathError("invalid-policy", "github", "legacy mode is distinct from a canonical credential");
   }

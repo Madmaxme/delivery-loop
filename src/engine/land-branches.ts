@@ -6,9 +6,12 @@ import { join } from "node:path";
 import {
   allowlistedEnv,
   assertHealthy,
+  CanonicalPathError,
   credentialSecret,
   type CanonicalCredential,
 } from "../adapters/canonical-path.ts";
+import type { LegacyCapability } from "../cli/trusted-config.ts";
+import { hasLegacyCapability } from "../cli/trusted-config.ts";
 import { registerSecret } from "./redact.ts";
 import type { RepoSpec } from "../schema/pack.ts";
 
@@ -83,7 +86,7 @@ export function confirmLandBranches(input: {
 export function lookupRemoteHead(
   repoUrl: string,
   branch: string,
-  credential: CanonicalCredential | string | null = null,
+  credential: CanonicalCredential | { token: string; legacy: LegacyCapability } | null = null,
   spawn: typeof spawnSync = spawnSync,
 ): string | null {
   const token = gitToken(credential, repoUrl);
@@ -101,9 +104,15 @@ export function lookupRemoteHead(
   }
 }
 
-function gitToken(credential: CanonicalCredential | string | null, repoUrl: string): string {
-  if (typeof credential === "string") {
-    const token = credential.trim();
+function gitToken(
+  credential: CanonicalCredential | { token: string; legacy: LegacyCapability } | null,
+  repoUrl: string,
+): string {
+  if (credential && "legacy" in credential) {
+    if (!hasLegacyCapability(credential.legacy)) {
+      throw new CanonicalPathError("non-canonical-credential", "github", "github rejects a raw token");
+    }
+    const token = credential.token.trim();
     if (token) registerSecret(token);
     return token;
   }

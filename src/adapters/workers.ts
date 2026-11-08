@@ -1,3 +1,5 @@
+import type { LegacyCapability } from "../cli/trusted-config.ts";
+import { hasLegacyCapability } from "../cli/trusted-config.ts";
 import {
   assertCanonicalCredential,
   assertHealthy,
@@ -7,27 +9,48 @@ import {
   credentialRole,
   credentialSecret,
   isLegacyCredential,
+  sameAuthorizedDestination,
   type CanonicalCredential,
 } from "./canonical-path.ts";
 
-function issued(credential: CanonicalCredential, api: string): string {
+function issued(credential: CanonicalCredential, api: string, requestUrl: string): string {
   assertCanonicalCredential(credential, api);
   assertHealthy(credential);
   return credentialSecret(credential, {
     api,
     operation: api === "github" ? "rest" : "call",
     role: api === "github" ? "opener" : undefined,
-    destination: credentialPrimaryDestination(credential),
+    destination: requestUrl,
   });
 }
 
-function workerSecret(opts: { credential?: CanonicalCredential; legacyKey?: string }, api: string): string {
+function workerSecret(
+  opts: { credential?: CanonicalCredential; legacyKey?: string; legacy?: LegacyCapability | null },
+  api: string,
+  requestUrl: string,
+): string {
   const legacy = Boolean(opts.legacyKey);
   if (legacy === Boolean(opts.credential)) {
     throw new CanonicalPathError("invalid-policy", api, "legacy mode is distinct from a canonical credential");
   }
-  if (legacy) return opts.legacyKey ?? "";
-  return issued(opts.credential as CanonicalCredential, api);
+  if (legacy) {
+    if (!hasLegacyCapability(opts.legacy)) {
+      throw new CanonicalPathError("non-canonical-credential", api, `${api} rejects a raw token`);
+    }
+    return opts.legacyKey ?? "";
+  }
+  return issued(opts.credential as CanonicalCredential, api, requestUrl);
+}
+
+async function guardedFetch(fetchImpl: FetchLike, url: string, init: RequestInit, allowed: string): Promise<Response> {
+  if (!sameAuthorizedDestination(url, allowed)) {
+    throw new CanonicalPathError("non-canonical-credential", "http", "http destination is not authorized");
+  }
+  const response = await fetchImpl(url, { ...init, redirect: "manual" });
+  if (response.status >= 300 && response.status < 400) {
+    throw new CanonicalPathError("non-canonical-credential", "http", "http redirect is not followed");
+  }
+  return response;
 }
 import type { FetchLike, WorkerAdapter, WorkerResult, WorkerStart } from "./types.js";
 
@@ -49,30 +72,35 @@ export function httpWorker(opts: {
   statusUrl: string;
   credential?: CanonicalCredential;
   legacyKey?: string;
+  legacy?: LegacyCapability | null;
   fetch?: FetchLike;
 }): WorkerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    Authorization: authorizationHeader(workerSecret(opts, "http")),
+    Authorization: authorizationHeader(workerSecret(opts, "http", opts.startUrl)),
   };
+  workerSecret(opts, "http", opts.statusUrl);
   return {
     kind: "http",
     async start(input: WorkerStart) {
-      const response = await fetchImpl(opts.startUrl, {
+      const response = await guardedFetch(fetchImpl, opts.startUrl, {
         method: "POST",
         headers,
         body: JSON.stringify(input),
-      });
+      }, opts.startUrl);
       if (!response.ok) throw new Error(`HTTP worker start failed: ${response.status}`);
       const json = (await response.json()) as { runId: string };
       return { runId: json.runId };
     },
     async join(runId: string) {
       return poll(async () => {
-        const response = await fetchImpl(`${opts.statusUrl.replace(/\/$/, "")}/${runId}`, {
-          headers,
-        });
+        const response = await guardedFetch(
+          fetchImpl,
+          `${opts.statusUrl.replace(/\/$/, "")}/${runId}`,
+          { headers },
+          opts.statusUrl,
+        );
         if (!response.ok) throw new Error(`HTTP worker status failed: ${response.status}`);
         return (await response.json()) as WorkerResult;
       });
@@ -83,6 +111,7 @@ export function httpWorker(opts: {
 export function copilotWorker(opts: {
   credential?: CanonicalCredential;
   legacyKey?: string;
+  legacy?: LegacyCapability | null;
   owner: string;
   repo: string;
   fetch?: FetchLike;
@@ -95,7 +124,7 @@ export function copilotWorker(opts: {
   }
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    Authorization: authorizationHeader(workerSecret(opts, "github")),
+    Authorization: authorizationHeader(workerSecret(opts, "github", "https://api.github.com")),
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2026-03-10",
     "Content-Type": "application/json",
@@ -148,11 +177,14 @@ export function copilotWorker(opts: {
 export function codexWorker(opts: {
   credential?: CanonicalCredential;
   legacyKey?: string;
+  legacy?: LegacyCapability | null;
   fetch?: FetchLike;
 }): WorkerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    Authorization: authorizationHeader(workerSecret(opts, "openai")),
+    Authorization: authorizationHeader(
+      workerSecret(opts, "openai", opts.credential ? credentialPrimaryDestination(opts.credential) : "https://api.openai.com"),
+    ),
     "Content-Type": "application/json",
     "OpenAI-Beta": "agents=v1",
   };
@@ -208,11 +240,16 @@ export function codexWorker(opts: {
 export function claudeWorker(opts: {
   credential?: CanonicalCredential;
   legacyKey?: string;
+  legacy?: LegacyCapability | null;
   fetch?: FetchLike;
 }): WorkerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
-    "x-api-key": workerSecret(opts, "anthropic"),
+    "x-api-key": workerSecret(
+      opts,
+      "anthropic",
+      opts.credential ? credentialPrimaryDestination(opts.credential) : "https://api.anthropic.com",
+    ),
     "anthropic-version": "2023-06-01",
     "Content-Type": "application/json",
   };
@@ -352,6 +389,7 @@ type CursorLiveRun = {
 export function cursorWorker(opts: {
   credential?: CanonicalCredential;
   legacyKey?: string;
+  legacy?: LegacyCapability | null;
   sdk?: CursorSdk;
 }): WorkerAdapter {
   const live = new Map<string, CursorLiveRun>();
@@ -362,7 +400,11 @@ export function cursorWorker(opts: {
         opts.sdk ??
         ((await import("@cursor/sdk")) as { Agent: CursorSdk }).Agent;
       const agent = await sdk.create({
-        apiKey: workerSecret(opts, "cursor"),
+        apiKey: workerSecret(
+          opts,
+          "cursor",
+          opts.credential ? credentialPrimaryDestination(opts.credential) : "https://api.cursor.com",
+        ),
         cloud: {
           repos: [{ url: input.repoUrl, startingRef: input.baseRef }],
           autoCreatePR: false,

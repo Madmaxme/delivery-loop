@@ -127,6 +127,6 @@ export async function readyExtension(api: string, token = "k"): Promise<Canonica
     },
     token,
   );
-  await probeExtension(credential, () => ({ status: 0, stdout: `{"id":"example-${api}"}\n` }), {});
+  await probeExtension(credential, async () => json({ id: `example-${api}` }), {});
   return credential;
 }

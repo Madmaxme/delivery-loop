@@ -2,6 +2,7 @@ import { createSign, timingSafeEqual } from "node:crypto";
 
 import { assertCanonicalPath, STORED_ENV } from "../bots/canonical.ts";
 import { registerSecret } from "../engine/redact.ts";
+import { canonicalGithubRepo } from "../schema/pack.ts";
 import type { AwsCallerClass, CanonicalPath, GithubRole } from "../bots/canonical.ts";
 import type { CommitActor } from "../schema/pack.ts";
 import type { FetchLike } from "./types.ts";
@@ -156,13 +157,40 @@ export function assertCanonicalCredential(value: unknown, api: string): asserts 
 }
 
 function scopesFor(path: CanonicalPath): { operations: string[]; destinations: string[] } {
-  if (path.api === "linear") return { operations: ["graphql"], destinations: ["api.linear.app"] };
-  if (path.api === "github" && path.role === "merger") return { operations: ["rest"], destinations: ["api.github.com"] };
-  if (path.api === "github") return { operations: ["rest", "graphql", "git", "gh"], destinations: ["api.github.com", "github.com"] };
-  if (path.api === "aws") return { operations: ["sts"], destinations: ["sts.amazonaws.com"] };
-  if (path.api === "figma") return { operations: ["rest"], destinations: ["api.figma.com"] };
+  if (path.api === "linear") return { operations: ["graphql"], destinations: ["https://api.linear.app"] };
+  if (path.api === "github" && path.role === "merger") return { operations: ["rest"], destinations: ["https://api.github.com"] };
+  if (path.api === "github") {
+    return { operations: ["rest", "graphql", "git", "gh"], destinations: ["https://api.github.com", "https://github.com"] };
+  }
+  if (path.api === "aws") return { operations: ["sts"], destinations: ["https://sts.amazonaws.com"] };
+  if (path.api === "figma") return { operations: ["rest"], destinations: ["https://api.figma.com"] };
   const host = path.destinationHost?.trim() || `${path.api}.invalid`;
-  return { operations: ["call"], destinations: [host] };
+  const origin = host.includes("://") ? host : `https://${host}`;
+  return { operations: ["call"], destinations: [origin] };
+}
+
+function originParts(value: string): { protocol: string; hostname: string; port: string } | null {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (url.username || url.password) return null;
+  if (url.protocol !== "https:" && url.protocol !== "http:" && url.protocol !== "ssh:") return null;
+  return { protocol: url.protocol, hostname: url.hostname.toLowerCase(), port: url.port };
+}
+
+/** Exact origin, or the same canonical GitHub repository. Substring hosts do not match. */
+export function sameAuthorizedDestination(request: string, allowed: string): boolean {
+  const requestRepo = canonicalGithubRepo(request);
+  const allowedRepo = canonicalGithubRepo(allowed);
+  if (requestRepo && allowedRepo) return requestRepo === allowedRepo;
+  const left = originParts(request.includes("://") ? request : `https://${request}`);
+  const right = originParts(allowed.includes("://") ? allowed : `https://${allowed}`);
+  if (requestRepo && right?.hostname === "github.com" && right.protocol === "https:") return true;
+  if (!left || !right) return false;
+  return left.protocol === right.protocol && left.hostname === right.hostname && left.port === right.port;
 }
 
 export function credentialSecret(value: CanonicalCredential, use: CredentialUse): string {
@@ -179,8 +207,7 @@ export function credentialSecret(value: CanonicalCredential, use: CredentialUse)
   if (!record.operations.includes(use.operation)) {
     throw new CanonicalPathError("non-canonical-credential", use.api, `${use.api} ${use.operation} is not allowed for this credential`);
   }
-  const dest = use.destination.toLowerCase();
-  if (!record.destinations.some((allowed) => dest === allowed || dest.includes(allowed))) {
+  if (!record.destinations.some((allowed) => sameAuthorizedDestination(use.destination, allowed))) {
     throw new CanonicalPathError("non-canonical-credential", use.api, `${use.api} destination is not authorized`);
   }
   return record.token;
@@ -360,12 +387,15 @@ async function mintInstallation(path: CanonicalPath, deps: ResolveDeps, copies: 
     throw new CanonicalPathError("mint-failed", "github", "github installation mint is missing the app key");
   }
   const jwt = signAppJwt(path.appId, pem);
+  const repoName = path.repository?.split("/")[1]?.trim() ?? "";
   const minted = await deps.fetch(`https://api.github.com/app/installations/${path.installation}/access_tokens`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${jwt}`,
       Accept: "application/vnd.github+json",
+      "Content-Type": "application/json",
     },
+    body: JSON.stringify(repoName ? { repositories: [repoName] } : {}),
   });
   if (minted.status !== 201 && minted.status !== 200) {
     throw new CanonicalPathError("mint-failed", "github", "github installation mint failed", minted.status);
@@ -375,23 +405,42 @@ async function mintInstallation(path: CanonicalPath, deps: ResolveDeps, copies: 
   if (!token) throw new CanonicalPathError("mint-failed", "github", "github installation mint returned no token");
   uncheckedStoredNames(path, token, deps.env, copies);
   const credential = stamp(path, token);
-  const listed = await deps.fetch("https://api.github.com/installation/repositories?per_page=100", {
-    headers: {
-      Authorization: authorizationHeader(token),
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-  });
-  if (listed.status !== 200) {
-    throw new CanonicalPathError("credential-unhealthy", "github", "github installation health check failed", listed.status);
-  }
-  const repos = (await listed.json()) as { repositories?: { full_name?: string }[] };
-  const names = (repos.repositories ?? []).map((repo) => repo.full_name?.toLowerCase() ?? "");
+  const names = await listInstallationRepos(deps.fetch, token);
   if (!path.repository || !names.includes(path.repository.toLowerCase())) {
     throw new CanonicalPathError("credential-unhealthy", "github", "github installation does not include the declared repository");
   }
   markHealthy(credential, `installation:${path.installation}`);
   return credential;
+}
+
+function nextLink(headers: Headers | undefined): string | null {
+  const link = headers?.get?.("link") ?? "";
+  const match = link.match(/<([^>]+)>;\s*rel="next"/);
+  return match?.[1] ?? null;
+}
+
+async function listInstallationRepos(fetchImpl: FetchLike, token: string): Promise<string[]> {
+  const names: string[] = [];
+  let url: string | null = "https://api.github.com/installation/repositories?per_page=100";
+  for (let page = 0; page < 50 && url; page += 1) {
+    const listed = await fetchImpl(url, {
+      headers: {
+        Authorization: authorizationHeader(token),
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+      redirect: "manual",
+    });
+    if (listed.status !== 200) {
+      throw new CanonicalPathError("credential-unhealthy", "github", "github installation health check failed", listed.status);
+    }
+    const repos = (await listed.json()) as { repositories?: { full_name?: string }[] };
+    for (const repo of repos.repositories ?? []) {
+      if (repo.full_name) names.push(repo.full_name.toLowerCase());
+    }
+    url = nextLink(listed.headers);
+  }
+  return names;
 }
 
 function lastLine(stdout: string): string {
@@ -636,21 +685,27 @@ export function assertDistinctPrincipals(opener: CanonicalCredential, merger: Ca
   }
 }
 
-export async function probeExtension(credential: CanonicalCredential, spawn: CommandSpawn, env: NodeJS.ProcessEnv): Promise<void> {
+export async function probeExtension(
+  credential: CanonicalCredential,
+  fetchImpl: FetchLike,
+  _env: NodeJS.ProcessEnv = {},
+): Promise<void> {
   const record = recordOf(credential);
-  if (!record.healthCommand) {
-    throw new CanonicalPathError("credential-unhealthy", record.api, `${record.api} health check failed`);
+  const origin = record.destinations.find((item) => item.startsWith("https://"));
+  if (!origin || !record.expectedExtensionId) {
+    throw new CanonicalPathError("credential-unhealthy", record.api, `${record.api} probe is UNVERIFIED`);
   }
-  const result = spawn(record.healthCommand, allowlistedEnv(env, { DELIVERY_LOOP_CREDENTIAL: record.token }));
-  if (result.status !== 0) {
-    throw new CanonicalPathError("credential-unhealthy", record.api, `${record.api} health check failed`);
+  const response = await fetchImpl(`${origin}/identity`, {
+    headers: { Authorization: authorizationHeader(record.token) },
+    redirect: "manual",
+  });
+  if (response.status >= 300 && response.status < 400) {
+    throw new CanonicalPathError("credential-unhealthy", record.api, `${record.api} probe redirected`);
   }
-  let json: { id?: string };
-  try {
-    json = parseJson(result.stdout ?? "") as { id?: string };
-  } catch {
-    json = {};
+  if (response.status !== 200) {
+    throw new CanonicalPathError("credential-unhealthy", record.api, `${record.api} identity probe failed`, response.status);
   }
+  const json = (await response.json()) as { id?: string };
   if (!json.id?.trim() || json.id.trim() !== record.expectedExtensionId) {
     throw new CanonicalPathError("credential-unhealthy", record.api, `${record.api} identity does not match the canonical path`);
   }
@@ -744,7 +799,7 @@ export async function prepareDispatchCredentials(input: {
     const path = input.paths.find((item) => item.api === api);
     if (!path) throw new CanonicalPathError("missing-policy", api, `missing canonical path for ${api}`);
     const credential = await resolveCredential(path, deps);
-    await probeExtension(credential, input.spawn, input.env);
+    await probeExtension(credential, input.fetch, input.env);
     prepared.extensions[api] = credential;
   }
   for (const callerClass of input.awsClasses ?? []) {

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
+import { issueLegacyCapability } from "../cli/trusted-config.ts";
 import { confirmLandBranches, lookupRemoteHead, renderBranch } from "./land-branches.ts";
 
 const repos = [{ name: "api", url: "https://github.com/acme/api", trunk: "main" }];
@@ -80,7 +81,7 @@ printf '%s\\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main"
     process.env.GH_TOKEN = "ambient-token";
     process.env.HTTPS_PROXY = "http://proxy.example";
     try {
-      const sha = lookupRemoteHead("https://github.com/acme/api", "main", token);
+      const sha = lookupRemoteHead("https://github.com/acme/api", "main", { token, legacy: issueLegacyCapability() });
       assert.equal(sha, "a".repeat(40));
       const args = readFileSync(argsFile, "utf8");
       assert.equal(args.includes(token), false);

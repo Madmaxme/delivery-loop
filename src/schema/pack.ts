@@ -305,6 +305,56 @@ export function repoByName(pack: ProjectPack, name: string): RepoSpec | undefine
   return pack.repos.find((r) => r.name === name);
 }
 
+const GITHUB_OWNER = "[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?";
+const GITHUB_REPO = "[A-Za-z0-9_.-]+";
+
+function githubIdentity(owner: string, repo: string): string | null {
+  const name = repo.toLowerCase().replace(/\.git$/, "");
+  if (!name || !new RegExp(`^${GITHUB_REPO}$`).test(name)) return null;
+  if (!new RegExp(`^${GITHUB_OWNER}$`, "i").test(owner)) return null;
+  return `${owner.toLowerCase()}/${name}`;
+}
+
+/**
+ * Identity of a GitHub repository URL.
+ * Only `https://github.com/o/r`, `git@github.com:o/r`, and `ssh://git@github.com/o/r` match.
+ */
+export function canonicalGithubRepo(url: string): string | null {
+  const text = url.trim();
+  const patterns = [
+    new RegExp(`^https://github\\.com/(${GITHUB_OWNER})/(${GITHUB_REPO})(?:\\.git)?/?$`),
+    new RegExp(`^ssh://git@github\\.com/(${GITHUB_OWNER})/(${GITHUB_REPO})(?:\\.git)?/?$`),
+    new RegExp(`^git@github\\.com:(${GITHUB_OWNER})/(${GITHUB_REPO})(?:\\.git)?$`),
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    return githubIdentity(match[1], match[2]);
+  }
+  return null;
+}
+
+export type TrustedProofPaths = {
+  paths: string[] | null;
+  trunkSha: string | null;
+};
+
+/**
+ * Workspace home. Null when `agent.url` or `agent.trunk` is missing, the URL is not a
+ * canonical GitHub repo, or that repo is also a product repo.
+ */
+export function trustedPackHome(pack: ProjectPack): { url: string; trunk: string } | null {
+  const url = pack.agent?.url?.trim() ?? "";
+  const trunk = pack.agent?.trunk?.trim() ?? "";
+  if (!url || !trunk) return null;
+  const home = canonicalGithubRepo(url);
+  if (!home) return null;
+  for (const repo of pack.repos ?? []) {
+    if (canonicalGithubRepo(repo.url) === home) return null;
+  }
+  return { url, trunk };
+}
+
 /** Where the coding agent checks out. Product pull requests stay on `repos`. */
 export function agentHome(pack: ProjectPack): { url: string; trunk: string } {
   if (pack.agent?.url && pack.agent.trunk) {

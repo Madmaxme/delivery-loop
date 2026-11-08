@@ -1,53 +1,43 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { commitActorsFromTrustedRef } from "./main.ts";
+import type { ForgeTreeReader } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
+import { textFromTrustedRef } from "../schema/trusted-ref.ts";
+import { parse } from "yaml";
 
-function git(cwd: string, args: string[]) {
-  const result = spawnSync("git", args, {
-    cwd,
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      GIT_AUTHOR_NAME: "test",
-      GIT_AUTHOR_EMAIL: "test@example.com",
-      GIT_COMMITTER_NAME: "test",
-      GIT_COMMITTER_EMAIL: "test@example.com",
-    },
+const pack = {
+  agent: { url: "https://github.com/acme/loop", trunk: "main" },
+  repos: [{ name: "api", url: "https://github.com/acme/api", trunk: "main" }],
+} as ProjectPack;
+
+describe("textFromTrustedRef", () => {
+  it("reads actors from the pinned sha and ignores any other ref", async () => {
+    const forge: ForgeTreeReader = {
+      async trunkSha() {
+        return "b".repeat(40);
+      },
+      async readTextFile(input) {
+        assert.equal(input.ref, "b".repeat(40));
+        assert.equal(input.path, "delivery-loop.yaml");
+        return "commitActors:\n  - login: owner\n    repos: []\n";
+      },
+    };
+    const read = await textFromTrustedRef(forge, pack, "delivery-loop.yaml");
+    const actors = (parse(read.text) as { commitActors?: { login: string }[] }).commitActors ?? [];
+    assert.equal(actors[0]?.login, "owner");
+    assert.equal(read.trunkSha, "b".repeat(40));
   });
-  assert.equal(result.status, 0, result.stderr);
-}
 
-describe("commitActorsFromTrustedRef", () => {
-  it("reads the trunk file and ignores the working tree", () => {
-    const dir = mkdtempSync(join(tmpdir(), "commit-actors-"));
-    git(dir, ["init", "-b", "main"]);
-    writeFileSync(
-      join(dir, "delivery-loop.yaml"),
-      "commitActors:\n  - login: owner\n",
-    );
-    git(dir, ["add", "delivery-loop.yaml"]);
-    git(dir, ["commit", "-m", "base"]);
-    git(dir, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
-    writeFileSync(
-      join(dir, "delivery-loop.yaml"),
-      "commitActors:\n  - login: attacker\n",
-    );
-    const previous = process.cwd();
-    process.chdir(dir);
-    try {
-      const actors = commitActorsFromTrustedRef({
-        agent: { url: "https://github.com/acme/loop", trunk: "main" },
-        commitActors: [],
-      } as ProjectPack);
-      assert.equal(actors?.[0]?.login, "owner");
-    } finally {
-      process.chdir(previous);
-    }
+  it("refuses when the forge does not return a sha", async () => {
+    const forge: ForgeTreeReader = {
+      async trunkSha() {
+        return null;
+      },
+      async readTextFile() {
+        return "commitActors: []\n";
+      },
+    };
+    await assert.rejects(() => textFromTrustedRef(forge, pack, "delivery-loop.yaml"), /trusted trunk sha is absent/);
   });
 });

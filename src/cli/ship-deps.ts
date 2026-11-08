@@ -1,3 +1,4 @@
+import type { LegacyCapability } from "./trusted-config.ts";
 import type { PreparedCredentials } from "../adapters/canonical-path.ts";
 import type { ForgeAdapter, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { githubIssuesTracker, linearTracker } from "../adapters/trackers.js";
@@ -77,7 +78,11 @@ function envToken(name: string): string {
   return value;
 }
 
-function trackerFor(pack: ProjectPack, prepared: PreparedCredentials | null): TrackerAdapter {
+function trackerFor(
+  pack: ProjectPack,
+  prepared: PreparedCredentials | null,
+  legacy: LegacyCapability | null,
+): TrackerAdapter {
   if (pack.tracker === "linear") {
     if (prepared?.linear) {
       return linearTracker({
@@ -88,6 +93,7 @@ function trackerFor(pack: ProjectPack, prepared: PreparedCredentials | null): Tr
     }
     return linearTracker({
       legacyKey: envToken("LINEAR_API_KEY"),
+      legacy,
       team: pack.linearTeam ?? "",
       intakeState: pack.status.intake,
     });
@@ -101,6 +107,7 @@ function trackerFor(pack: ProjectPack, prepared: PreparedCredentials | null): Tr
   }
   return githubIssuesTracker({
     legacyToken: envToken("GH_TOKEN"),
+    legacy,
     repo: pack.githubRepo ?? "",
     intakeLabel: pack.status.intake,
   });
@@ -112,7 +119,12 @@ function trackerFor(pack: ProjectPack, prepared: PreparedCredentials | null): Tr
  * A failed step opens the tracker to record one owner edit, then starts
  * the worker.
  */
-export function shipInvocationDeps(pack: ProjectPack, cwd: string, prepared: PreparedCredentials | null = null): LoopDeps {
+export function shipInvocationDeps(
+  pack: ProjectPack,
+  cwd: string,
+  prepared: PreparedCredentials | null = null,
+  legacy: LegacyCapability | null = null,
+): LoopDeps {
   const needsTracker = pack.ship?.markStatus !== false;
   const opener = prepared?.opener;
   return {
@@ -120,8 +132,9 @@ export function shipInvocationDeps(pack: ProjectPack, cwd: string, prepared: Pre
     cwd,
     worker: idleWorker(),
     forge: idleForge(),
-    tracker: needsTracker ? trackerFor(pack, prepared) : idleTracker(),
-    openTracker: () => trackerFor(pack, prepared),
+    tracker: needsTracker ? trackerFor(pack, prepared, legacy) : idleTracker(),
+    openTracker: () => trackerFor(pack, prepared, legacy),
+    legacy,
     lookupHead: (repoUrl, branch) => lookupRemoteHead(repoUrl, branch, opener ?? null),
     credentialMode: prepared ? "canonical" : "legacy",
     githubHandle: opener ?? null,

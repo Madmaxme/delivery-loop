@@ -27,6 +27,7 @@ describe("git forge", () => {
       number: pr.number,
       branch: "cursor/api-1-api",
       base: "main",
+      headSha: "a".repeat(40),
     });
     assert.equal(sha, "abc1234");
     assert.deepEqual(calls, [

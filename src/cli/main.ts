@@ -12,7 +12,8 @@ import { fileURLToPath } from "node:url";
 import { parse, stringify } from "yaml";
 
 import { allowlistedEnv, CanonicalPathError, prepareDispatchCredentials, type PreparedCredentials } from "../adapters/canonical-path.ts";
-import { decideCredentialMode } from "./trusted-config.ts";
+import { botsPathFromPackYaml, trustedDecision, type CredentialDecision } from "./trusted-config.ts";
+import { localForgeTreeReader } from "../schema/trusted-ref.ts";
 import { gitForge } from "../adapters/forge-git.js";
 import { githubForge } from "../adapters/forge-github.js";
 import { runGh } from "../adapters/gh.js";
@@ -128,93 +129,74 @@ function extensionApi(worker: ProjectPack["worker"]): string | null {
   return null;
 }
 
-/** Named owners come from the fetched trunk file. The working copy is not the allowlist. */
-export function commitActorsFromTrustedRef(pack: ProjectPack): ProjectPack["commitActors"] {
-  const trunk = pack.agent?.trunk ?? "main";
-  const ref = `origin/${trunk}:delivery-loop.yaml`;
-  const shown = spawnSync("git", ["show", ref], { cwd: process.cwd(), encoding: "utf8" });
-  if (shown.status !== 0 || !shown.stdout?.trim()) {
-    throw new Error(`commitActors must be read from ${ref}, not the working tree`);
-  }
-  const parsed = parse(shown.stdout) as { commitActors?: ProjectPack["commitActors"] };
-  return parsed.commitActors ?? [];
-}
-
-function gitShow(ref: string, cwd: string): string | null {
-  const shown = spawnSync("git", ["show", ref], { cwd, encoding: "utf8" });
-  if (shown.status !== 0 || !shown.stdout) return null;
-  return shown.stdout;
-}
-
-export function trustedDecision(cwd: string, workPackYaml: string) {
-  const head = spawnSync("git", ["rev-parse", "--abbrev-ref", "origin/HEAD"], { cwd, encoding: "utf8" });
-  const base = head.status === 0 && head.stdout.trim().startsWith("origin/") ? head.stdout.trim().slice("origin/".length) : "main";
-  let trusted = gitShow(`origin/${base}:delivery-loop.yaml`, cwd);
-  let trunk = base;
-  if (trusted) {
-    const named = decideCredentialMode({
-      workPackYaml,
-      trustedPackYaml: trusted,
-      workInventoryYaml: null,
-      trustedInventoryYaml: null,
-    }).trunk;
-    if (named !== base) {
-      const again = gitShow(`origin/${named}:delivery-loop.yaml`, cwd);
-      if (!again) return decideCredentialMode({ workPackYaml, trustedPackYaml: null, workInventoryYaml: null, trustedInventoryYaml: null });
-      trusted = again;
-      trunk = named;
-    }
-  }
-  const trustedBots = trusted ? decideCredentialMode({ workPackYaml, trustedPackYaml: trusted, workInventoryYaml: "", trustedInventoryYaml: "" }) : null;
-  const rel = trusted && /bots:\s*\n(?:[ \t].*\n)*?[ \t]*path:\s*(\S+)/.exec(trusted)?.[1];
-  const trustedInventory = rel ? gitShow(`origin/${trunk}:${rel.replace(/\/$/, "")}/inventory.yaml`, cwd) : null;
-  const workInventory = rel && existsSync(resolve(cwd, rel, "inventory.yaml")) ? readFileSync(resolve(cwd, rel, "inventory.yaml"), "utf8") : null;
-  void trustedBots;
-  return decideCredentialMode({
-    workPackYaml,
-    trustedPackYaml: trusted,
-    workInventoryYaml: workInventory,
-    trustedInventoryYaml: trustedInventory,
-  });
-}
-
-export async function preparePackCredentials(pack: ProjectPack, workPackYaml: string, cwd: string): Promise<PreparedCredentials | null> {
-  const decision = trustedDecision(cwd, workPackYaml);
+export async function preparePackCredentials(
+  pack: ProjectPack,
+  workPackYaml: string,
+  cwd: string,
+): Promise<{ prepared: PreparedCredentials | null; decision: CredentialDecision }> {
+  const decision = await loadTrustedDecision(workPackYaml, cwd);
   if (decision.mode === "refused") throw new CanonicalPathError("invalid-policy", "credential", decision.reason);
-  if (decision.mode === "legacy") return null;
-  const actors = commitActorsFromTrustedRef(pack);
+  if (decision.mode === "legacy") return { prepared: null, decision };
   const extension = extensionApi(pack.worker);
   const github = pack.forge !== "git" || pack.tracker === "github" || pack.worker === "copilot";
-  return prepareDispatchCredentials({
-    paths: decision.paths,
-    env: process.env,
-    fetch,
-    spawn: commandSpawn,
-    actors,
-    linear: pack.tracker === "linear",
-    github,
-    extensions: extension ? [extension] : [],
+  const extensions = [
+    ...(extension ? [extension] : []),
+    ...(pack.design && decision.paths.some((path) => path.api === "figma") ? ["figma"] : []),
+  ];
+  return {
+    prepared: await prepareDispatchCredentials({
+      paths: decision.paths,
+      env: process.env,
+      fetch,
+      spawn: commandSpawn,
+      actors: decision.actors,
+      linear: pack.tracker === "linear",
+      github,
+      extensions,
+    }),
+    decision,
+  };
+}
+
+export async function loadTrustedDecision(workPackYaml: string, cwd: string): Promise<CredentialDecision> {
+  const rel = botsPathFromPackYaml(workPackYaml);
+  return trustedDecision(workPackYaml, localForgeTreeReader(cwd), (path) => {
+    if (!rel || path !== rel) return null;
+    const file = resolve(cwd, rel, "inventory.yaml");
+    return existsSync(file) ? readFileSync(file, "utf8") : null;
   });
 }
 
-export async function adaptersFor(pack: ProjectPack, prepared: PreparedCredentials | null): Promise<{
+export async function adaptersFor(
+  pack: ProjectPack,
+  prepared: PreparedCredentials | null,
+  decision: CredentialDecision,
+): Promise<{
   tracker: TrackerAdapter;
   worker: WorkerAdapter;
   forge: ForgeAdapter;
 }> {
-  const legacy = prepared == null;
+  const legacy = decision.mode === "legacy" ? decision.legacy : null;
+  if (decision.mode === "legacy" && !legacy) {
+    throw new CanonicalPathError("invalid-policy", "credential", "legacy mode was not issued by the trusted config");
+  }
   const repo =
     pack.githubRepo ??
     githubRepoFromUrl(pack.repos[0].url).owner + "/" + githubRepoFromUrl(pack.repos[0].url).repo;
-  const actors = prepared?.actors ?? (legacy ? [] : commitActorsFromTrustedRef(pack));
+  const actors = decision.actors;
   const forge =
     pack.forge === "git"
-      ? gitForge({ cwd: process.cwd(), mode: legacy ? "legacy" : "canonical", credential: prepared?.opener })
+      ? gitForge({
+          cwd: process.cwd(),
+          mode: legacy ? "legacy" : "canonical",
+          credential: prepared?.opener,
+          legacy,
+        })
       : legacy
-        ? githubForge({ legacyToken: requireEnv("GH_TOKEN"), repo, commitActors: actors })
+        ? githubForge({ legacyToken: requireEnv("GH_TOKEN"), legacy, repo, commitActors: actors })
         : githubForge({
-            opener: prepared.opener,
-            merger: prepared.merger,
+            opener: prepared?.opener,
+            merger: prepared?.merger,
             repo,
             commitActors: actors,
           });
@@ -223,43 +205,50 @@ export async function adaptersFor(pack: ProjectPack, prepared: PreparedCredentia
       ? legacy
         ? linearTracker({
             legacyKey: requireEnv("LINEAR_API_KEY"),
+            legacy,
             team: pack.linearTeam ?? "",
             intakeState: pack.status.intake,
           })
         : linearTracker({
-            credential: prepared.linear,
+            credential: prepared?.linear,
             team: pack.linearTeam ?? "",
             intakeState: pack.status.intake,
           })
       : legacy
         ? githubIssuesTracker({
             legacyToken: requireEnv("GH_TOKEN"),
+            legacy,
             repo: pack.githubRepo ?? "",
             intakeLabel: pack.status.intake,
           })
         : githubIssuesTracker({
-            credential: prepared.opener,
+            credential: prepared?.opener,
             repo: pack.githubRepo ?? "",
             intakeLabel: pack.status.intake,
           });
-  const worker = workerFor(pack, prepared);
+  const worker = workerFor(pack, prepared, legacy);
   return { tracker, worker, forge };
 }
 
-function workerFor(pack: ProjectPack, prepared: PreparedCredentials | null): WorkerAdapter {
+function workerFor(
+  pack: ProjectPack,
+  prepared: PreparedCredentials | null,
+  legacy: CredentialDecision["legacy"],
+): WorkerAdapter {
   if (!prepared) {
-    if (pack.worker === "cursor") return cursorWorker({ legacyKey: requireEnv("CURSOR_API_KEY") });
-    if (pack.worker === "claude") return claudeWorker({ legacyKey: requireEnv("ANTHROPIC_API_KEY") });
-    if (pack.worker === "codex") return codexWorker({ legacyKey: requireEnv("OPENAI_API_KEY") });
+    if (pack.worker === "cursor") return cursorWorker({ legacyKey: requireEnv("CURSOR_API_KEY"), legacy });
+    if (pack.worker === "claude") return claudeWorker({ legacyKey: requireEnv("ANTHROPIC_API_KEY"), legacy });
+    if (pack.worker === "codex") return codexWorker({ legacyKey: requireEnv("OPENAI_API_KEY"), legacy });
     if (pack.worker === "copilot") {
       const repo = pack.githubRepo ?? "";
       const [owner, name] = repo.split("/");
-      return copilotWorker({ legacyKey: requireEnv("GH_TOKEN"), owner, repo: name });
+      return copilotWorker({ legacyKey: requireEnv("GH_TOKEN"), legacy, owner, repo: name });
     }
     return httpWorker({
       startUrl: pack.workerHttp?.startUrl ?? "",
       statusUrl: pack.workerHttp?.statusUrl ?? "",
       legacyKey: requireEnv("HTTP_WORKER_TOKEN"),
+      legacy,
     });
   }
   if (pack.worker === "cursor") {
@@ -294,8 +283,9 @@ function workerFor(pack: ProjectPack, prepared: PreparedCredentials | null): Wor
 
 async function dispatchGh(args: string[]): Promise<number | null> {
   const opened = openPack(packPath(process.cwd()));
-  const prepared = await preparePackCredentials(opened.pack, readFileSync(packPath(process.cwd()), "utf8"), process.cwd());
+  const { prepared, decision } = await preparePackCredentials(opened.pack, readFileSync(packPath(process.cwd()), "utf8"), process.cwd());
   if (!prepared) {
+    if (!decision.legacy) throw new CanonicalPathError("invalid-policy", "github", "legacy mode was not issued by the trusted config");
     const token = requireEnv("GH_TOKEN");
     return spawnSync("gh", args, {
       env: allowlistedEnv(process.env, { GH_TOKEN: token, GITHUB_TOKEN: token }),
@@ -327,14 +317,17 @@ async function dispatchOrRun(mode: string, argv: string[]): Promise<void> {
       return;
     }
     const opened = openPack(packPath(process.cwd()));
-    const prepared = await preparePackCredentials(opened.pack, readFileSync(packPath(process.cwd()), "utf8"), process.cwd());
+    const { prepared, decision } = await preparePackCredentials(opened.pack, readFileSync(packPath(process.cwd()), "utf8"), process.cwd());
     const continueMode = argv.includes("continue");
     const rest = argv.filter((item) => item !== "continue");
     const issue = rest.find((a) => /^[A-Z][A-Z0-9]*-\d+$/i.test(a));
     const extra = rest.filter((a) => a !== issue).join(" ");
-    const deps = shipInvocationDeps(opened.pack, process.cwd(), prepared);
+    const deps = shipInvocationDeps(opened.pack, process.cwd(), prepared, decision.legacy);
+    deps.credentialMode = decision.mode === "canonical" ? "canonical" : "legacy";
+    deps.legacy = decision.legacy;
+    deps.proof = decision.proof;
     deps.ownerHeal = async (input) => {
-      const worker = workerFor(opened.pack, prepared);
+      const worker = workerFor(opened.pack, prepared, decision.legacy);
       const started = await worker.start(input);
       const joined = await worker.join(started.runId);
       if (joined.status === "failed") throw new Error(joined.text || "owner edit failed");
@@ -377,18 +370,20 @@ async function dispatchOrRun(mode: string, argv: string[]): Promise<void> {
     return;
   }
   const opened = openPack(packPath(process.cwd()));
-  const prepared = await preparePackCredentials(opened.pack, readFileSync(packPath(process.cwd()), "utf8"), process.cwd());
+  const { prepared, decision } = await preparePackCredentials(opened.pack, readFileSync(packPath(process.cwd()), "utf8"), process.cwd());
   const started = Number(
     process.env.DELIVERY_LOOP_PAGE_STARTED_MS || "",
   );
   const deps = {
     pack: opened.pack,
-    ...(await adaptersFor(opened.pack, prepared)),
+    ...(await adaptersFor(opened.pack, prepared, decision)),
     cwd: process.cwd(),
     project: plan.project,
     pageStartedAtMs: Number.isFinite(started) && started > 0 ? started : null,
     lookupHead: (repoUrl: string, branch: string) => lookupRemoteHead(repoUrl, branch, prepared?.opener ?? null),
-    credentialMode: prepared ? "canonical" : "legacy",
+    credentialMode: decision.mode === "canonical" ? "canonical" : "legacy",
+    legacy: decision.legacy,
+    proof: decision.proof,
     figmaCredential: prepared?.extensions.figma ?? null,
     githubHandle: prepared?.opener ?? null,
   };

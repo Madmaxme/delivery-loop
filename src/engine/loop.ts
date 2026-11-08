@@ -3,8 +3,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { CompareStatus, DesignCheckProbe, FetchLike, ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
-import { agentHome, holdStatus, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
+import type { CompareStatus, DesignVerdict, FetchLike, ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
+import { holdStatus, repoByName, trustedPackHome, unblockingStates, type ProjectPack, type RepoSpec, type TrustedProofPaths } from "../schema/pack.js";
+import { hasLegacyCapability, type LegacyCapability } from "../cli/trusted-config.ts";
 import {
   designRepairText,
   designRepo,
@@ -128,6 +129,10 @@ export type LoopDeps = {
   figmaToken?: string | null;
   /** Canonical mode does not read an ambient Figma token. */
   credentialMode?: "legacy" | "canonical";
+  /** Issued only by the trusted config when the pinned pack has no bots path. */
+  legacy?: LegacyCapability | null;
+  /** Pinned trunk SHA from the trusted read. `paths` stays null until proof paths are read. */
+  proof?: TrustedProofPaths;
   figmaCredential?: CanonicalCredential | null;
   /** Override for tests. Default is global fetch. The token is not written into prompts. */
   figmaFetch?: FetchLike;
@@ -588,7 +593,7 @@ function trunkHasTicketCommit(deps: LoopDeps, identifier: string, text: string):
     const result = spawnSync(
       "git",
       ["-C", dir, "log", spec.trunk, "--grep", identifier, "-1", "--format=%H"],
-      { encoding: "utf8" },
+      { encoding: "utf8", env: operationEnv(deps) },
     );
     if (result.status === 0 && result.stdout.trim()) return true;
   }
@@ -672,7 +677,8 @@ async function executeTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResu
     return { identifier: ticket.identifier, outcome: "skipped-lease", detail: "lease held" };
   }
 
-  const home = agentHome(deps.pack);
+  const home = trustedPackHome(deps.pack);
+  if (!home) throw new Error("trusted home is missing or ambiguous");
   if (lease.cursorRunId && lease.cursorRunId !== "pending") {
     const joined = await deps.worker.join(
       JSON.stringify({ agentId: lease.cursorRunId, runId: lease.cursorRunId, status: "running" }),
@@ -1175,7 +1181,7 @@ function refreshShipGithubToken(deps: LoopDeps, env: NodeJS.ProcessEnv): boolean
   if (deps.credentialMode === "canonical") return false;
   const command = (env.DELIVERY_LOOP_GITHUB_MINT ?? process.env.DELIVERY_LOOP_GITHUB_MINT ?? "").trim();
   if (!command) return false;
-  const result = spawnSync(command, { shell: true, encoding: "utf8" });
+  const result = spawnSync(command, { shell: true, encoding: "utf8", env: allowlistedEnv(process.env) });
   const token = (result.stdout ?? "").trim().split(/\n/).at(-1)?.trim() ?? "";
   if (result.status !== 0 || !token) return false;
   registerSecret(token);
@@ -1202,7 +1208,10 @@ function remoteHead(deps: LoopDeps): (repoUrl: string, branch: string) => string
     if (deps.credentialMode === "canonical" || deps.githubHandle) {
       return lookupRemoteHead(repoUrl, branch, deps.githubHandle ?? null);
     }
-    return lookupRemoteHead(repoUrl, branch, deps.githubCredential ?? "");
+    if (deps.githubCredential && hasLegacyCapability(deps.legacy)) {
+      return lookupRemoteHead(repoUrl, branch, { token: deps.githubCredential, legacy: deps.legacy });
+    }
+    return lookupRemoteHead(repoUrl, branch, null);
   };
 }
 
@@ -1257,12 +1266,43 @@ function runShipSteps(deps: LoopDeps, identifier: string): string | null {
   }
 }
 
-function defaultRunPackCommand(
+function operationEnv(deps: LoopDeps, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const env = allowlistedEnv(process.env, {
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    ...extra,
+  });
+  if (deps.credentialMode === "canonical" && deps.githubHandle) {
+    const token = credentialSecret(deps.githubHandle, {
+      api: "github",
+      operation: "gh",
+      role: "opener",
+      destination: "https://api.github.com",
+    });
+    env.GH_TOKEN = token;
+    env.GITHUB_TOKEN = token;
+  } else if (deps.githubCredential && hasLegacyCapability(deps.legacy)) {
+    env.GH_TOKEN = deps.githubCredential;
+    env.GITHUB_TOKEN = deps.githubCredential;
+  }
+  return env;
+}
+
+function runPackCommand(
+  deps: LoopDeps,
   command: string,
   cwd: string,
   stdin: string,
 ): { status: number | null; stdout: string } {
-  const result = spawnSync(command, { shell: true, cwd, input: stdin, encoding: "utf8" });
+  if (deps.runPackCommand) return deps.runPackCommand(command, cwd, stdin);
+  const result = spawnSync(command, {
+    shell: true,
+    cwd,
+    input: stdin,
+    encoding: "utf8",
+    env: operationEnv(deps),
+  });
   return { status: result.status, stdout: result.stdout ?? "" };
 }
 
@@ -1270,8 +1310,7 @@ function defaultRunPackCommand(
 async function symbolsResolve(deps: LoopDeps, symbols: string[]): Promise<boolean> {
   const command = deps.pack.symbolsCommand?.trim();
   if (!command || symbols.length === 0) return true;
-  const run = deps.runPackCommand ?? defaultRunPackCommand;
-  const result = run(command, deps.cwd ?? process.cwd(), `${symbols.join("\n")}\n`);
+  const result = runPackCommand(deps, command, deps.cwd ?? process.cwd(), `${symbols.join("\n")}\n`);
   return result.status === 0;
 }
 
@@ -1282,8 +1321,7 @@ async function symbolsResolve(deps: LoopDeps, symbols: string[]): Promise<boolea
 function journeyCommandProof(deps: LoopDeps, stdin: string): string | null {
   const command = deps.pack.journeyCommand?.trim();
   if (!command) return "";
-  const run = deps.runPackCommand ?? defaultRunPackCommand;
-  const result = run(command, deps.cwd ?? process.cwd(), stdin);
+  const result = runPackCommand(deps, command, deps.cwd ?? process.cwd(), stdin);
   if (result.status !== 0) return null;
   if (parseJourneyProofs(result.stdout).length === 0) return null;
   return result.stdout;
@@ -1529,9 +1567,14 @@ let releaseTagCache: string[] | undefined | null = null;
 /** Tags the opener can see with the checkout's existing remote. No new credential. */
 function releaseTagsForHeal(): string[] | undefined {
   if (releaseTagCache !== null) return releaseTagCache;
-  const listed = spawnSync("git", ["ls-remote", "--tags", "--refs", "origin"], {
+  const listed = spawnSync("git", ["-c", "credential.helper=", "ls-remote", "--tags", "--refs", "origin"], {
     encoding: "utf8",
     timeout: 8000,
+    env: allowlistedEnv(process.env, {
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+    }),
   });
   if (listed.status !== 0 || !listed.stdout?.trim()) {
     releaseTagCache = undefined;
@@ -1567,7 +1610,8 @@ async function applyOwnerHeal(
     await markHealExhausted(deps, ticket, type);
     throw new HealExhaustedError(type);
   }
-  const home = agentHome(deps.pack);
+  const home = trustedPackHome(deps.pack);
+  if (!home) throw new Error("trusted home is missing or ambiguous");
   const prompt = ownerHealPrompt({
     reason,
     tokenEnv: deps.pack.commitActorTokenEnv,
@@ -1685,7 +1729,8 @@ async function spendFix(
     await deps.tracker.comment(ticket.identifier, paused.detail);
     return paused;
   }
-  const home = agentHome(deps.pack);
+  const home = trustedPackHome(deps.pack);
+  if (!home) throw new Error("trusted home is missing or ambiguous");
   let text = "";
   try {
     const started = await deps.worker.start({
@@ -1790,6 +1835,7 @@ async function stopForMissingFigmaToken(deps: LoopDeps, ticket: Ticket): Promise
     design: deps.pack.design,
     credential: deps.figmaCredential,
     mode: deps.credentialMode ?? "legacy",
+    legacy: deps.legacy,
   });
   if (!token) {
     const envName = deps.pack.design?.figmaTokenEnv?.trim() || "FIGMA_ACCESS_TOKEN";
@@ -1807,6 +1853,7 @@ async function stopForMissingFigmaToken(deps: LoopDeps, ticket: Ticket): Promise
     figmaToken: deps.figmaToken,
     figmaCredential: deps.figmaCredential,
     credentialMode: deps.credentialMode,
+    legacy: deps.legacy,
     figmaFetch: deps.figmaFetch,
   });
   return null;
@@ -1821,6 +1868,7 @@ async function repairContext(deps: LoopDeps, ticket: Ticket, pr: OpenPull): Prom
     figmaToken: deps.figmaToken,
     figmaCredential: deps.figmaCredential,
     credentialMode: deps.credentialMode,
+    legacy: deps.legacy,
     figmaFetch: deps.figmaFetch,
   });
   return text ? `\n${text}` : "";
@@ -1831,15 +1879,17 @@ async function readDesignCheck(
   deps: LoopDeps,
   ticket: Ticket,
   pr: OpenPull,
-): Promise<DesignCheckProbe | null> {
+): Promise<DesignVerdict | null> {
   if (ticketFigmaUrls(ticket).length > 0) return null;
   const spec = designRepo(deps.pack.design, pr.repo.name);
   if (!spec) return null;
+  const trunkSha = deps.proof?.trunkSha ?? null;
   if (!deps.forge.designCheck) {
     return {
       state: "missing",
       detail: `design check ${spec.checkName} missing on ${pr.headSha}`,
       headSha: null,
+      trunkSha,
     };
   }
   const probe = await deps.forge.designCheck({
@@ -1852,9 +1902,10 @@ async function readDesignCheck(
       state: "missing",
       detail: probe.detail || `stale design check ${spec.checkName} ignored`,
       headSha: null,
+      trunkSha,
     };
   }
-  return probe;
+  return { ...probe, trunkSha };
 }
 
 async function landPull(
@@ -2004,7 +2055,7 @@ type QualityWait = {
 };
 
 function defaultRunCommand(command: string, cwd: string): { status: number | null } {
-  return spawnSync(command, { shell: true, cwd, stdio: "inherit" });
+  return spawnSync(command, { shell: true, cwd, stdio: "inherit", env: allowlistedEnv(process.env) });
 }
 
 async function waitForQuality(
@@ -2194,28 +2245,10 @@ export async function ship(
 ): Promise<void> {
   const steps = mode === "continue" ? (deps.pack.ship?.continue ?? []) : (deps.pack.ship?.steps ?? []);
   if (mode === "continue" && steps.length === 0) throw new Error("ship continue has no steps");
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
+  const env = operationEnv(deps, {
     DELIVERY_LOOP_ISSUE: identifier ?? "",
     DELIVERY_LOOP_SHIP_ARGS: extraArgs ?? "",
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: "/dev/null",
-  };
-  if (deps.credentialMode === "canonical") {
-    delete env.GH_TOKEN;
-    delete env.GITHUB_TOKEN;
-    delete env.LINEAR_API_KEY;
-    if (deps.githubHandle) {
-      const token = credentialSecret(deps.githubHandle, {
-        api: "github",
-        operation: "gh",
-        role: "opener",
-        destination: "https://api.github.com",
-      });
-      env.GH_TOKEN = token;
-      env.GITHUB_TOKEN = token;
-    }
-  }
+  });
   async function loadTicket(): Promise<Ticket | null> {
     if (!identifier) return null;
     try {

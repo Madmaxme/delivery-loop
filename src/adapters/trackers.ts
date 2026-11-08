@@ -1,5 +1,7 @@
 import { figmaUrlsFromText } from "../engine/design-gate.ts";
 import type { IssueBlocker, LinearProgramSnapshot } from "../engine/linear-harness-policy.js";
+import type { LegacyCapability } from "../cli/trusted-config.ts";
+import { hasLegacyCapability } from "../cli/trusted-config.ts";
 import {
   assertCanonicalCredential,
   assertHealthy,
@@ -31,6 +33,7 @@ type LinearIssue = {
 export function linearTracker(opts: {
   credential?: CanonicalCredential;
   legacyKey?: string;
+  legacy?: LegacyCapability | null;
   team: string;
   intakeState: string;
   fetch?: FetchLike;
@@ -38,6 +41,9 @@ export function linearTracker(opts: {
   const legacy = Boolean(opts.legacyKey);
   if (legacy === Boolean(opts.credential)) {
     throw new CanonicalPathError("invalid-policy", "linear", "legacy mode is distinct from a canonical credential");
+  }
+  if (legacy && !hasLegacyCapability(opts.legacy)) {
+    throw new CanonicalPathError("non-canonical-credential", "linear", "linear rejects a raw token");
   }
   if (!legacy && opts.credential) assertCanonicalCredential(opts.credential, "linear");
   const fetchImpl = opts.fetch ?? fetch;
@@ -340,6 +346,7 @@ function blockersFrom(
 export function githubIssuesTracker(opts: {
   credential?: CanonicalCredential;
   legacyToken?: string;
+  legacy?: LegacyCapability | null;
   repo: string;
   intakeLabel: string;
   fetch?: FetchLike;
@@ -347,6 +354,9 @@ export function githubIssuesTracker(opts: {
   const legacy = Boolean(opts.legacyToken);
   if (legacy === Boolean(opts.credential)) {
     throw new CanonicalPathError("invalid-policy", "github", "legacy mode is distinct from a canonical credential");
+  }
+  if (legacy && !hasLegacyCapability(opts.legacy)) {
+    throw new CanonicalPathError("non-canonical-credential", "github", "github rejects a raw token");
   }
   if (!legacy && opts.credential) assertCanonicalCredential(opts.credential, "github");
   const fetchImpl = opts.fetch ?? fetch;

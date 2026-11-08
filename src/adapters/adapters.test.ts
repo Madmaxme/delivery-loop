@@ -245,8 +245,8 @@ describe("adapters", () => {
   it("starts and joins a self-hosted worker", async () => {
     const worker = httpWorker({
       credential: await readyExtension("http"),
-      startUrl: "https://host.example/start",
-      statusUrl: "https://host.example/status",
+      startUrl: "https://http.example/start",
+      statusUrl: "https://http.example/status",
       fetch: async (url) => {
         if (String(url).endsWith("/start")) return jsonResponse({ runId: "r1" });
         return jsonResponse({ status: "finished", branch: "b", head: "h", text: "done" });

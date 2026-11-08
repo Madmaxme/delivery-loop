@@ -72,7 +72,7 @@ jobs:
             fi
             if [ "$code" -eq 0 ]; then
               pack="$(git show HEAD:delivery-loop.yaml 2>/dev/null || true)"
-              if printf '%s\n' "$pack" | awk 'BEGIN{p=0} /^bots:/{p=1} p && /^[^ ]/{if(!/^bots:/) p=0} p && /path:/{found=1} END{exit found?0:1}'; then
+              if printf '%s' "$pack" | (cd "$dir" && node --import tsx -e 'import { botsPathFromPackYaml } from "./src/cli/trusted-config.ts"; import { readFileSync } from "node:fs"; process.exit(botsPathFromPackYaml(readFileSync(0, "utf8")) ? 0 : 1);'); then
                 unset LINEAR_API_KEY
               else
                 unset LINEAR_OAUTH_CLIENT_ID LINEAR_OAUTH_CLIENT_SECRET

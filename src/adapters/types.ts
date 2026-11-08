@@ -82,6 +82,15 @@ export type DesignCheckProbe = {
   headSha: string | null;
 };
 
+/** Design check plus the trunk SHA it was pinned to. */
+export type DesignVerdict = DesignCheckProbe & { trunkSha: string | null };
+
+/** Reads a file through the forge. The local checkout is not a source. */
+export type ForgeTreeReader = {
+  trunkSha(input: { repoUrl: string; trunk: string }): Promise<string | null>;
+  readTextFile(input: { repoUrl: string; path: string; ref: string }): Promise<string | null>;
+};
+
 /** What the forge knows before a merge. `unknown` means the host has not computed it yet. */
 export type Mergeability = "clean" | "behind" | "conflict" | "blocked" | "unknown";
 
@@ -136,8 +145,8 @@ export type ForgeAdapter = {
     /** Set for a git merge. GitHub squash uses `number`. */
     branch?: string;
     base?: string;
-    /** Current pull request head. GitHub rejects the merge when it moved. */
-    headSha?: string;
+    /** Current pull request head. A merge without a 40-hex SHA is refused. */
+    headSha: string;
   }): Promise<string>;
   dispatch(input: { workflow: string; ref: string; inputs: Record<string, string> }): Promise<void>;
 };

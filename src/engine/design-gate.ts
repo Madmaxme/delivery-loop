@@ -1,7 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { credentialSecret, type CanonicalCredential } from "../adapters/canonical-path.ts";
+import { CanonicalPathError, credentialSecret, type CanonicalCredential } from "../adapters/canonical-path.ts";
+import type { LegacyCapability } from "../cli/trusted-config.ts";
+import { hasLegacyCapability } from "../cli/trusted-config.ts";
 import type { DesignCheckProbe, FetchLike, Ticket } from "../adapters/types.ts";
 import type { DesignRepo, DesignSpec } from "../schema/pack.ts";
 
@@ -168,13 +170,23 @@ export function figmaTokenValue(input: {
   design: DesignSpec | undefined;
   credential?: CanonicalCredential | null;
   mode?: "legacy" | "canonical";
+  legacy?: LegacyCapability | null;
 }): string | null {
+  if (input.mode === "canonical" && typeof input.figmaToken === "string" && input.figmaToken.trim()) {
+    throw new CanonicalPathError("non-canonical-credential", "figma", "figma rejects an explicit token");
+  }
   if (input.figmaToken === null) return null;
-  if (typeof input.figmaToken === "string" && input.figmaToken.trim()) return input.figmaToken.trim();
   if (input.credential) {
     return credentialSecret(input.credential, { api: "figma", operation: "rest", destination: "https://api.figma.com" });
   }
   if (input.mode === "canonical") return null;
+  if (typeof input.figmaToken === "string" && input.figmaToken.trim()) {
+    if (!hasLegacyCapability(input.legacy)) {
+      throw new CanonicalPathError("non-canonical-credential", "figma", "figma rejects an explicit token");
+    }
+    return input.figmaToken.trim();
+  }
+  if (!hasLegacyCapability(input.legacy)) return null;
   const name = input.design?.figmaTokenEnv?.trim() || "FIGMA_ACCESS_TOKEN";
   const value = process.env[name]?.trim();
   return value || null;
@@ -241,6 +253,7 @@ export async function designRepairText(input: {
   figmaToken?: string | null;
   figmaCredential?: CanonicalCredential | null;
   credentialMode?: "legacy" | "canonical";
+  legacy?: LegacyCapability | null;
   figmaFetch?: FetchLike;
 }): Promise<string> {
   const frames = ticketFigmaUrls(input.ticket);
@@ -250,6 +263,7 @@ export async function designRepairText(input: {
       design: input.design,
       credential: input.figmaCredential,
       mode: input.credentialMode ?? "legacy",
+      legacy: input.legacy,
     });
     const fetchImpl = input.figmaFetch ?? fetch;
     const blocks: string[] = [];
