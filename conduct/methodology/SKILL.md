@@ -7,19 +7,21 @@ description: Master copy of the delivery-loop harness. Ticket flow, status write
 
 This file is the master copy of the harness methodology. Git tags version it. A client pins a tag and keeps product names, repos, and proof in its own repo. This file names no client.
 
-Code conduct is [conduct/conduct/SKILL.md](../conduct/SKILL.md). The runner prepends that file to every ground and build prompt. Do not copy those rules into an overlay.
+The orchestrator talks to the owner. The engineering bot owns the code and runs the loop: it dispatches sweeps, launches cloud agents, and merges, or leaves the merge to the lander or the engine-heal workflow. GitHub is the record.
 
-The engine is the only status writer. Ground and build prompts tell the worker not to call the tracker.
+Code conduct is [conduct/conduct/SKILL.md](../conduct/SKILL.md). The runner prepends that file to every ground and build prompt. Conduct stays in that skill.
+
+The engine is the only status writer. Ground and build prompts leave tracker calls to the engine.
 
 ## From intake to dev
 
 1. Sweep lists tickets in `status.intake`. The default name is Todo.
 2. A ticket runs when every `blockedBy` link is in `status.dev`, `status.prod`, or `status.closed`. The defaults are Dev, Prod, Canceled, and Duplicate. A self-link is not ready.
-3. One runner holds a ticket. The hold is a `DELIVERY_LEASE` comment with a two-hour expiry. Sweep skips a live lease. Deliver waits. A dead Actions run can be taken. A live run is taken only after expiry.
+3. One runner holds a ticket. The hold is a `DELIVERY_LEASE` comment with a two-hour expiry. The lease records the live agent id as soon as the worker starts. Sweep skips a live lease. Deliver waits. A dead Actions run can be taken. A live run is taken only after expiry.
 4. Ground reads the code and returns a verdict. It does not edit. A verdict other than BUILDABLE is parked or left in intake. See the status table.
 5. Build runs only when the handoff has a work order, an invariant that already exists, `**Prior request:**`, `**Outside grant:**`, and `**Journey evidence:**`. `**Repos:**` names land repos from the pack. The checkout directory is not a land repo unless it is on that list.
 6. Land opens one pull request per repo, in pack order. A branch identical to trunk, or with no commits of its own, is not opened. The next sweep leaves that ticket alone while that commit is still the tip.
-7. The pull request merges only when quality is green and the forge reports the branch clean. Quality is the `quality` workflow, or `qualityCommand` when `check` is `command`. A branch that is only behind is updated, then quality runs again on the new head. Two updates are the limit. A conflict or a refused merge is a heal.
+7. The pull request merges only when quality is green and the forge reports the branch clean. Any actor may squash-merge that head. Quality is the `quality` workflow, or `qualityCommand` when `check` is `command`. A branch that is only behind is updated from trunk, then quality runs again on the new head. Two updates are the limit. A conflict or a refused merge is a heal.
 8. The merge is a squash. Quality then runs on the trunk tip that contains the merge. A later green commit on that trunk counts. A red or pending tip stays in intake. The runner does not start a coding worker from trunk.
 9. When the trunk check is green, `dev.promote` runs its command once for each landed repo that is also listed in `dev.promote.repos`. `{repo}` is replaced. When `promote` is set, `dev.steps` are not run. Otherwise `dev.steps` run.
 10. The ticket moves to `status.dev`, or to `status.hold` when `**Outside grant:**` is open. Hold does not clear blockers. The default hold name is Hold.
@@ -65,7 +67,7 @@ Program mode runs one ticket at a time. Land merges one pull request at a time. 
 
 ## Pull request and merge
 
-The worker pushes a branch and does not merge it. The engine opens the pull request, waits for quality, and squash-merges. A red quality check, a conflict, a refused merge, a dev promote failure, and a ship failure use the same heal. The heal answers `**Heal:**` edit, wait, or login. There is no list of failure phrases.
+The worker pushes a branch. The lander opens the pull request, waits until quality is green on that head, and squash-merges. Any actor may squash-merge once that check is green. A red quality check, a conflict, a refused merge, a dev promote failure, and a ship failure use the same heal. The heal answers `**Heal:**` edit, wait, or login.
 
 ## Promote and ship
 
@@ -75,7 +77,7 @@ Promote runs only after the trunk check is green, and only for repos named in `d
 
 edit changes the owner of the step that returned no. That owner may be the ticket branch, the checkout, a repo the command ships, or this package. Production promote and store continue use that same heal. A note or a side watcher is not the fix.
 
-When the owner is this package, the edit opens a pull request. It does not push a commit to main. The branch is `engine-heal/<ticket>` and the label is `engine-heal`. The pull request already contains the next patch of `package.json` and `package-lock.json` after the highest `v*` tag. The first heal after `v1.0.0` is `1.0.1`. If that tag already exists, the edit stops. The opener pushes with the commit-actor token. The `pull_request` quality check gates that head. The `engine-heal` workflow does not push a commit. It waits until that check is green, squash-merges, reads the version from the merged `package.json`, tags that commit, and publishes the GitHub release. A pull request without the bump gets a comment and stops. No person approves that path. Clients install the tag. They do not install main.
+When the owner is this package, the edit opens a pull request on `engine-heal/<ticket>` with the label `engine-heal`. The pull request contains the next patch of `package.json` and `package-lock.json` after the highest `v*` tag. The first heal after `v1.0.0` is `1.0.1`. If that tag already exists, the edit stops. The opener pushes with the commit-actor token. The `pull_request` quality check gates that head. The engine-heal workflow squash-merges, reads the version from the merged `package.json`, tags that commit, and publishes the GitHub release. A pull request without the bump gets a comment and stops. A client pins the tag when it needs the change.
 
 Each failure type has a cap. The default is 3. `heal.maxAttempts` changes the default. `heal.caps.<type>` overrides one type. The count is the `OWNER_HEAL` comments of that type on the ticket, so it survives the next run. At the cap the engine writes the labels and the exhausted comment and stops. A failed write of the `OWNER_HEAL` comment fails the heal. The attempt is not counted, so the cap cannot be skipped by ignoring that error.
 

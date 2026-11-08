@@ -5,12 +5,16 @@ alwaysApply: true
 
 # Delivery loop
 
-The master copy is `conduct/methodology/SKILL.md`, versioned by git tags. Clients pin a tag and add overlays. Code conduct is `conduct/conduct/SKILL.md`. Do not copy it.
+The master copy is `conduct/methodology/SKILL.md`, versioned by git tags. Clients pin a tag and add overlays. Code conduct is `conduct/conduct/SKILL.md`. Conduct stays in that skill.
 
-The engine is the only status writer. Workers do not call the tracker.
+The engine is the only status writer. Workers leave tracker calls to the engine.
 
-Sweep reads `status.intake` (default Todo). One runner holds the ticket with a `DELIVERY_LEASE` comment. Ground, then build, then one pull request per land repo. Quality must be green. The merge is a squash. Trunk quality must be green before `dev.promote` and before the dev status. `dev.promote` runs only for repos listed in `dev.promote.repos`. Ship is a separate command unless `ship.afterDev` is set. A failed ship step leaves the dev status.
+The orchestrator talks to the owner. The engineering bot owns the code and runs the loop: it dispatches sweeps, launches cloud agents, and merges, or leaves the merge to the lander or the engine-heal workflow. Any actor may squash-merge once quality is green on the head. GitHub is the record.
 
-A required step that returned no has one heal: edit, wait, or login. There is no list of failure phrases. edit changes the owner of the failure. When that owner is this package, open branch `engine-heal/<ticket>`, label it `engine-heal`, and include the next patch after the highest `v*` tag. Do not push a commit to main. The `pull_request` `quality` check gates it. The workflow does not push a commit. It waits until that check is green, squash-merges, and tags the merge commit. Clients install the tag.
+Sweep reads `status.intake` (default Todo). One runner holds the ticket with a `DELIVERY_LEASE` comment and records the live agent id as soon as the worker starts. Ground, then build, then one pull request per land repo. Quality is green before the squash. A branch that is only behind is updated from trunk, then quality runs again on the new head. Trunk quality is green before `dev.promote` and before the dev status. `dev.promote` runs only for repos listed in `dev.promote.repos`. Ship is a separate command unless `ship.afterDev` is set. A failed ship step leaves the dev status.
+
+A required step that returned no has one heal: edit, wait, or login. edit changes the owner of the failure. When that owner is this package, open branch `engine-heal/<ticket>`, label it `engine-heal`, and include the next patch after the highest `v*` tag. The `pull_request` `quality` check gates it. The workflow squash-merges that head and may tag the merge commit. A pull request without the bump gets a comment and stops. A client pins the tag when it needs the change.
 
 Heal caps live in `delivery-loop.yaml` under `heal.maxAttempts` and `heal.caps`. The default is 3 per failure type (`quality-red`, `merge-conflict`, `promote-failed`, `ship-failed`, `quality-pending`, `quality-unscheduled`, `runner-blocked`, `other`). The count is `OWNER_HEAL` comments on the ticket. At the cap the engine labels `heal-exhausted` and the failure type, writes `HEAL_EXHAUSTED`, and stops. A failed marker comment fails the heal.
+
+Token and secret values are never printed or stored.
