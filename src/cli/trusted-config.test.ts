@@ -75,4 +75,16 @@ describe("trusted credential mode", () => {
     assert.equal(decision.mode, "canonical");
     assert.equal(decision.trunk, "main");
   });
+
+  it("does not take the trunk from the first repo", () => {
+    const pack = legacyPack.replace("trunk: main", "trunk: develop");
+    const decision = decideCredentialMode({
+      workPackYaml: pack,
+      trustedPackYaml: pack,
+      workInventoryYaml: null,
+      trustedInventoryYaml: null,
+    });
+    assert.equal(decision.mode, "legacy");
+    assert.equal(decision.trunk, "main");
+  });
 });

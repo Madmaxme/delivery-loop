@@ -20,11 +20,9 @@ function botsPath(yaml: string): string | null {
 }
 
 function trunkOf(yaml: string): string {
-  const doc = parse(yaml) as { agent?: { trunk?: unknown }; repos?: { trunk?: unknown }[] } | null;
+  const doc = parse(yaml) as { agent?: { trunk?: unknown } } | null;
   const named = doc?.agent?.trunk;
   if (typeof named === "string" && named.trim()) return named.trim();
-  const repo = doc?.repos?.[0]?.trunk;
-  if (typeof repo === "string" && repo.trim()) return repo.trim();
   return "main";
 }
 
