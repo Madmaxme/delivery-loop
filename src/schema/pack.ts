@@ -180,9 +180,12 @@ export type ProjectPack = {
    * (for example a store park that must not be marked shipped early).
    * `afterDev` runs `steps` once the dev gate has passed. When it is
    * absent, sweep stops at the dev state and does not run `steps`,
-   * including a later page that still has a ship marker. A failed step
-   * leaves the dev state. The ship command edits that step's owner once,
-   * then the next run retries it. `continue` is the store-continue command.
+   * including a later page that still has a ship marker. The ship
+   * command passes `--issue <id>` in `DELIVERY_LOOP_SHIP_ARGS`, then any
+   * extra arguments. A command without a ticket id stops before the
+   * steps run. A failed step leaves the dev state. The ship command
+   * edits that step's owner once, then the next run retries it.
+   * `continue` is the store-continue command and takes the same ticket id.
    * A clean exit, including a store wait, is not a failure.
    */
   ship?: { steps: string[]; continue?: string[]; markStatus?: boolean; afterDev?: boolean };
