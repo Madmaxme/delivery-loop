@@ -95,7 +95,7 @@ export type LoopDeps = {
   qualityPollMs?: number;
   /** How long a missing Actions run stays missing before the lander requests one. */
   qualityNoRunMs?: number;
-  /** Fix attempts after a red quality check. Default is `DELIVERY_LOOP_CI_FIX_MAX`, then `QWS_CI_FIX_MAX`, then 5. */
+  /** Fix attempts after a red quality check. This override wins, then `DELIVERY_LOOP_CI_FIX_MAX`, then 5. */
   ciFixMax?: number;
   /**
    * Shared with every ticket on this page. An owner edit sets `stop` so the
@@ -396,9 +396,10 @@ function buildPrompt(
   ].filter((part) => part.length > 0).join("\n\n");
 }
 
-function ciFixLimit(deps: LoopDeps): number {
+/** Fix attempts after a red quality check. A caller override wins, then `DELIVERY_LOOP_CI_FIX_MAX`, then 5. */
+export function ciFixLimit(deps: LoopDeps): number {
   if (deps.ciFixMax != null) return deps.ciFixMax;
-  const raw = process.env.DELIVERY_LOOP_CI_FIX_MAX ?? process.env.QWS_CI_FIX_MAX ?? "5";
+  const raw = process.env.DELIVERY_LOOP_CI_FIX_MAX ?? "5";
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 5;
 }
