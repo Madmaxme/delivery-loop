@@ -1,3 +1,8 @@
+import {
+  credentialFetch,
+  githubEndpointClass,
+  type CredentialNoteFn,
+} from "../engine/credential-log.ts";
 import { figmaUrlsFromText } from "../engine/design-gate.ts";
 import type { IssueBlocker, LinearProgramSnapshot } from "../engine/linear-harness-policy.js";
 import type { FetchLike, Ticket, TrackerAdapter } from "./types.js";
@@ -25,18 +30,25 @@ export function linearTracker(opts: {
   team: string;
   intakeState: string;
   fetch?: FetchLike;
+  credentialNote?: CredentialNoteFn;
 }): TrackerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
 
   async function gql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
-    const response = await fetchImpl("https://api.linear.app/graphql", {
-      method: "POST",
-      headers: {
-        Authorization: opts.apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ query, variables }),
-    });
+    const response = await credentialFetch(
+      "linear",
+      "linear-graphql",
+      () =>
+        fetchImpl("https://api.linear.app/graphql", {
+          method: "POST",
+          headers: {
+            Authorization: opts.apiKey,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ query, variables }),
+        }),
+      opts.credentialNote,
+    );
     if (!response.ok) {
       throw new Error(`Linear failed: ${response.status} ${await response.text()}`);
     }
@@ -311,6 +323,7 @@ export function githubIssuesTracker(opts: {
   repo: string;
   intakeLabel: string;
   fetch?: FetchLike;
+  credentialNote?: CredentialNoteFn;
 }): TrackerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
@@ -321,10 +334,16 @@ export function githubIssuesTracker(opts: {
   };
 
   async function api(path: string, init?: RequestInit): Promise<unknown> {
-    const response = await fetchImpl(`https://api.github.com${path}`, {
-      ...init,
-      headers: { ...headers, ...(init?.headers ?? {}) },
-    });
+    const response = await credentialFetch(
+      "gh-token",
+      githubEndpointClass(path),
+      () =>
+        fetchImpl(`https://api.github.com${path}`, {
+          ...init,
+          headers: { ...headers, ...(init?.headers ?? {}) },
+        }),
+      opts.credentialNote,
+    );
     if (!response.ok) {
       throw new Error(`GitHub issues ${path} failed: ${response.status} ${await response.text()}`);
     }

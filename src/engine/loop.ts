@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { DEFAULT_JOURNEY_SPEC } from "../../scripts/journey-proof.mjs";
 import { interpretMintOutput, runMintCommand } from "../adapters/github-mint.ts";
+import { noteMint } from "./credential-log.ts";
 import type { CompareStatus, DesignCheckProbe, FetchLike, ForgeAdapter, ListedPull, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { agentHome, holdStatus, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
 import {
@@ -164,6 +165,11 @@ export type LoopDeps = {
    * when that ticket finishes. Default writes a single line to stdout.
    */
   report?: (event: TicketProgress) => void;
+  /**
+   * Proof, promote, ship, and land success lines. Default writes to stderr.
+   * Credential calls use the process credential log.
+   */
+  engineLog?: (line: string) => void;
 };
 
 /** ground, build, and land are in progress. done is the ticket result. */
@@ -218,6 +224,15 @@ function noteTicket(deps: LoopDeps, event: TicketProgress): void {
     return;
   }
   process.stdout.write(`${formatTicketProgress(event)}\n`);
+}
+
+function noteEngine(deps: LoopDeps, line: string): void {
+  const text = `[delivery-loop] ${line}`;
+  if (deps.engineLog) {
+    deps.engineLog(text);
+    return;
+  }
+  process.stderr.write(`${text}\n`);
 }
 
 function noteDone(deps: LoopDeps, result: TicketResult): void {
@@ -1282,12 +1297,17 @@ export function latestLandMarker(comments: { body: string }[]): LandMarker | nul
   return null;
 }
 
-function runDevCommands(deps: LoopDeps, commands: string[]): string | null {
+function runDevCommands(
+  deps: LoopDeps,
+  commands: string[],
+  kind: "promote" | "ship" | "dev",
+): string | null {
   const cwd = deps.cwd ?? process.cwd();
   const run = deps.runCommand ?? defaultRunCommand;
   for (const command of commands) {
     const result = run(command, cwd);
     if (result.status !== 0) return command;
+    noteEngine(deps, `${kind} ok`);
   }
   return null;
 }
@@ -1319,8 +1339,11 @@ function refreshShipGithubToken(env: NodeJS.ProcessEnv): boolean {
   const command = env.DELIVERY_LOOP_GITHUB_MINT?.trim();
   if (!command) return false;
   const result = runMintCommand(command);
-  const minted = result.status === 0 ? interpretMintOutput(result.stdout, Date.now()) : null;
-  if (!minted) return false;
+  const now = Date.now();
+  const minted = result.status === 0 ? interpretMintOutput(result.stdout, now) : null;
+  const ok = Boolean(minted && minted.expiresAtMs > now);
+  noteMint({ exitStatus: result.status, ok });
+  if (!minted || !ok) return false;
   env.GH_TOKEN = minted.token;
   env.GITHUB_TOKEN = minted.token;
   process.env.GH_TOKEN = minted.token;
@@ -1366,7 +1389,7 @@ function runShipSteps(deps: LoopDeps, identifier: string): string | null {
   process.env.DELIVERY_LOOP_ISSUE = identifier;
   process.env.DELIVERY_LOOP_SHIP_ARGS = shipStepArgs(identifier);
   try {
-    return runDevCommands(deps, deps.pack.ship?.steps ?? []);
+    return runDevCommands(deps, deps.pack.ship?.steps ?? [], "ship");
   } finally {
     if (previousIssue === undefined) delete process.env.DELIVERY_LOOP_ISSUE;
     else process.env.DELIVERY_LOOP_ISSUE = previousIssue;
@@ -1565,9 +1588,11 @@ async function applyRecordedProof(
     (proofSatisfies(deps, `${evidence}\n${existing}`, existing, onMerge) ||
       proofSatisfies(deps, `${evidence}\n${existing}`, existing, onDev))
   ) {
+    noteEngine(deps, "proof ok");
     return { ok: true, recorded: true, proofReceipt: existing };
   }
   if (proofSatisfies(deps, evidence, receipt, onMerge) || proofSatisfies(deps, evidence, receipt, onDev)) {
+    noteEngine(deps, "proof ok");
     return { ok: true, recorded: true, proofReceipt: receipt.trim() ? receipt : declared };
   }
   const printed = journeyCommandProof(deps, evidence);
@@ -1601,6 +1626,7 @@ async function applyRecordedProof(
       },
     };
   }
+  noteEngine(deps, "proof ok");
   return { ok: true, recorded: true, proofReceipt };
 }
 
@@ -1653,6 +1679,7 @@ async function settleTrunk(
         return repo ? deployRefContains(deps, repo, ref, sha) : false;
       },
     ),
+    deps.pack.dev?.promote?.command ? "promote" : "dev",
   );
   if (failed) {
     const signature = shipNoSignature(failed) || failed;
@@ -2273,6 +2300,7 @@ async function commitLand(
         headSha: current.headSha,
       });
       if (!mergedSha?.trim()) throw new Error("merge did not return a commit");
+      noteEngine(deps, "land ok");
       return { mergedSha };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);

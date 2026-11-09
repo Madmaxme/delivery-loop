@@ -30,13 +30,19 @@ delivery-loop update
 
 A worker run may write `delivery-loop.run.started` and `delivery-loop.run.finished` as JSON files and upload them as a workflow artifact. The writer is `scripts/run-event.sh`. This repository does not post those files. A client posts one by setting `DELIVERY_LOOP_EVENT_URL`. The field contract is in [METHODOLOGY.md](METHODOLOGY.md). A failed post leaves the run's own exit code unless `DELIVERY_LOOP_EVENT_REQUIRED` is `true` or `1`.
 
+## Credential log
+
+Each credential call writes one `[delivery-loop] credential` line with the slot, the endpoint class, and the status. Success is included. A re-mint near expiry adds `refresh=1`. The run ends with `[delivery-loop] credential summary` lines of counts by slot, endpoint class, and status. The field contract and the limits are in [METHODOLOGY.md](METHODOLOGY.md). The token, the headers, and the request URL are not written.
+
+A recorded proof that passes writes `[delivery-loop] proof ok`. A promote or ship command that exits 0 writes `[delivery-loop] promote ok` or `[delivery-loop] ship ok`. A squash that returns a commit writes `[delivery-loop] land ok`.
+
 ## Bot definitions
 
 A leftover `bots` key is ignored with a warning.
 
 ## Worker keys
 
-The cursor worker launches with the env var named by `workerKeys.primary`, then the env var named by `workerKeys.fallback`. The defaults are `CURSOR_API_KEY` and `CURSOR_API_KEY_FALLBACK`. The log records the slot in use, `primary` or `fallback`. The value stays in the environment.
+The cursor worker launches with the env var named by `workerKeys.primary`, then the env var named by `workerKeys.fallback`. The defaults are `CURSOR_API_KEY` and `CURSOR_API_KEY_FALLBACK`. The log records the slot in use, `primary` or `fallback`, and the launch status. A launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. The value stays in the environment.
 
 ```yaml
 workerKeys:

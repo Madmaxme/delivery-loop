@@ -1,5 +1,11 @@
 import { interpretDesignChecks, type DesignCheckRun } from "../engine/design-gate.ts";
 import {
+  credentialFetch,
+  githubEndpointClass,
+  noteMint,
+  type CredentialNoteFn,
+} from "../engine/credential-log.ts";
+import {
   credentialDue,
   interpretMintOutput,
   runMintCommand,
@@ -21,16 +27,12 @@ import type { CompareStatus, FetchLike, ForgeAdapter, ListedPull, PullMerge, Pul
 import { githubRepoFromUrl } from "./types.js";
 
 async function readCommit(
-  fetchImpl: FetchLike,
-  headers: Record<string, string>,
+  call: (path: string, init?: RequestInit) => Promise<Response>,
   owner: string,
   repo: string,
   sha: string,
 ): Promise<{ message: string; tree: string; committedAt: string } | null> {
-  const response = await fetchImpl(
-    `https://api.github.com/repos/${owner}/${repo}/commits/${sha}`,
-    { headers },
-  );
+  const response = await call(`/repos/${owner}/${repo}/commits/${sha}`);
   if (!response.ok) return null;
   const json = (await response.json()) as {
     commit?: { message?: string; tree?: { sha?: string }; committer?: { date?: string } };
@@ -141,8 +143,11 @@ export function githubForge(opts: {
   mintCommand?: string;
   nowMs?: () => number;
   runMint?: (command: string) => MintRun;
+  /** Defaults to the process credential log. */
+  credentialNote?: CredentialNoteFn;
 }): ForgeAdapter {
   const fetchImpl = opts.fetch ?? fetch;
+  const note = opts.credentialNote;
   const headers = {
     Authorization: `Bearer ${opts.token}`,
     Accept: "application/vnd.github+json",
@@ -154,7 +159,7 @@ export function githubForge(opts: {
   async function requireActor(repoUrl: string): Promise<void> {
     const expected = commitActorLogin(opts.commitActors, repoUrl);
     if (!expected) return;
-    loginPromise ??= githubUserLogin(fetchImpl, opts.token);
+    loginPromise ??= githubUserLogin(fetchImpl, opts.token, note);
     assertCommitActor(repoUrl, await loginPromise, expected);
   }
 
@@ -165,29 +170,42 @@ export function githubForge(opts: {
     return process.env.DELIVERY_LOOP_GITHUB_MINT?.trim() ?? "";
   }
 
-  async function tokenForCheckRuns(): Promise<string> {
+  async function tokenForCheckRuns(): Promise<{ token: string; slot: "mint" | "gh-token" }> {
     const command = mintCommand();
-    if (!command) return opts.token;
+    if (!command) return { token: opts.token, slot: "gh-token" };
     const now = (opts.nowMs ?? Date.now)();
     if (checksCredential && !credentialDue(checksCredential.expiresAtMs, now)) {
-      return checksCredential.token;
+      return { token: checksCredential.token, slot: "mint" };
     }
+    const refresh = checksCredential !== null;
     const result = (opts.runMint ?? runMintCommand)(command);
     const minted = result.status === 0 ? interpretMintOutput(result.stdout, now) : null;
+    const ok = Boolean(minted && minted.expiresAtMs > now);
+    noteMint({ exitStatus: result.status, ok, refresh, note });
     if (!minted || minted.expiresAtMs <= now) {
       throw new Error(
         "credential error: DELIVERY_LOOP_GITHUB_MINT did not return an installation token that is still valid.",
       );
     }
     checksCredential = minted;
-    return minted.token;
+    return { token: minted.token, slot: "mint" };
+  }
+
+  function callGithub(path: string, init?: RequestInit, slot = "gh-token"): Promise<Response> {
+    return credentialFetch(
+      slot,
+      githubEndpointClass(path),
+      () =>
+        fetchImpl(`https://api.github.com${path}`, {
+          ...init,
+          headers: { ...headers, ...(init?.headers ?? {}) },
+        }),
+      note,
+    );
   }
 
   async function api(path: string, init?: RequestInit): Promise<Response> {
-    const response = await fetchImpl(`https://api.github.com${path}`, {
-      ...init,
-      headers: { ...headers, ...(init?.headers ?? {}) },
-    });
+    const response = await callGithub(path, init);
     if (!response.ok) {
       const err = new Error(`GitHub ${path} failed: ${response.status}`);
       (err as Error & { httpStatus: number }).httpStatus = response.status;
@@ -207,9 +225,8 @@ export function githubForge(opts: {
         head: input.head,
         base: input.base,
       });
-      const created = await fetchImpl(`https://api.github.com/repos/${owner}/${repo}/pulls`, {
+      const created = await callGithub(`/repos/${owner}/${repo}/pulls`, {
         method: "POST",
-        headers,
         body,
       });
       if (created.status === 422) {
@@ -251,11 +268,13 @@ export function githubForge(opts: {
     },
     async designCheck(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
-      const token = await tokenForCheckRuns();
+      const minted = await tokenForCheckRuns();
       const path = `/repos/${owner}/${repo}/commits/${input.headSha}/check-runs?per_page=100`;
-      const response = await fetchImpl(`https://api.github.com${path}`, {
-        headers: { ...headers, Authorization: `Bearer ${token}` },
-      });
+      const response = await callGithub(
+        path,
+        { headers: { Authorization: `Bearer ${minted.token}` } },
+        minted.slot,
+      );
       if (response.status === 401 || response.status === 403) {
         await response.text().catch(() => undefined);
         throw checkRunsCredentialError(response.status, owner, repo);
@@ -299,14 +318,14 @@ export function githubForge(opts: {
       );
       const interpreted = interpretQualityActions(named, input.headSha);
       if (!qualityRunUnscheduled(interpreted.detail)) return interpreted;
-      const commit = await readCommit(fetchImpl, headers, owner, repo, input.headSha);
+      const commit = await readCommit(callGithub, owner, repo, input.headSha);
       return commit?.committedAt
         ? { ...interpreted, committedAt: commit.committedAt }
         : interpreted;
     },
     async requestQualityRun(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
-      const commit = await readCommit(fetchImpl, headers, owner, repo, input.headSha);
+      const commit = await readCommit(callGithub, owner, repo, input.headSha);
       const requested = input.message.split("\n")[0]?.trim();
       const current = commit?.message.split("\n")[0]?.trim();
       if (!commit?.tree || !requested || current === requested) return null;
@@ -342,10 +361,7 @@ export function githubForge(opts: {
     async compare(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
       const spec = `${encodeURIComponent(input.base)}...${encodeURIComponent(input.head)}`;
-      const response = await fetchImpl(
-        `https://api.github.com/repos/${owner}/${repo}/compare/${spec}`,
-        { headers },
-      );
+      const response = await callGithub(`/repos/${owner}/${repo}/compare/${spec}`);
       if (!response.ok) return "unknown";
       const json = (await response.json()) as { status?: string };
       return interpretCompare(json.status);
@@ -365,11 +381,10 @@ export function githubForge(opts: {
     async updateBranch(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
       await requireActor(`https://github.com/${owner}/${repo}`);
-      const response = await fetchImpl(
-        `https://api.github.com/repos/${owner}/${repo}/pulls/${input.number}/update-branch`,
+      const response = await callGithub(
+        `/repos/${owner}/${repo}/pulls/${input.number}/update-branch`,
         {
           method: "PUT",
-          headers,
           body: JSON.stringify(
             input.expectedHeadSha ? { expected_head_sha: input.expectedHeadSha } : {},
           ),

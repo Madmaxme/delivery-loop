@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import type { DesignCheckProbe, FetchLike, Ticket } from "../adapters/types.ts";
 import type { DesignRepo, DesignSpec } from "../schema/pack.ts";
+import { credentialFetch, type CredentialNoteFn } from "./credential-log.ts";
 
 const FIGMA_URL_RE =
   /https?:\/\/(?:www\.)?figma\.com\/(?:file|design|proto|board|slides)\/[A-Za-z0-9]+[^\s)<>"'`]*/gi;
@@ -190,15 +191,26 @@ export function parseFigmaTarget(url: string): { fileKey: string; nodeId: string
 }
 
 /** Short frame description. The token is not copied into the text. */
-export async function readFigmaFrame(url: string, token: string, fetchImpl: FetchLike): Promise<string> {
+export async function readFigmaFrame(
+  url: string,
+  token: string,
+  fetchImpl: FetchLike,
+  note?: CredentialNoteFn,
+): Promise<string> {
   const target = parseFigmaTarget(url);
   if (!target) return `unreadable figma url ${url}`;
   const path = target.nodeId
     ? `/v1/files/${target.fileKey}/nodes?ids=${encodeURIComponent(target.nodeId)}`
     : `/v1/files/${target.fileKey}?depth=1`;
-  const response = await fetchImpl(`https://api.figma.com${path}`, {
-    headers: { "X-Figma-Token": token },
-  });
+  const response = await credentialFetch(
+    "figma",
+    "figma",
+    () =>
+      fetchImpl(`https://api.figma.com${path}`, {
+        headers: { "X-Figma-Token": token },
+      }),
+    note,
+  );
   if (!response.ok) return `figma read failed: ${response.status}`;
   const json = (await response.json()) as {
     name?: string;

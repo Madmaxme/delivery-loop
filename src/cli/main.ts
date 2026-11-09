@@ -25,6 +25,7 @@ import {
 import { githubRepoFromUrl } from "../adapters/types.js";
 import type { ForgeAdapter, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { findConnector } from "../connectors/catalog.js";
+import { writeCredentialSummary } from "../engine/credential-log.js";
 import { deliver, ship, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
 import { shipInvocationDeps } from "./ship-deps.js";
 import { ghaDispatchFields, planDeliveryInvocation } from "../engine/delivery-runtime.js";
@@ -215,9 +216,11 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       () => console.log("shipped"),
       (err) => {
         console.error(err instanceof Error ? err.message : String(err));
-        process.exit(1);
+        process.exitCode = 1;
       },
-    );
+    ).finally(() => {
+      writeCredentialSummary();
+    });
     return;
   }
   const packRunner = existsSync(packPath(process.cwd()))
@@ -273,7 +276,10 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       })
       .catch((error: unknown) => {
         console.error(error instanceof Error ? error.message : String(error));
-        process.exit(1);
+        process.exitCode = 1;
+      })
+      .finally(() => {
+        writeCredentialSummary();
       });
     return;
   }
@@ -281,13 +287,29 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     const issue = plan.issue;
     if (!issue) throw new Error("ship needs a ticket id");
     const extra = argv.filter((a) => a.toUpperCase() !== issue.toUpperCase()).join(" ");
-    ship(deps, issue, extra).then(() => console.log("shipped"));
+    ship(deps, issue, extra)
+      .then(() => console.log("shipped"))
+      .catch((error: unknown) => {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      })
+      .finally(() => {
+        writeCredentialSummary();
+      });
     return;
   }
   const issue = plan.issue;
   if (!issue) throw new Error("deliver needs a ticket id");
   const until = mode === "ground" ? "ground" : undefined;
-  deliver(deps, issue, until ? { until } : undefined).then((result) => console.log(JSON.stringify(result, null, 2)));
+  deliver(deps, issue, until ? { until } : undefined)
+    .then((result) => console.log(JSON.stringify(result, null, 2)))
+    .catch((error: unknown) => {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    })
+    .finally(() => {
+      writeCredentialSummary();
+    });
 }
 
 function init(argv: string[]): void {
