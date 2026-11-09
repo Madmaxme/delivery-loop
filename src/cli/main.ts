@@ -182,8 +182,9 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       const repo = process.env.GITHUB_REPOSITORY;
       if (!repo) throw new Error("GITHUB_REPOSITORY is required to dispatch the runner");
       const issue = argv.find((a) => /^[A-Z][A-Z0-9]*-\d+$/i.test(a));
+      if (!issue) throw new Error("ship needs a ticket id");
       const args = ["workflow", "run", "delivery-loop.yml", "--repo", repo, "-f", "mode=ship"];
-      if (issue) args.push("-f", `issue=${issue.toUpperCase()}`);
+      args.push("-f", `issue=${issue.toUpperCase()}`);
       const result = spawnSync("gh", args, { stdio: "inherit" });
       if (result.status !== 0) process.exit(result.status ?? 1);
       return;
@@ -192,6 +193,7 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     const continueMode = argv.includes("continue");
     const rest = argv.filter((item) => item !== "continue");
     const issue = rest.find((a) => /^[A-Z][A-Z0-9]*-\d+$/i.test(a));
+    if (!issue) throw new Error("ship needs a ticket id");
     const extra = rest.filter((a) => a !== issue).join(" ");
     const deps = shipInvocationDeps(pack, process.cwd());
     deps.ownerHeal = async (input) => {
@@ -201,7 +203,7 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       if (joined.status === "failed") throw new Error(joined.text || "owner edit failed");
       return joined.text;
     };
-    ship(deps, issue?.toUpperCase(), extra, continueMode ? "continue" : "ship").then(
+    ship(deps, issue.toUpperCase(), extra, continueMode ? "continue" : "ship").then(
       () => console.log("shipped"),
       (err) => {
         console.error(err instanceof Error ? err.message : String(err));
@@ -268,8 +270,10 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     return;
   }
   if (mode === "ship") {
-    const extra = argv.filter((a) => a.toUpperCase() !== (plan.issue ?? "").toUpperCase()).join(" ");
-    ship(deps, plan.issue ?? undefined, extra).then(() => console.log("shipped"));
+    const issue = plan.issue;
+    if (!issue) throw new Error("ship needs a ticket id");
+    const extra = argv.filter((a) => a.toUpperCase() !== issue.toUpperCase()).join(" ");
+    ship(deps, issue, extra).then(() => console.log("shipped"));
     return;
   }
   const issue = plan.issue;
@@ -346,7 +350,7 @@ if (isCli) {
     dispatchOrRun(command === "deliver" ? "pipeline" : command, argv.slice(1));
   } else {
     console.error(
-      "Usage: delivery-loop init|update|connector add <name>|sweep|deliver <id>|ground <id>|ship [continue] [id]",
+      "Usage: delivery-loop init|update|connector add <name>|sweep|deliver <id>|ground <id>|ship [continue] <id>",
     );
     process.exit(command ? 1 : 0);
   }
