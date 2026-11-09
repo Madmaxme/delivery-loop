@@ -7,6 +7,8 @@ import {
   copilotWorker,
   cursorKeySlots,
   cursorReceiptText,
+  CURSOR_ACCOUNT_DEFAULT_MODEL,
+  CURSOR_LAUNCH_RETRY_MS,
   cursorWorker,
   httpWorker,
   type CursorSdk,
@@ -447,12 +449,14 @@ const BALANCE = "[usage_limit_exceeded] Your team's prepaid balance is used up";
 
 function scriptedCursor(opts: {
   keys: string[];
+  models?: ({ id: string } | undefined)[];
   onCreate: (apiKey: string) => Error | "ok";
   disposed?: { count: number };
 }): CursorSdk {
   return {
     async create(options) {
       opts.keys.push(options.apiKey);
+      opts.models?.push(options.model);
       const outcome = opts.onCreate(options.apiKey);
       if (outcome instanceof Error) throw outcome;
       return {
@@ -480,14 +484,28 @@ function scriptedCursor(opts: {
 
 async function launch(input: {
   slots: { slot: "primary" | "fallback"; apiKey: string }[];
+  model?: string;
   onCreate: (apiKey: string) => Error | "ok";
-}): Promise<{ lines: string[]; keys: string[]; runId?: string; error?: Error }> {
+}): Promise<{
+  lines: string[];
+  keys: string[];
+  models: ({ id: string } | undefined)[];
+  waits: number[];
+  runId?: string;
+  error?: Error;
+}> {
   const lines: string[] = [];
   const keys: string[] = [];
+  const models: ({ id: string } | undefined)[] = [];
+  const waits: number[] = [];
   const worker = cursorWorker({
     slots: input.slots,
+    model: input.model,
     log: (line) => lines.push(line),
-    sdk: scriptedCursor({ keys, onCreate: input.onCreate }),
+    sleep: async (ms) => {
+      waits.push(ms);
+    },
+    sdk: scriptedCursor({ keys, models, onCreate: input.onCreate }),
   });
   try {
     const started = await worker.start({
@@ -495,10 +513,22 @@ async function launch(input: {
       repoUrl: "https://github.com/acme/workspace",
       baseRef: "main",
     });
-    return { lines, keys, runId: started.runId };
+    return { lines, keys, models, waits, runId: started.runId };
   } catch (error) {
-    return { lines, keys, error: error instanceof Error ? error : new Error(String(error)) };
+    return {
+      lines,
+      keys,
+      models,
+      waits,
+      error: error instanceof Error ? error : new Error(String(error)),
+    };
   }
+}
+
+function httpStatus(status: number): Error {
+  const error = new Error(`HTTP ${status}`);
+  (error as Error & { status: number }).status = status;
+  return error;
 }
 
 describe("cursor worker key slots", () => {
@@ -510,7 +540,11 @@ describe("cursor worker key slots", () => {
   it("uses the primary slot when that launch succeeds", async () => {
     const result = await launch({ slots: both, onCreate: () => "ok" });
     assert.deepEqual(result.keys, [PRIMARY]);
-    assert.deepEqual(result.lines, ["credential slot=primary endpoint=cursor-launch status=200"]);
+    assert.deepEqual(result.lines, [
+      CURSOR_ACCOUNT_DEFAULT_MODEL,
+      "credential slot=primary endpoint=cursor-launch status=200",
+    ]);
+    assert.deepEqual(result.models, [undefined]);
     assert.equal(result.error, undefined);
     assert.equal(result.lines.join(" ").includes(PRIMARY), false);
     assert.equal(result.lines.join(" ").includes(FALLBACK), false);
@@ -523,6 +557,7 @@ describe("cursor worker key slots", () => {
     });
     assert.deepEqual(result.keys, [PRIMARY, FALLBACK]);
     assert.deepEqual(result.lines, [
+      CURSOR_ACCOUNT_DEFAULT_MODEL,
       "credential slot=primary endpoint=cursor-launch status=0",
       "credential slot=fallback endpoint=cursor-launch status=200",
     ]);
@@ -542,9 +577,62 @@ describe("cursor worker key slots", () => {
     assert.equal(result.error?.message.includes(PRIMARY), false);
     assert.equal(result.error?.message.includes(FALLBACK), false);
     assert.deepEqual(result.lines, [
+      CURSOR_ACCOUNT_DEFAULT_MODEL,
       "credential slot=primary endpoint=cursor-launch status=0",
       "credential slot=fallback endpoint=cursor-launch status=0",
     ]);
+  });
+
+  it("retries a 5xx once on the same slot and then succeeds", async () => {
+    let attempts = 0;
+    const result = await launch({
+      slots: both,
+      onCreate: () => {
+        attempts += 1;
+        return attempts === 1 ? httpStatus(502) : "ok";
+      },
+    });
+    assert.equal(attempts, 2);
+    assert.deepEqual(result.keys, [PRIMARY, PRIMARY]);
+    assert.deepEqual(result.waits, [CURSOR_LAUNCH_RETRY_MS]);
+    assert.deepEqual(result.lines, [
+      CURSOR_ACCOUNT_DEFAULT_MODEL,
+      "credential slot=primary endpoint=cursor-launch status=502",
+      "credential slot=primary endpoint=cursor-launch status=200",
+    ]);
+    assert.equal(result.error, undefined);
+  });
+
+  it("uses the fallback slot after two 5xx responses on the primary slot", async () => {
+    const result = await launch({
+      slots: both,
+      onCreate: (apiKey) => (apiKey === PRIMARY ? httpStatus(502) : "ok"),
+    });
+    assert.deepEqual(result.keys, [PRIMARY, PRIMARY, FALLBACK]);
+    assert.deepEqual(result.waits, [CURSOR_LAUNCH_RETRY_MS]);
+    assert.deepEqual(result.lines, [
+      CURSOR_ACCOUNT_DEFAULT_MODEL,
+      "credential slot=primary endpoint=cursor-launch status=502",
+      "credential slot=primary endpoint=cursor-launch status=502",
+      "credential slot=fallback endpoint=cursor-launch status=200",
+    ]);
+    assert.equal(result.error, undefined);
+  });
+
+  it("passes a configured model id and omits the model when it is unset", async () => {
+    const configured = await launch({
+      slots: both,
+      model: "model-4.7",
+      onCreate: () => "ok",
+    });
+    assert.deepEqual(configured.models, [{ id: "model-4.7" }]);
+    assert.deepEqual(configured.lines, [
+      "credential slot=primary endpoint=cursor-launch status=200 detail=model-4.7",
+    ]);
+    assert.equal(configured.lines.join("\n").includes(CURSOR_ACCOUNT_DEFAULT_MODEL), false);
+    const unset = await launch({ slots: both, onCreate: () => "ok" });
+    assert.deepEqual(unset.models, [undefined]);
+    assert.equal(unset.lines[0], CURSOR_ACCOUNT_DEFAULT_MODEL);
   });
 
   it("stops on an authentication failure without the fallback slot", async () => {

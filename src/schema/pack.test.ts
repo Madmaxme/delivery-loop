@@ -46,6 +46,19 @@ workerKeys:
     assert.throws(() => loadPack(write(`${base}\nworkerKeys:\n  primary: "not an env"\n`)), /workerKeys/);
   });
 
+  it("keeps a workerModel id and omits it when the key is absent", () => {
+    const unset = loadPack(write(base));
+    assert.equal(unset.workerModel, undefined);
+    const pack = loadPack(write(`${base}workerModel: model-4.7\n`));
+    assert.equal(pack.workerModel, "model-4.7");
+  });
+
+  it("refuses a workerModel value that is not a model id", () => {
+    assert.throws(() => loadPack(write(`${base}workerModel: "not a model"\n`)), /workerModel/);
+    assert.throws(() => loadPack(write(`${base}workerModel: 4\n`)), /workerModel/);
+    assert.throws(() => loadPack(write(`${base}workerModel: ""\n`)), /workerModel/);
+  });
+
   it("defaults the four slots without naming a project", () => {
     const pack = loadPack(write(base));
     assert.equal(pack.forge, "github");
