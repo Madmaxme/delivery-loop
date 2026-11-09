@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -2151,6 +2151,42 @@ describe("loop", () => {
     assert.equal(starts, 1);
     assert.deepEqual(events, ["promote mobile", "state:Dev"]);
     assert.equal(env.state(), "Dev");
+  });
+
+  it("passes the ticket id to the ship step", async () => {
+    const env = harness(BUILDABLE);
+    const note = join(mkdtempSync(join(tmpdir(), "ship-id-")), "args");
+    env.deps.pack = {
+      ...pack,
+      ship: { steps: [`printf '%s' "$DELIVERY_LOOP_SHIP_ARGS" > '${note}'`], markStatus: false },
+    };
+    await ship(env.deps, "API-1");
+    assert.equal(readFileSync(note, "utf8"), "--issue API-1");
+  });
+
+  it("keeps extra arguments after the ticket id", async () => {
+    const env = harness(BUILDABLE);
+    const note = join(mkdtempSync(join(tmpdir(), "ship-extra-")), "args");
+    const step = `printf '%s' "$DELIVERY_LOOP_SHIP_ARGS" > '${note}'`;
+    env.deps.pack = {
+      ...pack,
+      ship: { steps: ["true"], continue: [step], markStatus: false },
+    };
+    await ship(env.deps, "API-1", " --dry-run ", "continue");
+    assert.equal(readFileSync(note, "utf8"), "--issue API-1 --dry-run");
+  });
+
+  it("stops before ship steps when the ticket id is missing", async () => {
+    const env = harness(BUILDABLE);
+    const note = join(mkdtempSync(join(tmpdir(), "ship-missing-")), "args");
+    env.deps.pack = {
+      ...pack,
+      ship: { steps: [`printf '%s' ran > '${note}'`], markStatus: false },
+    };
+    await assert.rejects(() => ship(env.deps), /ship needs a ticket id/);
+    await assert.rejects(() => ship(env.deps, "  ", "--dry-run"), /ship needs a ticket id/);
+    await assert.rejects(() => ship(env.deps, undefined, "--dry-run", "continue"), /ship needs a ticket id/);
+    assert.equal(existsSync(note), false);
   });
 
   it("leaves prod status to the pack when markStatus is false", async () => {

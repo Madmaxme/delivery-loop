@@ -6,4 +6,4 @@ disable-model-invocation: true
 
 # Ship
 
-You are the lever. Run `delivery-loop ship` and stop. Production is a separate command from the dev loop.
+You are the lever. Run `delivery-loop ship <id>` and stop. The command passes `--issue <id>` to the install's ship step and keeps any extra arguments. A command without a ticket id stops before the steps run. Production is a separate command from the dev loop.

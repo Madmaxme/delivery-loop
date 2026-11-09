@@ -1352,12 +1352,19 @@ function runShipStep(
   });
 }
 
-/** Ship this ticket only. An empty arg list is a bulk ship. */
+/** `--issue <id>`, then any extra arguments, for `DELIVERY_LOOP_SHIP_ARGS`. */
+function shipStepArgs(identifier: string, extraArgs?: string): string {
+  const extra = (extraArgs ?? "").trim();
+  const issue = `--issue ${identifier}`;
+  return extra ? `${issue} ${extra}` : issue;
+}
+
+/** Pass this ticket to the ship step as `--issue <id>`. */
 function runShipSteps(deps: LoopDeps, identifier: string): string | null {
   const previousIssue = process.env.DELIVERY_LOOP_ISSUE;
   const previousArgs = process.env.DELIVERY_LOOP_SHIP_ARGS;
   process.env.DELIVERY_LOOP_ISSUE = identifier;
-  process.env.DELIVERY_LOOP_SHIP_ARGS = `--issue ${identifier}`;
+  process.env.DELIVERY_LOOP_SHIP_ARGS = shipStepArgs(identifier);
   try {
     return runDevCommands(deps, deps.pack.ship?.steps ?? []);
   } finally {
@@ -2549,17 +2556,18 @@ export async function ship(
   extraArgs?: string,
   mode: "ship" | "continue" = "ship",
 ): Promise<void> {
+  const id = identifier?.trim() ?? "";
+  if (!id) throw new Error("ship needs a ticket id");
   const steps = mode === "continue" ? (deps.pack.ship?.continue ?? []) : (deps.pack.ship?.steps ?? []);
   if (mode === "continue" && steps.length === 0) throw new Error("ship continue has no steps");
   const env = {
     ...process.env,
-    DELIVERY_LOOP_ISSUE: identifier ?? "",
-    DELIVERY_LOOP_SHIP_ARGS: extraArgs ?? "",
+    DELIVERY_LOOP_ISSUE: id,
+    DELIVERY_LOOP_SHIP_ARGS: shipStepArgs(id, extraArgs),
   };
   async function loadTicket(): Promise<Ticket | null> {
-    if (!identifier) return null;
     try {
-      return await deps.tracker.get(identifier);
+      return await deps.tracker.get(id);
     } catch {
       return null;
     }
@@ -2579,8 +2587,8 @@ export async function ship(
         current = await loadTicket();
       }
       const standIn: Ticket = current ?? {
-        id: identifier ?? "ship",
-        identifier: identifier ?? "ship",
+        id,
+        identifier: id,
         title: "",
         body: "",
         stateName: "",
@@ -2619,7 +2627,7 @@ export async function ship(
       result = await runShipStep(step, cwd, env);
     }
   }
-  if (identifier && deps.pack.ship?.markStatus !== false) {
-    await deps.tracker.setState(identifier, deps.pack.status.prod);
+  if (deps.pack.ship?.markStatus !== false) {
+    await deps.tracker.setState(id, deps.pack.status.prod);
   }
 }
