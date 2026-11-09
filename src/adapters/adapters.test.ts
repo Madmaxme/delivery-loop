@@ -3,7 +3,14 @@ import { describe, it } from "node:test";
 
 import { githubForge } from "./forge-github.ts";
 import { githubIssuesTracker, linearTracker } from "./trackers.ts";
-import { copilotWorker, cursorReceiptText, cursorWorker, httpWorker } from "./workers.ts";
+import {
+  copilotWorker,
+  cursorKeySlots,
+  cursorReceiptText,
+  cursorWorker,
+  httpWorker,
+  type CursorSdk,
+} from "./workers.ts";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -392,6 +399,7 @@ describe("adapters", () => {
     );
     const worker = cursorWorker({
       apiKey: "k",
+      log: () => undefined,
       sdk: {
         async create() {
           return {
@@ -430,5 +438,163 @@ describe("adapters", () => {
     assert.equal(joined.text, receipt);
     assert.equal(joined.text.includes('"status":"finished"'), false);
     assert.equal(joined.branches?.[0]?.branch, "cursor/qui-1");
+  });
+});
+
+const PRIMARY = "primary-slot-value";
+const FALLBACK = "fallback-slot-value";
+const BALANCE = "[usage_limit_exceeded] Your team's prepaid balance is used up";
+
+function scriptedCursor(opts: {
+  keys: string[];
+  onCreate: (apiKey: string) => Error | "ok";
+  disposed?: { count: number };
+}): CursorSdk {
+  return {
+    async create(options) {
+      opts.keys.push(options.apiKey);
+      const outcome = opts.onCreate(options.apiKey);
+      if (outcome instanceof Error) throw outcome;
+      return {
+        agentId: `agent-${opts.keys.length}`,
+        async send() {
+          return {
+            id: `run-${opts.keys.length}`,
+            async wait() {
+              return { status: "finished", result: "done" };
+            },
+          };
+        },
+        async [Symbol.asyncDispose]() {
+          if (opts.disposed) opts.disposed.count += 1;
+        },
+      };
+    },
+    messages: {
+      async list() {
+        return [];
+      },
+    },
+  };
+}
+
+async function launch(input: {
+  slots: { slot: "primary" | "fallback"; apiKey: string }[];
+  onCreate: (apiKey: string) => Error | "ok";
+}): Promise<{ lines: string[]; keys: string[]; runId?: string; error?: Error }> {
+  const lines: string[] = [];
+  const keys: string[] = [];
+  const worker = cursorWorker({
+    slots: input.slots,
+    log: (line) => lines.push(line),
+    sdk: scriptedCursor({ keys, onCreate: input.onCreate }),
+  });
+  try {
+    const started = await worker.start({
+      prompt: "ground",
+      repoUrl: "https://github.com/acme/workspace",
+      baseRef: "main",
+    });
+    return { lines, keys, runId: started.runId };
+  } catch (error) {
+    return { lines, keys, error: error instanceof Error ? error : new Error(String(error)) };
+  }
+}
+
+describe("cursor worker key slots", () => {
+  const both = [
+    { slot: "primary" as const, apiKey: PRIMARY },
+    { slot: "fallback" as const, apiKey: FALLBACK },
+  ];
+
+  it("uses the primary slot when that launch succeeds", async () => {
+    const result = await launch({ slots: both, onCreate: () => "ok" });
+    assert.deepEqual(result.keys, [PRIMARY]);
+    assert.deepEqual(result.lines, ["worker key slot=primary"]);
+    assert.equal(result.error, undefined);
+    assert.equal(result.lines.join(" ").includes(PRIMARY), false);
+    assert.equal(result.lines.join(" ").includes(FALLBACK), false);
+  });
+
+  it("retries that launch once on the fallback slot after a balance refusal", async () => {
+    const result = await launch({
+      slots: both,
+      onCreate: (apiKey) => (apiKey === PRIMARY ? new Error(BALANCE) : "ok"),
+    });
+    assert.deepEqual(result.keys, [PRIMARY, FALLBACK]);
+    assert.deepEqual(result.lines, [
+      "worker key slot=primary refused for capacity",
+      "worker key slot=fallback",
+    ]);
+    assert.equal(result.error, undefined);
+    assert.equal(result.lines.join("\n").includes(PRIMARY), false);
+    assert.equal(result.lines.join("\n").includes(FALLBACK), false);
+  });
+
+  it("fails when both slots are out of capacity", async () => {
+    const result = await launch({
+      slots: both,
+      onCreate: () => new Error(BALANCE),
+    });
+    assert.deepEqual(result.keys, [PRIMARY, FALLBACK]);
+    assert.match(result.error?.message ?? "", /both key slots are out of capacity/);
+    assert.match(result.error?.message ?? "", /usage_limit_exceeded/);
+    assert.equal(result.error?.message.includes(PRIMARY), false);
+    assert.equal(result.error?.message.includes(FALLBACK), false);
+    assert.deepEqual(result.lines, [
+      "worker key slot=primary refused for capacity",
+      "worker key slot=fallback refused for capacity",
+    ]);
+  });
+
+  it("stops on an authentication failure without the fallback slot", async () => {
+    const result = await launch({
+      slots: both,
+      onCreate: () => new Error(`[unauthenticated] Invalid API key ${PRIMARY}`),
+    });
+    assert.deepEqual(result.keys, [PRIMARY]);
+    assert.match(result.error?.message ?? "", /primary key slot/);
+    assert.match(result.error?.message ?? "", /unauthenticated/);
+    assert.equal(result.error?.message.includes(PRIMARY), false);
+    assert.match(result.error?.message ?? "", /\[redacted\]/);
+    assert.equal(result.lines.some((line) => line.includes("fallback")), false);
+  });
+
+  it("stops on a rate limit without the fallback slot", async () => {
+    const result = await launch({
+      slots: both,
+      onCreate: () => new Error("[rate_limit_exceeded] Too many requests"),
+    });
+    assert.deepEqual(result.keys, [PRIMARY]);
+    assert.match(result.error?.message ?? "", /primary key slot/);
+    assert.match(result.error?.message ?? "", /rate_limit_exceeded/);
+    assert.equal(result.lines.some((line) => line.includes("fallback")), false);
+  });
+
+  it("stops on a network failure without the fallback slot", async () => {
+    const result = await launch({
+      slots: both,
+      onCreate: () => new Error("getaddrinfo ENOTFOUND api.cursor.com"),
+    });
+    assert.deepEqual(result.keys, [PRIMARY]);
+    assert.match(result.error?.message ?? "", /primary key slot/);
+    assert.match(result.error?.message ?? "", /ENOTFOUND/);
+  });
+
+  it("stays on the primary slot when no fallback is configured", async () => {
+    const result = await launch({
+      slots: [{ slot: "primary", apiKey: PRIMARY }],
+      onCreate: () => new Error(BALANCE),
+    });
+    assert.deepEqual(result.keys, [PRIMARY]);
+    assert.match(result.error?.message ?? "", /primary key slot/);
+    assert.match(result.error?.message ?? "", /out of capacity/);
+    assert.equal(/both key slots/.test(result.error?.message ?? ""), false);
+  });
+
+  it("drops a blank or duplicate fallback before the launch", () => {
+    assert.deepEqual(cursorKeySlots(PRIMARY, ""), [{ slot: "primary", apiKey: PRIMARY }]);
+    assert.deepEqual(cursorKeySlots(PRIMARY, PRIMARY), [{ slot: "primary", apiKey: PRIMARY }]);
+    assert.deepEqual(cursorKeySlots("  ", FALLBACK), []);
   });
 });

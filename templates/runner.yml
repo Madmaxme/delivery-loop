@@ -46,6 +46,8 @@ jobs:
           DELIVERY_LOOP_GITHUB_MINT: ${{ vars.DELIVERY_LOOP_GITHUB_MINT }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          # Second cursor key slot. An empty secret leaves the launch on the primary slot.
+          CURSOR_API_KEY_FALLBACK: ${{ secrets.CURSOR_API_KEY_FALLBACK }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           # Empty URL writes the event file and does not post.

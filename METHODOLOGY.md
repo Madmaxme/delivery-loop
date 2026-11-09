@@ -29,3 +29,14 @@ One runner holds the ticket with a `DELIVERY_LEASE` comment. The lease records t
 ## Bot definitions
 
 A leftover `bots` key is ignored with a warning.
+
+## Worker keys
+
+The cursor worker launches with the env var named by `workerKeys.primary`, then the env var named by `workerKeys.fallback`. The defaults are `CURSOR_API_KEY` and `CURSOR_API_KEY_FALLBACK`. The log records the slot in use, `primary` or `fallback`. The value stays in the environment.
+
+A capacity or balance refusal on the primary slot retries that launch once on the fallback slot.
+An authentication failure stops on the slot that returned it.
+A rate limit stops on the slot that returned it.
+A network failure stops on the slot that returned it.
+A refusal from both slots fails the launch and reports that both slots are out of capacity.
+An empty fallback variable leaves that launch on the primary slot.

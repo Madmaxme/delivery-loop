@@ -1648,8 +1648,9 @@ const RETRIABLE_AGENT_RUN_STATUSES = new Set([
 ]);
 
 /**
- * Cursor refused to start an agent because the account spend limit or included
- * usage is exhausted. Retrying the same send cannot succeed.
+ * Cursor refused to start an agent because the account spend limit, included
+ * usage, or prepaid balance is exhausted. Retrying the same key cannot succeed.
+ * A rate limit, an authentication failure, and a network failure stay false.
  */
 export function isAgentCapacityRefusal(
   notes: string | null | undefined,
@@ -1660,7 +1661,8 @@ export function isAgentCapacityRefusal(
     n.includes("usage-based pricing") ||
     n.includes("on-demand usage") ||
     n.includes("hard limit") ||
-    n.includes("spend limit")
+    n.includes("spend limit") ||
+    n.includes("prepaid balance")
   );
 }
 

@@ -14,9 +14,20 @@ import {
   shouldStopForPageReserve,
   pageBudgetRemainingMs,
   isSweepIntakeState,
+  isAgentCapacityRefusal,
 } from "./linear-harness-policy.ts";
 
 describe("ported policy", () => {
+  it("treats a prepaid balance refusal as capacity and leaves other failures alone", () => {
+    assert.equal(
+      isAgentCapacityRefusal("[usage_limit_exceeded] Your team's prepaid balance is used up"),
+      true,
+    );
+    assert.equal(isAgentCapacityRefusal("[rate_limit_exceeded] Too many requests"), false);
+    assert.equal(isAgentCapacityRefusal("[unauthenticated] Invalid API key"), false);
+    assert.equal(isAgentCapacityRefusal("getaddrinfo ENOTFOUND api.cursor.com"), false);
+  });
+
   it("parks a milestone only when the install named that rule", () => {
     assert.deepEqual(parksFromMilestoneCopy("Stage 5 — CRM Depth (Later)", ""), []);
     assert.deepEqual(

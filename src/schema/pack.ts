@@ -49,6 +49,15 @@ export type TrackerKind = "linear" | "github";
 /** Who edits the code. The runner starts this and waits. */
 export type WorkerKind = "cursor" | "claude" | "codex" | "copilot" | "http";
 
+/** Env var names for the cursor worker. The values are not stored in the pack. */
+export type WorkerKeys = {
+  primary: string;
+  fallback: string;
+};
+
+export const DEFAULT_CURSOR_PRIMARY_ENV = "CURSOR_API_KEY";
+export const DEFAULT_CURSOR_FALLBACK_ENV = "CURSOR_API_KEY_FALLBACK";
+
 /**
  * Where the branch is published and merged.
  * `github` uses pull requests. `git` merges with git on any remote.
@@ -98,6 +107,13 @@ export type ProjectPack = {
   agent?: { url: string; trunk: string };
   /** Tracker team key, such as ENG. */
   linearTeam?: string;
+  /**
+   * Env var names for the cursor worker's key slots. Values stay in the
+   * environment. `primary` defaults to CURSOR_API_KEY. `fallback` defaults
+   * to CURSOR_API_KEY_FALLBACK. An empty fallback value leaves the launch
+   * on the primary slot.
+   */
+  workerKeys?: WorkerKeys;
   workerHttp?: { startUrl: string; statusUrl: string };
   repos: RepoSpec[];
   /**
@@ -256,7 +272,26 @@ export function loadPack(path: string): ProjectPack {
   };
   raw.invariantHeadings = raw.invariantHeadings ?? [];
   raw.design = loadDesign(raw.design, path);
+  raw.workerKeys = loadWorkerKeys(raw.workerKeys, path);
   return raw;
+}
+
+/** Env var names for the cursor worker. Absent names use the generic slots. */
+export function workerKeyNames(pack: Pick<ProjectPack, "workerKeys">): WorkerKeys {
+  return {
+    primary: pack.workerKeys?.primary?.trim() || DEFAULT_CURSOR_PRIMARY_ENV,
+    fallback: pack.workerKeys?.fallback?.trim() || DEFAULT_CURSOR_FALLBACK_ENV,
+  };
+}
+
+function loadWorkerKeys(keys: WorkerKeys | undefined, path: string): WorkerKeys {
+  const named = workerKeyNames({ workerKeys: keys });
+  for (const name of [named.primary, named.fallback]) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new Error(`${path} workerKeys names an env var`);
+    }
+  }
+  return named;
 }
 
 /** A leftover bots key is ignored with a warning. */
