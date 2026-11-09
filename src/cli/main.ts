@@ -214,7 +214,10 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       return joined.text;
     };
     ship(deps, issue.toUpperCase(), extra, continueMode ? "continue" : "ship").then(
-      () => console.log("shipped"),
+      (result) => {
+        if (result.exitCode !== 0) process.exitCode = result.exitCode;
+        else console.log("shipped");
+      },
       (err) => {
         console.error(err instanceof Error ? err.message : String(err));
         process.exitCode = 1;
@@ -289,7 +292,10 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     if (!issue) throw new Error("ship needs a ticket id");
     const extra = argv.filter((a) => a.toUpperCase() !== issue.toUpperCase()).join(" ");
     ship(deps, issue, extra)
-      .then(() => console.log("shipped"))
+      .then((result) => {
+        if (result.exitCode !== 0) process.exitCode = result.exitCode;
+        else console.log("shipped");
+      })
       .catch((error: unknown) => {
         console.error(error instanceof Error ? error.message : String(error));
         process.exitCode = 1;

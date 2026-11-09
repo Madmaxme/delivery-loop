@@ -54,6 +54,10 @@ One runner holds the ticket with a `DELIVERY_LEASE` comment. The lease records t
 
 A leftover `bots` key is ignored with a warning.
 
+## Ship outcomes
+
+A zero ship exit with no outcome lines is success, including a store wait. The pack reports `delivery-loop outcome <ticket> COMPLETE`, `PARKED`, or `BLOCKED`, plus an optional reason. The engine prints `ship outcome <ticket> <state> [reason]` and `ship outcomes complete=<n> parked=<n> blocked=<n>`. Exit 0 means every ticket is COMPLETE. Exit 2 means a PARKED ticket and no BLOCKED ticket, unless `ship.parkSuccess` is true. Any BLOCKED line exits 1. `ship.parkSuccess` defaults to false. Exit 75, or a non-zero exit with `delivery-loop transient <reason>`, retries that ship or promote step. `transient.maxAttempts` defaults to 3. Waits start at one second and double. `transient.maxWaitMs` defaults to 60000 and caps the sum. A spent budget reports the reason and does not edit an owner. A non-transient failure still edits the owner. `$GITHUB_STEP_SUMMARY`, when set, receives the same rows as Markdown.
+
 ## Worker keys
 
 The cursor worker launches with the env var named by `workerKeys.primary`, then the env var named by `workerKeys.fallback`. The defaults are `CURSOR_API_KEY` and `CURSOR_API_KEY_FALLBACK`. The log records the slot in use, `primary` or `fallback`, and the launch status. A launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. The value stays in the environment.

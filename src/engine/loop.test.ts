@@ -7,7 +7,7 @@ import { describe, it } from "node:test";
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
-import { ciFixLimit, formatTicketProgress, latestLandMarker, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage } from "./loop.ts";
+import { ciFixLimit, formatTicketProgress, latestLandMarker, repoCheckoutDir, runDevCommands, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage } from "./loop.ts";
 import { classifyQualityCause } from "./quality-cause.ts";
 import { ownerHealPrompt } from "./stall.ts";
 
@@ -2259,6 +2259,82 @@ describe("loop", () => {
     assert.equal(starts, 1);
     assert.deepEqual(events, ["promote mobile", "state:Dev"]);
     assert.equal(env.state(), "Dev");
+  });
+
+  it("retries a transient ship step once and records COMPLETE", async () => {
+    const env = harness(BUILDABLE);
+    const dir = mkdtempSync(join(tmpdir(), "ship-transient-"));
+    const count = join(dir, "n");
+    const step = `n=$(cat ${count} 2>/dev/null || echo 0); echo $((n+1)) > ${count}; if [ "$n" = "0" ]; then echo 'delivery-loop transient rate limit'; exit 75; fi; echo 'delivery-loop outcome API-1 COMPLETE'`;
+    const waits: number[] = [];
+    env.deps.sleep = async (ms) => {
+      waits.push(ms);
+    };
+    env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
+    const result = await ship(env.deps, "API-1");
+    assert.deepEqual(waits, [1000]);
+    assert.equal(result.exitCode, 0);
+    assert.match(result.lines.join("\n"), /ship outcome API-1 COMPLETE/);
+    assert.match(result.lines.join("\n"), /ship outcomes complete=1 parked=0 blocked=0/);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("exits 2 for a park, writes the summary, and does not edit an owner", async () => {
+    const env = harness(BUILDABLE);
+    const prompts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return start(input);
+    };
+    const summary = join(mkdtempSync(join(tmpdir(), "ship-summary-")), "summary.md");
+    const previous = process.env.GITHUB_STEP_SUMMARY;
+    process.env.GITHUB_STEP_SUMMARY = summary;
+    env.deps.pack = {
+      ...pack,
+      ship: { steps: ["echo 'delivery-loop outcome API-1 PARKED store gate'"], markStatus: true },
+    };
+    try {
+      const result = await ship(env.deps, "API-1");
+      assert.equal(result.exitCode, 2);
+      assert.match(result.lines.join("\n"), /ship outcome API-1 PARKED store gate/);
+      assert.match(readFileSync(summary, "utf8"), /PARKED/);
+      assert.equal(prompts.some((prompt) => prompt.includes("Fix that owner")), false);
+      assert.equal(env.state(), "Todo");
+    } finally {
+      if (previous === undefined) delete process.env.GITHUB_STEP_SUMMARY;
+      else process.env.GITHUB_STEP_SUMMARY = previous;
+    }
+  });
+
+  it("treats a blocked outcome as a failure exit", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = {
+      ...pack,
+      ship: { steps: ["echo 'delivery-loop outcome API-1 BLOCKED missing tip'; exit 0"], markStatus: false },
+    };
+    const result = await ship(env.deps, "API-1");
+    assert.equal(result.exitCode, 1);
+    assert.match(result.lines.join("\n"), /ship outcome API-1 BLOCKED missing tip/);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("retries a transient promote step and then records success", async () => {
+    const env = harness(BUILDABLE);
+    let calls = 0;
+    const waits: number[] = [];
+    env.deps.sleep = async (ms) => {
+      waits.push(ms);
+    };
+    env.deps.runCommand = () => {
+      calls += 1;
+      if (calls === 1) return { status: 75, stdout: "delivery-loop transient registry\n", stderr: "" };
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    const run = await runDevCommands(env.deps, ["./scripts/promote.sh"], "promote");
+    assert.equal(run.failed, null);
+    assert.equal(calls, 2);
+    assert.deepEqual(waits, [1000]);
   });
 
   it("passes the ticket id to the ship step", async () => {

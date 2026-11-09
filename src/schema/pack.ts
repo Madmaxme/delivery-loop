@@ -207,9 +207,22 @@ export type ProjectPack = {
    * steps run. A failed step leaves the dev state. The ship command
    * edits that step's owner once, then the next run retries it.
    * `continue` is the store-continue command and takes the same ticket id.
-   * A clean exit, including a store wait, is not a failure.
+   * A zero exit with no outcome lines is success, including a store wait.
+   * `parkSuccess` defaults to false. A PARKED outcome is exit 2 unless it is true.
    */
-  ship?: { steps: string[]; continue?: string[]; markStatus?: boolean; afterDev?: boolean };
+  ship?: {
+    steps: string[];
+    continue?: string[];
+    markStatus?: boolean;
+    afterDev?: boolean;
+    parkSuccess?: boolean;
+  };
+  /**
+   * Retries a ship or promote step that reports transient.
+   * `maxAttempts` defaults to 3. `maxWaitMs` defaults to 60000.
+   * Waits start at one second and double. The sum stops at `maxWaitMs`.
+   */
+  transient?: { maxAttempts?: number; maxWaitMs?: number };
   /**
    * Heal attempts per failure type, counted from OWNER_HEAL comments on the ticket.
    * `maxAttempts` is the default. `caps` overrides one type.
@@ -279,7 +292,24 @@ export function loadPack(path: string): ProjectPack {
   raw.design = loadDesign(raw.design, path);
   raw.workerKeys = loadWorkerKeys(raw.workerKeys, path);
   raw.workerModel = loadWorkerModel(raw.workerModel, path);
+  raw.transient = loadTransient(raw.transient, path);
+  if (raw.ship) raw.ship.parkSuccess = raw.ship.parkSuccess === true;
   return raw;
+}
+
+function loadTransient(
+  value: ProjectPack["transient"],
+  path: string,
+): ProjectPack["transient"] {
+  const maxAttempts = value?.maxAttempts ?? 3;
+  const maxWaitMs = value?.maxWaitMs ?? 60_000;
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new Error(`${path} transient.maxAttempts is a positive integer`);
+  }
+  if (!Number.isInteger(maxWaitMs) || maxWaitMs < 0) {
+    throw new Error(`${path} transient.maxWaitMs is a non-negative integer`);
+  }
+  return { maxAttempts, maxWaitMs };
 }
 
 const WORKER_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
