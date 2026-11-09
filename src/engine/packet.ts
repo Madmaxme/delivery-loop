@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { matchesJourneySpec } from "../../scripts/journey-proof.mjs";
 import type { InvariantHeading } from "../schema/pack.ts";
 
 export const VERDICTS = [
@@ -201,8 +202,12 @@ export type JourneyProof =
   | { kind: "recording"; url: string }
   | { kind: "route-test"; repo: string; path: string };
 
-/** Proof tokens from every `**Journey proof:**` line. A sentence without a token is empty. */
-export function parseJourneyProofs(text: string): JourneyProof[] {
+/**
+ * Proof tokens from every `**Journey proof:**` line. A sentence without a token is empty.
+ * A route test counts when its path matches `journeySpec`.
+ * A spec outside that pattern is not proof.
+ */
+export function parseJourneyProofs(text: string, journeySpec?: string): JourneyProof[] {
   const proofs: JourneyProof[] = [];
   for (const match of text.matchAll(/\*\*Journey proof:\*\*\s*(.+)/gi)) {
     const tokens = [...match[1].matchAll(/`([^`]+)`/g)].map((item) => item[1].trim());
@@ -212,26 +217,29 @@ export function parseJourneyProofs(text: string): JourneyProof[] {
         continue;
       }
       const route = token.match(ROUTE_TEST_PROOF_RE);
-      if (route) proofs.push({ kind: "route-test", repo: route[1], path: route[2] });
+      if (route && matchesJourneySpec(route[2], journeySpec)) {
+        proofs.push({ kind: "route-test", repo: route[1], path: route[2] });
+      }
     }
   }
   return proofs;
 }
 
 /**
- * `recorded` is proven only when every cited proof is real.
- * A recording URL has to be in the build receipt. A route test has to be on the commit.
- * `not-applicable` is proven. Anything else is not.
+ * `recorded` is proven when every cited proof is real.
+ * A recording URL is in the build receipt. A route test is on the commit and matches `journeySpec`.
+ * A spec outside that pattern is not proof. `not-applicable` is proven.
  */
 export function journeyEvidenceProven(
   declared: string,
   receipt: string,
   fileOnCommit: (repo: string, path: string) => boolean,
+  journeySpec?: string,
 ): boolean {
   const evidence = parseJourneyEvidence(declared);
   if (evidence === "not-applicable") return true;
   if (evidence !== "recorded") return false;
-  const proofs = parseJourneyProofs(`${declared}\n${receipt}`);
+  const proofs = parseJourneyProofs(`${declared}\n${receipt}`, journeySpec);
   if (proofs.length === 0) return false;
   return proofs.every((proof) => {
     if (proof.kind === "recording") return receipt.includes(proof.url);

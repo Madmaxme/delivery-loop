@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { DEFAULT_JOURNEY_SPEC } from "../../scripts/journey-proof.mjs";
 import type { CompareStatus, DesignCheckProbe, FetchLike, ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { agentHome, holdStatus, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
 import {
@@ -344,7 +345,7 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "A missing line stays in intake. Reading a vendor's documentation is not the grant.",
     "Every BUILDABLE handoff includes **Journey evidence:** recorded | not-applicable | blocked.",
     "not-applicable means the done-state is not a journey a person walks.",
-    "recorded means it is. Web proof is **Journey proof:** an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. Mobile proof is **Journey proof:** a route test on the merged commit, `repo/path_test.dart` or `repo/path.test.ts`. A sentence that names no token is not proof.",
+    `recorded means it is. Web proof is **Journey proof:** an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. Mobile proof is **Journey proof:** a route test on the merged commit, \`repo/path_test.dart\` or \`repo/path.test.ts\`, whose path matches \`${deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC}\`. A sentence that names no token is not proof. A spec outside that pattern stays in intake.`,
     "blocked means that proof cannot be produced in this run. A missing line or blocked stays in intake and does not mark dev-done.",
     `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
     landRepoLine(deps.pack),
@@ -390,7 +391,7 @@ function buildPrompt(
       ? `Push these branches from each repo trunk: ${branches.join(", ")}. Include repo and branch in the handoff. Do not merge.`
       : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
     "Stay inside the allowlist. Run the validation commands.",
-    "When the handoff says **Journey evidence:** recorded, the pack journey command prints **Journey proof:**. A web token is an https recording or screenshot URL. A mobile token is the route test on the commit. The author does not write that token. The runner does not mark dev-done without it.",
+    "When the handoff says **Journey evidence:** recorded, the pack journey command prints **Journey proof:**. A web token is an https recording or screenshot URL. A mobile token is the route test on the commit whose path matches the journey-spec pattern. The author does not write that token. The runner does not mark dev-done without it.",
     retry,
   ].filter((part) => part.length > 0).join("\n\n");
 }
@@ -723,8 +724,12 @@ async function runHeldTicket(
             : null,
         journeyProven:
           verdict === "ALREADY SHIPPED"
-            ? journeyEvidenceProven(ground.text, ground.text, (repo, path) =>
-                journeyFileInCheckout(deps, repo, repoByName(deps.pack, repo)?.trunk ?? "", path),
+            ? journeyEvidenceProven(
+                ground.text,
+                ground.text,
+                (repo, path) =>
+                  journeyFileInCheckout(deps, repo, repoByName(deps.pack, repo)?.trunk ?? "", path),
+                deps.pack.journeySpec,
               )
             : null,
       });
@@ -1093,11 +1098,41 @@ async function publishProofReceipt(
   ticket.comments = [...ticket.comments, { body }];
 }
 
-function landWaitMarker(hold: boolean, rows: { repo: string; sha: string }[]): string {
-  const lines = ["<!-- LAND_WAIT", `hold=${hold ? "1" : "0"}`];
+function landWaitMarker(
+  hold: boolean,
+  rows: { repo: string; sha: string }[],
+  receipt = "",
+): string {
+  const lines: string[] = [];
+  const saved = receipt.trim();
+  if (saved) lines.push(saved);
+  lines.push("<!-- LAND_WAIT", `hold=${hold ? "1" : "0"}`);
   for (const row of rows) lines.push(`${row.repo} ${row.sha}`);
   lines.push("-->");
   return lines.join("\n");
+}
+
+/** Build receipt saved ahead of the land-wait marker. A resume reads the same text. */
+function savedLandReceipt(body: string): string {
+  const at = body.lastIndexOf("<!-- LAND_WAIT");
+  if (at <= 0) return "";
+  return body.slice(0, at).trim();
+}
+
+/** Ground text and build receipt for a land that is already marked. */
+function resumeProofTexts(comments: { body: string }[]): { declared: string; receipt: string } {
+  const published = publishedProofReceipt(comments) ?? "";
+  let saved = "";
+  let declared = "";
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const body = comments[i]?.body ?? "";
+    if (!saved && body.includes("<!-- LAND_WAIT")) saved = savedLandReceipt(body);
+    if (!declared && !body.includes("<!-- LAND_WAIT") && body !== published && parseJourneyEvidence(body)) {
+      declared = body;
+    }
+  }
+  const receipt = [saved, published].filter(Boolean).join("\n");
+  return { declared: declared || receipt, receipt };
 }
 
 function landEmptyMarker(rows: { repo: string; sha: string }[]): string {
@@ -1272,7 +1307,7 @@ function journeyCommandProof(deps: LoopDeps, stdin: string): string | null {
   const run = deps.runPackCommand ?? defaultRunPackCommand;
   const result = run(command, deps.cwd ?? process.cwd(), stdin);
   if (result.status !== 0) return null;
-  if (parseJourneyProofs(result.stdout).length === 0) return null;
+  if (parseJourneyProofs(result.stdout, deps.pack.journeySpec).length === 0) return null;
   return result.stdout;
 }
 
@@ -1329,6 +1364,110 @@ function journeyFileInCheckout(deps: LoopDeps, repo: string, ref: string, path: 
   return present(ref);
 }
 
+function reposForMarker(
+  deps: LoopDeps,
+  rows: { repo: string; sha: string }[],
+): { repo: RepoSpec; sha: string }[] {
+  const out: { repo: RepoSpec; sha: string }[] = [];
+  for (const row of rows) {
+    const spec = repoByName(deps.pack, row.repo);
+    if (spec) out.push({ repo: spec, sha: row.sha });
+  }
+  return out;
+}
+
+type RecordedProof =
+  | { ok: true; recorded: boolean; proofReceipt: string }
+  | { ok: false; result: TicketResult };
+
+function proofFileOnCommit(
+  deps: LoopDeps,
+  rows: { repo: RepoSpec; sha: string }[],
+): (repo: string, path: string) => boolean {
+  return (repo, path) => {
+    const row = rows.find((item) => item.repo.name === repo);
+    const ref = row?.sha || repoByName(deps.pack, repo)?.trunk || "";
+    return journeyFileInCheckout(deps, repo, ref, path);
+  };
+}
+
+/**
+ * Recorded journey proof before the dev status. A fresh land and a resume
+ * both use this. A proof comment that already proves the journey is reused.
+ * A spec outside the journey-spec pattern is not that proof.
+ */
+async function applyRecordedProof(
+  deps: LoopDeps,
+  ticket: Ticket,
+  rows: { repo: RepoSpec; sha: string; url?: string }[],
+  declared: string,
+  receipt: string,
+): Promise<RecordedProof> {
+  const recorded =
+    parseJourneyEvidence(declared) === "recorded" || parseJourneyEvidence(receipt) === "recorded";
+  if (!recorded) return { ok: true, recorded: false, proofReceipt: receipt };
+  const onCommit = proofFileOnCommit(deps, rows);
+  const existing = publishedProofReceipt(ticket.comments);
+  if (
+    existing &&
+    journeyEvidenceProven(`${declared}\n${receipt}\n${existing}`, existing, onCommit, deps.pack.journeySpec)
+  ) {
+    return { ok: true, recorded: true, proofReceipt: existing };
+  }
+  const printed = journeyCommandProof(deps, `${declared}\n${receipt}`);
+  if (printed === null) {
+    await deps.tracker.comment(
+      ticket.identifier,
+      "The journey command did not print a **Journey proof:** token. The ticket stays in intake.",
+    );
+    return {
+      ok: false,
+      result: {
+        identifier: ticket.identifier,
+        outcome: "journey-missing",
+        detail: "journey command",
+      },
+    };
+  }
+  const proofReceipt = `${receipt}\n${printed}`;
+  const proven = journeyEvidenceProven(
+    `${declared}\n${proofReceipt}`,
+    proofReceipt,
+    onCommit,
+    deps.pack.journeySpec,
+  );
+  if (!proven) {
+    await deps.tracker.comment(
+      ticket.identifier,
+      "Journey evidence is recorded, and the proof is not on this merge. A web journey needs the recording URL in the build receipt. A mobile journey needs the route test on the commit under the journey-spec pattern. The ticket stays in intake.",
+    );
+    return {
+      ok: false,
+      result: {
+        identifier: ticket.identifier,
+        outcome: "journey-missing",
+        detail: "recorded proof missing",
+      },
+    };
+  }
+  return { ok: true, recorded: true, proofReceipt };
+}
+
+async function publishDevProof(
+  deps: LoopDeps,
+  ticket: Ticket,
+  recorded: boolean,
+  proofReceipt: string,
+  rows: { sha: string; url?: string }[],
+): Promise<void> {
+  const existing = publishedProofReceipt(ticket.comments);
+  await publishProofReceipt(
+    deps,
+    ticket,
+    recorded ? { receipt: proofReceipt, rows } : existing ? { receipt: existing, rows } : null,
+  );
+}
+
 async function settleTrunk(
   deps: LoopDeps,
   ticket: Ticket,
@@ -1344,8 +1483,9 @@ async function settleTrunk(
     const quality = await trunkQuality(deps, { repo: row.repo, sha: tip });
     if (quality.state !== "success") waiting.push({ repo: row.repo.name, sha: tip });
   }
+  const carried = [declared, receipt].filter((part) => part.trim()).join("\n");
   if (waiting.length > 0) {
-    await deps.tracker.comment(ticket.identifier, landWaitMarker(hold, waiting));
+    await deps.tracker.comment(ticket.identifier, landWaitMarker(hold, waiting, carried));
     return {
       identifier: ticket.identifier,
       outcome: "trunk-waiting",
@@ -1361,7 +1501,11 @@ async function settleTrunk(
     await applyOwnerHeal(deps, ticket, `heal:dev:${signature}`, `Dev step returned no: ${failed}`);
     await deps.tracker.comment(
       ticket.identifier,
-      landWaitMarker(hold, rows.map((row) => ({ repo: row.repo.name, sha: row.sha }))),
+      landWaitMarker(
+        hold,
+        rows.map((row) => ({ repo: row.repo.name, sha: row.sha })),
+        carried,
+      ),
     );
     return {
       identifier: ticket.identifier,
@@ -1369,49 +1513,10 @@ async function settleTrunk(
       detail: `dev step failed: ${failed}`,
     };
   }
-  let proofReceipt = receipt;
-  if (parseJourneyEvidence(declared) === "recorded" || parseJourneyEvidence(receipt) === "recorded") {
-    const printed = journeyCommandProof(deps, `${declared}\n${receipt}`);
-    if (printed === null) {
-      await deps.tracker.comment(
-        ticket.identifier,
-        "The journey command did not print a **Journey proof:** token. The ticket stays in intake.",
-      );
-      return {
-        identifier: ticket.identifier,
-        outcome: "journey-missing",
-        detail: "journey command",
-      };
-    }
-    proofReceipt = `${receipt}\n${printed}`;
-    const proven = journeyEvidenceProven(`${declared}\n${proofReceipt}`, proofReceipt, (repo, path) => {
-      const row = rows.find((item) => item.repo.name === repo);
-      const ref = row?.sha || repoByName(deps.pack, repo)?.trunk || "";
-      return journeyFileInCheckout(deps, repo, ref, path);
-    });
-    if (!proven) {
-      await deps.tracker.comment(
-        ticket.identifier,
-        "Journey evidence is recorded, and the proof is not on this merge. A web journey needs the recording URL in the build receipt. A mobile journey needs the route test on the commit. The ticket stays in intake.",
-      );
-      return {
-        identifier: ticket.identifier,
-        outcome: "journey-missing",
-        detail: "recorded proof missing",
-      };
-    }
-  }
+  const gate = await applyRecordedProof(deps, ticket, rows, declared, receipt);
+  if (!gate.ok) return gate.result;
   const devState = hold ? holdStatus(deps.pack) : deps.pack.status.dev;
-  if (!hold) {
-    const existing = publishedProofReceipt(ticket.comments);
-    const recorded =
-      parseJourneyEvidence(declared) === "recorded" || parseJourneyEvidence(receipt) === "recorded";
-    await publishProofReceipt(
-      deps,
-      ticket,
-      recorded ? { receipt: proofReceipt, rows } : existing ? { receipt: existing, rows } : null,
-    );
-  }
+  if (!hold) await publishDevProof(deps, ticket, gate.recorded, gate.proofReceipt, rows);
   if (deps.pack.ship?.afterDev) {
     await deps.tracker.setState(ticket.identifier, devState);
     const failed = runShipSteps(deps, ticket.identifier);
@@ -1481,7 +1586,12 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
   }
   if (marker.kind === "ship") {
     noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
+    const texts = resumeProofTexts(ticket.comments);
+    const shipRows = reposForMarker(deps, marker.rows);
+    const gate = await applyRecordedProof(deps, ticket, shipRows, texts.declared, texts.receipt);
+    if (!gate.ok) return gate.result;
     const devState = marker.hold ? holdStatus(deps.pack) : deps.pack.status.dev;
+    if (!marker.hold) await publishDevProof(deps, ticket, gate.recorded, gate.proofReceipt, shipRows);
     await deps.tracker.setState(ticket.identifier, devState);
     if (!deps.pack.ship?.afterDev) {
       return {
@@ -1514,7 +1624,8 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
     rows.push({ repo: spec, sha: row.sha });
   }
   noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
-  return settleTrunk(deps, ticket, marker.hold, rows, "trunk green");
+  const texts = resumeProofTexts(ticket.comments);
+  return settleTrunk(deps, ticket, marker.hold, rows, "trunk green", texts.declared, texts.receipt);
 }
 
 let releaseTagCache: string[] | undefined | null = null;
