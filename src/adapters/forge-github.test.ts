@@ -72,4 +72,39 @@ describe("github mergeability", () => {
       "deadbeef",
     );
   });
+
+  it("reads a design job from Actions when the Checks API refuses the token", async () => {
+    const head = "a".repeat(40);
+    const calls: string[] = [];
+    const forge = githubForge({
+      token: "token",
+      fetch: async (url) => {
+        calls.push(String(url));
+        if (String(url).includes("/check-runs")) {
+          return new Response("no", { status: 403 });
+        }
+        if (String(url).includes("/actions/runs?") && !String(url).includes("/jobs")) {
+          return Response.json({
+            workflow_runs: [{ id: 9, head_sha: head }],
+          });
+        }
+        if (String(url).includes("/actions/runs/9/jobs")) {
+          return Response.json({
+            jobs: [
+              { name: "ui-primitives", status: "completed", conclusion: "success" },
+            ],
+          });
+        }
+        return Response.json({});
+      },
+    });
+    const probe = await forge.designCheck?.({
+      repoUrl: "https://github.com/acme/admin-web",
+      headSha: head,
+      name: "ui-primitives",
+    });
+    assert.equal(probe?.state, "success");
+    assert.ok(calls.some((url) => url.includes("/check-runs")));
+    assert.ok(calls.some((url) => url.includes("/jobs")));
+  });
 });

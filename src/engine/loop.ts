@@ -991,30 +991,45 @@ async function runHeldTicket(
     };
   }
   noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
-  const merged: MergedHead[] = [];
+  const ready: OpenPull[] = [];
   for (const pr of opened) {
-    try {
-      const landed = await landPull(deps, ticket, pr, ground.text);
-      if ("outcome" in landed) return landed;
-      merged.push({ repo: pr.repo, sha: landed.mergedSha, url: pr.url });
-    } catch (error) {
-      if (error instanceof HealExhaustedError) {
-        return {
-          identifier: ticket.identifier,
-          outcome: "heal-exhausted",
-          detail: error.failureType,
-        };
-      }
-      const paused = pauseLand(
-        ticket.identifier,
-        pr.url,
-        error instanceof Error ? error.message : String(error),
-      );
-      await deps.tracker.comment(ticket.identifier, paused.detail);
-      return paused;
-    }
+    const prepared = await settleLand(deps, ticket, pr, ground.text);
+    if ("outcome" in prepared) return prepared;
+    ready.push({ ...pr, headSha: prepared.headSha });
+  }
+  const merged: MergedHead[] = [];
+  for (const pr of ready) {
+    const landed = await commitLand(deps, ticket, pr);
+    if ("outcome" in landed) return landed;
+    merged.push({ repo: pr.repo, sha: landed.mergedSha, url: pr.url });
   }
   return finishMerged(deps, ticket, grant === "open", merged, ground.text, builtReceipt);
+}
+
+async function settleLand(
+  deps: LoopDeps,
+  ticket: Ticket,
+  pr: OpenPull,
+  orderText: string,
+): Promise<TicketResult | { headSha: string }> {
+  try {
+    return await landPull(deps, ticket, pr, orderText);
+  } catch (error) {
+    if (error instanceof HealExhaustedError) {
+      return {
+        identifier: ticket.identifier,
+        outcome: "heal-exhausted",
+        detail: error.failureType,
+      };
+    }
+    const paused = pauseLand(
+      ticket.identifier,
+      pr.url,
+      error instanceof Error ? error.message : String(error),
+    );
+    await deps.tracker.comment(ticket.identifier, paused.detail);
+    return paused;
+  }
 }
 
 const QUALITY_POLL_MS = 30_000;
@@ -1899,7 +1914,7 @@ async function stopForMissingFigmaToken(deps: LoopDeps, ticket: Ticket): Promise
     );
     return { identifier: ticket.identifier, outcome: "missing-credential", detail: "figma" };
   }
-  deps.figmaGroundBlock = await designRepairText({
+  const block = await designRepairText({
     ticket,
     design: deps.pack.design,
     repoName: "",
@@ -1907,6 +1922,15 @@ async function stopForMissingFigmaToken(deps: LoopDeps, ticket: Ticket): Promise
     figmaToken: deps.figmaToken,
     figmaFetch: deps.figmaFetch,
   });
+  if (/figma read failed:/i.test(block)) {
+    const envName = deps.pack.design?.figmaTokenEnv?.trim() || "FIGMA_ACCESS_TOKEN";
+    await deps.tracker.comment(
+      ticket.identifier,
+      `${block}\n\nShare the file with the account that owns ${envName}. The ticket stays in intake.`,
+    );
+    return { identifier: ticket.identifier, outcome: "missing-credential", detail: "figma" };
+  }
+  deps.figmaGroundBlock = block;
   return null;
 }
 
@@ -1953,12 +1977,63 @@ async function readDesignCheck(
   return probe;
 }
 
+async function commitLand(
+  deps: LoopDeps,
+  ticket: Ticket,
+  current: OpenPull,
+): Promise<TicketResult | { mergedSha: string }> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const tries = { waits: 0, login: false };
+  for (let step = 0; step < 8; step++) {
+    try {
+      const mergedSha = await deps.forge.squashMerge({
+        repoUrl: current.repo.url,
+        number: current.number,
+        branch: current.branch,
+        base: current.repo.trunk,
+        headSha: current.headSha,
+      });
+      if (!mergedSha?.trim()) throw new Error("merge did not return a commit");
+      return { mergedSha };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (ownerOnlyLandFailure(error)) {
+        const paused = pauseLand(
+          ticket.identifier,
+          current.url,
+          "Needs the owner. The merge was refused for a token, scope, or protection failure. The next page does not start a coding worker.",
+          "",
+        );
+        await deps.tracker.comment(ticket.identifier, paused.detail);
+        return paused;
+      }
+      const paused = await healNo(
+        deps,
+        ticket,
+        current,
+        `heal:merge:${shipNoSignature(reason) || "merge"}`,
+        reason,
+        sleep,
+        tries,
+      );
+      if (paused) return paused;
+    }
+  }
+  const paused = pauseLand(
+    ticket.identifier,
+    current.url,
+    `Land did not finish on \`${current.branch}\`. The next page resumes this branch.`,
+  );
+  await deps.tracker.comment(ticket.identifier, paused.detail);
+  return paused;
+}
+
 async function landPull(
   deps: LoopDeps,
   ticket: Ticket,
   pr: OpenPull,
   orderText: string,
-): Promise<LandPullResult> {
+): Promise<TicketResult | { headSha: string }> {
   void orderText;
   let current = pr;
   let updates = 0;
@@ -2045,39 +2120,7 @@ async function landPull(
       await sleep(MERGE_SETTLE_MS);
       continue;
     }
-    try {
-      const mergedSha = await deps.forge.squashMerge({
-        repoUrl: current.repo.url,
-        number: current.number,
-        branch: current.branch,
-        base: current.repo.trunk,
-        headSha: head,
-      });
-      if (!mergedSha?.trim()) throw new Error("merge did not return a commit");
-      return { mergedSha };
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      if (ownerOnlyLandFailure(error)) {
-        const paused = pauseLand(
-          ticket.identifier,
-          current.url,
-          "Needs the owner. The merge was refused for a token, scope, or protection failure. The next page does not start a coding worker.",
-          "",
-        );
-        await deps.tracker.comment(ticket.identifier, paused.detail);
-        return paused;
-      }
-      const paused = await healNo(
-        deps,
-        ticket,
-        current,
-        `heal:merge:${shipNoSignature(reason) || "merge"}`,
-        reason,
-        sleep,
-        tries,
-      );
-      if (paused) return paused;
-    }
+    return { headSha: head };
   }
   const paused = pauseLand(
     ticket.identifier,

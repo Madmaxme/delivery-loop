@@ -1,3 +1,9 @@
+import { interpretDesignChecks, type DesignCheckRun } from "../engine/design-gate.ts";
+import {
+  interpretQualityActions,
+  qualityRunUnscheduled,
+  type QualityRunLite,
+} from "../engine/linear-harness-policy.js";
 import {
   assertCommitActor,
   commitActorLogin,
@@ -30,12 +36,73 @@ async function readCommit(
     committedAt: json.commit?.committer?.date ?? "",
   };
 }
-import { interpretDesignChecks } from "../engine/design-gate.ts";
-import {
-  interpretQualityActions,
-  qualityRunUnscheduled,
-  type QualityRunLite,
-} from "../engine/linear-harness-policy.js";
+
+type ApiGet = (path: string, init?: RequestInit) => Promise<Response>;
+
+/** A personal access token is refused by the Checks API. Actions jobs are the same signal. */
+export async function readDesignRuns(
+  api: ApiGet,
+  owner: string,
+  repo: string,
+  headSha: string,
+): Promise<DesignCheckRun[]> {
+  try {
+    const response = await api(
+      `/repos/${owner}/${repo}/commits/${headSha}/check-runs?per_page=100`,
+    );
+    const json = (await response.json()) as {
+      check_runs?: {
+        name?: string;
+        status?: string;
+        conclusion?: string | null;
+        head_sha?: string;
+      }[];
+    };
+    return (json.check_runs ?? []).map((run) => ({
+      name: run.name ?? "",
+      status: run.status ?? "",
+      conclusion: run.conclusion ?? null,
+      headSha: run.head_sha ?? "",
+    }));
+  } catch (error) {
+    const status = (error as { httpStatus?: number }).httpStatus;
+    if (status !== 403) throw error;
+    return designRunsFromActions(api, owner, repo, headSha);
+  }
+}
+
+export async function designRunsFromActions(
+  api: ApiGet,
+  owner: string,
+  repo: string,
+  headSha: string,
+): Promise<DesignCheckRun[]> {
+  const listed = await api(
+    `/repos/${owner}/${repo}/actions/runs?head_sha=${headSha}&per_page=20`,
+  );
+  const runs = (await listed.json()) as {
+    workflow_runs?: { id?: number; head_sha?: string }[];
+  };
+  const checks: DesignCheckRun[] = [];
+  for (const run of runs.workflow_runs ?? []) {
+    if (!run.id) continue;
+    const jobsResponse = await api(
+      `/repos/${owner}/${repo}/actions/runs/${run.id}/jobs?per_page=100`,
+    );
+    const jobs = (await jobsResponse.json()) as {
+      jobs?: { name?: string; status?: string; conclusion?: string | null }[];
+    };
+    for (const job of jobs.jobs ?? []) {
+      checks.push({
+        name: job.name ?? "",
+        status: job.status ?? "",
+        conclusion: job.conclusion ?? null,
+        headSha: run.head_sha ?? headSha,
+      });
+    }
+  }
+  return checks;
+}
 
 export function interpretMergeability(body: {
   mergeable?: boolean | null;
@@ -151,27 +218,8 @@ export function githubForge(opts: {
     },
     async designCheck(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
-      const response = await api(
-        `/repos/${owner}/${repo}/commits/${input.headSha}/check-runs?per_page=100`,
-      );
-      const json = (await response.json()) as {
-        check_runs?: {
-          name?: string;
-          status?: string;
-          conclusion?: string | null;
-          head_sha?: string;
-        }[];
-      };
-      return interpretDesignChecks(
-        (json.check_runs ?? []).map((run) => ({
-          name: run.name ?? "",
-          status: run.status ?? "",
-          conclusion: run.conclusion ?? null,
-          headSha: run.head_sha ?? "",
-        })),
-        input.headSha,
-        input.name,
-      );
+      const runs = await readDesignRuns(api, owner, repo, input.headSha);
+      return interpretDesignChecks(runs, input.headSha, input.name);
     },
     async quality(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
