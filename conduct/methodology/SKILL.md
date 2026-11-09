@@ -76,7 +76,7 @@ When `DELIVERY_LOOP_GITHUB_MINT` is set, each run mints once at startup and read
 
 A Figma frame URL is the `figma.com` address. Surrounding markdown and a trailing `)` `]` `>` `.` `,` `;` or quote are not part of it. `node-id=1-2` is read as `1:2`. A 400 includes Figma's `err` or `message` and stops as a rejected request. A 403 or 404 stops as access and names `design.figmaTokenEnv`. The token, the headers, and a URL that contains a token are not written.
 
-Each credential call logs its slot, endpoint class, and status, success included. A re-mint near expiry adds `refresh=1`. The run ends with a count by slot, endpoint class, and status. The token, the headers, and the request URL are not written. A worker launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. A recorded proof that passes, a promote or ship command that exits 0, and a squash that returns a commit each write one success line.
+Each credential call logs its slot, endpoint class, and status, success included. A re-mint near expiry adds `refresh=1`. The run ends with a count by slot, endpoint class, and status. The token, the headers, and the request URL are not written. A worker launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. `workerModel` is the cursor model id. The launch passes `{ id }` and the credential line names that id. An absent `workerModel` omits the model and logs that the account default is in use. A 5xx on a cursor launch waits one second and retries that slot once. A second 5xx uses the fallback slot. A recorded proof that passes, a promote or ship command that exits 0, and a squash that returns a commit each write one success line.
 
 ## Promote and ship
 

@@ -241,9 +241,15 @@ export type CursorRunResult = {
   };
 };
 
+/** One wait before the second attempt on the same key slot. */
+export const CURSOR_LAUNCH_RETRY_MS = 1000;
+
+export const CURSOR_ACCOUNT_DEFAULT_MODEL = "cursor worker model is the account default";
+
 export type CursorSdk = {
   create(options: {
     apiKey: string;
+    model?: { id: string };
     cloud: { repos: { url: string; startingRef: string }[]; autoCreatePR: boolean };
   }): Promise<{
     agentId: string;
@@ -362,21 +368,31 @@ function launchStatus(error: unknown): number {
   return 0;
 }
 
+function isLaunchServerError(status: number): boolean {
+  return status >= 500 && status <= 599;
+}
+
 export function cursorWorker(opts: {
   apiKey?: string;
   slots?: CursorKeySlot[];
+  /** Model id from `workerModel`. Absent omits the model. */
+  model?: string;
   sdk?: CursorSdk;
   log?: (line: string) => void;
   credentialNote?: CredentialNoteFn;
+  sleep?: (ms: number) => Promise<void>;
 }): WorkerAdapter {
   const live = new Map<string, CursorLiveRun>();
   const slots = (opts.slots ?? cursorKeySlots(opts.apiKey, undefined)).slice(0, 2);
   const log = opts.log ?? ((line: string) => console.error(`[delivery-loop] ${line}`));
   const emit: CredentialNoteFn = opts.credentialNote ?? ((call) => noteCredential(call, log));
+  const sleep = opts.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const modelId = opts.model?.trim() || "";
   return {
     kind: "cursor",
     async start(input) {
       if (slots.length === 0) throw new Error("CURSOR_API_KEY is required");
+      if (!modelId) log(CURSOR_ACCOUNT_DEFAULT_MODEL);
       const sdk =
         opts.sdk ??
         ((await import("@cursor/sdk")) as { Agent: CursorSdk }).Agent;
@@ -385,52 +401,80 @@ export function cursorWorker(opts: {
       let capacityRefusals = 0;
       for (let i = 0; i < slots.length; i++) {
         const current = slots[i];
-        try {
-          const agent = await sdk.create({
-            apiKey: current.apiKey,
-            cloud: {
-              repos: [{ url: input.repoUrl, startingRef: input.baseRef }],
-              autoCreatePR: false,
-            },
-          });
-          let run: Awaited<ReturnType<(typeof agent)["send"]>>;
+        let retried = false;
+        for (;;) {
           try {
-            run = await agent.send(input.prompt);
-          } catch (error) {
-            await agent[Symbol.asyncDispose]().catch(() => undefined);
-            throw error;
-          }
-          emit({ slot: current.slot, endpoint: "cursor-launch", status: 200 });
-          const runKey = run.id?.trim() || agent.agentId;
-          live.set(runKey, {
-            agentId: agent.agentId,
-            wait: () => run.wait(),
-            dispose: () => agent[Symbol.asyncDispose](),
-            repoUrl: input.repoUrl,
-          });
-          return {
-            runId: JSON.stringify({
+            const agent = await sdk.create({
+              apiKey: current.apiKey,
+              ...(modelId ? { model: { id: modelId } } : {}),
+              cloud: {
+                repos: [{ url: input.repoUrl, startingRef: input.baseRef }],
+                autoCreatePR: false,
+              },
+            });
+            let run: Awaited<ReturnType<(typeof agent)["send"]>>;
+            try {
+              run = await agent.send(input.prompt);
+            } catch (error) {
+              await agent[Symbol.asyncDispose]().catch(() => undefined);
+              throw error;
+            }
+            emit({
+              slot: current.slot,
+              endpoint: "cursor-launch",
+              status: 200,
+              detail: modelId || undefined,
+            });
+            const runKey = run.id?.trim() || agent.agentId;
+            live.set(runKey, {
               agentId: agent.agentId,
-              runId: runKey,
-              status: "running",
-            }),
-          };
-        } catch (error) {
-          const message = redactSecrets(error instanceof Error ? error.message : String(error), secrets);
-          emit({ slot: current.slot, endpoint: "cursor-launch", status: launchStatus(error) });
-          if (!isAgentCapacityRefusal(message)) {
-            throw new Error(`Cursor worker launch failed on the ${current.slot} key slot: ${message}`);
-          }
-          capacityRefusals += 1;
-          const last = i + 1 >= slots.length;
-          if (last && slots.length > 1 && capacityRefusals === slots.length) {
-            failure = new Error(`Cursor worker launch failed: both key slots are out of capacity. ${message}`);
-            break;
-          }
-          if (last) {
-            failure = new Error(
-              `Cursor worker launch failed on the ${current.slot} key slot: the account is out of capacity. ${message}`,
-            );
+              wait: () => run.wait(),
+              dispose: () => agent[Symbol.asyncDispose](),
+              repoUrl: input.repoUrl,
+            });
+            return {
+              runId: JSON.stringify({
+                agentId: agent.agentId,
+                runId: runKey,
+                status: "running",
+              }),
+            };
+          } catch (error) {
+            const message = redactSecrets(error instanceof Error ? error.message : String(error), secrets);
+            const status = launchStatus(error);
+            emit({
+              slot: current.slot,
+              endpoint: "cursor-launch",
+              status,
+              detail: modelId || undefined,
+            });
+            if (isLaunchServerError(status)) {
+              if (!retried) {
+                retried = true;
+                await sleep(CURSOR_LAUNCH_RETRY_MS);
+                continue;
+              }
+              const last = i + 1 >= slots.length;
+              if (last) {
+                failure = new Error(`Cursor worker launch failed on the ${current.slot} key slot: ${message}`);
+              }
+              break;
+            }
+            if (!isAgentCapacityRefusal(message)) {
+              throw new Error(`Cursor worker launch failed on the ${current.slot} key slot: ${message}`);
+            }
+            capacityRefusals += 1;
+            const last = i + 1 >= slots.length;
+            if (last && slots.length > 1 && capacityRefusals === slots.length) {
+              failure = new Error(`Cursor worker launch failed: both key slots are out of capacity. ${message}`);
+              break;
+            }
+            if (last) {
+              failure = new Error(
+                `Cursor worker launch failed on the ${current.slot} key slot: the account is out of capacity. ${message}`,
+              );
+              break;
+            }
             break;
           }
         }

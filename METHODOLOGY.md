@@ -64,3 +64,6 @@ A rate limit stops on the slot that returned it.
 A network failure stops on the slot that returned it.
 A refusal from both slots fails the launch and reports that both slots are out of capacity.
 An empty fallback variable leaves that launch on the primary slot.
+
+`workerModel` is the cursor model id. The launch passes `{ id }` and the credential line names that id. An absent `workerModel` omits the model and logs that the account default is in use.
+A 5xx on a cursor launch waits one second and retries that slot once. A second 5xx uses the fallback slot. Each attempt logs its slot, `endpoint=cursor-launch`, and status.

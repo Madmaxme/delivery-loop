@@ -85,6 +85,11 @@ const RUNNERS: readonly RunnerKind[] = ["gha", "local"];
 export type ProjectPack = {
   tracker: TrackerKind;
   worker: WorkerKind;
+  /**
+   * Cursor model id. The launch passes `{ id }` and no other model fields.
+   * Absent omits the model, so the account default is used.
+   */
+  workerModel?: string;
   /** `github` opens pull requests. `git` merges the branch with git. */
   forge?: ForgeKind;
   /** `workflow` polls the quality workflow. `command` runs `qualityCommand`. */
@@ -273,7 +278,19 @@ export function loadPack(path: string): ProjectPack {
   raw.invariantHeadings = raw.invariantHeadings ?? [];
   raw.design = loadDesign(raw.design, path);
   raw.workerKeys = loadWorkerKeys(raw.workerKeys, path);
+  raw.workerModel = loadWorkerModel(raw.workerModel, path);
   return raw;
+}
+
+const WORKER_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+
+/** A model id, or absent when the install leaves the account default. */
+export function loadWorkerModel(value: unknown, path: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || !WORKER_MODEL_ID.test(value.trim())) {
+    throw new Error(`${path} workerModel is a model id`);
+  }
+  return value.trim();
 }
 
 /** Env var names for the cursor worker. Absent names use the generic slots. */

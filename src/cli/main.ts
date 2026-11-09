@@ -162,6 +162,7 @@ function workerFor(pack: ProjectPack): WorkerAdapter {
     if (!primary?.trim()) throw new Error(`${names.primary} is required`);
     return cursorWorker({
       slots: cursorKeySlots(primary, process.env[names.fallback]),
+      model: pack.workerModel,
     });
   }
   if (pack.worker === "claude") return claudeWorker({ apiKey: requireEnv("ANTHROPIC_API_KEY") });
