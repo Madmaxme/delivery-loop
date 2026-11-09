@@ -1517,6 +1517,93 @@ describe("loop", () => {
     assert.equal(env.comments.some((body) => body.includes("<!-- PROOF_RECEIPT -->")), false);
   });
 
+  it("records a journey token from the promoted dev ref when the merge commit lacks it", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "main-tip";
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => ({
+      status: 0,
+      stdout: "**Journey proof:** `api/e2e/signup.spec.ts`",
+    });
+    env.deps.journeyFileAt = ({ ref, path }) => ref === "main" && path === "e2e/signup.spec.ts";
+    const result = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          { body: "**Journey evidence:** recorded\n**Outside grant:** none" },
+          { body: "<!-- LAND_WAIT\nhold=0\napi abc\n-->" },
+        ],
+      }),
+    );
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+    const proof = env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->"));
+    assert.equal(proof.length, 1);
+    assert.match(proof[0], /api\/e2e\/signup\.spec\.ts/);
+  });
+
+  it("keeps recorded proof that already matches the promoted dev ref", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "main-tip";
+    let runs = 0;
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => {
+      runs += 1;
+      return { status: 1, stdout: "" };
+    };
+    env.deps.journeyFileAt = ({ ref, path }) => ref === "dev-a" && path === "e2e/signup.spec.ts";
+    env.deps.runCommand = () => ({ status: 0 });
+    env.deps.pack = {
+      ...env.deps.pack,
+      dev: { promote: { command: "promote {repo}", repos: ["api"], refs: { api: ["dev-a"] } } },
+    };
+    const result = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          {
+            body: "**Journey evidence:** recorded\n**Journey proof:** `api/e2e/signup.spec.ts`\n**Outside grant:** none",
+          },
+          { body: "<!-- LAND_WAIT\nhold=0\napi abc\n-->" },
+        ],
+      }),
+    );
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+    assert.equal(runs, 0);
+    const proof = env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->"));
+    assert.equal(proof.length, 1);
+  });
+
+  it("names the journey command when it prints no token", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "main-tip";
+    env.deps.pack = {
+      ...pack,
+      journeyCommand: "node scripts/journey-proof.mjs",
+      journeySpec: "{e2e,integration_test,journey}/**",
+    };
+    env.deps.runPackCommand = () => ({ status: 0, stdout: "no token\n" });
+    const result = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          { body: "**Journey evidence:** recorded\n**Outside grant:** none" },
+          { body: "<!-- LAND_WAIT\nhold=0\napi abc\n-->" },
+        ],
+      }),
+    );
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(result.detail, "journey command");
+    assert.equal(env.state(), "Todo");
+    const note = env.comments.find((body) => body.includes("Journey command"));
+    assert.ok(note);
+    assert.match(note, /API-1/);
+    assert.match(note, /node scripts\/journey-proof\.mjs/);
+    assert.match(note, /\{e2e,integration_test,journey\}\/\*\*/);
+    assert.equal(env.comments.some((body) => body.includes("<!-- PROOF_RECEIPT -->")), false);
+  });
+
   it("advances a resumed land when recorded proof is present and posts that comment once", async () => {
     const env = harness(BUILDABLE);
     env.deps.lookupHead = () => "trunk";
