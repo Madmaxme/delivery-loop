@@ -77,6 +77,23 @@ ship:
     assert.deepEqual(pack.dev?.promote?.repos, ["customer-app"]);
   });
 
+  it("keeps the deploy refs a promote command moves", () => {
+    const loaded = loadPack(
+      write(`${base}
+dev:
+  promote:
+    command: promote {repo}
+    repos:
+      - mobile
+    refs:
+      mobile:
+        - dev-a
+        - dev-b
+`),
+    );
+    assert.deepEqual(loaded.dev?.promote?.refs, { mobile: ["dev-a", "dev-b"] });
+  });
+
   it("keeps heal caps and leaves an absent cap at the runner default", () => {
     const pack = loadPack(
       write(`${base}

@@ -148,12 +148,14 @@ export type ProjectPack = {
   design?: DesignSpec;
   /**
    * After trunk quality is green. `promote` runs `command` once per landed
-   * repo that is also listed in `repos`, with `{repo}` replaced.
-   * When `promote` is set, `steps` are not run.
+   * repo that is also listed in `repos`, with `{repo}` replaced. A pull
+   * request that merged before this sweep still counts as landed. When
+   * `refs` names the deploy branches, a repo whose refs already contain
+   * the landed commit is skipped. When `promote` is set, `steps` are not run.
    */
   dev?: {
     steps?: string[];
-    promote?: { command: string; repos: string[] };
+    promote?: { command: string; repos: string[]; refs?: Record<string, string[]> };
   };
   /**
    * Resolves `**Symbols:**` lines. The engine passes one `repo/path#symbol`

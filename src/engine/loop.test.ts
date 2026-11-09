@@ -127,6 +127,78 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
   };
 }
 
+const MERGED_SHA = "m".repeat(40);
+const OPEN_SHA = "o".repeat(40);
+
+function audit(repos: string, journey = "**Journey evidence:** not-applicable"): string {
+  return BUILDABLE.replace("**Repos:** `api`", `**Repos:** \`${repos}\``).replace(
+    "**Journey evidence:** not-applicable",
+    journey,
+  );
+}
+
+function listedPull(input: {
+  number: number;
+  branch: string;
+  base: string;
+  state: "open" | "merged";
+  headSha?: string;
+}) {
+  return {
+    number: input.number,
+    url: `https://github.com/acme/repo/pull/${input.number}`,
+    headSha: input.headSha ?? "h".repeat(40),
+    branch: input.branch,
+    base: input.base,
+    state: input.state,
+    mergedSha: input.state === "merged" ? MERGED_SHA : null,
+  };
+}
+
+function surfaceBoard(
+  env: ReturnType<typeof harness>,
+  opts?: { refs?: boolean; contained?: boolean },
+) {
+  const api = { name: "api", url: "https://github.com/acme/api", trunk: "main" };
+  const mobile = { name: "mobile", url: "https://github.com/acme/mobile", trunk: "main" };
+  const refs = opts?.refs === false ? undefined : { mobile: ["dev-a", "dev-b"] };
+  env.deps.pack = {
+    ...pack,
+    repos: [api, mobile],
+    branchTemplate: "cursor/{issue}-{repo}",
+    dev: {
+      promote: {
+        command: "promote {repo}",
+        repos: ["mobile"],
+        ...(refs ? { refs } : {}),
+      },
+    },
+  };
+  env.deps.lookupHead = () => MERGED_SHA;
+  env.deps.sleep = async () => {};
+  env.deps.deployRefContains = () => opts?.contained ?? false;
+  return {
+    api,
+    mobile,
+    watch(events: string[]) {
+      env.deps.runCommand = (command) => {
+        events.push(command);
+        return { status: 0 };
+      };
+      const setState = env.deps.tracker.setState.bind(env.deps.tracker);
+      env.deps.tracker.setState = async (id, next) => {
+        events.push(`state:${next}`);
+        await setState(id, next);
+      };
+      const comment = env.deps.tracker.comment.bind(env.deps.tracker);
+      env.deps.tracker.comment = async (id, body) => {
+        if (body.includes("PROOF_RECEIPT")) events.push("proof");
+        await comment(id, body);
+      };
+    },
+  };
+}
+
 const BUILDABLE = `
 **Verdict:** BUILDABLE
 **Prior request:** none
@@ -1819,6 +1891,216 @@ describe("loop", () => {
     );
     assert.equal(again.outcome, "heal-exhausted");
     assert.equal(starts, 0);
+  });
+
+  it("lands an open pull request when another repo is already merged", async () => {
+    const env = harness(BUILDABLE);
+    const board = surfaceBoard(env);
+    const events: string[] = [];
+    board.watch(events);
+    let behind = true;
+    env.deps.forge.mergeability = async (input) => {
+      if (input.number === 2 && behind) {
+        behind = false;
+        return { state: "behind", headSha: OPEN_SHA };
+      }
+      return { state: "clean", headSha: OPEN_SHA };
+    };
+    env.deps.forge.updateBranch = async () => {
+      events.push("update");
+    };
+    env.deps.forge.squashMerge = async () => {
+      events.push("merge");
+      return MERGED_SHA;
+    };
+    env.deps.forge.listPullRequests = async (input) =>
+      input.repoUrl.endsWith("/api")
+        ? [listedPull({ number: 1, branch: input.head, base: input.base, state: "merged" })]
+        : [listedPull({ number: 2, branch: input.head, base: input.base, state: "open", headSha: OPEN_SHA })];
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(
+      env.deps,
+      ticket({ comments: [{ body: audit("api, mobile") }] }),
+    );
+    assert.equal(result.outcome, "landed");
+    assert.equal(starts, 0);
+    assert.deepEqual(events, ["update", "merge", "promote mobile", "state:Dev"]);
+    assert.equal(env.state(), "Dev");
+  });
+
+  it("promotes a ticket whose pull requests are already merged and posts the proof", async () => {
+    const env = harness(BUILDABLE);
+    const board = surfaceBoard(env, { refs: false });
+    const events: string[] = [];
+    board.watch(events);
+    env.deps.journeyFileAt = ({ path, ref }) =>
+      path === "e2e/signup_route_test.dart" && ref === MERGED_SHA;
+    env.deps.forge.listPullRequests = async (input) => [
+      listedPull({ number: 1, branch: input.head, base: input.base, state: "merged" }),
+    ];
+    env.deps.forge.squashMerge = async () => {
+      events.push("merge");
+      return MERGED_SHA;
+    };
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          {
+            body: audit(
+              "api, mobile",
+              "**Journey evidence:** recorded\n**Journey proof:** `mobile/e2e/signup_route_test.dart`",
+            ),
+          },
+        ],
+      }),
+    );
+    assert.equal(result.outcome, "landed");
+    assert.equal(starts, 0);
+    assert.equal(events.includes("merge"), false);
+    assert.deepEqual(events, ["promote mobile", "proof", "state:Dev"]);
+    assert.equal(env.state(), "Dev");
+  });
+
+  it("skips promote when the deploy refs already contain the merge", async () => {
+    const env = harness(BUILDABLE);
+    const board = surfaceBoard(env, { contained: true });
+    const events: string[] = [];
+    board.watch(events);
+    env.deps.forge.listPullRequests = async (input) =>
+      input.repoUrl.endsWith("/mobile")
+        ? [listedPull({ number: 3, branch: input.head, base: input.base, state: "merged" })]
+        : [];
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(
+      env.deps,
+      ticket({ comments: [{ body: audit("mobile") }] }),
+    );
+    assert.equal(result.outcome, "landed");
+    assert.equal(starts, 0);
+    assert.deepEqual(events, ["state:Dev"]);
+    assert.equal(env.state(), "Dev");
+  });
+
+  it("does nothing when the ticket is already dev and the deploy refs contain the merge", async () => {
+    const env = harness(BUILDABLE);
+    const board = surfaceBoard(env, { contained: true });
+    const events: string[] = [];
+    board.watch(events);
+    env.deps.forge.listPullRequests = async (input) =>
+      input.repoUrl.endsWith("/mobile")
+        ? [listedPull({ number: 3, branch: input.head, base: input.base, state: "merged" })]
+        : [];
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(
+      env.deps,
+      ticket({ stateName: "Dev", comments: [{ body: audit("mobile") }] }),
+    );
+    assert.equal(result.outcome, "landed");
+    assert.equal(result.detail, "already finished");
+    assert.equal(starts, 0);
+    assert.deepEqual(events, []);
+    assert.deepEqual(env.comments, []);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("promotes a dev ticket whose deploy ref does not contain the merge", async () => {
+    const env = harness(BUILDABLE);
+    const board = surfaceBoard(env);
+    const events: string[] = [];
+    board.watch(events);
+    env.deps.forge.listPullRequests = async (input) =>
+      input.repoUrl.endsWith("/mobile")
+        ? [listedPull({ number: 3, branch: input.head, base: input.base, state: "merged" })]
+        : [];
+    const result = await runTicket(
+      env.deps,
+      ticket({ stateName: "Dev", comments: [{ body: audit("mobile") }] }),
+    );
+    assert.equal(result.outcome, "landed");
+    assert.deepEqual(events, ["promote mobile"]);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("leaves a named repo that still has its own commits on the ground path", async () => {
+    const env = harness("**Verdict:** NEEDS DIAGNOSIS");
+    surfaceBoard(env);
+    env.deps.forge.compare = async () => "ahead";
+    env.deps.forge.listPullRequests = async (input) =>
+      input.repoUrl.endsWith("/api")
+        ? [listedPull({ number: 1, branch: input.head, base: input.base, state: "merged" })]
+        : [];
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(
+      env.deps,
+      ticket({ comments: [{ body: audit("api, mobile") }] }),
+    );
+    assert.equal(result.outcome, "verdict");
+    assert.equal(starts, 1);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("promotes before dev when the verdict is already shipped", async () => {
+    const env = harness(
+      "**Verdict:** ALREADY SHIPPED\n**Repos:** `mobile`\n**Outside grant:** none\n**Journey evidence:** not-applicable\n",
+    );
+    const mobile = { name: "mobile", url: "https://github.com/acme/mobile", trunk: "main" };
+    const events: string[] = [];
+    env.deps.pack = {
+      ...pack,
+      repos: [mobile],
+      dev: {
+        promote: {
+          command: "promote {repo}",
+          repos: ["mobile"],
+          refs: { mobile: ["dev-a", "dev-b"] },
+        },
+      },
+    };
+    env.deps.lookupHead = () => MERGED_SHA;
+    env.deps.ticketOnTrunk = () => MERGED_SHA;
+    env.deps.deployRefContains = () => false;
+    env.deps.runCommand = (command) => {
+      events.push(command);
+      return { status: 0 };
+    };
+    const setState = env.deps.tracker.setState.bind(env.deps.tracker);
+    env.deps.tracker.setState = async (id, next) => {
+      events.push(`state:${next}`);
+      await setState(id, next);
+    };
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(result.detail, "already on trunk");
+    assert.equal(starts, 1);
+    assert.deepEqual(events, ["promote mobile", "state:Dev"]);
+    assert.equal(env.state(), "Dev");
   });
 
   it("leaves prod status to the pack when markStatus is false", async () => {

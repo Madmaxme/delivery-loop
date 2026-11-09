@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { githubForge, interpretCompare, interpretMergeability } from "./forge-github.ts";
+import { githubForge, interpretCompare, interpretMergeability, interpretPullList } from "./forge-github.ts";
 
 describe("github mergeability", () => {
   it("maps the host state onto the land decision", () => {
@@ -71,6 +71,74 @@ describe("github mergeability", () => {
       }),
       "deadbeef",
     );
+  });
+
+  it("keeps a merged pull and drops a different head", () => {
+    const head = "cursor/api-1-api";
+    const rows = interpretPullList(
+      [
+        {
+          number: 9,
+          html_url: "https://github.com/acme/api/pull/9",
+          state: "closed",
+          merged_at: "2026-01-01T00:00:00Z",
+          merge_commit_sha: "m".repeat(40),
+          head: { ref: head, sha: "h".repeat(40) },
+          base: { ref: "main" },
+        },
+        {
+          number: 4,
+          html_url: "https://github.com/acme/api/pull/4",
+          state: "open",
+          head: { ref: head, sha: "o".repeat(40) },
+          base: { ref: "main" },
+        },
+        {
+          number: 3,
+          state: "closed",
+          head: { ref: "other", sha: "x".repeat(40) },
+          base: { ref: "main" },
+        },
+      ],
+      { head, base: "main" },
+    );
+    assert.deepEqual(
+      rows.map((row) => row.state),
+      ["merged", "open"],
+    );
+    assert.equal(rows[0]?.mergedSha, "m".repeat(40));
+  });
+
+  it("lists pull requests for one head and base", async () => {
+    const head = "cursor/api-1-api";
+    let seen = "";
+    const forge = githubForge({
+      token: "token",
+      fetch: async (url) => {
+        seen = String(url);
+        return Response.json([
+          {
+            number: 9,
+            html_url: "https://github.com/acme/api/pull/9",
+            state: "closed",
+            merged_at: "2026-01-01T00:00:00Z",
+            merge_commit_sha: "m".repeat(40),
+            head: { ref: head, sha: "h".repeat(40) },
+            base: { ref: "main" },
+          },
+        ]);
+      },
+    });
+    const rows = await forge.listPullRequests?.({
+      repoUrl: "https://github.com/acme/api",
+      head,
+      base: "main",
+    });
+    assert.equal(rows?.[0]?.state, "merged");
+    assert.match(seen, /\/pulls\?/);
+    assert.match(seen, /state=all/);
+    assert.match(seen, new RegExp(`head=.*${encodeURIComponent(head)}`));
+    assert.match(seen, /base=main/);
   });
 
   it("reads a design job from Actions when the Checks API refuses the token", async () => {
