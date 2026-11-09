@@ -6,6 +6,8 @@ export type CredentialNote = {
   status: number;
   /** Set when the mint ran again because the previous token was near expiry. */
   refresh?: boolean;
+  /** Short API reason. A token, a header, or a URL is not a reason. */
+  detail?: string;
 };
 
 export type CredentialNoteFn = (call: CredentialNote) => void;
@@ -33,6 +35,7 @@ const ENDPOINTS = new Set([
   "issues",
   "git",
   "user",
+  "rate-limit",
   "github",
   "linear-graphql",
   "cursor-launch",
@@ -68,7 +71,15 @@ export function githubEndpointClass(path: string): string {
   if (clean.includes("/commits")) return "commits";
   if (clean.includes("/git/")) return "git";
   if (clean === "/user" || clean.startsWith("/user/")) return "user";
+  if (clean === "/rate_limit" || clean.startsWith("/rate_limit/")) return "rate-limit";
   return "github";
+}
+
+function cleanDetail(detail: string | undefined): string {
+  if (!detail) return "";
+  const clean = detail.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+  if (!clean || /https?:\/\//i.test(clean) || /bearer\s/i.test(clean)) return "";
+  return clean;
 }
 
 export function formatCredentialLine(call: CredentialNote): string {
@@ -76,7 +87,9 @@ export function formatCredentialLine(call: CredentialNote): string {
   const endpoint = cleanToken(call.endpoint, ENDPOINTS);
   const status = cleanStatus(call.status);
   const refresh = call.refresh ? " refresh=1" : "";
-  return `credential slot=${slot} endpoint=${endpoint} status=${status}${refresh}`;
+  const detail = cleanDetail(call.detail);
+  const suffix = detail ? ` detail=${detail}` : "";
+  return `credential slot=${slot} endpoint=${endpoint} status=${status}${refresh}${suffix}`;
 }
 
 export function formatCredentialSummary(row: CountKey): string {
@@ -160,6 +173,7 @@ export async function credentialFetch(
   endpoint: string,
   run: () => Promise<Response>,
   note: CredentialNoteFn = noteCredential,
+  detailOf?: (response: Response) => Promise<string | undefined>,
 ): Promise<Response> {
   let response: Response;
   try {
@@ -168,7 +182,15 @@ export async function credentialFetch(
     note({ slot, endpoint, status: 0 });
     throw error;
   }
-  note({ slot, endpoint, status: response.status });
+  let detail: string | undefined;
+  if (!response.ok && detailOf) {
+    try {
+      detail = await detailOf(response.clone());
+    } catch {
+      detail = undefined;
+    }
+  }
+  note({ slot, endpoint, status: response.status, detail });
   return response;
 }
 

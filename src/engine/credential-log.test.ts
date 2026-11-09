@@ -31,6 +31,7 @@ describe("credential log", () => {
     assert.equal(githubEndpointClass("/repos/acme/api/git/refs/heads/main"), "git");
     assert.equal(githubEndpointClass("/user"), "user");
     assert.equal(githubEndpointClass("https://api.github.com/user"), "user");
+    assert.equal(githubEndpointClass("/rate_limit"), "rate-limit");
   });
 
   it("formats a success line, a re-mint, and a summary", () => {
@@ -181,6 +182,22 @@ describe("credential log", () => {
       "credential summary slot=mint endpoint=mint status=200 count=2",
       "credential summary slot=primary endpoint=cursor-launch status=200 count=1",
     ]);
+  });
+
+  it("logs a Figma 400 with the API reason and without the token", async () => {
+    const rec = createCredentialRecorder();
+    const text = await readFigmaFrame(
+      "https://www.figma.com/design/dummy-secret-figma-key/Frame?node-id=1-2",
+      FIGMA,
+      async () => Response.json({ err: `bad ${FIGMA} id` }, { status: 400 }),
+      rec.note,
+    );
+    assert.equal(text, "figma read failed: 400 bad id");
+    assert.deepEqual(rec.lines(), ["credential slot=figma endpoint=figma status=400 detail=bad id"]);
+    assert.deepEqual(rec.summaryLines(), [
+      "credential summary slot=figma endpoint=figma status=400 count=1",
+    ]);
+    assert.equal(rec.lines().join("\n").includes(FIGMA), false);
   });
 
   it("logs a failed mint without the command output", async () => {

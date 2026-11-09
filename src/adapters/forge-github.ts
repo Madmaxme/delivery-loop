@@ -266,6 +266,25 @@ export function githubForge(opts: {
         created: true,
       };
     },
+    async probeCredentials() {
+      if (!mintCommand()) return;
+      let token = "";
+      try {
+        token = (await tokenForCheckRuns()).token;
+      } catch {
+        return;
+      }
+      try {
+        const response = await callGithub(
+          "/rate_limit",
+          { headers: { Authorization: `Bearer ${token}` } },
+          "mint",
+        );
+        await response.text().catch(() => undefined);
+      } catch {
+        /* The status is already recorded. The run continues. */
+      }
+    },
     async designCheck(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
       const minted = await tokenForCheckRuns();

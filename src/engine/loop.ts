@@ -12,6 +12,7 @@ import {
   designRepairText,
   designRepo,
   designWorkOrderStop,
+  figmaReadStop,
   figmaTokenValue,
   ticketFigmaUrls,
 } from "./design-gate.ts";
@@ -2228,13 +2229,11 @@ async function stopForMissingFigmaToken(deps: LoopDeps, ticket: Ticket): Promise
     figmaToken: deps.figmaToken,
     figmaFetch: deps.figmaFetch,
   });
-  if (/figma read failed:/i.test(block)) {
-    const envName = deps.pack.design?.figmaTokenEnv?.trim() || "FIGMA_ACCESS_TOKEN";
-    await deps.tracker.comment(
-      ticket.identifier,
-      `${block}\n\nShare the file with the account that owns ${envName}. The ticket stays in intake.`,
-    );
-    return { identifier: ticket.identifier, outcome: "missing-credential", detail: "figma" };
+  const envName = deps.pack.design?.figmaTokenEnv?.trim() || "FIGMA_ACCESS_TOKEN";
+  const stop = figmaReadStop(block, envName);
+  if (stop) {
+    await deps.tracker.comment(ticket.identifier, `${block}\n\n${stop.footer}`);
+    return { identifier: ticket.identifier, outcome: stop.outcome, detail: stop.detail };
   }
   deps.figmaGroundBlock = block;
   return null;
@@ -2556,7 +2555,17 @@ const MAX_SWEEP_PASSES = 50;
  * or a verdict moves it. A ticket that was waiting on that one can run in
  * this same page. A pass that only skips blocked tickets stops.
  */
+async function probeConfiguredCredentials(deps: LoopDeps): Promise<void> {
+  if (!deps.forge.probeCredentials) return;
+  try {
+    await deps.forge.probeCredentials();
+  } catch {
+    noteEngine(deps, "credential probe failed");
+  }
+}
+
 export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
+  await probeConfiguredCredentials(deps);
   if (!deps.pageControl) deps.pageControl = { stop: false, healed: [] };
   const settled = new Set<string>();
   const blocked = new Set<string>();
@@ -2626,6 +2635,7 @@ export async function deliver(
   identifier: string,
   opts?: { until?: "ground" },
 ): Promise<TicketResult> {
+  await probeConfiguredCredentials(deps);
   const ticket = await deps.tracker.get(identifier);
   const program = await loadProgram(deps, deps.project ?? ticket.projectName ?? null);
   const next = opts?.until ? { ...deps, until: opts.until } : deps;
@@ -2640,6 +2650,7 @@ export async function ship(
 ): Promise<void> {
   const id = identifier?.trim() ?? "";
   if (!id) throw new Error("ship needs a ticket id");
+  await probeConfiguredCredentials(deps);
   const steps = mode === "continue" ? (deps.pack.ship?.continue ?? []) : (deps.pack.ship?.steps ?? []);
   if (mode === "continue" && steps.length === 0) throw new Error("ship continue has no steps");
   const env = {

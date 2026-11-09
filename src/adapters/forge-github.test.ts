@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { createCredentialRecorder } from "../engine/credential-log.ts";
 import { githubForge, interpretCompare, interpretMergeability, interpretPullList } from "./forge-github.ts";
 import { INSTALLATION_TOKEN_REFRESH_SKEW_MS } from "./github-mint.ts";
 
@@ -257,5 +258,78 @@ describe("github mergeability", () => {
     });
     const quality = auths.find((call) => call.url.includes("/actions/runs"));
     assert.equal(quality?.authorization, "Bearer pat-token");
+  });
+
+  it("mints once at startup and reads the rate limit with that token", async () => {
+    const rec = createCredentialRecorder();
+    const secret = "mint-secret-value";
+    let mints = 0;
+    const calls: { url: string; authorization: string }[] = [];
+    const forge = githubForge({
+      token: "pat-token",
+      mintCommand: "mint-installation-token",
+      credentialNote: rec.note,
+      runMint: () => {
+        mints += 1;
+        return { status: 0, stdout: secret };
+      },
+      fetch: async (url, init) => {
+        calls.push({
+          url: String(url),
+          authorization: new Headers(init?.headers).get("authorization") ?? "",
+        });
+        return Response.json({ resources: { core: { limit: 5000 } } });
+      },
+    });
+    await forge.probeCredentials?.();
+    const head = "a".repeat(40);
+    await forge.designCheck?.({
+      repoUrl: "https://github.com/acme/admin-web",
+      headSha: head,
+      name: "ui",
+    });
+    assert.equal(mints, 1);
+    const rate = calls.filter((call) => call.url.endsWith("/rate_limit"));
+    assert.equal(rate.length, 1);
+    assert.equal(rate[0]?.authorization, `Bearer ${secret}`);
+    const check = calls.find((call) => call.url.includes("/check-runs"));
+    assert.equal(check?.authorization, `Bearer ${secret}`);
+    const lines = rec.lines();
+    assert.equal(lines.filter((line) => line === "credential slot=mint endpoint=mint status=200").length, 1);
+    assert.ok(lines.includes("credential slot=mint endpoint=rate-limit status=200"));
+    assert.equal(lines.join("\n").includes(secret), false);
+  });
+
+  it("logs a failed startup mint and does not call GitHub", async () => {
+    const rec = createCredentialRecorder();
+    let fetches = 0;
+    const forge = githubForge({
+      token: "pat-token",
+      mintCommand: "mint-installation-token",
+      credentialNote: rec.note,
+      runMint: () => ({ status: 1, stdout: "mint-secret-value" }),
+      fetch: async () => {
+        fetches += 1;
+        return Response.json({});
+      },
+    });
+    await forge.probeCredentials?.();
+    assert.equal(fetches, 0);
+    assert.deepEqual(rec.lines(), ["credential slot=mint endpoint=mint status=1"]);
+    assert.equal(rec.lines().join("\n").includes("mint-secret-value"), false);
+  });
+
+  it("skips the startup mint when the command is unset", async () => {
+    let fetches = 0;
+    const forge = githubForge({
+      token: "pat-token",
+      mintCommand: "",
+      fetch: async () => {
+        fetches += 1;
+        return Response.json({});
+      },
+    });
+    await forge.probeCredentials?.();
+    assert.equal(fetches, 0);
   });
 });
