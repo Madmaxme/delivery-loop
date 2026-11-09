@@ -1,3 +1,4 @@
+import { designRunsWhenChecksForbidden } from "./checks-api-fallback.ts";
 import { interpretDesignChecks, type DesignCheckRun } from "../engine/design-gate.ts";
 import {
   interpretQualityActions,
@@ -10,7 +11,7 @@ import {
   githubUserLogin,
   type CommitActor,
 } from "./github-actor.js";
-import type { CompareStatus, FetchLike, ForgeAdapter, PullMerge, PullRequest } from "./types.js";
+import type { CompareStatus, FetchLike, ForgeAdapter, ListedPull, PullMerge, PullRequest } from "./types.js";
 import { githubRepoFromUrl } from "./types.js";
 
 async function readCommit(
@@ -39,7 +40,7 @@ async function readCommit(
 
 type ApiGet = (path: string, init?: RequestInit) => Promise<Response>;
 
-/** A personal access token is refused by the Checks API. Actions jobs are the same signal. */
+/** Checks API first. A 403 uses the Actions fallback in checks-api-fallback.ts. */
 export async function readDesignRuns(
   api: ApiGet,
   owner: string,
@@ -67,41 +68,43 @@ export async function readDesignRuns(
   } catch (error) {
     const status = (error as { httpStatus?: number }).httpStatus;
     if (status !== 403) throw error;
-    return designRunsFromActions(api, owner, repo, headSha);
+    return designRunsWhenChecksForbidden(api, owner, repo, headSha);
   }
 }
 
-export async function designRunsFromActions(
-  api: ApiGet,
-  owner: string,
-  repo: string,
-  headSha: string,
-): Promise<DesignCheckRun[]> {
-  const listed = await api(
-    `/repos/${owner}/${repo}/actions/runs?head_sha=${headSha}&per_page=20`,
-  );
-  const runs = (await listed.json()) as {
-    workflow_runs?: { id?: number; head_sha?: string }[];
-  };
-  const checks: DesignCheckRun[] = [];
-  for (const run of runs.workflow_runs ?? []) {
-    if (!run.id) continue;
-    const jobsResponse = await api(
-      `/repos/${owner}/${repo}/actions/runs/${run.id}/jobs?per_page=100`,
-    );
-    const jobs = (await jobsResponse.json()) as {
-      jobs?: { name?: string; status?: string; conclusion?: string | null }[];
-    };
-    for (const job of jobs.jobs ?? []) {
-      checks.push({
-        name: job.name ?? "",
-        status: job.status ?? "",
-        conclusion: job.conclusion ?? null,
-        headSha: run.head_sha ?? headSha,
-      });
-    }
+export type PullListRow = {
+  number?: number;
+  html_url?: string;
+  state?: string;
+  merged_at?: string | null;
+  merge_commit_sha?: string | null;
+  head?: { sha?: string; ref?: string };
+  base?: { ref?: string };
+};
+
+/** Keep pulls whose head and base match the land branch. A merged row keeps the squash commit. */
+export function interpretPullList(
+  rows: PullListRow[],
+  expected: { head: string; base: string },
+): ListedPull[] {
+  const out: ListedPull[] = [];
+  for (const row of rows) {
+    const branch = row.head?.ref ?? "";
+    const base = row.base?.ref ?? "";
+    if (!row.number || !branch || branch !== expected.head || base !== expected.base) continue;
+    const merged = Boolean(row.merged_at);
+    const state = merged ? "merged" : row.state === "open" ? "open" : "closed";
+    out.push({
+      number: row.number,
+      url: row.html_url ?? "",
+      headSha: row.head?.sha ?? "",
+      branch,
+      base,
+      state,
+      mergedSha: row.merge_commit_sha?.trim() || null,
+    });
   }
-  return checks;
+  return out;
 }
 
 export function interpretMergeability(body: {
@@ -299,6 +302,18 @@ export function githubForge(opts: {
       if (!response.ok) return "unknown";
       const json = (await response.json()) as { status?: string };
       return interpretCompare(json.status);
+    },
+    async listPullRequests(input) {
+      const { owner, repo } = githubRepoFromUrl(input.repoUrl);
+      const head = `${owner}:${input.head}`;
+      const response = await api(
+        `/repos/${owner}/${repo}/pulls?state=all&per_page=100&head=${encodeURIComponent(head)}&base=${encodeURIComponent(input.base)}`,
+      );
+      const rows = (await response.json()) as PullListRow[];
+      return interpretPullList(Array.isArray(rows) ? rows : [], {
+        head: input.head,
+        base: input.base,
+      });
     },
     async updateBranch(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);

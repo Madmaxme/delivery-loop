@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DEFAULT_JOURNEY_SPEC } from "../../scripts/journey-proof.mjs";
-import type { CompareStatus, DesignCheckProbe, FetchLike, ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
+import type { CompareStatus, DesignCheckProbe, FetchLike, ForgeAdapter, ListedPull, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { agentHome, holdStatus, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
 import {
   designRepairText,
@@ -148,6 +148,16 @@ export type LoopDeps = {
    * A recording URL is not a file.
    */
   journeyFileAt?: (input: { repo: string; ref: string; path: string }) => boolean;
+  /**
+   * Commit on `repo.trunk` whose subject names the ticket. Null means none.
+   * Default reads the checkout with git.
+   */
+  ticketOnTrunk?: (input: { repo: RepoSpec; identifier: string }) => string | null;
+  /**
+   * True when `ref` already contains `sha`. Default is `git merge-base --is-ancestor`
+   * in the checkout. A missing checkout is false, so promote still runs.
+   */
+  deployRefContains?: (input: { repoUrl: string; ref: string; sha: string }) => boolean;
   /**
    * Receives one event when a ticket enters ground, build, or land, and one
    * when that ticket finishes. Default writes a single line to stdout.
@@ -551,31 +561,48 @@ function landingTargets(
   return targets.length ? targets : null;
 }
 
-function trunkHasTicketCommit(deps: LoopDeps, identifier: string, text: string): boolean | null {
+function trunkCommitSha(dir: string, trunk: string, identifier: string): string | null {
+  if (!existsSync(join(dir, ".git"))) return null;
+  const result = spawnSync(
+    "git",
+    ["-C", dir, "log", trunk, "--grep", identifier, "-1", "--format=%H"],
+    { encoding: "utf8" },
+  );
+  if (result.status !== 0) return null;
+  const sha = result.stdout.trim();
+  return sha || null;
+}
+
+/** Commits for the repos named in the audit. Null means a checkout was missing and none matched. */
+function trunkTicketCommits(
+  deps: LoopDeps,
+  identifier: string,
+  text: string,
+): { repo: RepoSpec; sha: string }[] | null {
   const named = [...text.matchAll(/\*\*Repos:\*\*\s*(.+)/gi)].flatMap((match) => repoNames(match[1]));
-  const repos = named.length ? named : [];
-  if (repos.length === 0) return false;
+  if (named.length === 0) return [];
   const cwd = deps.cwd ?? process.cwd();
+  const rows: { repo: RepoSpec; sha: string }[] = [];
   let unknown = false;
-  for (const name of repos) {
+  for (const name of named) {
     const spec = repoByName(deps.pack, name);
     if (!spec) {
       unknown = true;
       continue;
     }
-    const dir = repoCheckoutDir(cwd, spec, deps.pack);
-    if (!existsSync(join(dir, ".git"))) {
-      unknown = true;
+    const sha = deps.ticketOnTrunk
+      ? deps.ticketOnTrunk({ repo: spec, identifier })
+      : trunkCommitSha(repoCheckoutDir(cwd, spec, deps.pack), spec.trunk, identifier);
+    if (sha) {
+      rows.push({ repo: spec, sha });
       continue;
     }
-    const result = spawnSync(
-      "git",
-      ["-C", dir, "log", spec.trunk, "--grep", identifier, "-1", "--format=%H"],
-      { encoding: "utf8" },
-    );
-    if (result.status === 0 && result.stdout.trim()) return true;
+    if (!deps.ticketOnTrunk && !existsSync(join(repoCheckoutDir(cwd, spec, deps.pack), ".git"))) {
+      unknown = true;
+    }
   }
-  return unknown ? null : false;
+  if (rows.length === 0 && unknown) return null;
+  return rows;
 }
 
 async function finishWorker(worker: WorkerAdapter, runId: string) {
@@ -654,6 +681,9 @@ async function executeTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResu
   if (leaseIsHeld(lease, now, deps)) {
     return { identifier: ticket.identifier, outcome: "skipped-lease", detail: "lease held" };
   }
+  if (await alreadyFinished(deps, ticket)) {
+    return { identifier: ticket.identifier, outcome: "landed", detail: "already finished" };
+  }
 
   const home = agentHome(deps.pack);
   if (lease.cursorRunId && lease.cursorRunId !== "pending") {
@@ -679,8 +709,16 @@ async function runHeldTicket(
 ): Promise<TicketResult> {
   const credential = await stopForMissingFigmaToken(deps, ticket);
   if (credential) return credential;
-  const resumed = await resumeMarkedLand(deps, ticket);
-  if (resumed) return resumed;
+  const marker = latestLandMarker(ticket.comments);
+  if (marker?.kind === "ship" || marker?.kind === "empty") {
+    const resumed = await resumeMarkedLand(deps, ticket);
+    if (resumed) return resumed;
+  } else {
+    const existing = await resumeExistingPulls(deps, ticket);
+    if (existing) return existing;
+    const resumed = await resumeMarkedLand(deps, ticket);
+    if (resumed) return resumed;
+  }
   let ground;
   noteTicket(deps, { identifier: ticket.identifier, phase: "ground" });
   try {
@@ -713,16 +751,17 @@ async function runHeldTicket(
       `**Verdict:** ${verdict ?? "MISSING"}\n\n${ground.text}`,
     );
     if (verdict) {
+      const commits =
+        verdict === "ALREADY SHIPPED"
+          ? trunkTicketCommits(deps, ticket.identifier, ground.text)
+          : null;
       const parked = parkStateForVerdict({
         verdict,
         text: ground.text,
         priorComments: commentBodies(ticket),
         devStatus: deps.pack.status.dev,
         holdStatus: holdStatus(deps.pack),
-        trunkCommit:
-          verdict === "ALREADY SHIPPED"
-            ? trunkHasTicketCommit(deps, ticket.identifier, ground.text)
-            : null,
+        trunkCommit: verdict === "ALREADY SHIPPED" ? trunkCommitFlag(commits) : null,
         journeyProven:
           verdict === "ALREADY SHIPPED"
             ? journeyEvidenceProven(
@@ -734,6 +773,17 @@ async function runHeldTicket(
               )
             : null,
       });
+      if (parked === deps.pack.status.dev && commits && commits.length > 0) {
+        return settleTrunk(
+          deps,
+          ticket,
+          false,
+          commits,
+          "already on trunk",
+          ground.text,
+          ground.text,
+        );
+      }
       if (parked) await deps.tracker.setState(ticket.identifier, parked);
     }
     return {
@@ -778,7 +828,7 @@ async function runHeldTicket(
       "**Prior request:** kept. A written rule already asked for the current behavior.",
     );
     if (!preview || preview.symbols.length === 0) {
-      const onTrunk = trunkHasTicketCommit(deps, ticket.identifier, ground.text);
+      const onTrunk = trunkCommitFlag(trunkTicketCommits(deps, ticket.identifier, ground.text));
       const done = onTrunk === true ? deps.pack.status.dev : "Canceled";
       await deps.tracker.setState(ticket.identifier, done);
       return { identifier: ticket.identifier, outcome: "verdict", detail: "prior-request-kept" };
@@ -1059,16 +1109,38 @@ export function sortByPack<T>(pack: ProjectPack, rows: readonly T[], name: (row:
   });
 }
 
-function devCommands(pack: ProjectPack, landed: string[]): string[] {
+function trunkCommitFlag(commits: { sha: string }[] | null): boolean | null {
+  if (commits === null) return null;
+  return commits.length > 0;
+}
+
+function deployRefContains(deps: LoopDeps, repo: RepoSpec, ref: string, sha: string): boolean {
+  if (!ref || !sha) return false;
+  if (deps.deployRefContains) return deps.deployRefContains({ repoUrl: repo.url, ref, sha });
+  const dir = repoCheckoutDir(deps.cwd ?? process.cwd(), repo, deps.pack);
+  if (!existsSync(join(dir, ".git"))) return false;
+  return (
+    spawnSync("git", ["-C", dir, "merge-base", "--is-ancestor", sha, ref], { encoding: "utf8" })
+      .status === 0
+  );
+}
+
+function devCommands(
+  pack: ProjectPack,
+  landed: { name: string; sha: string }[],
+  contains: (name: string, ref: string, sha: string) => boolean,
+): string[] {
   const promote = pack.dev?.promote;
   if (promote?.command) {
     const allowed = new Set(promote.repos ?? []);
     const seen = new Set<string>();
     const commands: string[] = [];
-    for (const repo of landed) {
-      if (!allowed.has(repo) || seen.has(repo)) continue;
-      seen.add(repo);
-      commands.push(promote.command.replaceAll("{repo}", repo));
+    for (const row of landed) {
+      if (!allowed.has(row.name) || seen.has(row.name)) continue;
+      const refs = promote.refs?.[row.name] ?? [];
+      if (refs.length > 0 && row.sha && refs.every((ref) => contains(row.name, ref, row.sha))) continue;
+      seen.add(row.name);
+      commands.push(promote.command.replaceAll("{repo}", row.name));
     }
     return commands;
   }
@@ -1445,7 +1517,8 @@ async function applyRecordedProof(
       },
     };
   }
-  const proofReceipt = `${receipt}\n${printed}`;
+  const combined = [receipt, printed].filter((part) => part.trim()).join("\n");
+  const proofReceipt = combined.trim() ? combined : declared;
   const proven = journeyEvidenceProven(
     `${declared}\n${proofReceipt}`,
     proofReceipt,
@@ -1510,7 +1583,14 @@ async function settleTrunk(
   }
   const failed = runDevCommands(
     deps,
-    devCommands(deps.pack, rows.map((row) => row.repo.name)),
+    devCommands(
+      deps.pack,
+      rows.map((row) => ({ name: row.repo.name, sha: row.sha })),
+      (name, ref, sha) => {
+        const repo = rows.find((row) => row.repo.name === name)?.repo;
+        return repo ? deployRefContains(deps, repo, ref, sha) : false;
+      },
+    ),
   );
   if (failed) {
     const signature = shipNoSignature(failed) || failed;
@@ -1534,7 +1614,7 @@ async function settleTrunk(
   const devState = hold ? holdStatus(deps.pack) : deps.pack.status.dev;
   if (!hold) await publishDevProof(deps, ticket, gate.recorded, gate.proofReceipt, rows);
   if (deps.pack.ship?.afterDev) {
-    await deps.tracker.setState(ticket.identifier, devState);
+    await writeState(deps, ticket, devState);
     const failed = runShipSteps(deps, ticket.identifier);
     if (failed) {
       await healShipStep(deps, ticket, failed, "steps");
@@ -1554,12 +1634,18 @@ async function settleTrunk(
     await deps.tracker.setState(ticket.identifier, deps.pack.status.prod);
     return { identifier: ticket.identifier, outcome: "landed", detail: doneDetail };
   }
-  await deps.tracker.setState(ticket.identifier, devState);
+  await writeState(deps, ticket, devState);
   return {
     identifier: ticket.identifier,
     outcome: "landed",
     detail: doneDetail,
   };
+}
+
+async function writeState(deps: LoopDeps, ticket: Ticket, state: string): Promise<void> {
+  if (ticket.stateName === state) return;
+  await deps.tracker.setState(ticket.identifier, state);
+  ticket.stateName = state;
 }
 
 async function finishMerged(
@@ -1579,6 +1665,132 @@ async function finishMerged(
     declared,
     receipt,
   );
+}
+
+type FoundPull = ListedPull & { repo: RepoSpec };
+
+/** Repos named by the latest work order on the ticket. Null when no order was recorded. */
+function recordedLandRepos(ticket: Ticket): string[] | null {
+  for (let i = ticket.comments.length - 1; i >= 0; i--) {
+    const order = parseWorkOrder(ticket.comments[i]?.body ?? "");
+    if (order) return order.repos;
+  }
+  return null;
+}
+
+/**
+ * Pull requests this ticket already has, one head per land repo.
+ * Null when nothing has merged, or a named repo still has its own commits and no pull request.
+ */
+async function findTicketPulls(
+  deps: LoopDeps,
+  ticket: Ticket,
+): Promise<{ merged: FoundPull[]; open: FoundPull[] } | null> {
+  const list = deps.forge.listPullRequests;
+  const template = deps.pack.branchTemplate;
+  if (!list || !template) return null;
+  const merged: FoundPull[] = [];
+  const open: FoundPull[] = [];
+  for (const repo of deps.pack.repos) {
+    const branch = renderBranch(template, ticket.identifier, repo.name);
+    const rows = await list({ repoUrl: repo.url, head: branch, base: repo.trunk });
+    const mine = rows.filter((row) => row.branch === branch && row.base === repo.trunk);
+    const mergedRow = mine.find((row) => row.state === "merged" && row.mergedSha);
+    const openRow = mine.find((row) => row.state === "open" && row.headSha);
+    if (mergedRow?.mergedSha) merged.push({ ...mergedRow, repo });
+    if (openRow) open.push({ ...openRow, repo });
+  }
+  if (merged.length === 0) return null;
+  const named = recordedLandRepos(ticket);
+  if (named) {
+    for (const name of named) {
+      const repo = repoByName(deps.pack, name);
+      if (!repo) return null;
+      const known =
+        merged.some((row) => row.repo.name === name) || open.some((row) => row.repo.name === name);
+      if (known) continue;
+      if (!(await repoAlreadyOnTrunk(deps, ticket, repo))) return null;
+    }
+  }
+  return { merged, open };
+}
+
+/** True when the land branch has no commits of its own. A missing branch is not on trunk. */
+async function repoAlreadyOnTrunk(deps: LoopDeps, ticket: Ticket, repo: RepoSpec): Promise<boolean> {
+  const template = deps.pack.branchTemplate;
+  if (!template) return false;
+  const branch = renderBranch(template, ticket.identifier, repo.name);
+  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const sha = lookup(repo.url, branch);
+  if (!sha) return false;
+  try {
+    const compared = await deps.forge.compare({ repoUrl: repo.url, base: repo.trunk, head: sha });
+    return compared === "identical" || compared === "behind";
+  } catch {
+    return false;
+  }
+}
+
+function promoteSatisfied(deps: LoopDeps, merged: FoundPull[]): boolean {
+  const promote = deps.pack.dev?.promote;
+  if (!promote) return true;
+  for (const row of merged) {
+    if (!promote.repos.includes(row.repo.name)) continue;
+    const refs = promote.refs?.[row.repo.name] ?? [];
+    const sha = row.mergedSha ?? "";
+    if (refs.length === 0 || !sha) continue;
+    if (!refs.every((ref) => deployRefContains(deps, row.repo, ref, sha))) return false;
+  }
+  return true;
+}
+
+/**
+ * Dev or prod, every pull request merged, and every named deploy ref contains
+ * that commit. Intake tickets are never finished here.
+ */
+async function alreadyFinished(deps: LoopDeps, ticket: Ticket): Promise<boolean> {
+  const dev = deps.pack.status.dev;
+  const prod = deps.pack.status.prod;
+  if (ticket.stateName !== dev && ticket.stateName !== prod) return false;
+  const found = await findTicketPulls(deps, ticket);
+  if (!found || found.open.length > 0) return false;
+  if (ticket.stateName === prod) return true;
+  return promoteSatisfied(deps, found.merged);
+}
+
+/**
+ * Land the pull requests this ticket already has. Merged ones count as landed.
+ * Open ones use the same quality and merge path. Missing proof stays on ground.
+ */
+async function resumeExistingPulls(deps: LoopDeps, ticket: Ticket): Promise<TicketResult | null> {
+  const found = await findTicketPulls(deps, ticket);
+  if (!found) return null;
+  const texts = resumeProofTexts(ticket.comments);
+  const journey = parseJourneyEvidence(texts.declared) ?? parseJourneyEvidence(texts.receipt);
+  const grant = parseOutsideGrant(texts.declared);
+  if ((journey !== "recorded" && journey !== "not-applicable") || !grant) return null;
+  noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
+  const merged: MergedHead[] = [];
+  for (const row of sortByPack(deps.pack, found.merged, (item) => item.repo.name)) {
+    if (!row.mergedSha) continue;
+    merged.push({ repo: row.repo, sha: row.mergedSha, url: row.url });
+  }
+  for (const row of sortByPack(deps.pack, found.open, (item) => item.repo.name)) {
+    const pr: OpenPull = {
+      repo: row.repo,
+      number: row.number,
+      url: row.url,
+      headSha: row.headSha,
+      branch: row.branch,
+      created: false,
+    };
+    const prepared = await settleLand(deps, ticket, pr, texts.declared);
+    if ("outcome" in prepared) return prepared;
+    const landed = await commitLand(deps, ticket, { ...pr, headSha: prepared.headSha });
+    if ("outcome" in landed) return landed;
+    merged.push({ repo: row.repo, sha: landed.mergedSha, url: row.url });
+  }
+  return finishMerged(deps, ticket, grant === "open", merged, texts.declared, texts.receipt);
 }
 
 /**

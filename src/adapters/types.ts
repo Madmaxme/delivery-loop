@@ -97,6 +97,17 @@ export type PullMerge = {
   headSha: string;
 };
 
+/** One pull request on a head branch. `merged` carries the squash commit. */
+export type ListedPull = {
+  number: number;
+  url: string;
+  headSha: string;
+  branch: string;
+  base: string;
+  state: "open" | "merged" | "closed";
+  mergedSha: string | null;
+};
+
 export type ForgeAdapter = {
   openPullRequest(input: {
     repoUrl: string;
@@ -125,6 +136,14 @@ export type ForgeAdapter = {
   mergeability(input: { repoUrl: string; number: number }): Promise<PullMerge>;
   /** Compare trunk (`base`) to the branch or commit (`head`). */
   compare(input: { repoUrl: string; base: string; head: string }): Promise<CompareStatus>;
+  /**
+   * Pull requests for one head branch. Forges without a pull-request list omit this.
+   */
+  listPullRequests?(input: {
+    repoUrl: string;
+    head: string;
+    base: string;
+  }): Promise<ListedPull[]>;
   /**
    * Put the trunk commits onto the branch. A git forge has nothing to update
    * until `squashMerge`. An already up-to-date branch resolves.
