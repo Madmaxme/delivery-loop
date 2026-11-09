@@ -1526,6 +1526,8 @@ describe("loop", () => {
       stdout: "**Journey proof:** `api/e2e/signup.spec.ts`",
     });
     env.deps.journeyFileAt = ({ ref, path }) => ref === "main" && path === "e2e/signup.spec.ts";
+    const engine: string[] = [];
+    env.deps.engineLog = (line) => engine.push(line);
     const result = await runTicket(
       env.deps,
       ticket({
@@ -1540,6 +1542,7 @@ describe("loop", () => {
     const proof = env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->"));
     assert.equal(proof.length, 1);
     assert.match(proof[0], /api\/e2e\/signup\.spec\.ts/);
+    assert.ok(engine.includes("[delivery-loop] proof ok"));
   });
 
   it("keeps recorded proof that already matches the promoted dev ref", async () => {
@@ -1653,6 +1656,8 @@ describe("loop", () => {
       ship: { steps: ["ship"], markStatus: false, afterDev: true },
     };
     let shipArgs = "";
+    const engine: string[] = [];
+    env.deps.engineLog = (line) => engine.push(line);
     env.deps.runCommand = () => {
       runs += 1;
       shipArgs = process.env.DELIVERY_LOOP_SHIP_ARGS ?? "";
@@ -1671,6 +1676,7 @@ describe("loop", () => {
     assert.equal(env.state(), "Dev");
     assert.equal(shipArgs, "--issue API-1");
     assert.equal(heals, 1);
+    assert.equal(engine.filter((line) => line === "[delivery-loop] ship ok").length, 1);
   });
 
   it("stops at dev and does not resume ship when afterDev is off", async () => {
@@ -2009,6 +2015,8 @@ describe("loop", () => {
       starts += 1;
       return { runId: "run-1" };
     };
+    const engine: string[] = [];
+    env.deps.engineLog = (line) => engine.push(line);
     const result = await runTicket(
       env.deps,
       ticket({ comments: [{ body: audit("api, mobile") }] }),
@@ -2016,6 +2024,8 @@ describe("loop", () => {
     assert.equal(result.outcome, "landed");
     assert.equal(starts, 0);
     assert.deepEqual(events, ["update", "merge", "promote mobile", "state:Dev"]);
+    assert.ok(engine.includes("[delivery-loop] land ok"));
+    assert.ok(engine.includes("[delivery-loop] promote ok"));
     assert.equal(env.state(), "Dev");
   });
 

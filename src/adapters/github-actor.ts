@@ -1,3 +1,8 @@
+import {
+  credentialFetch,
+  githubEndpointClass,
+  type CredentialNoteFn,
+} from "../engine/credential-log.ts";
 import type { CommitActor } from "../schema/pack.js";
 import type { FetchLike } from "./types.js";
 
@@ -22,14 +27,24 @@ export function commitActorLogin(
 }
 
 /** The user a token authenticates as. An installation token has no user login. */
-export async function githubUserLogin(fetchImpl: FetchLike, token: string): Promise<string | null> {
-  const response = await fetchImpl("https://api.github.com/user", {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-  });
+export async function githubUserLogin(
+  fetchImpl: FetchLike,
+  token: string,
+  note?: CredentialNoteFn,
+): Promise<string | null> {
+  const response = await credentialFetch(
+    "gh-token",
+    githubEndpointClass("/user"),
+    () =>
+      fetchImpl("https://api.github.com/user", {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+      }),
+    note,
+  );
   if (response.status === 401 || response.status === 403) return null;
   if (!response.ok) {
     throw new Error(`GitHub user lookup failed: ${response.status}`);

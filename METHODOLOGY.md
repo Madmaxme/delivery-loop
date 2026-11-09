@@ -14,6 +14,26 @@ Any actor may squash-merge once quality is green on the head. A branch that is o
 
 Check-runs use the token printed by `DELIVERY_LOOP_GITHUB_MINT` when that command is set. Other forge calls keep the forge token. A bare token expires 60 minutes after the mint. JSON with `token` and `expires_at` uses that expiry. The forge mints again when five minutes or less remain. A 401 or 403 from check-runs is a credential error. The forge does not read that check from another endpoint.
 
+## Credential log
+
+Each credential call writes one line. The line names the slot, the endpoint class, and the status. A success is included. A mint writes `slot=mint` and `endpoint=mint`. A re-mint near expiry adds `refresh=1`. Check-runs write `endpoint=check-runs`, with `slot=mint` when the mint command is set and `slot=gh-token` when it is not. Other GitHub calls write `slot=gh-token` and a class such as `pulls`, `contents`, `commits`, `compare`, `actions`, `issues`, `git`, or `user`. Linear writes `slot=linear` and `endpoint=linear-graphql`. A cursor launch writes `slot=primary` or `slot=fallback` and `endpoint=cursor-launch`. A Figma read writes `slot=figma` and `endpoint=figma`.
+
+The run line is `[delivery-loop] credential slot=<slot> endpoint=<endpoint> status=<status>`. The run ends with one summary line per slot, endpoint class, and status: `[delivery-loop] credential summary slot=<slot> endpoint=<endpoint> status=<status> count=<n>`. A grep for `credential summary` that finds no status other than 200 means every recorded call returned 200.
+
+```text
+[delivery-loop] credential slot=mint endpoint=mint status=200
+[delivery-loop] credential slot=mint endpoint=mint status=200 refresh=1
+[delivery-loop] credential slot=mint endpoint=check-runs status=200
+[delivery-loop] credential slot=gh-token endpoint=pulls status=200
+[delivery-loop] credential summary slot=mint endpoint=check-runs status=200 count=1
+[delivery-loop] credential summary slot=mint endpoint=mint status=200 count=2
+[delivery-loop] credential summary slot=gh-token endpoint=pulls status=200 count=1
+```
+
+The token, the headers, and the request URL are not written. A slot or endpoint class outside the known set is logged as `unknown`. A usable mint is logged as `status=200`. A mint that exits 0 without a usable token logs `status=0`. A worker launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. A GraphQL error carried on HTTP 200 stays `status=200`. A promote that does not run, because the deploy ref already contains the commit, does not add a promote line. The promote and ship lines do not include the command.
+
+A recorded proof that passes writes `[delivery-loop] proof ok`. A promote or ship command that exits 0 writes `[delivery-loop] promote ok` or `[delivery-loop] ship ok`. A dev step that is not a promote writes `[delivery-loop] dev ok`. A squash that returns a commit writes `[delivery-loop] land ok`.
+
 ## Engine heal
 
 An engine heal of this package opens a pull request on `engine-heal/<ticket>` with the label `engine-heal`. The opener commits the next patch of `package.json` and `package-lock.json`, computed from the highest `v*` tag, and pushes with the commit-actor token. The first heal after `v1.0.0` is `1.0.1`. If that tag already exists, the opener stops. The `pull_request` `quality` check gates that head. The workflow squash-merges, reads the version from the merged `package.json`, tags that commit, and publishes the GitHub release. A pull request without the bump gets a comment and stops. A head from another repository is left unmerged. A client pins the tag when it needs the change.
@@ -32,7 +52,7 @@ A leftover `bots` key is ignored with a warning.
 
 ## Worker keys
 
-The cursor worker launches with the env var named by `workerKeys.primary`, then the env var named by `workerKeys.fallback`. The defaults are `CURSOR_API_KEY` and `CURSOR_API_KEY_FALLBACK`. The log records the slot in use, `primary` or `fallback`. The value stays in the environment.
+The cursor worker launches with the env var named by `workerKeys.primary`, then the env var named by `workerKeys.fallback`. The defaults are `CURSOR_API_KEY` and `CURSOR_API_KEY_FALLBACK`. The log records the slot in use, `primary` or `fallback`, and the launch status. A launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. The value stays in the environment.
 
 A capacity or balance refusal on the primary slot retries that launch once on the fallback slot.
 An authentication failure stops on the slot that returned it.

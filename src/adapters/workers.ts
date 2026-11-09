@@ -1,3 +1,4 @@
+import { credentialFetch, noteCredential, type CredentialNoteFn } from "../engine/credential-log.ts";
 import {
   isAgentCapacityRefusal,
   orderedCursorApiKeys,
@@ -29,20 +30,24 @@ export function httpWorker(opts: {
   return {
     kind: "http",
     async start(input: WorkerStart) {
-      const response = await fetchImpl(opts.startUrl, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(input),
-      });
+      const response = await credentialFetch("worker-http", "worker-http", () =>
+        fetchImpl(opts.startUrl, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(input),
+        }),
+      );
       if (!response.ok) throw new Error(`HTTP worker start failed: ${response.status}`);
       const json = (await response.json()) as { runId: string };
       return { runId: json.runId };
     },
     async join(runId: string) {
       return poll(async () => {
-        const response = await fetchImpl(`${opts.statusUrl.replace(/\/$/, "")}/${runId}`, {
-          headers,
-        });
+        const response = await credentialFetch("worker-http", "worker-http", () =>
+          fetchImpl(`${opts.statusUrl.replace(/\/$/, "")}/${runId}`, {
+            headers,
+          }),
+        );
         if (!response.ok) throw new Error(`HTTP worker status failed: ${response.status}`);
         return (await response.json()) as WorkerResult;
       });
@@ -67,22 +72,26 @@ export function copilotWorker(opts: {
   return {
     kind: "copilot",
     async start(input) {
-      const response = await fetchImpl(base, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          prompt: input.prompt,
-          base_ref: input.baseRef,
-          create_pull_request: false,
+      const response = await credentialFetch("gh-token", "copilot", () =>
+        fetchImpl(base, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            prompt: input.prompt,
+            base_ref: input.baseRef,
+            create_pull_request: false,
+          }),
         }),
-      });
+      );
       if (!response.ok) throw new Error(`Copilot task failed: ${response.status} ${await response.text()}`);
       const json = (await response.json()) as { id: string };
       return { runId: json.id };
     },
     async join(runId) {
       return poll(async () => {
-        const response = await fetchImpl(`${base}/${runId}`, { headers });
+        const response = await credentialFetch("gh-token", "copilot", () =>
+          fetchImpl(`${base}/${runId}`, { headers }),
+        );
         if (!response.ok) throw new Error(`Copilot status failed: ${response.status}`);
         const json = (await response.json()) as {
           state: string;
@@ -118,10 +127,11 @@ export function codexWorker(opts: { apiKey: string; fetch?: FetchLike }): Worker
   return {
     kind: "codex",
     async start(input) {
-      const response = await fetchImpl("https://api.openai.com/v1/agents/sessions", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
+      const response = await credentialFetch("codex", "codex", () =>
+        fetchImpl("https://api.openai.com/v1/agents/sessions", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
           agent: { model: "gpt-5.4", instructions: "Follow the work order. Do not widen the change." },
           environment: {
             type: "hosted",
@@ -130,16 +140,19 @@ export function codexWorker(opts: { apiKey: string; fetch?: FetchLike }): Worker
           },
           input: [{ role: "user", content: [{ type: "input_text", text: input.prompt }] }],
         }),
-      });
+      }),
+      );
       if (!response.ok) throw new Error(`Codex session failed: ${response.status} ${await response.text()}`);
       const json = (await response.json()) as { id: string };
       return { runId: json.id };
     },
     async join(runId) {
       return poll(async () => {
-        const response = await fetchImpl(`https://api.openai.com/v1/agents/sessions/${runId}`, {
-          headers,
-        });
+        const response = await credentialFetch("codex", "codex", () =>
+          fetchImpl(`https://api.openai.com/v1/agents/sessions/${runId}`, {
+            headers,
+          }),
+        );
         if (!response.ok) throw new Error(`Codex status failed: ${response.status}`);
         const json = (await response.json()) as {
           status: string;
@@ -174,24 +187,28 @@ export function claudeWorker(opts: { apiKey: string; fetch?: FetchLike }): Worke
   return {
     kind: "claude",
     async start(input) {
-      const response = await fetchImpl("https://api.anthropic.com/v1/sessions", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
+      const response = await credentialFetch("claude", "claude", () =>
+        fetchImpl("https://api.anthropic.com/v1/sessions", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
           model: "claude-sonnet-4-5",
           task: input.prompt,
           environment: { type: "repository", url: input.repoUrl, ref: input.baseRef },
         }),
-      });
+      }),
+      );
       if (!response.ok) throw new Error(`Claude session failed: ${response.status} ${await response.text()}`);
       const json = (await response.json()) as { id: string };
       return { runId: json.id };
     },
     async join(runId) {
       return poll(async () => {
-        const response = await fetchImpl(`https://api.anthropic.com/v1/sessions/${runId}`, {
-          headers,
-        });
+        const response = await credentialFetch("claude", "claude", () =>
+          fetchImpl(`https://api.anthropic.com/v1/sessions/${runId}`, {
+            headers,
+          }),
+        );
         if (!response.ok) throw new Error(`Claude status failed: ${response.status}`);
         const json = (await response.json()) as {
           status: string;
@@ -335,15 +352,27 @@ function redactSecrets(text: string, secrets: readonly string[]): string {
   return out;
 }
 
+function launchStatus(error: unknown): number {
+  if (error && typeof error === "object") {
+    const record = error as { status?: unknown; statusCode?: unknown; httpStatus?: unknown };
+    for (const value of [record.httpStatus, record.status, record.statusCode]) {
+      if (typeof value === "number" && value >= 100 && value <= 599) return value;
+    }
+  }
+  return 0;
+}
+
 export function cursorWorker(opts: {
   apiKey?: string;
   slots?: CursorKeySlot[];
   sdk?: CursorSdk;
   log?: (line: string) => void;
+  credentialNote?: CredentialNoteFn;
 }): WorkerAdapter {
   const live = new Map<string, CursorLiveRun>();
   const slots = (opts.slots ?? cursorKeySlots(opts.apiKey, undefined)).slice(0, 2);
   const log = opts.log ?? ((line: string) => console.error(`[delivery-loop] ${line}`));
+  const emit: CredentialNoteFn = opts.credentialNote ?? ((call) => noteCredential(call, log));
   return {
     kind: "cursor",
     async start(input) {
@@ -371,7 +400,7 @@ export function cursorWorker(opts: {
             await agent[Symbol.asyncDispose]().catch(() => undefined);
             throw error;
           }
-          log(`worker key slot=${current.slot}`);
+          emit({ slot: current.slot, endpoint: "cursor-launch", status: 200 });
           const runKey = run.id?.trim() || agent.agentId;
           live.set(runKey, {
             agentId: agent.agentId,
@@ -388,11 +417,11 @@ export function cursorWorker(opts: {
           };
         } catch (error) {
           const message = redactSecrets(error instanceof Error ? error.message : String(error), secrets);
+          emit({ slot: current.slot, endpoint: "cursor-launch", status: launchStatus(error) });
           if (!isAgentCapacityRefusal(message)) {
             throw new Error(`Cursor worker launch failed on the ${current.slot} key slot: ${message}`);
           }
           capacityRefusals += 1;
-          log(`worker key slot=${current.slot} refused for capacity`);
           const last = i + 1 >= slots.length;
           if (last && slots.length > 1 && capacityRefusals === slots.length) {
             failure = new Error(`Cursor worker launch failed: both key slots are out of capacity. ${message}`);

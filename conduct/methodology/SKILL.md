@@ -72,6 +72,8 @@ The worker pushes a branch. The lander opens the pull request, waits until quali
 
 The github forge reads check-runs with the token printed by `DELIVERY_LOOP_GITHUB_MINT` when that command is set. Other forge calls keep the forge token. The command prints a token, or one JSON object with `token` and `expires_at`. A bare token expires 60 minutes after the mint. The forge mints again when five minutes or less remain. A 401 or 403 from check-runs is a credential error. The forge does not read that check from another endpoint.
 
+Each credential call logs its slot, endpoint class, and status, success included. A re-mint near expiry adds `refresh=1`. The run ends with a count by slot, endpoint class, and status. The token, the headers, and the request URL are not written. A worker launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. A recorded proof that passes, a promote or ship command that exits 0, and a squash that returns a commit each write one success line.
+
 ## Promote and ship
 
 Promote runs only after the trunk check is green, and only for repos named in `dev.promote.repos`. Ship does not run during sweep unless `ship.afterDev` is set. A clean ship exit, including a store wait, is not a failure. `**Heal:**` wait runs the step again. `**Heal:**` login replaces the login and runs the step again.

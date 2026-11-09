@@ -510,7 +510,7 @@ describe("cursor worker key slots", () => {
   it("uses the primary slot when that launch succeeds", async () => {
     const result = await launch({ slots: both, onCreate: () => "ok" });
     assert.deepEqual(result.keys, [PRIMARY]);
-    assert.deepEqual(result.lines, ["worker key slot=primary"]);
+    assert.deepEqual(result.lines, ["credential slot=primary endpoint=cursor-launch status=200"]);
     assert.equal(result.error, undefined);
     assert.equal(result.lines.join(" ").includes(PRIMARY), false);
     assert.equal(result.lines.join(" ").includes(FALLBACK), false);
@@ -523,8 +523,8 @@ describe("cursor worker key slots", () => {
     });
     assert.deepEqual(result.keys, [PRIMARY, FALLBACK]);
     assert.deepEqual(result.lines, [
-      "worker key slot=primary refused for capacity",
-      "worker key slot=fallback",
+      "credential slot=primary endpoint=cursor-launch status=0",
+      "credential slot=fallback endpoint=cursor-launch status=200",
     ]);
     assert.equal(result.error, undefined);
     assert.equal(result.lines.join("\n").includes(PRIMARY), false);
@@ -542,8 +542,8 @@ describe("cursor worker key slots", () => {
     assert.equal(result.error?.message.includes(PRIMARY), false);
     assert.equal(result.error?.message.includes(FALLBACK), false);
     assert.deepEqual(result.lines, [
-      "worker key slot=primary refused for capacity",
-      "worker key slot=fallback refused for capacity",
+      "credential slot=primary endpoint=cursor-launch status=0",
+      "credential slot=fallback endpoint=cursor-launch status=0",
     ]);
   });
 
