@@ -1393,18 +1393,44 @@ async function symbolsResolve(deps: LoopDeps, symbols: string[]): Promise<boolea
   return result.status === 0;
 }
 
+type JourneyCommandPrint =
+  | { ok: true; stdout: string }
+  | { ok: false; reason: "failed"; status: number | null }
+  | { ok: false; reason: "empty" };
+
 /**
- * The pack command prints the proof token. Empty or unparsed stdout is not proof.
- * Returns the stdout to append, or null when the command failed.
+ * The pack command prints the proof token. An unset command prints nothing
+ * and leaves the recorded text to stand on its own. A failing command or
+ * stdout with no token is `ok: false`.
  */
-function journeyCommandProof(deps: LoopDeps, stdin: string): string | null {
+function journeyCommandProof(deps: LoopDeps, stdin: string): JourneyCommandPrint {
   const command = deps.pack.journeyCommand?.trim();
-  if (!command) return "";
+  if (!command) return { ok: true, stdout: "" };
   const run = deps.runPackCommand ?? defaultRunPackCommand;
   const result = run(command, deps.cwd ?? process.cwd(), stdin);
-  if (result.status !== 0) return null;
-  if (parseJourneyProofs(result.stdout, deps.pack.journeySpec).length === 0) return null;
-  return result.stdout;
+  if (result.status !== 0) return { ok: false, reason: "failed", status: result.status };
+  if (parseJourneyProofs(result.stdout, deps.pack.journeySpec).length === 0) {
+    return { ok: false, reason: "empty" };
+  }
+  return { ok: true, stdout: result.stdout };
+}
+
+function journeySpecText(deps: LoopDeps): string {
+  return deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC;
+}
+
+/** Names the command, the ticket, and the token the command should print. */
+function journeyTokenMissing(deps: LoopDeps, identifier: string, printed: JourneyCommandPrint): string {
+  const spec = journeySpecText(deps);
+  const command = deps.pack.journeyCommand?.trim() || "";
+  const expected = `Expected an https recording or screenshot URL, or a route test \`repo/path\` whose path matches \`${spec}\`.`;
+  if (!printed.ok && printed.reason === "failed") {
+    return `Journey command \`${command}\` exited ${printed.status ?? "null"} for ${identifier}. ${expected} The ticket stays in intake.`;
+  }
+  if (command) {
+    return `Journey command \`${command}\` printed no **Journey proof:** token for ${identifier}. ${expected} The ticket stays in intake.`;
+  }
+  return `No journey command is set for ${identifier}. ${expected} The ticket stays in intake.`;
 }
 
 async function trunkQuality(
@@ -1487,9 +1513,37 @@ function proofFileOnCommit(
   };
 }
 
+/** Deploy refs when the pack names them. Otherwise the repo trunk. */
+function promotedDevRefs(deps: LoopDeps, repoName: string): string[] {
+  const named = deps.pack.dev?.promote?.refs?.[repoName] ?? [];
+  if (named.length > 0) return named;
+  const trunk = repoByName(deps.pack, repoName)?.trunk;
+  return trunk ? [trunk] : [];
+}
+
+function proofFileOnPromotedDev(
+  deps: LoopDeps,
+): (repo: string, path: string) => boolean {
+  return (repo, path) => {
+    const refs = promotedDevRefs(deps, repo);
+    return refs.length > 0 && refs.every((ref) => journeyFileInCheckout(deps, repo, ref, path));
+  };
+}
+
+function proofSatisfies(
+  deps: LoopDeps,
+  evidence: string,
+  receipt: string,
+  fileOnCommit: (repo: string, path: string) => boolean,
+): boolean {
+  return journeyEvidenceProven(evidence, receipt, fileOnCommit, deps.pack.journeySpec);
+}
+
 /**
  * Recorded journey proof before the dev status. A fresh land and a resume
  * both use this. A proof comment that already proves the journey is reused.
+ * When the merged commit does not contain the route test, the promoted dev
+ * ref does: `dev.promote.refs` for that repo, or the repo trunk.
  * A spec outside the journey-spec pattern is not that proof.
  */
 async function applyRecordedProof(
@@ -1502,20 +1556,23 @@ async function applyRecordedProof(
   const recorded =
     parseJourneyEvidence(declared) === "recorded" || parseJourneyEvidence(receipt) === "recorded";
   if (!recorded) return { ok: true, recorded: false, proofReceipt: receipt };
-  const onCommit = proofFileOnCommit(deps, rows);
+  const onMerge = proofFileOnCommit(deps, rows);
+  const onDev = proofFileOnPromotedDev(deps);
+  const evidence = `${declared}\n${receipt}`;
   const existing = publishedProofReceipt(ticket.comments);
   if (
     existing &&
-    journeyEvidenceProven(`${declared}\n${receipt}\n${existing}`, existing, onCommit, deps.pack.journeySpec)
+    (proofSatisfies(deps, `${evidence}\n${existing}`, existing, onMerge) ||
+      proofSatisfies(deps, `${evidence}\n${existing}`, existing, onDev))
   ) {
     return { ok: true, recorded: true, proofReceipt: existing };
   }
-  const printed = journeyCommandProof(deps, `${declared}\n${receipt}`);
-  if (printed === null) {
-    await deps.tracker.comment(
-      ticket.identifier,
-      "The journey command did not print a **Journey proof:** token. The ticket stays in intake.",
-    );
+  if (proofSatisfies(deps, evidence, receipt, onMerge) || proofSatisfies(deps, evidence, receipt, onDev)) {
+    return { ok: true, recorded: true, proofReceipt: receipt.trim() ? receipt : declared };
+  }
+  const printed = journeyCommandProof(deps, evidence);
+  if (!printed.ok) {
+    await deps.tracker.comment(ticket.identifier, journeyTokenMissing(deps, ticket.identifier, printed));
     return {
       ok: false,
       result: {
@@ -1525,18 +1582,15 @@ async function applyRecordedProof(
       },
     };
   }
-  const combined = [receipt, printed].filter((part) => part.trim()).join("\n");
+  const combined = [receipt, printed.stdout].filter((part) => part.trim()).join("\n");
   const proofReceipt = combined.trim() ? combined : declared;
-  const proven = journeyEvidenceProven(
-    `${declared}\n${proofReceipt}`,
-    proofReceipt,
-    onCommit,
-    deps.pack.journeySpec,
-  );
+  const proven =
+    proofSatisfies(deps, `${declared}\n${proofReceipt}`, proofReceipt, onMerge) ||
+    proofSatisfies(deps, `${declared}\n${proofReceipt}`, proofReceipt, onDev);
   if (!proven) {
     await deps.tracker.comment(
       ticket.identifier,
-      "Journey evidence is recorded, and the proof is not on this merge. A web journey needs the recording URL in the build receipt. A mobile journey needs the route test on the commit under the journey-spec pattern. The ticket stays in intake.",
+      `Journey evidence for ${ticket.identifier} is recorded. The route test is absent from the merged commit and from the promoted dev ref. A web journey needs the recording URL in the build receipt. A mobile journey needs the route test on that ref under \`${journeySpecText(deps)}\`. The ticket stays in intake.`,
     );
     return {
       ok: false,
