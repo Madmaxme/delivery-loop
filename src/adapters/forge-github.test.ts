@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { githubForge, interpretCompare, interpretMergeability, interpretPullList } from "./forge-github.ts";
+import { INSTALLATION_TOKEN_REFRESH_SKEW_MS } from "./github-mint.ts";
 
 describe("github mergeability", () => {
   it("maps the host state onto the land decision", () => {
@@ -141,27 +142,84 @@ describe("github mergeability", () => {
     assert.match(seen, /base=main/);
   });
 
-  it("reads a design job from Actions when the Checks API refuses the token", async () => {
+  it("surfaces a 403 from check-runs as a credential error", async () => {
     const head = "a".repeat(40);
     const calls: string[] = [];
     const forge = githubForge({
-      token: "token",
+      token: "pat-token",
+      mintCommand: "",
       fetch: async (url) => {
         calls.push(String(url));
-        if (String(url).includes("/check-runs")) {
-          return new Response("no", { status: 403 });
-        }
-        if (String(url).includes("/actions/runs?") && !String(url).includes("/jobs")) {
+        if (String(url).includes("/check-runs")) return new Response("no", { status: 403 });
+        if (String(url).includes("/jobs")) {
           return Response.json({
-            workflow_runs: [{ id: 9, head_sha: head }],
+            jobs: [{ name: "ui-primitives", status: "completed", conclusion: "success" }],
           });
         }
-        if (String(url).includes("/actions/runs/9/jobs")) {
+        return Response.json({});
+      },
+    });
+    await assert.rejects(
+      () =>
+        forge.designCheck?.({
+          repoUrl: "https://github.com/acme/admin-web",
+          headSha: head,
+          name: "ui-primitives",
+        }),
+      (error: unknown) => {
+        assert.match(String(error), /credential error:/);
+        assert.match(String(error), /403/);
+        assert.match(String(error), /DELIVERY_LOOP_GITHUB_MINT/);
+        assert.equal((error as { httpStatus?: number }).httpStatus, 403);
+        return true;
+      },
+    );
+    assert.ok(calls.some((url) => url.includes("/check-runs")));
+    assert.equal(calls.some((url) => url.includes("/jobs")), false);
+    assert.equal(calls.some((url) => url.includes("/actions/runs")), false);
+  });
+
+  it("reads check-runs with the minted installation token and refreshes before expiry", async () => {
+    const head = "a".repeat(40);
+    const minted = ["checks-token-a", "checks-token-b"];
+    const auths: { url: string; authorization: string }[] = [];
+    let now = 0;
+    let mintCalls = 0;
+    const expiresAt = 20 * 60 * 1000;
+    const forge = githubForge({
+      token: "pat-token",
+      mintCommand: "mint-installation-token",
+      nowMs: () => now,
+      runMint: () => {
+        const token = minted[mintCalls] ?? "checks-token-extra";
+        mintCalls += 1;
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            token,
+            expires_at: new Date(expiresAt).toISOString(),
+          }),
+        };
+      },
+      fetch: async (url, init) => {
+        auths.push({
+          url: String(url),
+          authorization: new Headers(init?.headers).get("authorization") ?? "",
+        });
+        if (String(url).includes("/check-runs")) {
           return Response.json({
-            jobs: [
-              { name: "ui-primitives", status: "completed", conclusion: "success" },
+            check_runs: [
+              {
+                name: "ui-primitives",
+                status: "completed",
+                conclusion: "success",
+                head_sha: head,
+              },
             ],
           });
+        }
+        if (String(url).includes("/actions/runs")) {
+          return Response.json({ workflow_runs: [] });
         }
         return Response.json({});
       },
@@ -172,7 +230,32 @@ describe("github mergeability", () => {
       name: "ui-primitives",
     });
     assert.equal(probe?.state, "success");
-    assert.ok(calls.some((url) => url.includes("/check-runs")));
-    assert.ok(calls.some((url) => url.includes("/jobs")));
+    now = expiresAt - INSTALLATION_TOKEN_REFRESH_SKEW_MS - 1;
+    await forge.designCheck?.({
+      repoUrl: "https://github.com/acme/admin-web",
+      headSha: head,
+      name: "ui-primitives",
+    });
+    assert.equal(mintCalls, 1);
+    now = expiresAt - INSTALLATION_TOKEN_REFRESH_SKEW_MS;
+    await forge.designCheck?.({
+      repoUrl: "https://github.com/acme/admin-web",
+      headSha: head,
+      name: "ui-primitives",
+    });
+    assert.equal(mintCalls, 2);
+    const checkAuths = auths.filter((call) => call.url.includes("/check-runs")).map((call) => call.authorization);
+    assert.deepEqual(checkAuths, [
+      "Bearer checks-token-a",
+      "Bearer checks-token-a",
+      "Bearer checks-token-b",
+    ]);
+    await forge.quality?.({
+      repoUrl: "https://github.com/acme/admin-web",
+      headSha: head,
+      workflow: "quality",
+    });
+    const quality = auths.find((call) => call.url.includes("/actions/runs"));
+    assert.equal(quality?.authorization, "Bearer pat-token");
   });
 });
