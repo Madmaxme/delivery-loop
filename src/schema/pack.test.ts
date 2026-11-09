@@ -53,6 +53,24 @@ workerKeys:
     assert.equal(pack.workerModel, "model-4.7");
   });
 
+  it("defaults transient retries and keeps a park from counting as success", () => {
+    const pack = loadPack(write(base));
+    assert.equal(pack.transient?.maxAttempts, 3);
+    assert.equal(pack.transient?.maxWaitMs, 60_000);
+    assert.equal(pack.ship?.parkSuccess, undefined);
+    const named = loadPack(
+      write(`${base}transient:\n  maxAttempts: 4\n  maxWaitMs: 1000\nship:\n  parkSuccess: true\n  steps: []\n`),
+    );
+    assert.equal(named.transient?.maxAttempts, 4);
+    assert.equal(named.transient?.maxWaitMs, 1000);
+    assert.equal(named.ship?.parkSuccess, true);
+  });
+
+  it("refuses a transient budget that is not a count or a wait", () => {
+    assert.throws(() => loadPack(write(`${base}transient:\n  maxAttempts: 0\n`)), /transient.maxAttempts/);
+    assert.throws(() => loadPack(write(`${base}transient:\n  maxWaitMs: -1\n`)), /transient.maxWaitMs/);
+  });
+
   it("refuses a workerModel value that is not a model id", () => {
     assert.throws(() => loadPack(write(`${base}workerModel: "not a model"\n`)), /workerModel/);
     assert.throws(() => loadPack(write(`${base}workerModel: 4\n`)), /workerModel/);

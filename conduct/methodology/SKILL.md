@@ -80,7 +80,7 @@ Each credential call logs its slot, endpoint class, and status, success included
 
 ## Promote and ship
 
-Promote runs only after the trunk check is green, and only for repos named in `dev.promote.repos`. Ship does not run during sweep unless `ship.afterDev` is set. A clean ship exit, including a store wait, is not a failure. `**Heal:**` wait runs the step again. `**Heal:**` login replaces the login and runs the step again.
+Promote runs only after the trunk check is green, and only for repos named in `dev.promote.repos`. Ship does not run during sweep unless `ship.afterDev` is set. A zero exit with no outcome lines is success, including a store wait. `**Heal:**` wait runs the step again. `**Heal:**` login replaces the login and runs the step again. A pack reports one ticket with `delivery-loop outcome <ticket> COMPLETE`, `PARKED`, or `BLOCKED`, and an optional reason. Exit 0 means every ticket is COMPLETE. Exit 2 means a ticket is PARKED and none are BLOCKED, unless `ship.parkSuccess` is true. Any BLOCKED line exits 1. `ship.parkSuccess` defaults to false. Exit 75, or a non-zero exit with `delivery-loop transient <reason>`, waits and runs that ship or promote step again. `transient.maxAttempts` defaults to 3. Waits start at one second and double. `transient.maxWaitMs` defaults to 60000 and caps the sum. A spent budget reports the reason and does not edit an owner. A non-transient failure still edits the owner.
 
 ## Self-heal
 

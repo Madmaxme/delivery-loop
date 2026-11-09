@@ -57,6 +57,16 @@ A network failure stops on the slot that returned it.
 A refusal from both slots fails the launch and reports that both slots are out of capacity.
 An empty fallback variable leaves that launch on the primary slot.
 
+A zero ship exit with no outcome lines is success, including a store wait. The pack prints `delivery-loop outcome <ticket> COMPLETE`, `PARKED`, or `BLOCKED`, and an optional reason. Exit 0 means every ticket is COMPLETE. Exit 2 means a PARKED ticket and no BLOCKED ticket, unless `ship.parkSuccess` is true. Any BLOCKED line exits 1. `ship.parkSuccess` defaults to false. Exit 75, or a non-zero exit plus `delivery-loop transient <reason>`, retries that ship or promote step. `transient.maxAttempts` defaults to 3. Waits start at one second and double. `transient.maxWaitMs` defaults to 60000 and caps the sum. A spent budget reports the reason and does not edit an owner.
+
+```yaml
+transient:
+  maxAttempts: 3
+  maxWaitMs: 60000
+ship:
+  parkSuccess: false
+```
+
 `workerModel` is the cursor model id. The launch passes `{ id }` and the credential line names that id. An absent `workerModel` omits the model and logs that the account default is in use.
 
 ```yaml

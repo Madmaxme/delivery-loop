@@ -1,11 +1,19 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DEFAULT_JOURNEY_SPEC } from "../../scripts/journey-proof.mjs";
 import { interpretMintOutput, runMintCommand } from "../adapters/github-mint.ts";
 import { noteMint } from "./credential-log.ts";
+import {
+  parseOutcomeLines,
+  shipExitCode,
+  shipSummaryLines,
+  shipSummaryMarkdown,
+  transientReason,
+  transientWaitMs,
+} from "./step-outcome.ts";
 import type { CompareStatus, DesignCheckProbe, FetchLike, ForgeAdapter, ListedPull, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { agentHome, holdStatus, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
 import {
@@ -113,7 +121,10 @@ export type LoopDeps = {
   /** Builds the real tracker after a ship step returns no. Success does not call it. */
   openTracker?: () => TrackerAdapter;
   /** Runs `qualityCommand` when `check` is `command`. Default runs it in the checkout. */
-  runCommand?: (command: string, cwd: string) => { status: number | null };
+  runCommand?: (
+    command: string,
+    cwd: string,
+  ) => { status: number | null; stdout?: string; stderr?: string };
   /**
    * Figma REST token. `null` means the token is absent. Unset reads
    * `design.figmaTokenEnv`, which defaults to FIGMA_ACCESS_TOKEN.
@@ -1298,19 +1309,62 @@ export function latestLandMarker(comments: { body: string }[]): LandMarker | nul
   return null;
 }
 
-function runDevCommands(
+type CommandOutput = { status: number | null; stdout?: string; stderr?: string; output: string };
+
+function commandOutput(result: { status: number | null; stdout?: string; stderr?: string }): CommandOutput {
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  return { status: result.status, stdout, stderr, output: `${stdout}\n${stderr}` };
+}
+
+async function runWithTransient<T extends { status: number | null; output: string }>(
+  deps: LoopDeps,
+  runOnce: () => Promise<T>,
+): Promise<T> {
+  const maxAttempts = deps.pack.transient?.maxAttempts ?? 3;
+  const maxWaitMs = deps.pack.transient?.maxWaitMs ?? 60_000;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  let completed = 0;
+  let spent = 0;
+  let last = { status: 1 as number | null, output: "" } as T;
+  for (;;) {
+    last = await runOnce();
+    completed += 1;
+    const reason = transientReason(last.status, last.output);
+    if (!reason) return last;
+    const wait = transientWaitMs({ completedAttempts: completed, spentMs: spent, maxAttempts, maxWaitMs });
+    if (wait === null) {
+      noteEngine(deps, `transient exhausted: ${reason}`);
+      throw new Error(`transient exhausted: ${reason}`);
+    }
+    spent += wait;
+    if (wait > 0) await sleep(wait);
+  }
+}
+
+export async function runDevCommands(
   deps: LoopDeps,
   commands: string[],
   kind: "promote" | "ship" | "dev",
-): string | null {
+): Promise<{ failed: string | null; output: string }> {
   const cwd = deps.cwd ?? process.cwd();
   const run = deps.runCommand ?? defaultRunCommand;
+  let output = "";
   for (const command of commands) {
-    const result = run(command, cwd);
-    if (result.status !== 0) return command;
+    let result: { status: number | null; output: string };
+    try {
+      result = await runWithTransient(deps, async () =>
+        commandOutput(run(command, cwd)),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { failed: `${command} ${message}`, output };
+    }
+    output = `${output}\n${result.output}`;
+    if (result.status !== 0) return { failed: command, output };
     noteEngine(deps, `${kind} ok`);
   }
-  return null;
+  return { failed: null, output };
 }
 
 function rememberedVerdict(deps: LoopDeps, key: string): HealVerdict | undefined {
@@ -1356,23 +1410,29 @@ function runShipStep(
   step: string,
   cwd: string,
   env: NodeJS.ProcessEnv,
-): Promise<{ status: number | null; tail: string }> {
+): Promise<{ status: number | null; tail: string; output: string }> {
   return new Promise((resolve) => {
     const child = spawn(step, { shell: true, cwd, env, stdio: ["inherit", "pipe", "pipe"] });
     const lines: string[] = [];
+    const chunks: string[] = [];
     const take = (chunk: Buffer, dest: NodeJS.WriteStream) => {
       dest.write(chunk);
-      for (const piece of chunk.toString("utf8").split(/\n/)) {
+      const text = chunk.toString("utf8");
+      chunks.push(text);
+      if (chunks.join("").length > 200_000) chunks.splice(0, chunks.length - 20);
+      for (const piece of text.split(/\n/)) {
         const trimmed = piece.trim();
         if (!trimmed) continue;
         lines.push(trimmed);
         if (lines.length > 30) lines.shift();
       }
     };
+    const finish = (status: number | null) =>
+      resolve({ status, tail: lines.slice(-8).join("\n"), output: chunks.join("") });
     child.stdout?.on("data", (chunk: Buffer) => take(chunk, process.stdout));
     child.stderr?.on("data", (chunk: Buffer) => take(chunk, process.stderr));
-    child.on("error", () => resolve({ status: 1, tail: lines.slice(-8).join("\n") }));
-    child.on("close", (code) => resolve({ status: code, tail: lines.slice(-8).join("\n") }));
+    child.on("error", () => finish(1));
+    child.on("close", (code) => finish(code));
   });
 }
 
@@ -1383,14 +1443,34 @@ function shipStepArgs(identifier: string, extraArgs?: string): string {
   return extra ? `${issue} ${extra}` : issue;
 }
 
+export type ShipRun = { exitCode: number; lines: string[] };
+
+function publishShipSummary(outcomes: ReturnType<typeof parseOutcomeLines>): string[] {
+  const lines = shipSummaryLines(outcomes);
+  for (const line of lines) console.log(line);
+  const file = process.env.GITHUB_STEP_SUMMARY;
+  if (file) appendFileSync(file, shipSummaryMarkdown(outcomes));
+  return lines;
+}
+
 /** Pass this ticket to the ship step as `--issue <id>`. */
-function runShipSteps(deps: LoopDeps, identifier: string): string | null {
+async function runShipSteps(deps: LoopDeps, identifier: string): Promise<ShipRun & { failed: string | null }> {
   const previousIssue = process.env.DELIVERY_LOOP_ISSUE;
   const previousArgs = process.env.DELIVERY_LOOP_SHIP_ARGS;
   process.env.DELIVERY_LOOP_ISSUE = identifier;
   process.env.DELIVERY_LOOP_SHIP_ARGS = shipStepArgs(identifier);
   try {
-    return runDevCommands(deps, deps.pack.ship?.steps ?? [], "ship");
+    const run = await runDevCommands(deps, deps.pack.ship?.steps ?? [], "ship");
+    const parsed = parseOutcomeLines(run.output);
+    const outcomes =
+      parsed.length === 0 && !run.failed
+        ? [{ ticket: identifier, outcome: "COMPLETE" as const, reason: "" }]
+        : parsed;
+    const exitCode = run.failed ? 1 : shipExitCode(outcomes, deps.pack.ship?.parkSuccess === true);
+    const lines = publishShipSummary(outcomes);
+    if (run.failed) return { failed: run.failed, exitCode, lines };
+    if (exitCode !== 0) return { failed: null, exitCode, lines };
+    return { failed: null, exitCode: 0, lines };
   } finally {
     if (previousIssue === undefined) delete process.env.DELIVERY_LOOP_ISSUE;
     else process.env.DELIVERY_LOOP_ISSUE = previousIssue;
@@ -1670,7 +1750,7 @@ async function settleTrunk(
       detail: waiting.map((row) => `${row.repo} ${row.sha}`).join(" "),
     };
   }
-  const failed = runDevCommands(
+  const promoted = await runDevCommands(
     deps,
     devCommands(
       deps.pack,
@@ -1682,7 +1762,8 @@ async function settleTrunk(
     ),
     deps.pack.dev?.promote?.command ? "promote" : "dev",
   );
-  if (failed) {
+  if (promoted.failed) {
+    const failed = promoted.failed;
     const signature = shipNoSignature(failed) || failed;
     await applyOwnerHeal(deps, ticket, `heal:dev:${signature}`, `Dev step returned no: ${failed}`);
     await deps.tracker.comment(
@@ -1705,9 +1786,9 @@ async function settleTrunk(
   if (!hold) await publishDevProof(deps, ticket, gate.recorded, gate.proofReceipt, rows);
   if (deps.pack.ship?.afterDev) {
     await writeState(deps, ticket, devState);
-    const failed = runShipSteps(deps, ticket.identifier);
-    if (failed) {
-      await healShipStep(deps, ticket, failed, "steps");
+    const shipped = await runShipSteps(deps, ticket.identifier);
+    if (shipped.failed || shipped.exitCode !== 0) {
+      if (shipped.failed) await healShipStep(deps, ticket, shipped.failed, "steps");
       await deps.tracker.comment(
         ticket.identifier,
         shipWaitMarker(hold, rows.map((row) => ({ repo: row.repo.name, sha: row.sha }))),
@@ -1715,7 +1796,9 @@ async function settleTrunk(
       return {
         identifier: ticket.identifier,
         outcome: "ship-blocked",
-        detail: `ship step failed: ${failed}. Dev status stays. Ship retries from dev.`,
+        detail: shipped.failed
+          ? `ship step failed: ${shipped.failed}. Dev status stays. Ship retries from dev.`
+          : shipped.lines.join(" "),
       };
     }
     if (deps.pack.ship.markStatus === false) {
@@ -1923,13 +2006,15 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketR
         detail: "dev only",
       };
     }
-    const failed = runShipSteps(deps, ticket.identifier);
-    if (failed) {
-      await healShipStep(deps, ticket, failed, "steps");
+    const shipped = await runShipSteps(deps, ticket.identifier);
+    if (shipped.failed || shipped.exitCode !== 0) {
+      if (shipped.failed) await healShipStep(deps, ticket, shipped.failed, "steps");
       return {
         identifier: ticket.identifier,
         outcome: "ship-blocked",
-        detail: `ship step failed: ${failed}. Dev status stays. Ship retries from dev.`,
+        detail: shipped.failed
+          ? `ship step failed: ${shipped.failed}. Dev status stays. Ship retries from dev.`
+          : shipped.lines.join(" "),
       };
     }
     if (deps.pack.ship?.markStatus !== false) {
@@ -2448,8 +2533,14 @@ type QualityWait = {
   detail: string;
 };
 
-function defaultRunCommand(command: string, cwd: string): { status: number | null } {
-  return spawnSync(command, { shell: true, cwd, stdio: "inherit" });
+function defaultRunCommand(
+  command: string,
+  cwd: string,
+): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync(command, { shell: true, cwd, encoding: "utf8" });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
 async function waitForQuality(
@@ -2647,7 +2738,7 @@ export async function ship(
   identifier?: string,
   extraArgs?: string,
   mode: "ship" | "continue" = "ship",
-): Promise<void> {
+): Promise<ShipRun> {
   const id = identifier?.trim() ?? "";
   if (!id) throw new Error("ship needs a ticket id");
   await probeConfiguredCredentials(deps);
@@ -2670,8 +2761,10 @@ export async function ship(
   if (stopped) throw new HealExhaustedError(stopped);
   const cwd = deps.cwd ?? process.cwd();
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  let output = "";
   for (const step of steps) {
-    let result = await runShipStep(step, cwd, env);
+    let result = await runWithTransient(deps, async () => runShipStep(step, cwd, env));
+    output = `${output}\n${result.output}`;
     let waits = 0;
     let refreshedLogin = false;
     while (result.status !== 0) {
@@ -2707,20 +2800,31 @@ export async function ship(
         if (waits >= 40) throw new Error(`ship step failed: ${step}`);
         waits += 1;
         await sleep(30_000);
-        result = await runShipStep(step, cwd, env);
+        result = await runWithTransient(deps, async () => runShipStep(step, cwd, env));
+        output = `${output}\n${result.output}`;
         continue;
       }
       if (verdict === "login") {
         if (refreshedLogin || !refreshShipGithubToken(env)) throw new Error(`ship step failed: ${step}`);
         refreshedLogin = true;
-        result = await runShipStep(step, cwd, env);
+        result = await runWithTransient(deps, async () => runShipStep(step, cwd, env));
+        output = `${output}\n${result.output}`;
         continue;
       }
       waits = 0;
-      result = await runShipStep(step, cwd, env);
+      result = await runWithTransient(deps, async () => runShipStep(step, cwd, env));
+      output = `${output}\n${result.output}`;
     }
   }
-  if (deps.pack.ship?.markStatus !== false) {
+  const parsed = parseOutcomeLines(output);
+  const outcomes =
+    parsed.length === 0
+      ? [{ ticket: id, outcome: "COMPLETE" as const, reason: "" }]
+      : parsed;
+  const exitCode = shipExitCode(outcomes, deps.pack.ship?.parkSuccess === true);
+  const lines = publishShipSummary(outcomes);
+  if (exitCode === 0 && deps.pack.ship?.markStatus !== false) {
     await deps.tracker.setState(id, deps.pack.status.prod);
   }
+  return { exitCode, lines };
 }
