@@ -310,6 +310,19 @@ describe("design gate", () => {
     }
   });
 
+  it("stops before ground when the Figma file read is refused", async () => {
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    env.deps.figmaFetch = async () => new Response("forbidden", { status: 403 });
+    const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
+    assert.equal(result.outcome, "missing-credential");
+    assert.equal(result.detail, "figma");
+    assert.match(env.comments.join("\n"), /figma read failed: 403/);
+    assert.match(env.comments.join("\n"), /Share the file with the account that owns FIGMA_ACCESS_TOKEN/);
+    assert.equal(env.starts(), 0);
+    assert.equal(env.merged(), false);
+  });
+
   it("puts the Figma frame and the read output in the repair prompt", async () => {
     const env = harness(order(`**Design source:** \`${FRAME}\`\n**Validation:** \`${UI_CHECK}\``));
     env.deps.figmaToken = "fixture-token";

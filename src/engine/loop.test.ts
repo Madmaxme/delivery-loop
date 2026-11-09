@@ -968,6 +968,48 @@ describe("loop", () => {
     assert.deepEqual(opened, [api.url, client.url]);
   });
 
+  it("waits until every surface is ready before merging the first", async () => {
+    const env = harness(
+      BUILDABLE.replace("**Repos:** `api`", "**Repos:** `api, admin-web`"),
+    );
+    const api = { name: "api", url: "https://github.com/acme/api", trunk: "development" };
+    const web = { name: "admin-web", url: "https://github.com/acme/admin-web", trunk: "development" };
+    env.deps.pack = {
+      ...pack,
+      repos: [api, web],
+      branchTemplate: "cursor/{issue}-{repo}",
+      design: {
+        repos: [
+          {
+            name: "admin-web",
+            check: "npm test",
+            checkName: "ui-primitives",
+            tokenFile: "tokens.css",
+          },
+        ],
+      },
+    };
+    env.deps.lookupHead = () => "abc1234";
+    env.deps.sleep = async () => {};
+    env.deps.forge.designCheck = async (input) => {
+      if (input.repoUrl.includes("admin-web")) {
+        throw new Error(
+          "GitHub /repos/acme/admin-web/commits/abc1234/check-runs?per_page=100 failed: 403",
+        );
+      }
+      return { state: "success", detail: "ui-primitives success", headSha: input.headSha };
+    };
+    const merged: string[] = [];
+    env.deps.forge.squashMerge = async (input) => {
+      merged.push(input.repoUrl);
+      return "c".repeat(40);
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(merged.length, 0);
+    assert.equal(result.outcome, "land-blocked");
+    assert.match(result.detail, /check-runs\?per_page=100 failed: 403/);
+  });
+
   it("does not open a pull request when the branch is already on trunk", async () => {
     const env = harness(BUILDABLE);
     env.deps.pack = { ...pack, branchTemplate: "cursor/{issue}-{repo}" };
