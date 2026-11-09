@@ -5,8 +5,15 @@ import type { DesignCheckProbe, FetchLike, Ticket } from "../adapters/types.ts";
 import type { DesignRepo, DesignSpec } from "../schema/pack.ts";
 import { credentialFetch, type CredentialNoteFn } from "./credential-log.ts";
 
-const FIGMA_URL_RE =
-  /https?:\/\/(?:www\.)?figma\.com\/(?:file|design|proto|board|slides)\/[A-Za-z0-9]+[^\s()<>"'`\]]*/gi;
+const FIGMA_START_RE =
+  /https?:\/\/(?:www\.)?figma\.com\/(?:file|design|proto|board|slides)\//gi;
+
+/** Characters that belong to a Figma URL. Markdown wrappers are not in this set. */
+const FIGMA_URL_CHARS = new Set(
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/?#@!$&*+=%;,",
+);
+
+const TRAILING_URL_JUNK = new Set([")", "]", ">", ".", ",", ";", '"', "'", "("]);
 
 export type DesignCheckRun = {
   name: string;
@@ -15,9 +22,25 @@ export type DesignCheckRun = {
   headSha: string;
 };
 
+function trimTrailingUrlJunk(value: string): string {
+  let end = value.length;
+  while (end > 0 && TRAILING_URL_JUNK.has(value[end - 1] ?? "")) end -= 1;
+  return value.slice(0, end);
+}
+
+/** Drop wrappers and trailing punctuation, then keep the URL's own characters. */
+function figmaUrlText(raw: string): string {
+  const value = raw.trim();
+  const start = value.search(/https?:\/\/(?:www\.)?figma\.com\//i);
+  if (start < 0) return trimTrailingUrlJunk(value);
+  let end = start;
+  while (end < value.length && FIGMA_URL_CHARS.has(value[end] ?? "")) end += 1;
+  return trimTrailingUrlJunk(value.slice(start, end));
+}
+
 /** One Figma URL, comparable across description, comments, and attachments. */
 export function normalizeFigmaUrl(raw: string): string {
-  const trimmed = raw.trim().replace(/(?:\]\(|[)\].,>])+$/g, "");
+  const trimmed = figmaUrlText(raw);
   let parsed: URL;
   try {
     parsed = new URL(trimmed);
@@ -33,11 +56,14 @@ export function normalizeFigmaUrl(raw: string): string {
 }
 
 export function figmaUrlsFromText(text: string): string[] {
-  const found = text.match(FIGMA_URL_RE) ?? [];
   const urls: string[] = [];
-  for (const raw of found) {
-    const url = normalizeFigmaUrl(raw);
-    if (!urls.includes(url)) urls.push(url);
+  for (const match of text.matchAll(new RegExp(FIGMA_START_RE.source, "gi"))) {
+    const start = match.index ?? 0;
+    let end = start;
+    while (end < text.length && FIGMA_URL_CHARS.has(text[end] ?? "")) end += 1;
+    const url = normalizeFigmaUrl(text.slice(start, end));
+    if (!url.startsWith("https://www.figma.com/") || urls.includes(url)) continue;
+    urls.push(url);
   }
   return urls;
 }
@@ -177,7 +203,7 @@ export function figmaTokenValue(input: {
 export function parseFigmaTarget(url: string): { fileKey: string; nodeId: string | null } | null {
   let parsed: URL;
   try {
-    parsed = new URL(url);
+    parsed = new URL(normalizeFigmaUrl(url));
   } catch {
     return null;
   }

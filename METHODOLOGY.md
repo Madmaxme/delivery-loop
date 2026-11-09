@@ -16,7 +16,7 @@ Check-runs use the token printed by `DELIVERY_LOOP_GITHUB_MINT` when that comman
 
 When `DELIVERY_LOOP_GITHUB_MINT` is set, each run mints once at startup and reads `/rate_limit` with that token. Later check-runs reuse it. A failed mint or rate-limit read is logged and the run continues. That read is not a check.
 
-A Figma frame URL is the `figma.com` address. A 400 includes Figma's `err` or `message` and stops as a rejected request. A 403 or 404 stops as access and names `design.figmaTokenEnv`. The token, the headers, and a URL that contains a token are not written.
+A Figma frame URL is the `figma.com` address. Surrounding markdown and a trailing `)` `]` `>` `.` `,` `;` or quote are not part of it. `node-id=1-2` is read as `1:2`. A 400 includes Figma's `err` or `message` and stops as a rejected request. A 403 or 404 stops as access and names `design.figmaTokenEnv`. The token, the headers, and a URL that contains a token are not written.
 
 ## Credential log
 

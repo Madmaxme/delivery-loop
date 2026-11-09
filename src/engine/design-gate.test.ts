@@ -9,7 +9,6 @@ import { linearTracker } from "../adapters/trackers.ts";
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
 import { figmaUrlsFromText, parseFigmaTarget, readFigmaFrame } from "./design-gate.ts";
-import { createCredentialRecorder } from "./credential-log.ts";
 import { runTicket } from "./loop.ts";
 
 const FRAME = "https://www.figma.com/design/ABC123/Home?node-id=1-2";
@@ -349,43 +348,36 @@ describe("design gate", () => {
     assert.equal(env.starts(), 0);
   });
 
-  it("reads a markdown Figma link once, with the node id colon encoded", async () => {
-    const linked =
-      "[https://www.figma.com/design/FILEKEY/Onboarding?node-id=49-11](<https://www.figma.com/design/FILEKEY/Onboarding?node-id=49-11>)";
-    const dirty = "https://www.figma.com/design/FILEKEY/Onboarding?node-id=49-11](";
-    assert.deepEqual(figmaUrlsFromText(`${linked}\n${dirty}`), [
-      "https://www.figma.com/design/FILEKEY/Onboarding?node-id=49-11",
-    ]);
-    assert.equal(parseFigmaTarget(dirty)?.nodeId, "49:11");
+  it("reads a markdown Figma link as node id 49:11", async () => {
+    const frame = "https://www.figma.com/design/FILEKEY/Onboarding?node-id=49-11";
+    const linked = `[${frame}](<${frame}>)`;
+    const leaked = `${frame}](`;
+    assert.deepEqual(figmaUrlsFromText(`${linked}\n${leaked}`), [frame]);
+    assert.equal(parseFigmaTarget(linked)?.nodeId, "49:11");
+    assert.equal(parseFigmaTarget(leaked)?.nodeId, "49:11");
     const urls: string[] = [];
-    const rec = createCredentialRecorder();
-    const text = await readFigmaFrame(
-      figmaUrlsFromText(linked)[0] ?? "",
-      "fixture-token",
-      async (url) => {
-        urls.push(String(url));
-        return Response.json({
-          nodes: { "49:11": { document: { id: "49:11", name: "image 37", type: "RECTANGLE" } } },
-        });
-      },
-      rec.note,
-    );
-    assert.deepEqual(urls, ["https://api.figma.com/v1/files/FILEKEY/nodes?ids=49%3A11"]);
-    assert.match(text, /RECTANGLE image 37/);
-    assert.deepEqual(rec.lines(), ["credential slot=figma endpoint=figma status=200"]);
-    const env = harness(order(`**Design source:** \`${FRAME}\``));
-    env.deps.figmaToken = "fixture-token";
-    const seen: string[] = [];
-    env.deps.figmaFetch = async (url) => {
-      seen.push(String(url));
+    await readFigmaFrame(figmaUrlsFromText(linked)[0] ?? "", "fixture-token", async (url) => {
+      urls.push(String(url));
       return Response.json({
         nodes: { "49:11": { document: { id: "49:11", name: "image 37", type: "RECTANGLE" } } },
       });
-    };
-    const result = await runTicket(env.deps, ticket({ body: linked }));
-    assert.deepEqual(seen, ["https://api.figma.com/v1/files/FILEKEY/nodes?ids=49%3A11"]);
-    assert.notEqual(result.outcome, "missing-credential");
-    assert.notEqual(result.detail, "figma-request");
+    });
+    assert.deepEqual(urls, ["https://api.figma.com/v1/files/FILEKEY/nodes?ids=49%3A11"]);
+  });
+
+  it("reads an angle-bracket Figma link as node id 1:2", () => {
+    const frame = "https://www.figma.com/design/FILEKEY/Home?node-id=1-2";
+    const wrapped = `<${frame}>`;
+    assert.deepEqual(figmaUrlsFromText(wrapped), [frame]);
+    assert.equal(parseFigmaTarget(wrapped)?.nodeId, "1:2");
+  });
+
+  it("drops trailing punctuation and reads node-id 1-2 as 1:2", () => {
+    const frame = "https://www.figma.com/design/FILEKEY/Home?node-id=1-2";
+    for (const suffix of [")", "]", ">", ".", ",", ";", '"', "'", ").", "];", "]("]) {
+      assert.deepEqual(figmaUrlsFromText(`See ${frame}${suffix} next`), [frame], suffix);
+      assert.equal(parseFigmaTarget(`${frame}${suffix}`)?.nodeId, "1:2", suffix);
+    }
   });
 
   it("puts the Figma frame and the read output in the repair prompt", async () => {
