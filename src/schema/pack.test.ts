@@ -58,9 +58,15 @@ ship:
     );
     assert.equal(pack.symbolsCommand, "node scripts/code-graph.mjs --check");
     assert.equal(pack.journeyCommand, "node scripts/journey-proof.mjs");
+    assert.equal(pack.journeySpec, "{e2e,integration_test,journey}/**");
     assert.equal(pack.ship?.afterDev, true);
     assert.equal(pack.ship?.markStatus, false);
     assert.deepEqual(pack.ship?.steps, ["./scripts/ship.sh"]);
+  });
+
+  it("keeps a journey spec pattern and treats a directory as that tree", () => {
+    assert.equal(loadPack(write(base)).journeySpec, "{e2e,integration_test,journey}/**");
+    assert.equal(loadPack(write(`${base}\njourneySpec: test/e2e\n`)).journeySpec, "test/e2e/**");
   });
 
   it("keeps a scoped promote command on the dev block", () => {

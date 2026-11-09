@@ -753,11 +753,11 @@ describe("loop", () => {
   it("marks dev-done when the route test is on the merge commit", async () => {
     const ground = BUILDABLE.replace(
       "**Journey evidence:** not-applicable",
-      "**Journey evidence:** recorded\n**Journey proof:** `api/test/signup_route_test.dart`",
+      "**Journey evidence:** recorded\n**Journey proof:** `api/integration_test/signup_route_test.dart`",
     );
     const env = harness(ground);
     env.deps.journeyFileAt = ({ repo, ref, path }) =>
-      repo === "api" && ref === "trunk" && path === "test/signup_route_test.dart";
+      repo === "api" && ref === "trunk" && path === "integration_test/signup_route_test.dart";
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
     assert.equal(env.state(), "Dev");
@@ -766,7 +766,7 @@ describe("loop", () => {
   it("leaves the ticket in intake when the route test is not on the merge commit", async () => {
     const ground = BUILDABLE.replace(
       "**Journey evidence:** not-applicable",
-      "**Journey evidence:** recorded\n**Journey proof:** `api/test/signup_route_test.dart`",
+      "**Journey evidence:** recorded\n**Journey proof:** `api/integration_test/signup_route_test.dart`",
     );
     const env = harness(ground);
     env.deps.journeyFileAt = () => false;
@@ -1360,6 +1360,74 @@ describe("loop", () => {
       env.deps,
       ticket({
         comments: [
+          { body: proof[0] },
+          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
+        ],
+      }),
+    );
+    assert.equal(again.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+    assert.equal(env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->")).length, 1);
+  });
+
+  it("does not accept an api unit spec as journey proof", async () => {
+    const ground = BUILDABLE.replace(
+      "**Journey evidence:** not-applicable",
+      "**Journey evidence:** recorded\n**Journey proof:** `api/test/pay.spec.ts`",
+    );
+    const env = harness(ground);
+    env.deps.journeyFileAt = () => true;
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(result.detail, "recorded proof missing");
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("does not advance a resumed land without recorded proof", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "trunk";
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => ({ status: 0, stdout: "**Journey proof:** `api/test/pay.spec.ts`" });
+    env.deps.journeyFileAt = () => true;
+    const waiting = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          { body: "**Journey evidence:** recorded\n**Journey proof:** `api/test/pay.spec.ts`" },
+          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
+        ],
+      }),
+    );
+    assert.equal(waiting.outcome, "journey-missing");
+    assert.equal(env.state(), "Todo");
+    assert.equal(env.comments.some((body) => body.includes("<!-- PROOF_RECEIPT -->")), false);
+  });
+
+  it("advances a resumed land when recorded proof is present and posts that comment once", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "trunk";
+    env.deps.journeyFileAt = ({ path }) => path === "e2e/signup.spec.ts";
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => ({ status: 0, stdout: "**Journey proof:** `api/e2e/signup.spec.ts`" });
+    const first = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          { body: "**Journey evidence:** recorded" },
+          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
+        ],
+      }),
+    );
+    assert.equal(first.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+    const proof = env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->"));
+    assert.equal(proof.length, 1);
+    env.deps.runPackCommand = () => ({ status: 1, stdout: "" });
+    const again = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          { body: "**Journey evidence:** recorded" },
           { body: proof[0] },
           { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
         ],

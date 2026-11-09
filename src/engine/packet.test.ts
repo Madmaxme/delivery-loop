@@ -62,12 +62,12 @@ describe("journey evidence", () => {
   it("reads a recording URL and a route-test path, and ignores a sentence", () => {
     const text = [
       "**Journey proof:** `https://example.test/artifacts/signup.mp4`",
-      "**Journey proof:** `api/test/signup_route_test.dart`",
+      "**Journey proof:** `api/integration_test/signup_route_test.dart`",
       "**Journey proof:** the journey was walked",
     ].join("\n");
     assert.deepEqual(parseJourneyProofs(text), [
       { kind: "recording", url: "https://example.test/artifacts/signup.mp4" },
-      { kind: "route-test", repo: "api", path: "test/signup_route_test.dart" },
+      { kind: "route-test", repo: "api", path: "integration_test/signup_route_test.dart" },
     ]);
   });
 
@@ -79,12 +79,34 @@ describe("journey evidence", () => {
   });
 
   it("accepts a route test only when the file is on the commit", () => {
-    const declared = "**Journey evidence:** recorded\n**Journey proof:** `api/test/signup_route_test.dart`";
+    const declared =
+      "**Journey evidence:** recorded\n**Journey proof:** `api/integration_test/signup_route_test.dart`";
     assert.equal(
-      journeyEvidenceProven(declared, "", (repo, path) => repo === "api" && path === "test/signup_route_test.dart"),
+      journeyEvidenceProven(
+        declared,
+        "",
+        (repo, path) => repo === "api" && path === "integration_test/signup_route_test.dart",
+      ),
       true,
     );
     assert.equal(journeyEvidenceProven(declared, declared, () => false), false);
+  });
+
+  it("accepts a journey spec and leaves an api unit spec out", () => {
+    const text = [
+      "**Journey proof:** `api/test/pay.spec.ts`",
+      "**Journey proof:** `api/e2e/signup.spec.ts`",
+    ].join("\n");
+    assert.deepEqual(parseJourneyProofs(text), [
+      { kind: "route-test", repo: "api", path: "e2e/signup.spec.ts" },
+    ]);
+    const unit = "**Journey evidence:** recorded\n**Journey proof:** `api/test/pay.spec.ts`";
+    assert.equal(journeyEvidenceProven(unit, unit, () => true), false);
+    const journey = "**Journey evidence:** recorded\n**Journey proof:** `api/e2e/signup.spec.ts`";
+    assert.equal(
+      journeyEvidenceProven(journey, "", (repo, path) => repo === "api" && path === "e2e/signup.spec.ts"),
+      true,
+    );
   });
 
   it("keeps an already-shipped journey in intake until the proof is real", () => {

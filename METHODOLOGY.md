@@ -6,7 +6,7 @@
 
 ## Roles
 
-The orchestrator talks to the owner. The engineering bot owns the code and runs the loop. It dispatches sweeps, launches cloud agents, and merges, or leaves the merge to the lander or the engine-heal workflow. The lander opens one pull request per land repo and squash-merges it. Before `status.dev`, the engine posts one comment with the validated proof receipt, the merged SHA, and the pull request URL, and a resume reuses that comment. GitHub is the record of the pull request, the checks, and the merge.
+The orchestrator talks to the owner. The engineering bot owns the code and runs the loop. It dispatches sweeps, launches cloud agents, and merges, or leaves the merge to the lander or the engine-heal workflow. The lander opens one pull request per land repo and squash-merges it. Before `status.dev`, the engine posts one comment with the validated proof receipt, the merged SHA, and the pull request URL, and a resume reuses that comment. A resume applies the same recorded-proof check. A route-test proof matches `journeySpec`. A spec outside that pattern is not proof. GitHub is the record of the pull request, the checks, and the merge.
 
 ## Merge
 

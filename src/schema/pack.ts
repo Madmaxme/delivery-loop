@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 
+import { journeySpecPattern } from "../../scripts/journey-proof.mjs";
+
 /** Writes to `repos` are refused unless the token's GitHub login is `login`. */
 export type CommitActor = {
   login: string;
@@ -164,6 +166,13 @@ export type ProjectPack = {
    */
   journeyCommand?: string;
   /**
+   * Path pattern for an end-to-end journey spec, relative to the repo.
+   * A route-test proof matches this pattern. Absent uses
+   * `{e2e,integration_test,journey}/**`. A directory name is that tree.
+   * A spec outside the pattern is not journey proof.
+   */
+  journeySpec?: string;
+  /**
    * Pack-owned production steps. `markStatus` defaults to true.
    * Set it false when a step already moves the ticket to the prod state
    * (for example a store park that must not be marked shipped early).
@@ -234,6 +243,7 @@ export function loadPack(path: string): ProjectPack {
   raw.qualityWorkflow = raw.qualityWorkflow || "quality";
   raw.connectors = raw.connectors ?? [];
   raw.commitActors = raw.commitActors ?? [];
+  raw.journeySpec = journeySpecPattern(raw.journeySpec);
   raw.invariantsFile = raw.invariantsFile || "invariants.md";
   raw.prompts = {
     ground: raw.prompts?.ground ?? [],
