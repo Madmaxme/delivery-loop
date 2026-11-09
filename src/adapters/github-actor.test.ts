@@ -8,7 +8,7 @@ describe("commit actor", () => {
     const actors = [{ login: "Madmaxme", repos: ["https://github.com/Madmaxme/delivery-loop.git"] }];
     assert.equal(githubRepoKey("git@github.com:Madmaxme/delivery-loop.git"), "madmaxme/delivery-loop");
     assert.equal(commitActorLogin(actors, "https://github.com/Madmaxme/delivery-loop"), "Madmaxme");
-    assert.equal(commitActorLogin(actors, "https://github.com/Quickwash-tech/api"), null);
+    assert.equal(commitActorLogin(actors, "https://github.com/other/api"), null);
   });
 
   it("refuses a token that is not the commit actor", () => {

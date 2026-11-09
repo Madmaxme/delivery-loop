@@ -7,7 +7,7 @@ import { describe, it } from "node:test";
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
-import { formatTicketProgress, latestLandMarker, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage } from "./loop.ts";
+import { ciFixLimit, formatTicketProgress, latestLandMarker, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage } from "./loop.ts";
 import { classifyQualityCause } from "./quality-cause.ts";
 import { ownerHealPrompt } from "./stall.ts";
 
@@ -172,7 +172,7 @@ describe("loop", () => {
     assert.equal(result.outcome, "verdict");
     assert.match(prompt, /INSTALL GROUND DOC/);
     assert.doesNotMatch(prompt, /INSTALL BUILD DOC/);
-    assert.doesNotMatch(prompt, /money\//);
+    assert.match(prompt, /prefix\/slug/);
     assert.match(prompt, /every caller uses that owner/);
     assert.match(prompt, /Prior request/);
     assert.match(prompt, /Journey evidence/);
@@ -829,7 +829,7 @@ describe("loop", () => {
     assert.equal(env.comments.some((body) => body.includes('"id":')), false);
   });
 
-  it("moves a packet-cited needs-rescope to shaping", async () => {
+  it("moves a packet-cited needs-rescope to the hold status", async () => {
     const env = harness("**Verdict:** NEEDS RESCOPE\n\n**Harness packet:** no safe default remains.");
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "verdict");
@@ -868,8 +868,8 @@ describe("loop", () => {
     assert.equal(saw, "Billing");
     assert.match(prompt, /## Delivery program \(full project\)/);
     assert.match(prompt, /API-1 Todo/);
+    assert.match(prompt, /Project: Billing/);
     assert.match(prompt, /Hold \/ Dev/);
-    assert.doesNotMatch(prompt, /Shaping|Soon|qws-workspace|QuickWash/);
   });
 
   it("stops one ticket when a connector is missing and continues the sweep", async () => {
@@ -1791,5 +1791,46 @@ describe("loop", () => {
     };
     await ship(env.deps, "API-1");
     assert.equal(state, "Dev");
+  });
+});
+
+describe("ci fix limit", () => {
+  function withFixMax(value: string | undefined, run: () => void) {
+    const previous = process.env.DELIVERY_LOOP_CI_FIX_MAX;
+    if (value === undefined) delete process.env.DELIVERY_LOOP_CI_FIX_MAX;
+    else process.env.DELIVERY_LOOP_CI_FIX_MAX = value;
+    try {
+      run();
+    } finally {
+      if (previous === undefined) delete process.env.DELIVERY_LOOP_CI_FIX_MAX;
+      else process.env.DELIVERY_LOOP_CI_FIX_MAX = previous;
+    }
+  }
+
+  it("reads DELIVERY_LOOP_CI_FIX_MAX", () => {
+    const env = harness(BUILDABLE);
+    withFixMax("3", () => {
+      assert.equal(ciFixLimit({ ...env.deps, ciFixMax: undefined }), 3);
+    });
+  });
+
+  it("uses 5 when the variable is unset or not a positive integer", () => {
+    const env = harness(BUILDABLE);
+    withFixMax(undefined, () => {
+      assert.equal(ciFixLimit({ ...env.deps, ciFixMax: undefined }), 5);
+    });
+    for (const raw of ["0", "-2", "no", ""]) {
+      withFixMax(raw, () => {
+        assert.equal(ciFixLimit({ ...env.deps, ciFixMax: undefined }), 5);
+      });
+    }
+  });
+
+  it("uses the caller override before the environment", () => {
+    const env = harness(BUILDABLE);
+    withFixMax("3", () => {
+      assert.equal(ciFixLimit({ ...env.deps, ciFixMax: 1 }), 1);
+      assert.equal(ciFixLimit({ ...env.deps, ciFixMax: 0 }), 0);
+    });
   });
 });
