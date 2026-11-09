@@ -72,6 +72,10 @@ The worker pushes a branch. The lander opens the pull request, waits until quali
 
 The github forge reads check-runs with the token printed by `DELIVERY_LOOP_GITHUB_MINT` when that command is set. Other forge calls keep the forge token. The command prints a token, or one JSON object with `token` and `expires_at`. A bare token expires 60 minutes after the mint. The forge mints again when five minutes or less remain. A 401 or 403 from check-runs is a credential error. The forge does not read that check from another endpoint.
 
+When `DELIVERY_LOOP_GITHUB_MINT` is set, each run mints once at startup and reads `/rate_limit` with that token. Later check-runs reuse it. A failed mint or rate-limit read is logged and the run continues. That read is not a check.
+
+A Figma frame URL is the `figma.com` address. A 400 includes Figma's `err` or `message` and stops as a rejected request. A 403 or 404 stops as access and names `design.figmaTokenEnv`. The token, the headers, and a URL that contains a token are not written.
+
 Each credential call logs its slot, endpoint class, and status, success included. A re-mint near expiry adds `refresh=1`. The run ends with a count by slot, endpoint class, and status. The token, the headers, and the request URL are not written. A worker launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. A recorded proof that passes, a promote or ship command that exits 0, and a squash that returns a commit each write one success line.
 
 ## Promote and ship

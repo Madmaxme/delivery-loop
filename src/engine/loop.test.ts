@@ -404,6 +404,17 @@ describe("loop", () => {
     assert.equal(sweepNeedsAnotherPage(results), true);
   });
 
+  it("probes configured credentials once at the start of a sweep", async () => {
+    const env = harness(BUILDABLE);
+    let probes = 0;
+    env.deps.forge.probeCredentials = async () => {
+      probes += 1;
+    };
+    env.deps.tracker.listIntake = async () => [];
+    await sweep(env.deps);
+    assert.equal(probes, 1);
+  });
+
   it("runs a dependent in the same sweep after its blocker lands", async () => {
     const env = harness(BUILDABLE);
     let reads = 0;

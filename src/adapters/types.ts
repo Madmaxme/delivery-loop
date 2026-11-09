@@ -123,6 +123,11 @@ export type ForgeAdapter = {
    */
   designCheck?(input: { repoUrl: string; headSha: string; name: string }): Promise<DesignCheckProbe>;
   /**
+   * One startup read of each configured credential. A forge with nothing to
+   * probe omits this. A failed probe is logged and does not stop the run.
+   */
+  probeCredentials?(): Promise<void>;
+  /**
    * One empty commit on an existing head so a pull_request workflow can start.
    * Returns the new SHA, or null when this head already requested that run.
    */

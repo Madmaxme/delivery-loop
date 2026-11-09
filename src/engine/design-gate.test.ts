@@ -8,6 +8,8 @@ import { githubForge } from "../adapters/forge-github.ts";
 import { linearTracker } from "../adapters/trackers.ts";
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
+import { figmaUrlsFromText, parseFigmaTarget, readFigmaFrame } from "./design-gate.ts";
+import { createCredentialRecorder } from "./credential-log.ts";
 import { runTicket } from "./loop.ts";
 
 const FRAME = "https://www.figma.com/design/ABC123/Home?node-id=1-2";
@@ -321,6 +323,69 @@ describe("design gate", () => {
     assert.match(env.comments.join("\n"), /Share the file with the account that owns FIGMA_ACCESS_TOKEN/);
     assert.equal(env.starts(), 0);
     assert.equal(env.merged(), false);
+  });
+
+  it("stops before ground when the Figma file is missing", async () => {
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    env.deps.figmaFetch = async () => Response.json({ message: "Not found" }, { status: 404 });
+    const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
+    assert.equal(result.outcome, "missing-credential");
+    assert.equal(result.detail, "figma");
+    assert.match(env.comments.join("\n"), /figma read failed: 404 Not found/);
+    assert.match(env.comments.join("\n"), /Share the file with the account that owns FIGMA_ACCESS_TOKEN/);
+    assert.equal(env.starts(), 0);
+  });
+
+  it("reports a Figma 400 as a rejected request and keeps the API reason", async () => {
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    env.deps.figmaFetch = async () => Response.json({ err: "Node id is invalid" }, { status: 400 });
+    const result = await runTicket(env.deps, ticket({ body: `Use ${FRAME}` }));
+    assert.equal(result.outcome, "invalid-packet");
+    assert.equal(result.detail, "figma-request");
+    assert.match(env.comments.join("\n"), /figma read failed: 400 Node id is invalid/);
+    assert.equal(/Share the file/.test(env.comments.join("\n")), false);
+    assert.equal(env.starts(), 0);
+  });
+
+  it("reads a markdown Figma link once, with the node id colon encoded", async () => {
+    const linked =
+      "[https://www.figma.com/design/FILEKEY/Onboarding?node-id=49-11](<https://www.figma.com/design/FILEKEY/Onboarding?node-id=49-11>)";
+    const dirty = "https://www.figma.com/design/FILEKEY/Onboarding?node-id=49-11](";
+    assert.deepEqual(figmaUrlsFromText(`${linked}\n${dirty}`), [
+      "https://www.figma.com/design/FILEKEY/Onboarding?node-id=49-11",
+    ]);
+    assert.equal(parseFigmaTarget(dirty)?.nodeId, "49:11");
+    const urls: string[] = [];
+    const rec = createCredentialRecorder();
+    const text = await readFigmaFrame(
+      figmaUrlsFromText(linked)[0] ?? "",
+      "fixture-token",
+      async (url) => {
+        urls.push(String(url));
+        return Response.json({
+          nodes: { "49:11": { document: { id: "49:11", name: "image 37", type: "RECTANGLE" } } },
+        });
+      },
+      rec.note,
+    );
+    assert.deepEqual(urls, ["https://api.figma.com/v1/files/FILEKEY/nodes?ids=49%3A11"]);
+    assert.match(text, /RECTANGLE image 37/);
+    assert.deepEqual(rec.lines(), ["credential slot=figma endpoint=figma status=200"]);
+    const env = harness(order(`**Design source:** \`${FRAME}\``));
+    env.deps.figmaToken = "fixture-token";
+    const seen: string[] = [];
+    env.deps.figmaFetch = async (url) => {
+      seen.push(String(url));
+      return Response.json({
+        nodes: { "49:11": { document: { id: "49:11", name: "image 37", type: "RECTANGLE" } } },
+      });
+    };
+    const result = await runTicket(env.deps, ticket({ body: linked }));
+    assert.deepEqual(seen, ["https://api.figma.com/v1/files/FILEKEY/nodes?ids=49%3A11"]);
+    assert.notEqual(result.outcome, "missing-credential");
+    assert.notEqual(result.detail, "figma-request");
   });
 
   it("puts the Figma frame and the read output in the repair prompt", async () => {

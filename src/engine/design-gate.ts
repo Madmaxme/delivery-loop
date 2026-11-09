@@ -6,7 +6,7 @@ import type { DesignRepo, DesignSpec } from "../schema/pack.ts";
 import { credentialFetch, type CredentialNoteFn } from "./credential-log.ts";
 
 const FIGMA_URL_RE =
-  /https?:\/\/(?:www\.)?figma\.com\/(?:file|design|proto|board|slides)\/[A-Za-z0-9]+[^\s)<>"'`]*/gi;
+  /https?:\/\/(?:www\.)?figma\.com\/(?:file|design|proto|board|slides)\/[A-Za-z0-9]+[^\s()<>"'`\]]*/gi;
 
 export type DesignCheckRun = {
   name: string;
@@ -17,7 +17,7 @@ export type DesignCheckRun = {
 
 /** One Figma URL, comparable across description, comments, and attachments. */
 export function normalizeFigmaUrl(raw: string): string {
-  const trimmed = raw.trim().replace(/[)\].,>]+$/g, "");
+  const trimmed = raw.trim().replace(/(?:\]\(|[)\].,>])+$/g, "");
   let parsed: URL;
   try {
     parsed = new URL(trimmed);
@@ -187,7 +187,67 @@ export function parseFigmaTarget(url: string): { fileKey: string; nodeId: string
   const fileKey = parts[1];
   if (!fileKey) return null;
   const node = parsed.searchParams.get("node-id");
-  return { fileKey, nodeId: node ? node.replace(/-/g, ":") : null };
+  return { fileKey, nodeId: node ? figmaNodeId(node) : null };
+}
+
+/** A node id is the id token. Markdown punctuation after it is not part of the id. */
+function figmaNodeId(raw: string): string | null {
+  const token = /^[A-Za-z0-9:;_,-]+/.exec(raw)?.[0] ?? "";
+  if (!token) return null;
+  return token.replace(/-/g, ":");
+}
+
+/** Figma's `err` or `message`. The token and any URL are removed. */
+export function figmaReasonText(body: string, token: string): string {
+  let reason = "";
+  try {
+    const json = JSON.parse(body) as { err?: unknown; message?: unknown };
+    const picked = [json.err, json.message].find((item) => typeof item === "string" && item.trim());
+    if (typeof picked === "string") reason = picked;
+  } catch {
+    return "";
+  }
+  if (token) reason = reason.split(token).join("");
+  reason = reason.replace(/https?:\/\/\S+/gi, "").replace(/Bearer\s+\S+/gi, "");
+  reason = reason.replace(/\s+/g, " ").trim();
+  return reason.slice(0, 200);
+}
+
+export function figmaFailureStatuses(text: string): number[] {
+  const statuses: number[] = [];
+  for (const line of text.split("\n")) {
+    const match = /^figma read failed:\s*(\d{3})\b/i.exec(line.trim());
+    if (match) statuses.push(Number(match[1]));
+  }
+  return statuses;
+}
+
+/** 401, 403, and 404 are access. Any other failed read is a rejected request. */
+export function figmaReadStop(
+  block: string,
+  envName: string,
+): { outcome: "missing-credential" | "invalid-packet"; detail: string; footer: string } | null {
+  const statuses = figmaFailureStatuses(block);
+  if (statuses.length === 0) return null;
+  if (statuses.some((status) => status === 403 || status === 404)) {
+    return {
+      outcome: "missing-credential",
+      detail: "figma",
+      footer: `Share the file with the account that owns ${envName}. The ticket stays in intake.`,
+    };
+  }
+  if (statuses.some((status) => status === 401)) {
+    return {
+      outcome: "missing-credential",
+      detail: "figma",
+      footer: `The token in ${envName} was rejected. The ticket stays in intake.`,
+    };
+  }
+  return {
+    outcome: "invalid-packet",
+    detail: "figma-request",
+    footer: "The Figma request was rejected. The ticket stays in intake.",
+  };
 }
 
 /** Short frame description. The token is not copied into the text. */
@@ -200,8 +260,9 @@ export async function readFigmaFrame(
   const target = parseFigmaTarget(url);
   if (!target) return `unreadable figma url ${url}`;
   const path = target.nodeId
-    ? `/v1/files/${target.fileKey}/nodes?ids=${encodeURIComponent(target.nodeId)}`
-    : `/v1/files/${target.fileKey}?depth=1`;
+    ? `/v1/files/${encodeURIComponent(target.fileKey)}/nodes?ids=${encodeURIComponent(target.nodeId)}`
+    : `/v1/files/${encodeURIComponent(target.fileKey)}?depth=1`;
+  let reason = "";
   const response = await credentialFetch(
     "figma",
     "figma",
@@ -210,8 +271,14 @@ export async function readFigmaFrame(
         headers: { "X-Figma-Token": token },
       }),
     note,
+    async (clone) => {
+      reason = figmaReasonText(await clone.text(), token);
+      return reason || undefined;
+    },
   );
-  if (!response.ok) return `figma read failed: ${response.status}`;
+  if (!response.ok) {
+    return reason ? `figma read failed: ${response.status} ${reason}` : `figma read failed: ${response.status}`;
+  }
   const json = (await response.json()) as {
     name?: string;
     document?: { name?: string; type?: string };
