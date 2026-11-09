@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DEFAULT_JOURNEY_SPEC } from "../../scripts/journey-proof.mjs";
+import { interpretMintOutput, runMintCommand } from "../adapters/github-mint.ts";
 import type { CompareStatus, DesignCheckProbe, FetchLike, ForgeAdapter, ListedPull, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { agentHome, holdStatus, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
 import {
@@ -1317,13 +1318,13 @@ async function healShipStep(
 function refreshShipGithubToken(env: NodeJS.ProcessEnv): boolean {
   const command = env.DELIVERY_LOOP_GITHUB_MINT?.trim();
   if (!command) return false;
-  const result = spawnSync(command, { shell: true, encoding: "utf8" });
-  const token = (result.stdout ?? "").trim().split(/\n/).at(-1)?.trim() ?? "";
-  if (result.status !== 0 || !token) return false;
-  env.GH_TOKEN = token;
-  env.GITHUB_TOKEN = token;
-  process.env.GH_TOKEN = token;
-  process.env.GITHUB_TOKEN = token;
+  const result = runMintCommand(command);
+  const minted = result.status === 0 ? interpretMintOutput(result.stdout, Date.now()) : null;
+  if (!minted) return false;
+  env.GH_TOKEN = minted.token;
+  env.GITHUB_TOKEN = minted.token;
+  process.env.GH_TOKEN = minted.token;
+  process.env.GITHUB_TOKEN = minted.token;
   return true;
 }
 
@@ -1767,7 +1768,8 @@ async function alreadyFinished(deps: LoopDeps, ticket: Ticket): Promise<boolean>
 
 /**
  * Land the pull requests this ticket already has. Merged ones count as landed.
- * Open ones use the same quality and merge path. Missing proof stays on ground.
+ * Every open pull request is ready before the first squash. One that is not
+ * ready leaves the others unmerged. Missing proof stays on ground.
  */
 async function resumeExistingPulls(deps: LoopDeps, ticket: Ticket): Promise<TicketResult | null> {
   const found = await findTicketPulls(deps, ticket);
@@ -1782,6 +1784,7 @@ async function resumeExistingPulls(deps: LoopDeps, ticket: Ticket): Promise<Tick
     if (!row.mergedSha) continue;
     merged.push({ repo: row.repo, sha: row.mergedSha, url: row.url });
   }
+  const ready: OpenPull[] = [];
   for (const row of sortByPack(deps.pack, found.open, (item) => item.repo.name)) {
     const pr: OpenPull = {
       repo: row.repo,
@@ -1793,9 +1796,12 @@ async function resumeExistingPulls(deps: LoopDeps, ticket: Ticket): Promise<Tick
     };
     const prepared = await settleLand(deps, ticket, pr, texts.declared);
     if ("outcome" in prepared) return prepared;
-    const landed = await commitLand(deps, ticket, { ...pr, headSha: prepared.headSha });
+    ready.push({ ...pr, headSha: prepared.headSha });
+  }
+  for (const pr of ready) {
+    const landed = await commitLand(deps, ticket, pr);
     if ("outcome" in landed) return landed;
-    merged.push({ repo: row.repo, sha: landed.mergedSha, url: row.url });
+    merged.push({ repo: pr.repo, sha: landed.mergedSha, url: pr.url });
   }
   return finishMerged(deps, ticket, grant === "open", merged, texts.declared, texts.receipt);
 }

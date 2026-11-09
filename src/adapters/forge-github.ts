@@ -1,5 +1,11 @@
-import { designRunsWhenChecksForbidden } from "./checks-api-fallback.ts";
 import { interpretDesignChecks, type DesignCheckRun } from "../engine/design-gate.ts";
+import {
+  credentialDue,
+  interpretMintOutput,
+  runMintCommand,
+  type MintedCredential,
+  type MintRun,
+} from "./github-mint.ts";
 import {
   interpretQualityActions,
   qualityRunUnscheduled,
@@ -38,38 +44,30 @@ async function readCommit(
   };
 }
 
-type ApiGet = (path: string, init?: RequestInit) => Promise<Response>;
+/** A 401 or 403 from check-runs is a credential error. There is no other read. */
+export function checkRunsCredentialError(status: number, owner: string, repo: string): Error {
+  const err = new Error(
+    `credential error: GitHub check-runs returned ${status} for ${owner}/${repo}. ` +
+      "Set DELIVERY_LOOP_GITHUB_MINT to a command that prints a GitHub App installation token.",
+  );
+  (err as Error & { httpStatus: number }).httpStatus = status;
+  return err;
+}
 
-/** Checks API first. A 403 uses the Actions fallback in checks-api-fallback.ts. */
-export async function readDesignRuns(
-  api: ApiGet,
-  owner: string,
-  repo: string,
-  headSha: string,
-): Promise<DesignCheckRun[]> {
-  try {
-    const response = await api(
-      `/repos/${owner}/${repo}/commits/${headSha}/check-runs?per_page=100`,
-    );
-    const json = (await response.json()) as {
-      check_runs?: {
-        name?: string;
-        status?: string;
-        conclusion?: string | null;
-        head_sha?: string;
-      }[];
-    };
-    return (json.check_runs ?? []).map((run) => ({
-      name: run.name ?? "",
-      status: run.status ?? "",
-      conclusion: run.conclusion ?? null,
-      headSha: run.head_sha ?? "",
-    }));
-  } catch (error) {
-    const status = (error as { httpStatus?: number }).httpStatus;
-    if (status !== 403) throw error;
-    return designRunsWhenChecksForbidden(api, owner, repo, headSha);
-  }
+export function designRunsFromBody(json: {
+  check_runs?: {
+    name?: string;
+    status?: string;
+    conclusion?: string | null;
+    head_sha?: string;
+  }[];
+}): DesignCheckRun[] {
+  return (json.check_runs ?? []).map((run) => ({
+    name: run.name ?? "",
+    status: run.status ?? "",
+    conclusion: run.conclusion ?? null,
+    headSha: run.head_sha ?? "",
+  }));
 }
 
 export type PullListRow = {
@@ -136,6 +134,13 @@ export function githubForge(opts: {
   repo?: string;
   /** Writes to a listed repo require `GET /user` to be that login. */
   commitActors?: CommitActor[];
+  /**
+   * Command that prints an installation token for check-runs.
+   * Unset reads `DELIVERY_LOOP_GITHUB_MINT`. An empty string keeps the forge token.
+   */
+  mintCommand?: string;
+  nowMs?: () => number;
+  runMint?: (command: string) => MintRun;
 }): ForgeAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
@@ -151,6 +156,31 @@ export function githubForge(opts: {
     if (!expected) return;
     loginPromise ??= githubUserLogin(fetchImpl, opts.token);
     assertCommitActor(repoUrl, await loginPromise, expected);
+  }
+
+  let checksCredential: MintedCredential | null = null;
+
+  function mintCommand(): string {
+    if (opts.mintCommand !== undefined) return opts.mintCommand.trim();
+    return process.env.DELIVERY_LOOP_GITHUB_MINT?.trim() ?? "";
+  }
+
+  async function tokenForCheckRuns(): Promise<string> {
+    const command = mintCommand();
+    if (!command) return opts.token;
+    const now = (opts.nowMs ?? Date.now)();
+    if (checksCredential && !credentialDue(checksCredential.expiresAtMs, now)) {
+      return checksCredential.token;
+    }
+    const result = (opts.runMint ?? runMintCommand)(command);
+    const minted = result.status === 0 ? interpretMintOutput(result.stdout, now) : null;
+    if (!minted || minted.expiresAtMs <= now) {
+      throw new Error(
+        "credential error: DELIVERY_LOOP_GITHUB_MINT did not return an installation token that is still valid.",
+      );
+    }
+    checksCredential = minted;
+    return minted.token;
   }
 
   async function api(path: string, init?: RequestInit): Promise<Response> {
@@ -221,7 +251,24 @@ export function githubForge(opts: {
     },
     async designCheck(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);
-      const runs = await readDesignRuns(api, owner, repo, input.headSha);
+      const token = await tokenForCheckRuns();
+      const path = `/repos/${owner}/${repo}/commits/${input.headSha}/check-runs?per_page=100`;
+      const response = await fetchImpl(`https://api.github.com${path}`, {
+        headers: { ...headers, Authorization: `Bearer ${token}` },
+      });
+      if (response.status === 401 || response.status === 403) {
+        await response.text().catch(() => undefined);
+        throw checkRunsCredentialError(response.status, owner, repo);
+      }
+      if (!response.ok) {
+        await response.text().catch(() => undefined);
+        const err = new Error(`GitHub ${path} failed: ${response.status}`);
+        (err as Error & { httpStatus: number }).httpStatus = response.status;
+        throw err;
+      }
+      const runs = designRunsFromBody(
+        (await response.json()) as { check_runs?: { name?: string; status?: string; conclusion?: string | null; head_sha?: string }[] },
+      );
       return interpretDesignChecks(runs, input.headSha, input.name);
     },
     async quality(input) {

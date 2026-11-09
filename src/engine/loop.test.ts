@@ -1932,6 +1932,56 @@ describe("loop", () => {
     assert.equal(env.state(), "Dev");
   });
 
+  it("does not merge a ready pull request while another open surface is not ready", async () => {
+    const env = harness(BUILDABLE);
+    const api = { name: "api", url: "https://github.com/acme/api", trunk: "main" };
+    const web = { name: "web", url: "https://github.com/acme/web", trunk: "main" };
+    const mobile = { name: "mobile", url: "https://github.com/acme/mobile", trunk: "main" };
+    env.deps.pack = {
+      ...pack,
+      repos: [api, web, mobile],
+      branchTemplate: "cursor/{issue}-{repo}",
+    };
+    env.deps.sleep = async () => {};
+    let merges = 0;
+    env.deps.forge.squashMerge = async () => {
+      merges += 1;
+      return "c".repeat(40);
+    };
+    env.deps.forge.listPullRequests = async (input) => {
+      if (input.repoUrl.endsWith("/api")) {
+        return [listedPull({ number: 1, branch: input.head, base: input.base, state: "merged" })];
+      }
+      return [
+        listedPull({
+          number: input.repoUrl.endsWith("/web") ? 2 : 3,
+          branch: input.head,
+          base: input.base,
+          state: "open",
+          headSha: OPEN_SHA,
+        }),
+      ];
+    };
+    env.deps.forge.quality = async (input) => {
+      if (input.repoUrl.endsWith("/mobile")) throw new Error("mobile quality unread");
+      return { state: "success", detail: "quality success" };
+    };
+    env.deps.forge.mergeability = async () => ({ state: "clean", headSha: OPEN_SHA });
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "run-1" };
+    };
+    const result = await runTicket(
+      env.deps,
+      ticket({ comments: [{ body: audit("api, web, mobile") }] }),
+    );
+    assert.equal(merges, 0);
+    assert.equal(starts, 0);
+    assert.equal(result.outcome, "land-blocked");
+    assert.match(result.detail, /mobile quality unread/);
+  });
+
   it("promotes a ticket whose pull requests are already merged and posts the proof", async () => {
     const env = harness(BUILDABLE);
     const board = surfaceBoard(env, { refs: false });

@@ -42,6 +42,8 @@ jobs:
           GITHUB_ACTIONS: "true"
           DELIVERY_LOOP_RUNTIME: local
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          # Prints an installation token for check-runs. Empty keeps GH_TOKEN.
+          DELIVERY_LOOP_GITHUB_MINT: ${{ vars.DELIVERY_LOOP_GITHUB_MINT }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
