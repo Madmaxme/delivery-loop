@@ -24,6 +24,28 @@ qualityCommand: npm test
 `;
 
 describe("pack requirements", () => {
+  it("defaults the cursor key slot env names", () => {
+    const pack = loadPack(write(base));
+    assert.equal(pack.workerKeys?.primary, "CURSOR_API_KEY");
+    assert.equal(pack.workerKeys?.fallback, "CURSOR_API_KEY_FALLBACK");
+  });
+
+  it("keeps the env var names a client sets for the key slots", () => {
+    const pack = loadPack(
+      write(`${base}
+workerKeys:
+  primary: PRIMARY_SLOT
+  fallback: SECOND_SLOT
+`),
+    );
+    assert.equal(pack.workerKeys?.primary, "PRIMARY_SLOT");
+    assert.equal(pack.workerKeys?.fallback, "SECOND_SLOT");
+  });
+
+  it("refuses a workerKeys name that is not an env var", () => {
+    assert.throws(() => loadPack(write(`${base}\nworkerKeys:\n  primary: "not an env"\n`)), /workerKeys/);
+  });
+
   it("defaults the four slots without naming a project", () => {
     const pack = loadPack(write(base));
     assert.equal(pack.forge, "github");

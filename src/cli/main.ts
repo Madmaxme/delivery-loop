@@ -18,6 +18,7 @@ import {
   claudeWorker,
   codexWorker,
   copilotWorker,
+  cursorKeySlots,
   cursorWorker,
   httpWorker,
 } from "../adapters/workers.js";
@@ -27,7 +28,7 @@ import { findConnector } from "../connectors/catalog.js";
 import { deliver, ship, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
 import { shipInvocationDeps } from "./ship-deps.js";
 import { ghaDispatchFields, planDeliveryInvocation } from "../engine/delivery-runtime.js";
-import { defaultStatus, loadPack, type ProjectPack } from "../schema/pack.js";
+import { defaultStatus, loadPack, workerKeyNames, type ProjectPack } from "../schema/pack.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -154,7 +155,14 @@ export function adaptersFor(pack: ProjectPack): {
 }
 
 function workerFor(pack: ProjectPack): WorkerAdapter {
-  if (pack.worker === "cursor") return cursorWorker({ apiKey: requireEnv("CURSOR_API_KEY") });
+  if (pack.worker === "cursor") {
+    const names = workerKeyNames(pack);
+    const primary = process.env[names.primary];
+    if (!primary?.trim()) throw new Error(`${names.primary} is required`);
+    return cursorWorker({
+      slots: cursorKeySlots(primary, process.env[names.fallback]),
+    });
+  }
   if (pack.worker === "claude") return claudeWorker({ apiKey: requireEnv("ANTHROPIC_API_KEY") });
   if (pack.worker === "codex") return codexWorker({ apiKey: requireEnv("OPENAI_API_KEY") });
   if (pack.worker === "copilot") {

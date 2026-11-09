@@ -40,6 +40,7 @@ describe("installer", () => {
     assert.match(workflow, /https:\/\/github.com\/Madmaxme\/delivery-loop.git/);
     assert.doesNotMatch(workflow, /__DELIVERY_LOOP_REF__/);
     assert.match(workflow, /npm install --omit=dev/);
+    assert.match(workflow, /CURSOR_API_KEY_FALLBACK/);
     update(["--dir", dir]);
     assert.equal(readFileSync(join(dir, "delivery-loop.yaml"), "utf8"), before);
     assert.equal(readFileSync(join(dir, "invariants.md"), "utf8"), invariants);

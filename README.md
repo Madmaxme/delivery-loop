@@ -34,6 +34,23 @@ A worker run may write `delivery-loop.run.started` and `delivery-loop.run.finish
 
 A leftover `bots` key is ignored with a warning.
 
+## Worker keys
+
+The cursor worker launches with the env var named by `workerKeys.primary`, then the env var named by `workerKeys.fallback`. The defaults are `CURSOR_API_KEY` and `CURSOR_API_KEY_FALLBACK`. The log records the slot in use, `primary` or `fallback`. The value stays in the environment.
+
+```yaml
+workerKeys:
+  primary: <primary-env>
+  fallback: <fallback-env>
+```
+
+A capacity or balance refusal on the primary slot retries that launch once on the fallback slot.
+An authentication failure stops on the slot that returned it.
+A rate limit stops on the slot that returned it.
+A network failure stops on the slot that returned it.
+A refusal from both slots fails the launch and reports that both slots are out of capacity.
+An empty fallback variable leaves that launch on the primary slot.
+
 ## Contribute
 
 Clone this repo, branch from `main`, and open a pull request. The `quality` workflow runs the tests. Titles and bodies are in [CONTRIBUTING.md](CONTRIBUTING.md).
