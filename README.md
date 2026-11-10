@@ -77,11 +77,11 @@ A 5xx on a cursor launch waits one second and retries that slot once. A second 5
 
 ## HTTP worker
 
-`worker: http` posts the start request below to `workerHttp.startUrl`. The loop generates `id`. Without `statusStore`, it reads `workerHttp.statusUrl`. With `statusStore`, the loop writes a pending file through the forge before that POST and reads the same file afterward. The credential is the minted token, or the forge token when the mint command is unset. A missing `branch` is created from the default branch. A non-2xx seed fails the worker and does not start. A non-2xx start fails the worker and does not start another launcher.
+`worker: http` posts the start request below to `workerHttp.startUrl`. The loop generates `id`. Without `statusStore`, it reads `workerHttp.statusUrl`. With `statusStore`, the loop writes a pending file through the forge before start and reads the same file afterward. The credential is the minted token, or the forge token when the mint command is unset. A missing `branch` is created from the default branch. A non-2xx seed fails the worker and does not start. `request` replaces `startUrl`: after the seed the loop opens one forge issue, then assigns it. A non-2xx issue create or assign fails the worker and does not start another launcher. A non-2xx `startUrl` post fails the same way.
 
 `pollMs` defaults to 15000. `maxWaitMs` defaults to 3600000 and stays inside the hosted job budget of 360 minutes. Join sleeps `pollMs` between reads. `pending` and `running` stay open. `finished` and `failed` stop the wait. A spent `maxWaitMs` is a failed worker, detail `http worker join exceeded maxWaitMs`.
 
-Header maps name an env var, or `mint` or `gh-token`. `mint` is the minted installation token. `gh-token` is the forge token. No secret is stored in the pack. An http start logs `endpoint=worker-http-start`. A status read logs `endpoint=worker-http-status`. A seed logs `endpoint=worker-http-seed`. The request URL and the header values are not written.
+Header maps name an env var, or `mint` or `gh-token`. `mint` is the minted installation token. `gh-token` is the forge token. No secret is stored in the pack. An http start logs `endpoint=worker-http-start`. A status read logs `endpoint=worker-http-status`. A seed logs `endpoint=worker-http-seed`. An issue create logs `endpoint=worker-request-issue`. An assign logs `endpoint=worker-request-assign`. The request URL and the header values are not written.
 
 `model` is `{ id }` from `workerModel`. An absent `workerModel` omits it. A status URL body that is a base64 document (`encoding` of `base64` and `content`) is decoded as the result. A forge file read is the record itself.
 
@@ -102,7 +102,15 @@ workerHttp:
     repo: <owner/name>
     branch: <branch>
     path: worker-results/{id}.json
+  request:
+    kind: forge-issue
+    repo: <owner/name>
+    assignee: <login>
+    labels:
+      - <label>
 ```
+
+`request` replaces `startUrl` and requires `statusStore`. The issue title is `worker-request <id>`. The body is a fenced JSON block of the start record plus `requestedBy`. When that block is longer than 65536 characters, the full JSON is written at `worker-results/<id>.request.json` and the issue body is only that path.
 
 `statusUrl` stays the read path when `statusStore` is absent. `path` must contain `{id}`. The start body sends `statusStore` with that path filled in. The file written before the POST is `{"status":"pending","id","repoUrl","baseRef","requestedAt"}`. The relay updates that file. `pending` and `running` stay open. `finished` and `failed` stop the wait.
 

@@ -143,6 +143,39 @@ workerHttp:
     assert.equal(stored.workerHttp?.statusUrl, undefined);
     assert.equal(stored.workerHttp?.statusStore?.repo, "acme/store");
     assert.equal(stored.workerHttp?.statusStore?.path, "worker-results/{id}.json");
+    const issue = loadPack(
+      write(`${httpBase}
+workerHttp:
+  statusStore:
+    kind: forge
+    repo: acme/store
+    branch: results
+    path: worker-results/{id}.json
+  request:
+    kind: forge-issue
+    repo: acme/signals
+    assignee: relay-login
+    labels:
+      - run
+`),
+    );
+    assert.equal(issue.workerHttp?.startUrl, undefined);
+    assert.equal(issue.workerHttp?.request?.assignee, "relay-login");
+    assert.deepEqual(issue.workerHttp?.request?.labels, ["run"]);
+    assert.throws(
+      () =>
+        loadPack(
+          write(`${httpBase}
+workerHttp:
+  startUrl: https://host.example/start
+  request:
+    kind: forge-issue
+    repo: acme/signals
+    assignee: relay-login
+`),
+        ),
+      /request needs workerHttp.statusStore/,
+    );
     assert.throws(
       () =>
         loadPack(

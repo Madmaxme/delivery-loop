@@ -508,7 +508,7 @@ describe("adapters", () => {
       statusStore: { kind: "forge", repo: "acme/store", branch: "results", path: "worker-results/{id}.json" },
       files: {
         async write() {
-          return 403;
+          return { status: 403, actor: "" };
         },
         async read() {
           return { status: 200, text: "" };
@@ -524,6 +524,186 @@ describe("adapters", () => {
       /http worker seed failed: 403/,
     );
     assert.deepEqual(calls, []);
+  });
+
+  it("opens a forge issue after the seed and assigns it", async () => {
+    const rec = createCredentialRecorder();
+    const calls: string[] = [];
+    const forge = githubForge({
+      token: "forge-token",
+      mintCommand: "mint-installation-token",
+      runMint: () => ({ status: 0, stdout: "mint-token\n" }),
+      credentialNote: rec.note,
+      fetch: async (url, init) => {
+        const method = init?.method ?? "GET";
+        const href = String(url);
+        calls.push(`${method} ${href.split("?")[0]}`);
+        const headers = init?.headers as Record<string, string>;
+        assert.equal(headers.Authorization, "Bearer mint-token");
+        if (href.includes("/git/matching-refs/")) {
+          return jsonResponse([{ ref: "refs/heads/results", object: { sha: "abc123" } }]);
+        }
+        if (method === "PUT" && href.includes("/contents/")) {
+          return jsonResponse(
+            {
+              commit: { author: { name: "loop", email: "1+loop-bot[bot]@users.noreply.github.com" } },
+            },
+            201,
+          );
+        }
+        if (method === "POST" && href.endsWith("/issues")) {
+          const body = JSON.parse(String(init?.body)) as { title: string; body: string; labels?: string[]; assignees?: string[] };
+          assert.equal(body.title, "worker-request req-11");
+          assert.deepEqual(body.labels, ["run"]);
+          assert.equal(body.assignees, undefined);
+          const fenced = body.body.replace(/^```json\n/, "").replace(/\n```$/, "");
+          assert.deepEqual(JSON.parse(fenced), {
+            id: "req-11",
+            prompt: "ground the ticket",
+            repoUrl: "https://github.com/acme/api",
+            baseRef: "main",
+            model: { id: "model-4.7" },
+            statusStore: { repo: "acme/store", branch: "results", path: "worker-results/req-11.json" },
+            requestedBy: "loop-bot[bot]",
+          });
+          return jsonResponse({ number: 7 }, 201);
+        }
+        if (method === "POST" && href.endsWith("/assignees")) {
+          assert.equal(href.endsWith("/issues/7/assignees"), true);
+          assert.deepEqual(JSON.parse(String(init?.body)), { assignees: ["relay-login"] });
+          return jsonResponse({}, 201);
+        }
+        return jsonResponse({}, 500);
+      },
+    });
+    const worker = httpWorker({
+      model: "model-4.7",
+      newId: () => "req-11",
+      nowMs: () => Date.parse("2026-11-10T22:00:00.000Z"),
+      statusStore: { kind: "forge", repo: "acme/store", branch: "results", path: "worker-results/{id}.json" },
+      request: { kind: "forge-issue", repo: "acme/signals", assignee: "relay-login", labels: ["run"] },
+      files: {
+        write: (input) =>
+          forge.writeTextFile!({
+            repo: input.repo,
+            branch: input.branch,
+            path: input.path,
+            text: input.text,
+            message: input.message ?? "record a pending worker result",
+            endpoint: "worker-http-seed",
+          }),
+        read: (input) => forge.readTextFile!({ ...input, endpoint: "worker-http-status" }),
+      },
+      issues: {
+        open: (input) => forge.createIssue!({ ...input, endpoint: "worker-request-issue" }),
+        assign: (input) => forge.assignIssue!({ ...input, endpoint: "worker-request-assign" }),
+        actor: () => forge.actorLogin!(),
+      },
+      fetch: async () => {
+        calls.push("START");
+        return jsonResponse({}, 202);
+      },
+    });
+    const started = await worker.start({
+      prompt: "ground the ticket",
+      repoUrl: "https://github.com/acme/api",
+      baseRef: "main",
+    });
+    assert.equal(started.runId, "req-11");
+    assert.equal(calls.includes("START"), false);
+    const put = calls.findIndex((call) => call.startsWith("PUT "));
+    const issue = calls.findIndex((call) => call.endsWith("/issues"));
+    const assign = calls.findIndex((call) => call.endsWith("/assignees"));
+    assert.ok(put >= 0 && issue > put && assign > issue);
+    assert.ok(rec.lines().includes("credential slot=mint endpoint=worker-request-issue status=201"));
+    assert.ok(rec.lines().includes("credential slot=mint endpoint=worker-request-assign status=201"));
+    assert.equal(rec.lines().join("\n").includes("mint-token"), false);
+  });
+
+  it("does not assign when the forge issue is refused", async () => {
+    const steps: string[] = [];
+    const worker = httpWorker({
+      newId: () => "req-12",
+      statusStore: { kind: "forge", repo: "acme/store", branch: "results", path: "worker-results/{id}.json" },
+      request: { kind: "forge-issue", repo: "acme/signals", assignee: "relay-login" },
+      files: {
+        async write() {
+          steps.push("seed");
+          return { status: 201, actor: "loop-bot[bot]" };
+        },
+        async read() {
+          return { status: 200, text: "{}" };
+        },
+      },
+      issues: {
+        async open() {
+          steps.push("issue");
+          return { status: 422, number: 0 };
+        },
+        async assign() {
+          steps.push("assign");
+          return 201;
+        },
+        async actor() {
+          return "";
+        },
+      },
+    });
+    await assert.rejects(
+      () => worker.start({ prompt: "go", repoUrl: "https://github.com/acme/api", baseRef: "main" }),
+      /http worker request failed: 422/,
+    );
+    assert.deepEqual(steps, ["seed", "issue"]);
+  });
+
+  it("stores a large start body beside the record and puts that path on the issue", async () => {
+    const writes: { path: string; text: string }[] = [];
+    let issueBody = "";
+    const steps: string[] = [];
+    const worker = httpWorker({
+      model: "model-4.7",
+      newId: () => "req-13",
+      statusStore: { kind: "forge", repo: "acme/store", branch: "results", path: "worker-results/{id}.json" },
+      request: { kind: "forge-issue", repo: "acme/signals", assignee: "relay-login" },
+      files: {
+        async write(input) {
+          writes.push({ path: input.path, text: input.text });
+          steps.push(input.path.endsWith(".request.json") ? "request-file" : "seed");
+          return { status: 201, actor: "loop-bot[bot]" };
+        },
+        async read() {
+          return { status: 200, text: "{}" };
+        },
+      },
+      issues: {
+        async open(input) {
+          steps.push("issue");
+          issueBody = input.body;
+          return { status: 201, number: 4 };
+        },
+        async assign() {
+          steps.push("assign");
+          return 201;
+        },
+        async actor() {
+          steps.push("actor");
+          return "other";
+        },
+      },
+    });
+    const prompt = "p".repeat(70_000);
+    const started = await worker.start({
+      prompt,
+      repoUrl: "https://github.com/acme/api",
+      baseRef: "main",
+    });
+    assert.equal(started.runId, "req-13");
+    assert.deepEqual(steps, ["seed", "request-file", "issue", "assign"]);
+    assert.equal(issueBody, "worker-results/req-13.request.json");
+    const stored = JSON.parse(writes[1]?.text ?? "") as { prompt: string; requestedBy: string; statusStore: { path: string } };
+    assert.equal(stored.prompt, prompt);
+    assert.equal(stored.requestedBy, "loop-bot[bot]");
+    assert.equal(stored.statusStore.path, "worker-results/req-13.json");
   });
 
   it("starts a Copilot cloud task", async () => {

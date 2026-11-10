@@ -86,8 +86,21 @@ export type WorkerHttpStatusStore = {
   path: string;
 };
 
+/**
+ * Start signal written as a forge issue. Requires `statusStore`.
+ * `assignee` is applied in a second call so the forge emits an assignment.
+ */
+export type WorkerHttpRequest = {
+  kind: "forge-issue";
+  /** `owner/name`. */
+  repo: string;
+  assignee: string;
+  labels?: string[];
+};
+
 export type WorkerHttp = {
-  startUrl: string;
+  /** Absent when `request` opens a forge issue instead. */
+  startUrl?: string;
   /**
    * `{id}` is replaced with the request id. Without it, the id is the last path segment.
    * Absent when `statusStore` is set. Reads then use the store.
@@ -99,6 +112,11 @@ export type WorkerHttp = {
   statusHeaders?: WorkerHttpHeaders;
   /** When set, the loop seeds and reads this file through the forge. */
   statusStore?: WorkerHttpStatusStore;
+  /**
+   * When set, start opens a forge issue instead of posting `startUrl`.
+   * Requires `statusStore`.
+   */
+  request?: WorkerHttpRequest;
 };
 
 /**
@@ -169,6 +187,7 @@ export type ProjectPack = {
    * The header value is not stored here.
    * `statusStore` seeds a pending file through the forge before start.
    * Without it, status reads use `statusUrl`.
+   * `request` opens a forge issue after that seed. It replaces `startUrl`.
    */
   workerHttp?: WorkerHttp;
   repos: RepoSpec[];
@@ -417,8 +436,9 @@ function loadWorkerHttp(
   const startUrl = value.startUrl?.trim() ?? "";
   const statusUrl = value.statusUrl?.trim() ?? "";
   const statusStore = loadStatusStore(value.statusStore, path);
-  if (worker === "http" && !startUrl) {
-    throw new Error(`${path} worker http needs workerHttp.startUrl`);
+  const request = loadWorkerRequest(value.request, statusStore, path);
+  if (worker === "http" && !startUrl && !request) {
+    throw new Error(`${path} worker http needs workerHttp.startUrl or workerHttp.request`);
   }
   if (worker === "http" && !statusUrl && !statusStore) {
     throw new Error(`${path} worker http needs workerHttp.statusUrl or workerHttp.statusStore`);
@@ -441,14 +461,40 @@ function loadWorkerHttp(
     throw new Error(`${path} workerHttp.maxWaitMs stays inside the job budget`);
   }
   return {
-    startUrl,
+    ...(startUrl ? { startUrl } : {}),
     ...(statusUrl ? { statusUrl } : {}),
     pollMs,
     maxWaitMs,
     startHeaders: loadHeaderMap(value.startHeaders, path, "startHeaders"),
     statusHeaders: loadHeaderMap(value.statusHeaders, path, "statusHeaders"),
     ...(statusStore ? { statusStore } : {}),
+    ...(request ? { request } : {}),
   };
+}
+
+const FORGE_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+
+function loadWorkerRequest(
+  value: WorkerHttpRequest | undefined,
+  statusStore: WorkerHttpStatusStore | undefined,
+  path: string,
+): WorkerHttpRequest | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!statusStore) throw new Error(`${path} workerHttp.request needs workerHttp.statusStore`);
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${path} workerHttp.request is a forge issue`);
+  }
+  const kind = value.kind?.trim();
+  const repo = value.repo?.trim() ?? "";
+  const assignee = value.assignee?.trim() ?? "";
+  if (kind !== "forge-issue" || !STORE_REPO.test(repo) || !FORGE_LOGIN.test(assignee)) {
+    throw new Error(`${path} workerHttp.request is a forge issue`);
+  }
+  const labels = (value.labels ?? []).map((label) => (typeof label === "string" ? label.trim() : ""));
+  if (labels.some((label) => !label || /[\r\n]/.test(label))) {
+    throw new Error(`${path} workerHttp.request labels are names`);
+  }
+  return { kind: "forge-issue", repo, assignee, ...(labels.length ? { labels } : {}) };
 }
 
 const STORE_REPO = /^[^/\s]+\/[^/\s]+$/;

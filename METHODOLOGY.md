@@ -74,7 +74,7 @@ A 5xx on a cursor launch waits one second and retries that slot once. A second 5
 
 ## HTTP worker
 
-`worker: http` posts a start request to `workerHttp.startUrl`, then reads until the result is terminal. The loop generates the request id and sends it on start. Without `statusStore`, it reads `workerHttp.statusUrl`. With `statusStore`, the loop writes a pending file through the forge before the start POST, using the minted token or the forge token, and creates `branch` from the default branch when it is missing. Status reads then come from that file, so each read is a 200 file read. A non-2xx seed fails the worker and does not start. The seed logs `endpoint=worker-http-seed`. A non-2xx start fails that worker. It does not start another launcher.
+`worker: http` posts a start request to `workerHttp.startUrl`, then reads until the result is terminal. The loop generates the request id and sends it on start. Without `statusStore`, it reads `workerHttp.statusUrl`. With `statusStore`, the loop writes a pending file through the forge before start, using the minted token or the forge token, and creates `branch` from the default branch when it is missing. Status reads then come from that file, so each read is a 200 file read. A non-2xx seed fails the worker and does not start. The seed logs `endpoint=worker-http-seed`. When `request` is set, start does not post `startUrl`. After the seed it opens one forge issue titled `worker-request <id>`, then assigns `assignee` in a second call. The issue body is a fenced JSON block of the start record plus `requestedBy`, the login recorded for the forge credential. When that block is longer than 65536 characters, the full record is written beside the pending file at `<path-without-json>.request.json` and the issue body is only that path. A non-2xx issue create or assign fails the worker and does not start another launcher. Those calls log `endpoint=worker-request-issue` and `endpoint=worker-request-assign`. A non-2xx `startUrl` post fails that worker the same way.
 
 `workerHttp.pollMs` defaults to 15000. `workerHttp.maxWaitMs` defaults to 3600000. Join sleeps `pollMs` between reads. `pending` and `running` are not terminal. `finished` and `failed` are terminal. When `maxWaitMs` passes, the result is failed and the detail is `http worker join exceeded maxWaitMs`. `maxWaitMs` is at least `pollMs` and no greater than the hosted job budget of 360 minutes.
 
@@ -117,7 +117,17 @@ Start request:
 }
 ```
 
-`statusStore` is present only when that key is set. `path` is the template with `{id}` replaced. Any 2xx response is success. The body is ignored.
+`statusStore` is present only when `statusUrl` mode is used and that key is set, or when the same record is placed on a forge issue. `path` is the template with `{id}` replaced. `requestedBy` is added on the issue record. Any 2xx `startUrl` response is success. The body is ignored.
+
+Forge issue body, when it fits:
+
+````markdown
+```json
+{"id":"<request-id>","prompt":"<prompt>","repoUrl":"<repo-url>","baseRef":"<base-ref>","model":{"id":"<workerModel>"},"statusStore":{"repo":"<owner/name>","branch":"<branch>","path":"worker-results/<request-id>.json"},"requestedBy":"<login>"}
+```
+````
+
+When the fenced block is longer than 65536 characters, the issue body is `worker-results/<request-id>.request.json` and that file holds the same JSON.
 
 `statusUrl` replaces `{id}` with the request id. A URL with no `{id}` gains the id as its last path segment. A query string needs `{id}`.
 
@@ -152,6 +162,14 @@ workerHttp:
     repo: <owner/name>
     branch: <branch>
     path: worker-results/{id}.json
+  request:
+    kind: forge-issue
+    repo: <owner/name>
+    assignee: <login>
+    labels:
+      - <label>
 ```
+
+`request` replaces `startUrl` and requires `statusStore`. `labels` may be omitted.
 
 `statusUrl` is the read path when `statusStore` is absent. `statusStore` replaces those reads. `path` must contain `{id}`. The start body sends that path with the id filled in.

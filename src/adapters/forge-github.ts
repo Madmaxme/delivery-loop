@@ -546,7 +546,7 @@ export function githubForge(opts: {
       const [owner, repo] = input.repo.split("/");
       const minted = await tokenForCheckRuns();
       const ready = await ensureFileBranch(owner, repo, input.branch, minted.slot, minted.token, input.endpoint);
-      if (ready !== 0) return ready;
+      if (ready !== 0) return { status: ready, actor: "" };
       const response = await callGithub(
         `/repos/${owner}/${repo}/contents/${filePath(input.path)}`,
         {
@@ -561,9 +561,71 @@ export function githubForge(opts: {
         minted.slot,
         input.endpoint,
       );
-      if (!response.ok) await response.text().catch(() => undefined);
-      else await response.text().catch(() => undefined);
+      if (!response.ok) {
+        await response.text().catch(() => undefined);
+        return { status: response.status, actor: "" };
+      }
+      const json = (await response.json()) as {
+        commit?: { author?: { name?: string; email?: string }; committer?: { name?: string; email?: string } };
+      };
+      const author = json.commit?.author ?? json.commit?.committer;
+      return { status: response.status, actor: loginFromGitIdentity(author?.name, author?.email) };
+    },
+    async createIssue(input) {
+      const [owner, repo] = input.repo.split("/");
+      const minted = await tokenForCheckRuns();
+      const response = await callGithub(
+        `/repos/${owner}/${repo}/issues`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${minted.token}` },
+          body: JSON.stringify({
+            title: input.title,
+            body: input.body,
+            ...(input.labels?.length ? { labels: input.labels } : {}),
+          }),
+        },
+        minted.slot,
+        input.endpoint,
+      );
+      if (!response.ok) {
+        await response.text().catch(() => undefined);
+        return { status: response.status, number: 0 };
+      }
+      const json = (await response.json()) as { number?: number };
+      return { status: response.status, number: json.number ?? 0 };
+    },
+    async assignIssue(input) {
+      const [owner, repo] = input.repo.split("/");
+      const minted = await tokenForCheckRuns();
+      const response = await callGithub(
+        `/repos/${owner}/${repo}/issues/${input.number}/assignees`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${minted.token}` },
+          body: JSON.stringify({ assignees: [input.assignee] }),
+        },
+        minted.slot,
+        input.endpoint,
+      );
+      await response.text().catch(() => undefined);
       return response.status;
     },
+    async actorLogin() {
+      const minted = await tokenForCheckRuns();
+      return (await githubUserLogin(fetchImpl, minted.token, note, minted.slot)) ?? "";
+    },
   };
+}
+
+/** A noreply email or a bot name recorded on a commit. A display name is not a login. */
+export function loginFromGitIdentity(name?: string, email?: string): string {
+  const mail = email?.trim() ?? "";
+  const plus = mail.match(/\+([^@]+)@users\.noreply\.github\.com$/i);
+  if (plus?.[1]) return plus[1];
+  const plain = mail.match(/^([^@+]+)@users\.noreply\.github\.com$/i);
+  if (plain?.[1]) return plain[1];
+  const bot = name?.trim() ?? "";
+  if (/^[A-Za-z0-9-]+\[bot\]$/.test(bot)) return bot;
+  return "";
 }

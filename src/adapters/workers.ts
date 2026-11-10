@@ -9,6 +9,7 @@ import {
   DEFAULT_WORKER_HTTP_MAX_WAIT_MS,
   DEFAULT_WORKER_HTTP_POLL_MS,
   type WorkerHttpHeaders,
+  type WorkerHttpRequest,
   type WorkerHttpStatusStore,
 } from "../schema/pack.ts";
 import type { InstallationToken } from "./github-mint.ts";
@@ -117,10 +118,40 @@ function resultRecord(value: unknown): Record<string, unknown> | null {
 }
 
 export type WorkerHttpFiles = {
-  /** Returns the write status. A non-2xx status means the file was not seeded. */
-  write(input: { repo: string; branch: string; path: string; text: string }): Promise<number>;
+  /** Returns the write status and the forge login recorded on the commit, when it has one. */
+  write(input: {
+    repo: string;
+    branch: string;
+    path: string;
+    text: string;
+    message?: string;
+  }): Promise<{ status: number; actor: string }>;
   read(input: { repo: string; branch: string; path: string }): Promise<{ status: number; text: string }>;
 };
+
+export type WorkerHttpIssueClient = {
+  open(input: {
+    repo: string;
+    title: string;
+    body: string;
+    labels?: string[];
+  }): Promise<{ status: number; number: number }>;
+  assign(input: { repo: string; number: number; assignee: string }): Promise<number>;
+  /** Login when the seed commit did not record one. */
+  actor(): Promise<string>;
+};
+
+/** GitHub issue body limit. A larger start record is stored as a file. */
+export const WORKER_REQUEST_BODY_MAX = 65536;
+
+export function workerHttpRequestPath(recordPath: string): string {
+  if (recordPath.endsWith(".json")) return `${recordPath.slice(0, -".json".length)}.request.json`;
+  return `${recordPath}.request.json`;
+}
+
+export function fencedJson(value: unknown): string {
+  return "```json\n" + JSON.stringify(value) + "\n```";
+}
 
 export function workerHttpStorePath(template: string, id: string): string {
   const safe = /^[A-Za-z0-9._-]+$/.test(id) ? id : encodeURIComponent(id);
@@ -171,8 +202,8 @@ export function workerResultFromStatusBody(body: unknown): WorkerResult | null {
 }
 
 export function httpWorker(opts: {
-  startUrl: string;
-  statusUrl: string;
+  startUrl?: string;
+  statusUrl?: string;
   /** `workerModel`. Absent omits `model` from the start body. */
   model?: string;
   pollMs?: number;
@@ -182,8 +213,12 @@ export function httpWorker(opts: {
   startHeaders?: WorkerHttpHeaders;
   statusHeaders?: WorkerHttpHeaders;
   statusStore?: WorkerHttpStatusStore;
+  /** Forge issue that replaces `startUrl`. Requires `statusStore`. */
+  request?: WorkerHttpRequest;
   /** Forge file reads and writes. Required when `statusStore` is set. */
   files?: WorkerHttpFiles;
+  /** Forge issue create and assign. Required when `request` is set. */
+  issues?: WorkerHttpIssueClient;
   env?: Record<string, string | undefined>;
   tokens?: WorkerHttpToken;
   fetch?: FetchLike;
@@ -205,11 +240,12 @@ export function httpWorker(opts: {
     async start(input: WorkerStart) {
       const id = (opts.newId ?? randomUUID)();
       const storePath = opts.statusStore ? workerHttpStorePath(opts.statusStore.path, id) : "";
+      let actor = "";
       if (opts.statusStore) {
         if (!opts.files) throw new Error("http worker seed failed: forge has no file store");
-        let status: number;
+        let written: { status: number; actor: string };
         try {
-          status = await opts.files.write({
+          written = await opts.files.write({
             repo: opts.statusStore.repo,
             branch: opts.statusStore.branch,
             path: storePath,
@@ -225,8 +261,60 @@ export function httpWorker(opts: {
           const failed = statusOf(error);
           throw new Error(failed ? `http worker seed failed: ${failed}` : "http worker seed failed");
         }
-        if (status < 200 || status > 299) throw new Error(`http worker seed failed: ${status}`);
+        if (written.status < 200 || written.status > 299) throw new Error(`http worker seed failed: ${written.status}`);
+        actor = written.actor;
       }
+      if (opts.request) {
+        if (!opts.statusStore || !opts.files || !opts.issues) {
+          throw new Error("http worker request failed: forge issue needs a status store");
+        }
+        if (!actor) actor = await opts.issues.actor();
+        const payload: Record<string, unknown> = {
+          id,
+          prompt: input.prompt,
+          repoUrl: input.repoUrl,
+          baseRef: input.baseRef,
+        };
+        if (modelId) payload.model = { id: modelId };
+        payload.statusStore = {
+          repo: opts.statusStore.repo,
+          branch: opts.statusStore.branch,
+          path: storePath,
+        };
+        payload.requestedBy = actor;
+        let issueBody = fencedJson(payload);
+        if (issueBody.length > WORKER_REQUEST_BODY_MAX) {
+          const requestPath = workerHttpRequestPath(storePath);
+          const stored = await opts.files.write({
+            repo: opts.statusStore.repo,
+            branch: opts.statusStore.branch,
+            path: requestPath,
+            text: JSON.stringify(payload),
+            message: "record a worker request",
+          });
+          if (stored.status < 200 || stored.status > 299) {
+            throw new Error(`http worker request failed: ${stored.status}`);
+          }
+          issueBody = requestPath;
+        }
+        const opened = await opts.issues.open({
+          repo: opts.request.repo,
+          title: `worker-request ${id}`,
+          body: issueBody,
+          labels: opts.request.labels,
+        });
+        if (opened.status < 200 || opened.status > 299 || !opened.number) {
+          throw new Error(`http worker request failed: ${opened.status}`);
+        }
+        const assigned = await opts.issues.assign({
+          repo: opts.request.repo,
+          number: opened.number,
+          assignee: opts.request.assignee,
+        });
+        if (assigned < 200 || assigned > 299) throw new Error(`http worker request failed: ${assigned}`);
+        return { runId: id };
+      }
+      if (!opts.startUrl) throw new Error("http worker start failed: no start");
       const auth = await resolveHeaderMap(opts.startHeaders, opts.token, env, opts.tokens);
       const body: Record<string, unknown> = {
         id,

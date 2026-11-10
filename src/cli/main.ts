@@ -22,6 +22,7 @@ import {
   cursorWorker,
   httpWorker,
   type WorkerHttpFiles,
+  type WorkerHttpIssueClient,
   type WorkerHttpToken,
 } from "../adapters/workers.js";
 import { createInstallationToken } from "../adapters/github-mint.js";
@@ -191,6 +192,24 @@ function httpTokens(explicit?: WorkerHttpToken): WorkerHttpToken {
   };
 }
 
+function issuesFromForge(forge: ForgeAdapter | undefined): WorkerHttpIssueClient | undefined {
+  if (!forge?.createIssue || !forge.assignIssue || !forge.actorLogin) return undefined;
+  const createIssue = forge.createIssue.bind(forge);
+  const assignIssue = forge.assignIssue.bind(forge);
+  const actorLogin = forge.actorLogin.bind(forge);
+  return {
+    open(input) {
+      return createIssue({ ...input, endpoint: "worker-request-issue" });
+    },
+    assign(input) {
+      return assignIssue({ ...input, endpoint: "worker-request-assign" });
+    },
+    actor() {
+      return actorLogin();
+    },
+  };
+}
+
 function filesFromForge(forge: ForgeAdapter | undefined): WorkerHttpFiles | undefined {
   if (!forge?.writeTextFile || !forge.readTextFile) return undefined;
   const writeTextFile = forge.writeTextFile.bind(forge);
@@ -198,8 +217,11 @@ function filesFromForge(forge: ForgeAdapter | undefined): WorkerHttpFiles | unde
   return {
     write(input) {
       return writeTextFile({
-        ...input,
-        message: "record a pending worker result",
+        repo: input.repo,
+        branch: input.branch,
+        path: input.path,
+        text: input.text,
+        message: input.message ?? "record a pending worker result",
         endpoint: "worker-http-seed",
       });
     },
@@ -236,7 +258,9 @@ function workerFor(pack: ProjectPack, tokens?: WorkerHttpToken, forge?: ForgeAda
       startHeaders: pack.workerHttp?.startHeaders,
       statusHeaders: pack.workerHttp?.statusHeaders,
       statusStore: pack.workerHttp?.statusStore,
+      request: pack.workerHttp?.request,
       files: filesFromForge(forge),
+      issues: issuesFromForge(forge),
       token: process.env.WORKER_HTTP_TOKEN,
       tokens: httpTokens(tokens),
     });
