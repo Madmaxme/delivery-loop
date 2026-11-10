@@ -2,14 +2,11 @@ import { interpretDesignChecks, type DesignCheckRun } from "../engine/design-gat
 import {
   credentialFetch,
   githubEndpointClass,
-  noteMint,
   type CredentialNoteFn,
 } from "../engine/credential-log.ts";
 import {
-  credentialDue,
-  interpretMintOutput,
+  createInstallationToken,
   runMintCommand,
-  type MintedCredential,
   type MintRun,
 } from "./github-mint.ts";
 import {
@@ -145,6 +142,11 @@ export function githubForge(opts: {
   runMint?: (command: string) => MintRun;
   /** Defaults to the process credential log. */
   credentialNote?: CredentialNoteFn;
+  /**
+   * Shared mint cache. Absent builds one from `mintCommand`.
+   * The token is not written.
+   */
+  installation?: ReturnType<typeof createInstallationToken>;
 }): ForgeAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const note = opts.credentialNote;
@@ -163,32 +165,23 @@ export function githubForge(opts: {
     assertCommitActor(repoUrl, await loginPromise, expected);
   }
 
-  let checksCredential: MintedCredential | null = null;
-
   function mintCommand(): string {
     if (opts.mintCommand !== undefined) return opts.mintCommand.trim();
     return process.env.DELIVERY_LOOP_GITHUB_MINT?.trim() ?? "";
   }
 
-  async function tokenForCheckRuns(): Promise<{ token: string; slot: "mint" | "gh-token" }> {
-    const command = mintCommand();
-    if (!command) return { token: opts.token, slot: "gh-token" };
-    const now = (opts.nowMs ?? Date.now)();
-    if (checksCredential && !credentialDue(checksCredential.expiresAtMs, now)) {
-      return { token: checksCredential.token, slot: "mint" };
-    }
-    const refresh = checksCredential !== null;
-    const result = (opts.runMint ?? runMintCommand)(command);
-    const minted = result.status === 0 ? interpretMintOutput(result.stdout, now) : null;
-    const ok = Boolean(minted && minted.expiresAtMs > now);
-    noteMint({ exitStatus: result.status, ok, refresh, note });
-    if (!minted || minted.expiresAtMs <= now) {
-      throw new Error(
-        "credential error: DELIVERY_LOOP_GITHUB_MINT did not return an installation token that is still valid.",
-      );
-    }
-    checksCredential = minted;
-    return { token: minted.token, slot: "mint" };
+  const installation =
+    opts.installation ??
+    createInstallationToken({
+      command: mintCommand,
+      fallbackToken: opts.token,
+      nowMs: opts.nowMs,
+      runMint: opts.runMint ?? runMintCommand,
+      note,
+    });
+
+  function tokenForCheckRuns() {
+    return installation.get();
   }
 
   function callGithub(path: string, init?: RequestInit, slot = "gh-token"): Promise<Response> {

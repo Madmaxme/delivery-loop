@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 
+import { GHA_HOSTED_PAGE_BUDGET_MINUTES } from "../engine/linear-harness-policy.ts";
 import { journeySpecPattern } from "../../scripts/journey-proof.mjs";
 
 /** Writes to `repos` are refused unless the token's GitHub login is `login`. */
@@ -57,6 +58,31 @@ export type WorkerKeys = {
 
 export const DEFAULT_CURSOR_PRIMARY_ENV = "CURSOR_API_KEY";
 export const DEFAULT_CURSOR_FALLBACK_ENV = "CURSOR_API_KEY_FALLBACK";
+
+/** Pause between http worker status reads. A coding run is tens of minutes. */
+export const DEFAULT_WORKER_HTTP_POLL_MS = 15_000;
+
+/**
+ * Stop waiting for an http worker after this long.
+ * One hour stays inside the hosted job budget and covers a coding run.
+ */
+export const DEFAULT_WORKER_HTTP_MAX_WAIT_MS = 60 * 60 * 1000;
+
+/** Hosted job budget. `workerHttp.maxWaitMs` cannot exceed this. */
+export const WORKER_HTTP_JOB_BUDGET_MS = GHA_HOSTED_PAGE_BUDGET_MINUTES * 60_000;
+
+/** Header name to an env var, or the source `mint` or `gh-token`. Values are not secrets. */
+export type WorkerHttpHeaders = Record<string, string>;
+
+export type WorkerHttp = {
+  startUrl: string;
+  /** `{id}` is replaced with the request id. Without it, the id is the last path segment. */
+  statusUrl: string;
+  pollMs?: number;
+  maxWaitMs?: number;
+  startHeaders?: WorkerHttpHeaders;
+  statusHeaders?: WorkerHttpHeaders;
+};
 
 /**
  * Where the branch is published and merged.
@@ -119,7 +145,13 @@ export type ProjectPack = {
    * on the primary slot.
    */
   workerKeys?: WorkerKeys;
-  workerHttp?: { startUrl: string; statusUrl: string };
+  /**
+   * HTTP worker. `pollMs` defaults to 15000. `maxWaitMs` defaults to 3600000.
+   * `maxWaitMs` stays inside the hosted job budget (360 minutes).
+   * Header maps name an env var, or the source `mint` or `gh-token`.
+   * The header value is not stored here.
+   */
+  workerHttp?: WorkerHttp;
   repos: RepoSpec[];
   /**
    * Repos whose commits must show a person. Absent repos keep the token's
@@ -292,6 +324,7 @@ export function loadPack(path: string): ProjectPack {
   raw.design = loadDesign(raw.design, path);
   raw.workerKeys = loadWorkerKeys(raw.workerKeys, path);
   raw.workerModel = loadWorkerModel(raw.workerModel, path);
+  raw.workerHttp = loadWorkerHttp(raw.workerHttp, raw.worker, path);
   raw.transient = loadTransient(raw.transient, path);
   if (raw.ship) raw.ship.parkSuccess = raw.ship.parkSuccess === true;
   return raw;
@@ -328,6 +361,69 @@ export function workerKeyNames(pack: Pick<ProjectPack, "workerKeys">): WorkerKey
   return {
     primary: pack.workerKeys?.primary?.trim() || DEFAULT_CURSOR_PRIMARY_ENV,
     fallback: pack.workerKeys?.fallback?.trim() || DEFAULT_CURSOR_FALLBACK_ENV,
+  };
+}
+
+const HEADER_NAME = /^[A-Za-z0-9-]+$/;
+const HEADER_SOURCE = /^(?:mint|gh-token|[A-Za-z_][A-Za-z0-9_]*)$/;
+
+function loadHeaderMap(
+  value: WorkerHttpHeaders | undefined,
+  path: string,
+  key: string,
+): WorkerHttpHeaders | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${path} workerHttp.${key} maps a header to an env var`);
+  }
+  const out: WorkerHttpHeaders = {};
+  for (const [name, source] of Object.entries(value)) {
+    if (!HEADER_NAME.test(name) || typeof source !== "string" || !HEADER_SOURCE.test(source.trim())) {
+      throw new Error(`${path} workerHttp.${key} maps a header to an env var or mint or gh-token`);
+    }
+    out[name] = source.trim();
+  }
+  return out;
+}
+
+function loadWorkerHttp(
+  value: WorkerHttp | undefined,
+  worker: WorkerKind,
+  path: string,
+): WorkerHttp | undefined {
+  if (!value) {
+    if (worker === "http") throw new Error(`${path} worker http needs workerHttp.startUrl and workerHttp.statusUrl`);
+    return undefined;
+  }
+  const startUrl = value.startUrl?.trim() ?? "";
+  const statusUrl = value.statusUrl?.trim() ?? "";
+  if (worker === "http" && (!startUrl || !statusUrl)) {
+    throw new Error(`${path} worker http needs workerHttp.startUrl and workerHttp.statusUrl`);
+  }
+  if (statusUrl.includes("?") && !statusUrl.includes("{id}")) {
+    throw new Error(`${path} workerHttp.statusUrl needs {id} when it has a query`);
+  }
+  const pollMs = value.pollMs ?? DEFAULT_WORKER_HTTP_POLL_MS;
+  const maxWaitMs = value.maxWaitMs ?? DEFAULT_WORKER_HTTP_MAX_WAIT_MS;
+  if (!Number.isInteger(pollMs) || pollMs < 1) {
+    throw new Error(`${path} workerHttp.pollMs is a positive integer`);
+  }
+  if (!Number.isInteger(maxWaitMs) || maxWaitMs < 1) {
+    throw new Error(`${path} workerHttp.maxWaitMs is a positive integer`);
+  }
+  if (maxWaitMs < pollMs) {
+    throw new Error(`${path} workerHttp.maxWaitMs is at least workerHttp.pollMs`);
+  }
+  if (maxWaitMs > WORKER_HTTP_JOB_BUDGET_MS) {
+    throw new Error(`${path} workerHttp.maxWaitMs stays inside the job budget`);
+  }
+  return {
+    startUrl,
+    statusUrl,
+    pollMs,
+    maxWaitMs,
+    startHeaders: loadHeaderMap(value.startHeaders, path, "startHeaders"),
+    statusHeaders: loadHeaderMap(value.statusHeaders, path, "statusHeaders"),
   };
 }
 

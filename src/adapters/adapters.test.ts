@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { createCredentialRecorder } from "../engine/credential-log.ts";
 import { githubForge } from "./forge-github.ts";
 import { githubIssuesTracker, linearTracker } from "./trackers.ts";
 import {
@@ -211,23 +212,181 @@ describe("adapters", () => {
     );
   });
 
-  it("starts and joins a self-hosted worker", async () => {
+  it("waits out pending status and returns the finished result", async () => {
+    const rec = createCredentialRecorder();
+    const sleeps: number[] = [];
+    const bodies: unknown[] = [];
+    const urls: string[] = [];
+    const statuses = ["pending", "pending", "finished"];
     const worker = httpWorker({
       startUrl: "https://host.example/start",
-      statusUrl: "https://host.example/status",
-      fetch: async (url) => {
-        if (String(url).endsWith("/start")) return jsonResponse({ runId: "r1" });
-        return jsonResponse({ status: "finished", branch: "b", head: "h", text: "done" });
+      statusUrl: "https://host.example/status?run={id}",
+      model: "model-4.7",
+      pollMs: 1000,
+      maxWaitMs: 60_000,
+      newId: () => "req-1",
+      nowMs: () => sleeps.reduce((sum, ms) => sum + ms, 0),
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      credentialNote: rec.note,
+      env: { START_TOKEN: "start-secret" },
+      startHeaders: { Authorization: "START_TOKEN" },
+      fetch: async (url, init) => {
+        urls.push(String(url));
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        if (init?.method === "POST") {
+          assert.equal(headers.Authorization, "Bearer start-secret");
+          bodies.push(JSON.parse(String(init.body)));
+          return jsonResponse({ runId: "ignored" }, 202);
+        }
+        const status = statuses.shift();
+        return jsonResponse({
+          status,
+          branch: "cursor/api-1",
+          head: "abc",
+          text: "done",
+          branches: [{ repoUrl: "https://github.com/acme/api", branch: "cursor/api-1" }],
+        });
       },
     });
     const started = await worker.start({
-      prompt: "go",
+      prompt: "ground the ticket",
       repoUrl: "https://github.com/acme/api",
       baseRef: "main",
     });
-    assert.equal(started.runId, "r1");
-    const joined = await worker.join("r1");
-    assert.equal(joined.branch, "b");
+    assert.equal(started.runId, "req-1");
+    assert.deepEqual(bodies[0], {
+      id: "req-1",
+      prompt: "ground the ticket",
+      repoUrl: "https://github.com/acme/api",
+      baseRef: "main",
+      model: { id: "model-4.7" },
+    });
+    const joined = await worker.join(started.runId);
+    assert.equal(joined.status, "finished");
+    assert.equal(joined.branch, "cursor/api-1");
+    assert.equal(joined.head, "abc");
+    assert.equal(joined.text, "done");
+    assert.equal(joined.branches?.[0]?.branch, "cursor/api-1");
+    assert.deepEqual(sleeps, [1000, 1000]);
+    assert.equal(urls.at(-1), "https://host.example/status?run=req-1");
+    assert.deepEqual(rec.lines(), [
+      "credential slot=worker-http endpoint=worker-http-start status=202",
+      "credential slot=worker-http endpoint=worker-http-status status=200",
+      "credential slot=worker-http endpoint=worker-http-status status=200",
+      "credential slot=worker-http endpoint=worker-http-status status=200",
+    ]);
+    const text = rec.lines().join("\n");
+    assert.equal(text.includes("start-secret"), false);
+    assert.equal(text.includes("Bearer"), false);
+    assert.equal(text.includes("host.example"), false);
+    assert.equal(text.includes("run="), false);
+  });
+
+  it("fails the join when maxWaitMs passes", async () => {
+    let now = 0;
+    const worker = httpWorker({
+      startUrl: "https://host.example/start",
+      statusUrl: "https://host.example/status/{id}",
+      pollMs: 1000,
+      maxWaitMs: 2500,
+      newId: () => "req-2",
+      nowMs: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+      fetch: async (_url, init) => {
+        if (init?.method === "POST") return jsonResponse({}, 200);
+        return jsonResponse({ status: "running", text: "" });
+      },
+    });
+    const started = await worker.start({ prompt: "go", repoUrl: "https://github.com/acme/api", baseRef: "main" });
+    const joined = await worker.join(started.runId);
+    assert.equal(joined.status, "failed");
+    assert.equal(joined.text, "http worker join exceeded maxWaitMs");
+    assert.equal(now, 2500);
+  });
+
+  it("fails a non-2xx start and does not read status or start again", async () => {
+    const rec = createCredentialRecorder();
+    const calls: string[] = [];
+    const worker = httpWorker({
+      startUrl: "https://host.example/start?token=start-secret",
+      statusUrl: "https://host.example/status/{id}",
+      credentialNote: rec.note,
+      fetch: async (url, init) => {
+        calls.push(`${init?.method ?? "GET"} ${url}`);
+        return jsonResponse({ message: "no" }, 400);
+      },
+    });
+    await assert.rejects(
+      () => worker.start({ prompt: "go", repoUrl: "https://github.com/acme/api", baseRef: "main" }),
+      /HTTP worker start failed: 400/,
+    );
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.startsWith("POST "), true);
+    assert.equal(calls.some((call) => call.startsWith("GET ")), false);
+    assert.deepEqual(rec.lines(), ["credential slot=worker-http endpoint=worker-http-start status=400"]);
+    assert.equal(rec.lines().join("\n").includes("start-secret"), false);
+    assert.equal(rec.lines().join("\n").includes("token="), false);
+  });
+
+  it("resolves header env vars and the minted token without writing them", async () => {
+    const rec = createCredentialRecorder();
+    const seen: Record<string, string>[] = [];
+    const worker = httpWorker({
+      startUrl: "https://host.example/start",
+      statusUrl: "https://host.example/status/{id}",
+      newId: () => "req-3",
+      credentialNote: rec.note,
+      env: { START_TOKEN: "start-secret", STATUS_ACCEPT: "application/vnd.github+json" },
+      startHeaders: { Authorization: "START_TOKEN" },
+      statusHeaders: { Authorization: "mint", Accept: "STATUS_ACCEPT" },
+      tokens: {
+        async mint() {
+          return { token: "mint-secret", slot: "mint" };
+        },
+        forge() {
+          return { token: "forge-secret", slot: "gh-token" };
+        },
+      },
+      fetch: async (_url, init) => {
+        seen.push({ ...(init?.headers as Record<string, string>) });
+        if (init?.method === "POST") return jsonResponse({}, 201);
+        const file = Buffer.from(
+          JSON.stringify({ status: "finished", branch: "b", head: "h", text: "from-file" }),
+          "utf8",
+        ).toString("base64");
+        return jsonResponse({ encoding: "base64", content: `${file.slice(0, 8)}\n${file.slice(8)}` });
+      },
+    });
+    const started = await worker.start({ prompt: "go", repoUrl: "https://github.com/acme/api", baseRef: "main" });
+    const joined = await worker.join(started.runId);
+    assert.equal(seen[0]?.Authorization, "Bearer start-secret");
+    assert.equal(seen[1]?.Authorization, "Bearer mint-secret");
+    assert.equal(seen[1]?.Accept, "application/vnd.github+json");
+    assert.equal(joined.status, "finished");
+    assert.equal(joined.text, "from-file");
+    assert.deepEqual(rec.lines(), [
+      "credential slot=worker-http endpoint=worker-http-start status=201",
+      "credential slot=mint endpoint=worker-http-status status=200",
+    ]);
+    const text = rec.lines().join("\n");
+    for (const secret of ["start-secret", "mint-secret", "forge-secret"]) {
+      assert.equal(text.includes(secret), false);
+    }
+    await assert.rejects(
+      () =>
+        httpWorker({
+          startUrl: "https://host.example/start",
+          statusUrl: "https://host.example/status/{id}",
+          env: {},
+          startHeaders: { Authorization: "START_TOKEN" },
+          fetch: async () => jsonResponse({}),
+        }).start({ prompt: "go", repoUrl: "https://github.com/acme/api", baseRef: "main" }),
+      /missing source START_TOKEN/,
+    );
   });
 
   it("starts a Copilot cloud task", async () => {

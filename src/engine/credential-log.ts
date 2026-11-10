@@ -41,6 +41,8 @@ const ENDPOINTS = new Set([
   "cursor-launch",
   "figma",
   "worker-http",
+  "worker-http-start",
+  "worker-http-status",
   "copilot",
   "codex",
   "claude",

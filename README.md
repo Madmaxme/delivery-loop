@@ -75,6 +75,58 @@ workerModel: <model-id>
 
 A 5xx on a cursor launch waits one second and retries that slot once. A second 5xx uses the fallback slot. Each attempt logs its slot, `endpoint=cursor-launch`, and status.
 
+## HTTP worker
+
+`worker: http` posts the start request below to `workerHttp.startUrl`. The loop generates `id`. The start handler writes a pending result for that id before it returns 2xx, and the loop reads it from `workerHttp.statusUrl`. The loop does not write that record. A non-2xx start fails the worker and does not start another launcher.
+
+`pollMs` defaults to 15000. `maxWaitMs` defaults to 3600000 and stays inside the hosted job budget of 360 minutes. Join sleeps `pollMs` between reads. `pending` and `running` stay open. `finished` and `failed` stop the wait. A spent `maxWaitMs` is a failed worker, detail `http worker join exceeded maxWaitMs`.
+
+Header maps name an env var, or `mint` or `gh-token`. `mint` is the minted installation token. `gh-token` is the forge token. No secret is stored in the pack. An http start logs `endpoint=worker-http-start`. A status read logs `endpoint=worker-http-status`. The request URL and the header values are not written.
+
+`model` is `{ id }` from `workerModel`. An absent `workerModel` omits it. A status body that is a base64 document (`encoding` of `base64` and `content`) is decoded as the result.
+
+```yaml
+worker: http
+workerModel: <model-id>
+workerHttp:
+  startUrl: https://<host>/start
+  statusUrl: https://<host>/status/{id}
+  pollMs: 15000
+  maxWaitMs: 3600000
+  startHeaders:
+    Authorization: <start-token-env>
+  statusHeaders:
+    Authorization: mint
+```
+
+Start request:
+
+```json
+{
+  "id": "<request-id>",
+  "prompt": "<prompt>",
+  "repoUrl": "<repo-url>",
+  "baseRef": "<base-ref>",
+  "model": { "id": "<workerModel>" }
+}
+```
+
+Any 2xx is success. The body is ignored. `statusUrl` replaces `{id}`. Without `{id}`, the id is the last path segment. A query string needs `{id}`.
+
+Status response, HTTP 200:
+
+```json
+{
+  "status": "pending",
+  "branch": "<branch>",
+  "head": "<sha>",
+  "branches": [{ "repoUrl": "<repo-url>", "branch": "<branch>" }],
+  "text": "<text>"
+}
+```
+
+`branch`, `head`, and `branches` may be absent until `finished`. `text` may be empty. A non-2xx status read fails the worker.
+
 ## Contribute
 
 Clone this repo, branch from `main`, and open a pull request. The `quality` workflow runs the tests. Titles and bodies are in [CONTRIBUTING.md](CONTRIBUTING.md).
