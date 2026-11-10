@@ -21,7 +21,11 @@ import {
   cursorKeySlots,
   cursorWorker,
   httpWorker,
+  type WorkerHttpFiles,
+  type WorkerHttpIssueClient,
+  type WorkerHttpToken,
 } from "../adapters/workers.js";
+import { createInstallationToken } from "../adapters/github-mint.js";
 import { githubRepoFromUrl } from "../adapters/types.js";
 import type { ForgeAdapter, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { findConnector } from "../connectors/catalog.js";
@@ -123,22 +127,42 @@ export function commitActorsFromTrustedRef(pack: ProjectPack): ProjectPack["comm
   return parsed.commitActors ?? [];
 }
 
+function openForge(pack: ProjectPack, withActors: boolean): {
+  forge: ForgeAdapter;
+  tokens: WorkerHttpToken;
+} {
+  const forgeToken = pack.forge === "git" ? "" : requireEnv("GH_TOKEN");
+  const installation = createInstallationToken({
+    command: () => process.env.DELIVERY_LOOP_GITHUB_MINT?.trim() ?? "",
+    fallbackToken: forgeToken,
+  });
+  const forge =
+    pack.forge === "git"
+      ? gitForge({ cwd: process.cwd() })
+      : githubForge({
+          token: forgeToken,
+          installation,
+          repo:
+            pack.githubRepo ??
+            githubRepoFromUrl(pack.repos[0].url).owner + "/" + githubRepoFromUrl(pack.repos[0].url).repo,
+          ...(withActors ? { commitActors: commitActorsFromTrustedRef(pack) } : {}),
+        });
+  return {
+    forge,
+    tokens: {
+      mint: () => installation.get(),
+      forge: () => ({ token: forgeToken, slot: "gh-token" }),
+    },
+  };
+}
+
 export function adaptersFor(pack: ProjectPack): {
   tracker: TrackerAdapter;
   worker: WorkerAdapter;
   forge: ForgeAdapter;
 } {
   const githubToken = () => requireEnv("GH_TOKEN");
-  const forge =
-    pack.forge === "git"
-      ? gitForge({ cwd: process.cwd() })
-      : githubForge({
-          token: githubToken(),
-          repo:
-            pack.githubRepo ??
-            githubRepoFromUrl(pack.repos[0].url).owner + "/" + githubRepoFromUrl(pack.repos[0].url).repo,
-          commitActors: commitActorsFromTrustedRef(pack),
-        });
+  const { forge, tokens } = openForge(pack, true);
   const tracker =
     pack.tracker === "linear"
       ? linearTracker({
@@ -151,11 +175,63 @@ export function adaptersFor(pack: ProjectPack): {
           repo: pack.githubRepo ?? "",
           intakeLabel: pack.status.intake,
         });
-  const worker = workerFor(pack);
+  const worker = workerFor(pack, tokens, forge);
   return { tracker, worker, forge };
 }
 
-function workerFor(pack: ProjectPack): WorkerAdapter {
+function httpTokens(explicit?: WorkerHttpToken): WorkerHttpToken {
+  if (explicit) return explicit;
+  const token = process.env.GH_TOKEN ?? "";
+  const installation = createInstallationToken({
+    command: () => process.env.DELIVERY_LOOP_GITHUB_MINT?.trim() ?? "",
+    fallbackToken: token,
+  });
+  return {
+    mint: () => installation.get(),
+    forge: () => ({ token, slot: "gh-token" }),
+  };
+}
+
+function issuesFromForge(forge: ForgeAdapter | undefined): WorkerHttpIssueClient | undefined {
+  if (!forge?.createIssue || !forge.assignIssue || !forge.actorLogin) return undefined;
+  const createIssue = forge.createIssue.bind(forge);
+  const assignIssue = forge.assignIssue.bind(forge);
+  const actorLogin = forge.actorLogin.bind(forge);
+  return {
+    open(input) {
+      return createIssue({ ...input, endpoint: "worker-request-issue" });
+    },
+    assign(input) {
+      return assignIssue({ ...input, endpoint: "worker-request-assign" });
+    },
+    actor() {
+      return actorLogin();
+    },
+  };
+}
+
+function filesFromForge(forge: ForgeAdapter | undefined): WorkerHttpFiles | undefined {
+  if (!forge?.writeTextFile || !forge.readTextFile) return undefined;
+  const writeTextFile = forge.writeTextFile.bind(forge);
+  const readTextFile = forge.readTextFile.bind(forge);
+  return {
+    write(input) {
+      return writeTextFile({
+        repo: input.repo,
+        branch: input.branch,
+        path: input.path,
+        text: input.text,
+        message: input.message ?? "record a pending worker result",
+        endpoint: "worker-http-seed",
+      });
+    },
+    read(input) {
+      return readTextFile({ ...input, endpoint: "worker-http-status" });
+    },
+  };
+}
+
+function workerFor(pack: ProjectPack, tokens?: WorkerHttpToken, forge?: ForgeAdapter): WorkerAdapter {
   if (pack.worker === "cursor") {
     const names = workerKeyNames(pack);
     const primary = process.env[names.primary];
@@ -172,11 +248,24 @@ function workerFor(pack: ProjectPack): WorkerAdapter {
     const [owner, name] = repo.split("/");
     return copilotWorker({ token: requireEnv("GH_TOKEN"), owner, repo: name });
   }
-  return httpWorker({
-    startUrl: pack.workerHttp?.startUrl ?? "",
-    statusUrl: pack.workerHttp?.statusUrl ?? "",
-    token: process.env.WORKER_HTTP_TOKEN,
-  });
+  if (pack.worker === "http") {
+    return httpWorker({
+      startUrl: pack.workerHttp?.startUrl ?? "",
+      statusUrl: pack.workerHttp?.statusUrl ?? "",
+      model: pack.workerModel,
+      pollMs: pack.workerHttp?.pollMs,
+      maxWaitMs: pack.workerHttp?.maxWaitMs,
+      startHeaders: pack.workerHttp?.startHeaders,
+      statusHeaders: pack.workerHttp?.statusHeaders,
+      statusStore: pack.workerHttp?.statusStore,
+      request: pack.workerHttp?.request,
+      files: filesFromForge(forge),
+      issues: issuesFromForge(forge),
+      token: process.env.WORKER_HTTP_TOKEN,
+      tokens: httpTokens(tokens),
+    });
+  }
+  throw new Error(`worker ${pack.worker} is not a launcher`);
 }
 
 function dispatchOrRun(mode: string, argv: string[]): void {
@@ -207,7 +296,8 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     const extra = rest.filter((a) => a !== issue).join(" ");
     const deps = shipInvocationDeps(pack, process.cwd());
     deps.ownerHeal = async (input) => {
-      const worker = workerFor(pack);
+      const side = pack.workerHttp?.statusStore ? openForge(pack, false) : undefined;
+      const worker = workerFor(pack, side?.tokens, side?.forge);
       const started = await worker.start(input);
       const joined = await worker.join(started.runId);
       if (joined.status === "failed") throw new Error(joined.text || "owner edit failed");

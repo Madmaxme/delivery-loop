@@ -2,14 +2,11 @@ import { interpretDesignChecks, type DesignCheckRun } from "../engine/design-gat
 import {
   credentialFetch,
   githubEndpointClass,
-  noteMint,
   type CredentialNoteFn,
 } from "../engine/credential-log.ts";
 import {
-  credentialDue,
-  interpretMintOutput,
+  createInstallationToken,
   runMintCommand,
-  type MintedCredential,
   type MintRun,
 } from "./github-mint.ts";
 import {
@@ -145,6 +142,11 @@ export function githubForge(opts: {
   runMint?: (command: string) => MintRun;
   /** Defaults to the process credential log. */
   credentialNote?: CredentialNoteFn;
+  /**
+   * Shared mint cache. Absent builds one from `mintCommand`.
+   * The token is not written.
+   */
+  installation?: ReturnType<typeof createInstallationToken>;
 }): ForgeAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const note = opts.credentialNote;
@@ -163,38 +165,34 @@ export function githubForge(opts: {
     assertCommitActor(repoUrl, await loginPromise, expected);
   }
 
-  let checksCredential: MintedCredential | null = null;
-
   function mintCommand(): string {
     if (opts.mintCommand !== undefined) return opts.mintCommand.trim();
     return process.env.DELIVERY_LOOP_GITHUB_MINT?.trim() ?? "";
   }
 
-  async function tokenForCheckRuns(): Promise<{ token: string; slot: "mint" | "gh-token" }> {
-    const command = mintCommand();
-    if (!command) return { token: opts.token, slot: "gh-token" };
-    const now = (opts.nowMs ?? Date.now)();
-    if (checksCredential && !credentialDue(checksCredential.expiresAtMs, now)) {
-      return { token: checksCredential.token, slot: "mint" };
-    }
-    const refresh = checksCredential !== null;
-    const result = (opts.runMint ?? runMintCommand)(command);
-    const minted = result.status === 0 ? interpretMintOutput(result.stdout, now) : null;
-    const ok = Boolean(minted && minted.expiresAtMs > now);
-    noteMint({ exitStatus: result.status, ok, refresh, note });
-    if (!minted || minted.expiresAtMs <= now) {
-      throw new Error(
-        "credential error: DELIVERY_LOOP_GITHUB_MINT did not return an installation token that is still valid.",
-      );
-    }
-    checksCredential = minted;
-    return { token: minted.token, slot: "mint" };
+  const installation =
+    opts.installation ??
+    createInstallationToken({
+      command: mintCommand,
+      fallbackToken: opts.token,
+      nowMs: opts.nowMs,
+      runMint: opts.runMint ?? runMintCommand,
+      note,
+    });
+
+  function tokenForCheckRuns() {
+    return installation.get();
   }
 
-  function callGithub(path: string, init?: RequestInit, slot = "gh-token"): Promise<Response> {
+  function callGithub(
+    path: string,
+    init?: RequestInit,
+    slot = "gh-token",
+    endpoint?: string,
+  ): Promise<Response> {
     return credentialFetch(
       slot,
-      githubEndpointClass(path),
+      endpoint ?? githubEndpointClass(path),
       () =>
         fetchImpl(`https://api.github.com${path}`, {
           ...init,
@@ -202,6 +200,86 @@ export function githubForge(opts: {
         }),
       note,
     );
+  }
+
+  function filePath(file: string): string {
+    const clean = file.replace(/^\/+/, "");
+    if (!clean || clean.split("/").some((part) => !part || part === "." || part === "..")) {
+      throw new Error("http worker seed failed: path");
+    }
+    return clean.split("/").map((part) => encodeURIComponent(part)).join("/");
+  }
+
+  async function branchSha(
+    owner: string,
+    repo: string,
+    branch: string,
+    slot: string,
+    token: string,
+    endpoint: string,
+  ): Promise<string | null> {
+    const response = await callGithub(
+      `/repos/${owner}/${repo}/git/matching-refs/heads/${filePath(branch)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+      slot,
+      endpoint,
+    );
+    if (!response.ok) {
+      await response.text().catch(() => undefined);
+      throw Object.assign(new Error(`http worker seed failed: ${response.status}`), { httpStatus: response.status });
+    }
+    const rows = (await response.json()) as { ref?: string; object?: { sha?: string } }[];
+    const exact = rows.find((row) => row.ref === `refs/heads/${branch}`);
+    const sha = exact?.object?.sha?.trim() ?? "";
+    return sha || null;
+  }
+
+  /** Create `branch` from the default branch when it is missing. Returns a failure status, or 0 when the branch is ready. */
+  async function ensureFileBranch(
+    owner: string,
+    repo: string,
+    branch: string,
+    slot: string,
+    token: string,
+    endpoint: string,
+  ): Promise<number> {
+    const existing = await branchSha(owner, repo, branch, slot, token, endpoint);
+    if (existing) return 0;
+    const repoResponse = await callGithub(
+      `/repos/${owner}/${repo}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+      slot,
+      endpoint,
+    );
+    if (!repoResponse.ok) {
+      await repoResponse.text().catch(() => undefined);
+      return repoResponse.status;
+    }
+    const described = (await repoResponse.json()) as { default_branch?: string };
+    const base = described.default_branch?.trim() ?? "";
+    if (!base) throw new Error("http worker seed failed: default branch is missing");
+    const sha = await branchSha(owner, repo, base, slot, token, endpoint);
+    if (!sha) throw new Error("http worker seed failed: default branch is missing");
+    const created = await callGithub(
+      `/repos/${owner}/${repo}/git/refs`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ ref: `refs/heads/${branch}`, sha }),
+      },
+      slot,
+      endpoint,
+    );
+    if (created.status === 422) {
+      await created.text().catch(() => undefined);
+      return 0;
+    }
+    if (!created.ok) {
+      await created.text().catch(() => undefined);
+      return created.status;
+    }
+    await created.text().catch(() => undefined);
+    return 0;
   }
 
   async function api(path: string, init?: RequestInit): Promise<Response> {
@@ -442,5 +520,112 @@ export function githubForge(opts: {
         body: JSON.stringify({ ref: input.ref, inputs: input.inputs }),
       });
     },
+    async readTextFile(input) {
+      const [owner, repo] = input.repo.split("/");
+      const minted = await tokenForCheckRuns();
+      const response = await callGithub(
+        `/repos/${owner}/${repo}/contents/${filePath(input.path)}?ref=${encodeURIComponent(input.branch)}`,
+        { headers: { Authorization: `Bearer ${minted.token}` } },
+        minted.slot,
+        input.endpoint,
+      );
+      if (!response.ok) {
+        await response.text().catch(() => undefined);
+        return { status: response.status, text: "" };
+      }
+      const json = (await response.json()) as { encoding?: string; content?: string };
+      if (json.encoding === "base64" && typeof json.content === "string") {
+        return {
+          status: response.status,
+          text: Buffer.from(json.content.replace(/\s+/g, ""), "base64").toString("utf8"),
+        };
+      }
+      return { status: response.status, text: typeof json.content === "string" ? json.content : "" };
+    },
+    async writeTextFile(input) {
+      const [owner, repo] = input.repo.split("/");
+      const minted = await tokenForCheckRuns();
+      const ready = await ensureFileBranch(owner, repo, input.branch, minted.slot, minted.token, input.endpoint);
+      if (ready !== 0) return { status: ready, actor: "" };
+      const response = await callGithub(
+        `/repos/${owner}/${repo}/contents/${filePath(input.path)}`,
+        {
+          method: "PUT",
+          headers: { Authorization: `Bearer ${minted.token}` },
+          body: JSON.stringify({
+            message: input.message,
+            content: Buffer.from(input.text, "utf8").toString("base64"),
+            branch: input.branch,
+          }),
+        },
+        minted.slot,
+        input.endpoint,
+      );
+      if (!response.ok) {
+        await response.text().catch(() => undefined);
+        return { status: response.status, actor: "" };
+      }
+      const json = (await response.json()) as {
+        commit?: { author?: { name?: string; email?: string }; committer?: { name?: string; email?: string } };
+      };
+      const author = json.commit?.author ?? json.commit?.committer;
+      return { status: response.status, actor: loginFromGitIdentity(author?.name, author?.email) };
+    },
+    async createIssue(input) {
+      const [owner, repo] = input.repo.split("/");
+      const minted = await tokenForCheckRuns();
+      const response = await callGithub(
+        `/repos/${owner}/${repo}/issues`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${minted.token}` },
+          body: JSON.stringify({
+            title: input.title,
+            body: input.body,
+            ...(input.labels?.length ? { labels: input.labels } : {}),
+          }),
+        },
+        minted.slot,
+        input.endpoint,
+      );
+      if (!response.ok) {
+        await response.text().catch(() => undefined);
+        return { status: response.status, number: 0 };
+      }
+      const json = (await response.json()) as { number?: number };
+      return { status: response.status, number: json.number ?? 0 };
+    },
+    async assignIssue(input) {
+      const [owner, repo] = input.repo.split("/");
+      const minted = await tokenForCheckRuns();
+      const response = await callGithub(
+        `/repos/${owner}/${repo}/issues/${input.number}/assignees`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${minted.token}` },
+          body: JSON.stringify({ assignees: [input.assignee] }),
+        },
+        minted.slot,
+        input.endpoint,
+      );
+      await response.text().catch(() => undefined);
+      return response.status;
+    },
+    async actorLogin() {
+      const minted = await tokenForCheckRuns();
+      return (await githubUserLogin(fetchImpl, minted.token, note, minted.slot)) ?? "";
+    },
   };
+}
+
+/** A noreply email or a bot name recorded on a commit. A display name is not a login. */
+export function loginFromGitIdentity(name?: string, email?: string): string {
+  const mail = email?.trim() ?? "";
+  const plus = mail.match(/\+([^@]+)@users\.noreply\.github\.com$/i);
+  if (plus?.[1]) return plus[1];
+  const plain = mail.match(/^([^@+]+)@users\.noreply\.github\.com$/i);
+  if (plain?.[1]) return plain[1];
+  const bot = name?.trim() ?? "";
+  if (/^[A-Za-z0-9-]+\[bot\]$/.test(bot)) return bot;
+  return "";
 }

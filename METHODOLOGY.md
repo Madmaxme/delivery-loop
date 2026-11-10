@@ -20,7 +20,7 @@ A Figma frame URL is the `figma.com` address. Surrounding markdown and a trailin
 
 ## Credential log
 
-Each credential call writes one line. The line names the slot, the endpoint class, and the status. A success is included. A mint writes `slot=mint` and `endpoint=mint`. A re-mint near expiry adds `refresh=1`. Check-runs write `endpoint=check-runs`, with `slot=mint` when the mint command is set and `slot=gh-token` when it is not. Other GitHub calls write `slot=gh-token` and a class such as `pulls`, `contents`, `commits`, `compare`, `actions`, `issues`, `git`, or `user`. Linear writes `slot=linear` and `endpoint=linear-graphql`. A cursor launch writes `slot=primary` or `slot=fallback` and `endpoint=cursor-launch`. A Figma read writes `slot=figma` and `endpoint=figma`.
+Each credential call writes one line. The line names the slot, the endpoint class, and the status. A success is included. A mint writes `slot=mint` and `endpoint=mint`. A re-mint near expiry adds `refresh=1`. Check-runs write `endpoint=check-runs`, with `slot=mint` when the mint command is set and `slot=gh-token` when it is not. Other GitHub calls write `slot=gh-token` and a class such as `pulls`, `contents`, `commits`, `compare`, `actions`, `issues`, `git`, or `user`. Linear writes `slot=linear` and `endpoint=linear-graphql`. A cursor launch writes `slot=primary` or `slot=fallback` and `endpoint=cursor-launch`. An http worker start writes `endpoint=worker-http-start`. An http worker status read writes `endpoint=worker-http-status`. A status-store seed writes `endpoint=worker-http-seed`. The slot is `worker-http`, or `mint` or `gh-token` when a header or the forge credential uses that source. A Figma read writes `slot=figma` and `endpoint=figma`.
 
 The run line is `[delivery-loop] credential slot=<slot> endpoint=<endpoint> status=<status>`. The run ends with one summary line per slot, endpoint class, and status: `[delivery-loop] credential summary slot=<slot> endpoint=<endpoint> status=<status> count=<n>`. A grep for `credential summary` that finds no status other than 200 means every recorded call returned 200.
 
@@ -71,3 +71,105 @@ An empty fallback variable leaves that launch on the primary slot.
 
 `workerModel` is the cursor model id. The launch passes `{ id }` and the credential line names that id. An absent `workerModel` omits the model and logs that the account default is in use.
 A 5xx on a cursor launch waits one second and retries that slot once. A second 5xx uses the fallback slot. Each attempt logs its slot, `endpoint=cursor-launch`, and status.
+
+## HTTP worker
+
+`worker: http` posts a start request to `workerHttp.startUrl`, then reads until the result is terminal. The loop generates the request id and sends it on start. Without `statusStore`, it reads `workerHttp.statusUrl`. With `statusStore`, the loop writes a pending file through the forge before start, using the minted token or the forge token, and creates `branch` from the default branch when it is missing. Status reads then come from that file, so each read is a 200 file read. A non-2xx seed fails the worker and does not start. The seed logs `endpoint=worker-http-seed`. When `request` is set, start does not post `startUrl`. After the seed it opens one forge issue titled `worker-request <id>`, then assigns `assignee` in a second call. The issue body is a fenced JSON block of the start record plus `requestedBy`, the login recorded for the forge credential. When that block is longer than 65536 characters, the full record is written beside the pending file at `<path-without-json>.request.json` and the issue body is only that path. A non-2xx issue create or assign fails the worker and does not start another launcher. Those calls log `endpoint=worker-request-issue` and `endpoint=worker-request-assign`. A non-2xx `startUrl` post fails that worker the same way.
+
+`workerHttp.pollMs` defaults to 15000. `workerHttp.maxWaitMs` defaults to 3600000. Join sleeps `pollMs` between reads. `pending` and `running` are not terminal. `finished` and `failed` are terminal. When `maxWaitMs` passes, the result is failed and the detail is `http worker join exceeded maxWaitMs`. `maxWaitMs` is at least `pollMs` and no greater than the hosted job budget of 360 minutes.
+
+`workerHttp.startHeaders` and `workerHttp.statusHeaders` map a header name to an env var name. The names `mint` and `gh-token` are the minted installation token and the forge token. `mint` uses the forge token when `DELIVERY_LOOP_GITHUB_MINT` is unset. An `Authorization` value with no scheme is sent as a bearer token. The value is not written. `WORKER_HTTP_TOKEN` is the Authorization value when the maps omit it.
+
+`workerModel` is sent as `model: { id }` on start, the same shape as a cursor launch. An absent `workerModel` omits `model`. The prompt is the one the engine already builds.
+
+A status URL body with `encoding` of `base64` and `content`, and no `status`, is decoded and read as the result. A forge file read returns the record itself.
+
+When `statusStore` is set, the start body adds the resolved file:
+
+```json
+"statusStore": { "repo": "<owner/name>", "branch": "<branch>", "path": "<resolved-path>" }
+```
+
+The loop writes this record before that POST:
+
+```json
+{
+  "status": "pending",
+  "id": "<request-id>",
+  "repoUrl": "<repo-url>",
+  "baseRef": "<base-ref>",
+  "requestedAt": "<iso-time>"
+}
+```
+
+The relay updates that same file. `pending` and `running` stay open. `finished` and `failed` stop the wait. `branch`, `head`, `branches`, and `text` are the same fields as a status URL response.
+
+Start request:
+
+```json
+{
+  "id": "<request-id>",
+  "prompt": "<prompt>",
+  "repoUrl": "<repo-url>",
+  "baseRef": "<base-ref>",
+  "model": { "id": "<workerModel>" },
+  "statusStore": { "repo": "<owner/name>", "branch": "<branch>", "path": "worker-results/<request-id>.json" }
+}
+```
+
+`statusStore` is present only when `statusUrl` mode is used and that key is set, or when the same record is placed on a forge issue. `path` is the template with `{id}` replaced. `requestedBy` is added on the issue record. Any 2xx `startUrl` response is success. The body is ignored.
+
+Forge issue body, when it fits:
+
+````markdown
+```json
+{"id":"<request-id>","prompt":"<prompt>","repoUrl":"<repo-url>","baseRef":"<base-ref>","model":{"id":"<workerModel>"},"statusStore":{"repo":"<owner/name>","branch":"<branch>","path":"worker-results/<request-id>.json"},"requestedBy":"<login>"}
+```
+````
+
+When the fenced block is longer than 65536 characters, the issue body is `worker-results/<request-id>.request.json` and that file holds the same JSON.
+
+`statusUrl` replaces `{id}` with the request id. A URL with no `{id}` gains the id as its last path segment. A query string needs `{id}`.
+
+Status response, HTTP 200:
+
+```json
+{
+  "status": "pending",
+  "branch": "<branch>",
+  "head": "<sha>",
+  "branches": [{ "repoUrl": "<repo-url>", "branch": "<branch>" }],
+  "text": "<text>"
+}
+```
+
+`branch`, `head`, and `branches` may be absent until `finished`. `text` may be empty. A non-2xx status read fails the worker.
+
+```yaml
+worker: http
+workerModel: <model-id>
+workerHttp:
+  startUrl: https://<host>/start
+  statusUrl: https://<host>/status/{id}
+  pollMs: 15000
+  maxWaitMs: 3600000
+  startHeaders:
+    Authorization: <start-token-env>
+  statusHeaders:
+    Authorization: mint
+  statusStore:
+    kind: forge
+    repo: <owner/name>
+    branch: <branch>
+    path: worker-results/{id}.json
+  request:
+    kind: forge-issue
+    repo: <owner/name>
+    assignee: <login>
+    labels:
+      - <label>
+```
+
+`request` replaces `startUrl` and requires `statusStore`. `labels` may be omitted.
+
+`statusUrl` is the read path when `statusStore` is absent. `statusStore` replaces those reads. `path` must contain `{id}`. The start body sends that path with the id filled in.

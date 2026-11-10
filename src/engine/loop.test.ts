@@ -1325,6 +1325,27 @@ describe("loop", () => {
     assert.deepEqual(lines, ["API-1 skipped-graph blocked by API-2 (Todo)"]);
   });
 
+  it("reports worker-failed when the worker start is refused and does not start again", async () => {
+    const env = harness(BUILDABLE);
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      throw new Error("HTTP worker start failed: 400");
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "worker-failed");
+    assert.match(result.detail ?? "", /HTTP worker start failed: 400/);
+    assert.equal(starts, 1);
+  });
+
+  it("reports worker-failed when the worker join exceeds its wait", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.worker.join = async () => ({ status: "failed", text: "http worker join exceeded maxWaitMs" });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "worker-failed");
+    assert.match(result.detail ?? "", /exceeded maxWaitMs/);
+  });
+
   it("keeps a progress line on one line", () => {
     assert.equal(formatTicketProgress({ identifier: "API-1", phase: "ground" }), "API-1 ground");
     assert.equal(

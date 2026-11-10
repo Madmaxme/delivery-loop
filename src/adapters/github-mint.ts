@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
 
+import { noteMint, type CredentialNoteFn } from "../engine/credential-log.ts";
+
 /** GitHub installation tokens last one hour when the mint command does not say otherwise. */
 export const INSTALLATION_TOKEN_TTL_MS = 60 * 60 * 1000;
 
@@ -49,6 +51,48 @@ export function interpretMintOutput(stdout: string, nowMs: number): MintedCreden
   const expiresAtMs = expiryLine ? Date.parse(expiryLine) : nowMs + INSTALLATION_TOKEN_TTL_MS;
   if (!Number.isFinite(expiresAtMs)) return null;
   return { token, expiresAtMs };
+}
+
+export type InstallationToken = {
+  token: string;
+  slot: "mint" | "gh-token";
+};
+
+/**
+ * One cache for the minted installation token.
+ * An empty command uses `fallbackToken` and slot `gh-token`.
+ * Callers must not print the token.
+ */
+export function createInstallationToken(opts: {
+  command: () => string;
+  fallbackToken: string;
+  nowMs?: () => number;
+  runMint?: (command: string) => MintRun;
+  note?: CredentialNoteFn;
+}): { get(): Promise<InstallationToken> } {
+  let cached: MintedCredential | null = null;
+  return {
+    async get() {
+      const command = opts.command().trim();
+      if (!command) return { token: opts.fallbackToken, slot: "gh-token" };
+      const now = (opts.nowMs ?? Date.now)();
+      if (cached && !credentialDue(cached.expiresAtMs, now)) {
+        return { token: cached.token, slot: "mint" };
+      }
+      const refresh = cached !== null;
+      const result = (opts.runMint ?? runMintCommand)(command);
+      const minted = result.status === 0 ? interpretMintOutput(result.stdout, now) : null;
+      const ok = Boolean(minted && minted.expiresAtMs > now);
+      noteMint({ exitStatus: result.status, ok, refresh, note: opts.note });
+      if (!minted || minted.expiresAtMs <= now) {
+        throw new Error(
+          "credential error: DELIVERY_LOOP_GITHUB_MINT did not return an installation token that is still valid.",
+        );
+      }
+      cached = minted;
+      return { token: minted.token, slot: "mint" };
+    },
+  };
 }
 
 /** True when the token should be minted again before the next check-runs call. */
