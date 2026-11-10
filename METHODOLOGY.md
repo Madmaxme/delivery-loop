@@ -20,7 +20,7 @@ A Figma frame URL is the `figma.com` address. Surrounding markdown and a trailin
 
 ## Credential log
 
-Each credential call writes one line. The line names the slot, the endpoint class, and the status. A success is included. A mint writes `slot=mint` and `endpoint=mint`. A re-mint near expiry adds `refresh=1`. Check-runs write `endpoint=check-runs`, with `slot=mint` when the mint command is set and `slot=gh-token` when it is not. Other GitHub calls write `slot=gh-token` and a class such as `pulls`, `contents`, `commits`, `compare`, `actions`, `issues`, `git`, or `user`. Linear writes `slot=linear` and `endpoint=linear-graphql`. A cursor launch writes `slot=primary` or `slot=fallback` and `endpoint=cursor-launch`. An http worker start writes `endpoint=worker-http-start`. An http worker status read writes `endpoint=worker-http-status`. The slot is `worker-http`, or `mint` or `gh-token` when a header uses that source. A Figma read writes `slot=figma` and `endpoint=figma`.
+Each credential call writes one line. The line names the slot, the endpoint class, and the status. A success is included. A mint writes `slot=mint` and `endpoint=mint`. A re-mint near expiry adds `refresh=1`. Check-runs write `endpoint=check-runs`, with `slot=mint` when the mint command is set and `slot=gh-token` when it is not. Other GitHub calls write `slot=gh-token` and a class such as `pulls`, `contents`, `commits`, `compare`, `actions`, `issues`, `git`, or `user`. Linear writes `slot=linear` and `endpoint=linear-graphql`. A cursor launch writes `slot=primary` or `slot=fallback` and `endpoint=cursor-launch`. An http worker start writes `endpoint=worker-http-start`. An http worker status read writes `endpoint=worker-http-status`. A status-store seed writes `endpoint=worker-http-seed`. The slot is `worker-http`, or `mint` or `gh-token` when a header or the forge credential uses that source. A Figma read writes `slot=figma` and `endpoint=figma`.
 
 The run line is `[delivery-loop] credential slot=<slot> endpoint=<endpoint> status=<status>`. The run ends with one summary line per slot, endpoint class, and status: `[delivery-loop] credential summary slot=<slot> endpoint=<endpoint> status=<status> count=<n>`. A grep for `credential summary` that finds no status other than 200 means every recorded call returned 200.
 
@@ -74,7 +74,7 @@ A 5xx on a cursor launch waits one second and retries that slot once. A second 5
 
 ## HTTP worker
 
-`worker: http` posts a start request to `workerHttp.startUrl`, then reads `workerHttp.statusUrl` until the result is terminal. The loop generates the request id and sends it on start. The start handler writes a pending result for that id before it returns, so every status read is HTTP 200. The loop does not write the status record. A non-2xx start fails that worker. It does not start another launcher.
+`worker: http` posts a start request to `workerHttp.startUrl`, then reads until the result is terminal. The loop generates the request id and sends it on start. Without `statusStore`, it reads `workerHttp.statusUrl`. With `statusStore`, the loop writes a pending file through the forge before the start POST, using the minted token or the forge token, and creates `branch` from the default branch when it is missing. Status reads then come from that file, so each read is a 200 file read. A non-2xx seed fails the worker and does not start. The seed logs `endpoint=worker-http-seed`. A non-2xx start fails that worker. It does not start another launcher.
 
 `workerHttp.pollMs` defaults to 15000. `workerHttp.maxWaitMs` defaults to 3600000. Join sleeps `pollMs` between reads. `pending` and `running` are not terminal. `finished` and `failed` are terminal. When `maxWaitMs` passes, the result is failed and the detail is `http worker join exceeded maxWaitMs`. `maxWaitMs` is at least `pollMs` and no greater than the hosted job budget of 360 minutes.
 
@@ -82,7 +82,27 @@ A 5xx on a cursor launch waits one second and retries that slot once. A second 5
 
 `workerModel` is sent as `model: { id }` on start, the same shape as a cursor launch. An absent `workerModel` omits `model`. The prompt is the one the engine already builds.
 
-A status body with `encoding` of `base64` and `content`, and no `status`, is decoded and read as the result. A forge contents response has that shape.
+A status URL body with `encoding` of `base64` and `content`, and no `status`, is decoded and read as the result. A forge file read returns the record itself.
+
+When `statusStore` is set, the start body adds the resolved file:
+
+```json
+"statusStore": { "repo": "<owner/name>", "branch": "<branch>", "path": "<resolved-path>" }
+```
+
+The loop writes this record before that POST:
+
+```json
+{
+  "status": "pending",
+  "id": "<request-id>",
+  "repoUrl": "<repo-url>",
+  "baseRef": "<base-ref>",
+  "requestedAt": "<iso-time>"
+}
+```
+
+The relay updates that same file. `pending` and `running` stay open. `finished` and `failed` stop the wait. `branch`, `head`, `branches`, and `text` are the same fields as a status URL response.
 
 Start request:
 
@@ -92,11 +112,12 @@ Start request:
   "prompt": "<prompt>",
   "repoUrl": "<repo-url>",
   "baseRef": "<base-ref>",
-  "model": { "id": "<workerModel>" }
+  "model": { "id": "<workerModel>" },
+  "statusStore": { "repo": "<owner/name>", "branch": "<branch>", "path": "worker-results/<request-id>.json" }
 }
 ```
 
-Any 2xx response is success. The body is ignored.
+`statusStore` is present only when that key is set. `path` is the template with `{id}` replaced. Any 2xx response is success. The body is ignored.
 
 `statusUrl` replaces `{id}` with the request id. A URL with no `{id}` gains the id as its last path segment. A query string needs `{id}`.
 
@@ -126,4 +147,11 @@ workerHttp:
     Authorization: <start-token-env>
   statusHeaders:
     Authorization: mint
+  statusStore:
+    kind: forge
+    repo: <owner/name>
+    branch: <branch>
+    path: worker-results/{id}.json
 ```
+
+`statusUrl` is the read path when `statusStore` is absent. `statusStore` replaces those reads. `path` must contain `{id}`. The start body sends that path with the id filled in.

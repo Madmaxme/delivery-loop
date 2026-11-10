@@ -184,10 +184,15 @@ export function githubForge(opts: {
     return installation.get();
   }
 
-  function callGithub(path: string, init?: RequestInit, slot = "gh-token"): Promise<Response> {
+  function callGithub(
+    path: string,
+    init?: RequestInit,
+    slot = "gh-token",
+    endpoint?: string,
+  ): Promise<Response> {
     return credentialFetch(
       slot,
-      githubEndpointClass(path),
+      endpoint ?? githubEndpointClass(path),
       () =>
         fetchImpl(`https://api.github.com${path}`, {
           ...init,
@@ -195,6 +200,86 @@ export function githubForge(opts: {
         }),
       note,
     );
+  }
+
+  function filePath(file: string): string {
+    const clean = file.replace(/^\/+/, "");
+    if (!clean || clean.split("/").some((part) => !part || part === "." || part === "..")) {
+      throw new Error("http worker seed failed: path");
+    }
+    return clean.split("/").map((part) => encodeURIComponent(part)).join("/");
+  }
+
+  async function branchSha(
+    owner: string,
+    repo: string,
+    branch: string,
+    slot: string,
+    token: string,
+    endpoint: string,
+  ): Promise<string | null> {
+    const response = await callGithub(
+      `/repos/${owner}/${repo}/git/matching-refs/heads/${filePath(branch)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+      slot,
+      endpoint,
+    );
+    if (!response.ok) {
+      await response.text().catch(() => undefined);
+      throw Object.assign(new Error(`http worker seed failed: ${response.status}`), { httpStatus: response.status });
+    }
+    const rows = (await response.json()) as { ref?: string; object?: { sha?: string } }[];
+    const exact = rows.find((row) => row.ref === `refs/heads/${branch}`);
+    const sha = exact?.object?.sha?.trim() ?? "";
+    return sha || null;
+  }
+
+  /** Create `branch` from the default branch when it is missing. Returns a failure status, or 0 when the branch is ready. */
+  async function ensureFileBranch(
+    owner: string,
+    repo: string,
+    branch: string,
+    slot: string,
+    token: string,
+    endpoint: string,
+  ): Promise<number> {
+    const existing = await branchSha(owner, repo, branch, slot, token, endpoint);
+    if (existing) return 0;
+    const repoResponse = await callGithub(
+      `/repos/${owner}/${repo}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+      slot,
+      endpoint,
+    );
+    if (!repoResponse.ok) {
+      await repoResponse.text().catch(() => undefined);
+      return repoResponse.status;
+    }
+    const described = (await repoResponse.json()) as { default_branch?: string };
+    const base = described.default_branch?.trim() ?? "";
+    if (!base) throw new Error("http worker seed failed: default branch is missing");
+    const sha = await branchSha(owner, repo, base, slot, token, endpoint);
+    if (!sha) throw new Error("http worker seed failed: default branch is missing");
+    const created = await callGithub(
+      `/repos/${owner}/${repo}/git/refs`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ ref: `refs/heads/${branch}`, sha }),
+      },
+      slot,
+      endpoint,
+    );
+    if (created.status === 422) {
+      await created.text().catch(() => undefined);
+      return 0;
+    }
+    if (!created.ok) {
+      await created.text().catch(() => undefined);
+      return created.status;
+    }
+    await created.text().catch(() => undefined);
+    return 0;
   }
 
   async function api(path: string, init?: RequestInit): Promise<Response> {
@@ -434,6 +519,51 @@ export function githubForge(opts: {
         method: "POST",
         body: JSON.stringify({ ref: input.ref, inputs: input.inputs }),
       });
+    },
+    async readTextFile(input) {
+      const [owner, repo] = input.repo.split("/");
+      const minted = await tokenForCheckRuns();
+      const response = await callGithub(
+        `/repos/${owner}/${repo}/contents/${filePath(input.path)}?ref=${encodeURIComponent(input.branch)}`,
+        { headers: { Authorization: `Bearer ${minted.token}` } },
+        minted.slot,
+        input.endpoint,
+      );
+      if (!response.ok) {
+        await response.text().catch(() => undefined);
+        return { status: response.status, text: "" };
+      }
+      const json = (await response.json()) as { encoding?: string; content?: string };
+      if (json.encoding === "base64" && typeof json.content === "string") {
+        return {
+          status: response.status,
+          text: Buffer.from(json.content.replace(/\s+/g, ""), "base64").toString("utf8"),
+        };
+      }
+      return { status: response.status, text: typeof json.content === "string" ? json.content : "" };
+    },
+    async writeTextFile(input) {
+      const [owner, repo] = input.repo.split("/");
+      const minted = await tokenForCheckRuns();
+      const ready = await ensureFileBranch(owner, repo, input.branch, minted.slot, minted.token, input.endpoint);
+      if (ready !== 0) return ready;
+      const response = await callGithub(
+        `/repos/${owner}/${repo}/contents/${filePath(input.path)}`,
+        {
+          method: "PUT",
+          headers: { Authorization: `Bearer ${minted.token}` },
+          body: JSON.stringify({
+            message: input.message,
+            content: Buffer.from(input.text, "utf8").toString("base64"),
+            branch: input.branch,
+          }),
+        },
+        minted.slot,
+        input.endpoint,
+      );
+      if (!response.ok) await response.text().catch(() => undefined);
+      else await response.text().catch(() => undefined);
+      return response.status;
     },
   };
 }

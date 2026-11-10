@@ -77,13 +77,13 @@ A 5xx on a cursor launch waits one second and retries that slot once. A second 5
 
 ## HTTP worker
 
-`worker: http` posts the start request below to `workerHttp.startUrl`. The loop generates `id`. The start handler writes a pending result for that id before it returns 2xx, and the loop reads it from `workerHttp.statusUrl`. The loop does not write that record. A non-2xx start fails the worker and does not start another launcher.
+`worker: http` posts the start request below to `workerHttp.startUrl`. The loop generates `id`. Without `statusStore`, it reads `workerHttp.statusUrl`. With `statusStore`, the loop writes a pending file through the forge before that POST and reads the same file afterward. The credential is the minted token, or the forge token when the mint command is unset. A missing `branch` is created from the default branch. A non-2xx seed fails the worker and does not start. A non-2xx start fails the worker and does not start another launcher.
 
 `pollMs` defaults to 15000. `maxWaitMs` defaults to 3600000 and stays inside the hosted job budget of 360 minutes. Join sleeps `pollMs` between reads. `pending` and `running` stay open. `finished` and `failed` stop the wait. A spent `maxWaitMs` is a failed worker, detail `http worker join exceeded maxWaitMs`.
 
-Header maps name an env var, or `mint` or `gh-token`. `mint` is the minted installation token. `gh-token` is the forge token. No secret is stored in the pack. An http start logs `endpoint=worker-http-start`. A status read logs `endpoint=worker-http-status`. The request URL and the header values are not written.
+Header maps name an env var, or `mint` or `gh-token`. `mint` is the minted installation token. `gh-token` is the forge token. No secret is stored in the pack. An http start logs `endpoint=worker-http-start`. A status read logs `endpoint=worker-http-status`. A seed logs `endpoint=worker-http-seed`. The request URL and the header values are not written.
 
-`model` is `{ id }` from `workerModel`. An absent `workerModel` omits it. A status body that is a base64 document (`encoding` of `base64` and `content`) is decoded as the result.
+`model` is `{ id }` from `workerModel`. An absent `workerModel` omits it. A status URL body that is a base64 document (`encoding` of `base64` and `content`) is decoded as the result. A forge file read is the record itself.
 
 ```yaml
 worker: http
@@ -97,7 +97,14 @@ workerHttp:
     Authorization: <start-token-env>
   statusHeaders:
     Authorization: mint
+  statusStore:
+    kind: forge
+    repo: <owner/name>
+    branch: <branch>
+    path: worker-results/{id}.json
 ```
+
+`statusUrl` stays the read path when `statusStore` is absent. `path` must contain `{id}`. The start body sends `statusStore` with that path filled in. The file written before the POST is `{"status":"pending","id","repoUrl","baseRef","requestedAt"}`. The relay updates that file. `pending` and `running` stay open. `finished` and `failed` stop the wait.
 
 Start request:
 
@@ -107,11 +114,12 @@ Start request:
   "prompt": "<prompt>",
   "repoUrl": "<repo-url>",
   "baseRef": "<base-ref>",
-  "model": { "id": "<workerModel>" }
+  "model": { "id": "<workerModel>" },
+  "statusStore": { "repo": "<owner/name>", "branch": "<branch>", "path": "worker-results/<request-id>.json" }
 }
 ```
 
-Any 2xx is success. The body is ignored. `statusUrl` replaces `{id}`. Without `{id}`, the id is the last path segment. A query string needs `{id}`.
+`statusStore` is present only when that key is set. `path` is the template with `{id}` replaced. Any 2xx is success. The body is ignored. `statusUrl` replaces `{id}`. Without `{id}`, the id is the last path segment. A query string needs `{id}`.
 
 Status response, HTTP 200:
 

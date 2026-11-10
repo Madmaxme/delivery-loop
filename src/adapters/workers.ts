@@ -9,6 +9,7 @@ import {
   DEFAULT_WORKER_HTTP_MAX_WAIT_MS,
   DEFAULT_WORKER_HTTP_POLL_MS,
   type WorkerHttpHeaders,
+  type WorkerHttpStatusStore,
 } from "../schema/pack.ts";
 import type { InstallationToken } from "./github-mint.ts";
 import type { FetchLike, WorkerAdapter, WorkerResult, WorkerStart } from "./types.js";
@@ -115,6 +116,47 @@ function resultRecord(value: unknown): Record<string, unknown> | null {
   return record;
 }
 
+export type WorkerHttpFiles = {
+  /** Returns the write status. A non-2xx status means the file was not seeded. */
+  write(input: { repo: string; branch: string; path: string; text: string }): Promise<number>;
+  read(input: { repo: string; branch: string; path: string }): Promise<{ status: number; text: string }>;
+};
+
+export function workerHttpStorePath(template: string, id: string): string {
+  const safe = /^[A-Za-z0-9._-]+$/.test(id) ? id : encodeURIComponent(id);
+  return template.replaceAll("{id}", safe);
+}
+
+function pendingWorkerRecord(input: {
+  id: string;
+  repoUrl: string;
+  baseRef: string;
+  requestedAt: string;
+}): string {
+  return JSON.stringify({
+    status: "pending",
+    id: input.id,
+    repoUrl: input.repoUrl,
+    baseRef: input.baseRef,
+    requestedAt: input.requestedAt,
+  });
+}
+
+/** A terminal result, or null while the status is still pending or running. */
+function classifyHttpResult(parsed: unknown): WorkerResult | null {
+  const result = workerResultFromStatusBody(parsed);
+  if (!result) return { status: "failed", text: "http worker status is not a result" };
+  if (HTTP_PENDING.has(result.status)) return null;
+  if (result.status === "finished" || result.status === "failed") return result;
+  return { status: "failed", text: `http worker status ${result.status}` };
+}
+
+function statusOf(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const value = (error as { httpStatus?: unknown }).httpStatus;
+  return typeof value === "number" ? value : undefined;
+}
+
 /** Status body, or the decoded document when the store wraps it. */
 export function workerResultFromStatusBody(body: unknown): WorkerResult | null {
   const record = resultRecord(body);
@@ -139,6 +181,9 @@ export function httpWorker(opts: {
   token?: string;
   startHeaders?: WorkerHttpHeaders;
   statusHeaders?: WorkerHttpHeaders;
+  statusStore?: WorkerHttpStatusStore;
+  /** Forge file reads and writes. Required when `statusStore` is set. */
+  files?: WorkerHttpFiles;
   env?: Record<string, string | undefined>;
   tokens?: WorkerHttpToken;
   fetch?: FetchLike;
@@ -159,6 +204,29 @@ export function httpWorker(opts: {
     kind: "http",
     async start(input: WorkerStart) {
       const id = (opts.newId ?? randomUUID)();
+      const storePath = opts.statusStore ? workerHttpStorePath(opts.statusStore.path, id) : "";
+      if (opts.statusStore) {
+        if (!opts.files) throw new Error("http worker seed failed: forge has no file store");
+        let status: number;
+        try {
+          status = await opts.files.write({
+            repo: opts.statusStore.repo,
+            branch: opts.statusStore.branch,
+            path: storePath,
+            text: pendingWorkerRecord({
+              id,
+              repoUrl: input.repoUrl,
+              baseRef: input.baseRef,
+              requestedAt: new Date(nowMs()).toISOString(),
+            }),
+          });
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith("http worker seed failed")) throw error;
+          const failed = statusOf(error);
+          throw new Error(failed ? `http worker seed failed: ${failed}` : "http worker seed failed");
+        }
+        if (status < 200 || status > 299) throw new Error(`http worker seed failed: ${status}`);
+      }
       const auth = await resolveHeaderMap(opts.startHeaders, opts.token, env, opts.tokens);
       const body: Record<string, unknown> = {
         id,
@@ -167,6 +235,13 @@ export function httpWorker(opts: {
         baseRef: input.baseRef,
       };
       if (modelId) body.model = { id: modelId };
+      if (opts.statusStore) {
+        body.statusStore = {
+          repo: opts.statusStore.repo,
+          branch: opts.statusStore.branch,
+          path: storePath,
+        };
+      }
       const response = await credentialFetch(
         auth.slot,
         "worker-http-start",
@@ -183,9 +258,34 @@ export function httpWorker(opts: {
       return { runId: id };
     },
     async join(runId: string) {
-      const url = workerHttpStatusUrl(opts.statusUrl, runId);
+      const url = workerHttpStatusUrl(opts.statusUrl ?? "", runId);
+      const storePath = opts.statusStore ? workerHttpStorePath(opts.statusStore.path, runId) : "";
       const started = nowMs();
       for (;;) {
+        if (opts.statusStore && opts.files) {
+          const read = await opts.files.read({
+            repo: opts.statusStore.repo,
+            branch: opts.statusStore.branch,
+            path: storePath,
+          });
+          if (read.status < 200 || read.status > 299) {
+            return { status: "failed", text: `http worker status failed: ${read.status}` };
+          }
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(read.text);
+          } catch {
+            return { status: "failed", text: "http worker status is not a result" };
+          }
+          const stored = classifyHttpResult(parsed);
+          if (stored) return stored;
+          if (nowMs() - started >= maxWaitMs) {
+            return { status: "failed", text: "http worker join exceeded maxWaitMs" };
+          }
+          const remaining = maxWaitMs - (nowMs() - started);
+          await sleep(Math.min(pollMs, remaining));
+          continue;
+        }
         const auth = await resolveHeaderMap(opts.statusHeaders, opts.token, env, opts.tokens);
         const response = await credentialFetch(
           auth.slot,

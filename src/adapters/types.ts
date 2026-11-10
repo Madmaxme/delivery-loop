@@ -164,6 +164,29 @@ export type ForgeAdapter = {
     headSha?: string;
   }): Promise<string>;
   dispatch(input: { workflow: string; ref: string; inputs: Record<string, string> }): Promise<void>;
+  /**
+   * Read one text file on a branch. The credential line uses `endpoint`.
+   * Absent when this forge has no file API.
+   */
+  readTextFile?(input: {
+    repo: string;
+    branch: string;
+    path: string;
+    endpoint: string;
+  }): Promise<{ status: number; text: string }>;
+  /**
+   * Write one text file on a branch, creating the branch from the default
+   * branch when it is missing. Returns the write status. The credential
+   * line uses `endpoint`.
+   */
+  writeTextFile?(input: {
+    repo: string;
+    branch: string;
+    path: string;
+    text: string;
+    message: string;
+    endpoint: string;
+  }): Promise<number>;
 };
 
 export type FetchLike = (

@@ -43,6 +43,7 @@ const ENDPOINTS = new Set([
   "worker-http",
   "worker-http-start",
   "worker-http-status",
+  "worker-http-seed",
   "copilot",
   "codex",
   "claude",

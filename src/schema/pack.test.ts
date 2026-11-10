@@ -129,6 +129,35 @@ workerHttp:
       /\{id\}/,
     );
     assert.throws(() => loadPack(write(httpBase)), /workerHttp.startUrl/);
+    const stored = loadPack(
+      write(`${httpBase}
+workerHttp:
+  startUrl: https://host.example/start
+  statusStore:
+    kind: forge
+    repo: acme/store
+    branch: results
+    path: worker-results/{id}.json
+`),
+    );
+    assert.equal(stored.workerHttp?.statusUrl, undefined);
+    assert.equal(stored.workerHttp?.statusStore?.repo, "acme/store");
+    assert.equal(stored.workerHttp?.statusStore?.path, "worker-results/{id}.json");
+    assert.throws(
+      () =>
+        loadPack(
+          write(`${httpBase}
+workerHttp:
+  startUrl: https://host.example/start
+  statusStore:
+    kind: forge
+    repo: acme/store
+    branch: results
+    path: worker-results/result.json
+`),
+        ),
+      /statusStore.path/,
+    );
     assert.throws(
       () =>
         loadPack(
