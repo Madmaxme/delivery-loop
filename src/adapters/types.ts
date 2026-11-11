@@ -26,7 +26,7 @@ export type DeliveryStateMarker = { kind: string; body: string; createdAt: strin
 export type StageVerificationReceipt = {
   stageId: string;
   target: string;
-  outcome: "passed" | "blocked" | "parked";
+  outcome: "passed" | "blocked" | "parked" | "not-applicable";
   reason: string;
   criteriaRevision: string;
   deployed: Array<{ repo: string; sha: string }>;
