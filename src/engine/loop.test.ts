@@ -910,7 +910,7 @@ describe("loop", () => {
     assert.match(build, /Put that raw URL in backticks in BUILD_HANDOFF/);
     assert.match(build, /Omit only the \*\*Journey proof:\*\* prefix/);
     assert.match(build, /non-mutating view or test data/);
-    assert.match(build, /Do not edit a real booking/);
+    assert.doesNotMatch(build, /real booking/);
     assert.match(env.comments.join("\n"), /https:\/\/example\.test\/artifacts\/signup\.png/);
   });
 
@@ -982,10 +982,12 @@ describe("loop", () => {
     const first = await runTicket(env.deps, ticket({ comments: prior }));
     assert.equal(first.outcome, "journey-missing");
     assert.equal(prompts.length, 1);
-    assert.match(prompts[0] ?? "", /Do not edit files/);
-    assert.match(prompts[0] ?? "", /Do not commit/);
-    assert.match(prompts[0] ?? "", /Do not push/);
-    assert.match(prompts[0] ?? "", /Do not edit a real booking/);
+    assert.match(
+      prompts[0] ?? "",
+      /The worker captures and publishes the journey proof; it does not change code, commit, push, open a pull request, or call the tracker\./,
+    );
+    assert.match(prompts[0] ?? "", /non-mutating view or test data/);
+    assert.doesNotMatch(prompts[0] ?? "", /real booking/);
     assert.match(prompts[0] ?? "", /api trunk `main` commit `trunk`/);
     assert.equal(env.state(), "Todo");
     const second = await runTicket(
@@ -994,6 +996,94 @@ describe("loop", () => {
     );
     assert.equal(second.outcome, "journey-missing");
     assert.equal(prompts.length, 1);
+  });
+
+  it("moves the ticket to dev when the proof worker returns a recording URL", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "trunk";
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "proof-1" };
+    };
+    env.deps.worker.join = async () => ({ status: "finished" as const, text: `Walked \`${url}\`` });
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({
+      status: 0,
+      stdout: proofLinesFor(stdin).join("\n"),
+    });
+    const result = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          { body: "**Journey evidence:** recorded\n**Outside grant:** none\n**Repos:** `api`" },
+          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
+        ],
+      }),
+    );
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+    assert.equal(starts, 1);
+    assert.match(env.comments.join("\n"), /https:\/\/example\.test\/artifacts\/signup\.png/);
+  });
+
+  it("keeps a failed proof worker's recording and does not spend a second attempt", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "trunk";
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "proof-1" };
+    };
+    env.deps.worker.join = async () => ({ status: "failed" as const, text: `Walked \`${url}\`` });
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({
+      status: 0,
+      stdout: proofLinesFor(stdin).join("\n"),
+    });
+    const prior = [
+      { body: "**Journey evidence:** recorded\n**Outside grant:** none\n**Repos:** `api`" },
+      { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
+    ];
+    const first = await runTicket(env.deps, ticket({ comments: prior }));
+    assert.equal(first.outcome, "journey-missing");
+    assert.equal(env.state(), "Todo");
+    assert.equal(starts, 1);
+    assert.match(env.comments.join("\n"), /JOURNEY_RECEIPT/);
+    assert.match(env.comments.join("\n"), /https:\/\/example\.test\/artifacts\/signup\.png/);
+    const second = await runTicket(
+      env.deps,
+      ticket({ comments: [...prior, ...env.comments.map((body) => ({ body }))] }),
+    );
+    assert.equal(second.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+    assert.equal(starts, 1);
+  });
+
+  it("saves the proof text when joining throws after the worker wrote it", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "trunk";
+    env.deps.worker.start = async () => ({ runId: "proof-1" });
+    env.deps.worker.join = async () => {
+      throw new Error(`Walked \`${url}\``);
+    };
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => ({ status: 0, stdout: "" });
+    const result = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          { body: "**Journey evidence:** recorded\n**Outside grant:** none\n**Repos:** `api`" },
+          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
+        ],
+      }),
+    );
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(env.state(), "Todo");
+    assert.match(env.comments.join("\n"), /JOURNEY_RECEIPT[\s\S]*https:\/\/example\.test\/artifacts\/signup\.png/);
   });
 
   it("treats a contents 200 as the route test and a 404 as a missing file", async () => {

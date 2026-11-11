@@ -429,7 +429,7 @@ function buildPrompt(
       ? `Push these branches from each repo trunk: ${branches.join(", ")}. Include repo and branch in the handoff. Do not merge.`
       : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
     "Stay inside the allowlist. Run the validation commands.",
-    "When the handoff says **Journey evidence:** recorded, capture that journey on the running build. A web journey is a screenshot or a short video of the done state. Publish it so an https URL exists. The URL ends in png, jpg, jpeg, webp, gif, mp4, webm, or mov, or it contains /artifacts/. Put that raw URL in backticks in BUILD_HANDOFF. Omit only the **Journey proof:** prefix. The journey command prints that prefix. A mobile token is the route test on the commit whose path matches the journey-spec pattern. Use a non-mutating view or test data. Do not edit a real booking. The runner does not mark dev-done without the token.",
+    "When the handoff says **Journey evidence:** recorded, capture that journey on the running build. A web journey is a screenshot or a short video of the done state. Publish it so an https URL exists. The URL ends in png, jpg, jpeg, webp, gif, mp4, webm, or mov, or it contains /artifacts/. Put that raw URL in backticks in BUILD_HANDOFF. Omit only the **Journey proof:** prefix. The journey command prints that prefix. A mobile token is the route test on the commit whose path matches the journey-spec pattern. Use a non-mutating view or test data. The runner does not mark dev-done without the token.",
     retry,
   ].filter((part) => part.length > 0).join("\n\n");
 }
@@ -1958,9 +1958,9 @@ function proofPrompt(
   return [
     universalConduct(),
     `Capture journey proof for ${ticket.identifier}. The pull requests are already merged.`,
-    "Do not edit files. Do not commit. Do not push. Do not open a pull request. Do not call the tracker.",
+    "The worker captures and publishes the journey proof; it does not change code, commit, push, open a pull request, or call the tracker.",
     "The running build is the landed trunk. Capture the journey the handoff declared: a screenshot or a short video of the done state. Publish it so an https URL exists. The URL ends in png, jpg, jpeg, webp, gif, mp4, webm, or mov, or it contains /artifacts/. Put that raw URL in backticks in BUILD_HANDOFF. Omit only the **Journey proof:** prefix. The journey command prints that prefix.",
-    "Use a non-mutating view or test data. Do not edit a real booking.",
+    "Use a non-mutating view or test data.",
     landed,
     declared,
   ]
@@ -1976,19 +1976,36 @@ async function runProofWorker(
 ): Promise<{ status: "text"; text: string } | { status: "running"; detail: string } | { status: "empty" }> {
   const home = rows[0];
   if (!home) return { status: "empty" };
+  let started: { runId: string };
   try {
-    const started = await deps.worker.start({
+    started = await deps.worker.start({
       prompt: proofPrompt(ticket, declared, rows),
       repoUrl: home.repo.url,
       baseRef: home.repo.trunk,
     });
-    await noteLiveRun(deps, ticket, "build", started.runId);
-    const built = await finishWorker(deps.worker, started.runId);
-    if (built.status === "running") return { status: "running", detail: `cursor_run=${started.runId}` };
-    return { status: "text", text: built.text ?? "" };
   } catch {
     return { status: "empty" };
   }
+  try {
+    await noteLiveRun(deps, ticket, "build", started.runId);
+  } catch {
+    return { status: "empty" };
+  }
+  let built: Awaited<ReturnType<WorkerAdapter["join"]>>;
+  try {
+    built = await deps.worker.join(started.runId);
+  } catch (error) {
+    const text = error instanceof Error ? error.message : "";
+    if (text.trim()) await rememberJourneyReceipt(deps, ticket, text);
+    return { status: "empty" };
+  }
+  const text = built.text ?? "";
+  if (built.status === "failed") {
+    if (text.trim()) await rememberJourneyReceipt(deps, ticket, text);
+    return { status: "empty" };
+  }
+  if (built.status === "running") return { status: "running", detail: `cursor_run=${started.runId}` };
+  return { status: "text", text };
 }
 
 async function settleTrunk(
