@@ -2070,8 +2070,8 @@ async function symbolsResolve(deps: LoopDeps, symbols: string[]): Promise<boolea
 
 type JourneyCommandPrint =
   | { ok: true; stdout: string }
-  | { ok: false; reason: "failed"; status: number | null }
-  | { ok: false; reason: "empty" };
+  | { ok: false; reason: "failed"; status: number | null; stdout: string }
+  | { ok: false; reason: "empty"; stdout: string };
 
 /**
  * The pack command prints the proof token. An unset command prints nothing
@@ -2083,11 +2083,12 @@ async function journeyCommandProof(deps: LoopDeps, stdin: string): Promise<Journ
   if (!command) return { ok: true, stdout: "" };
   const run = deps.runPackCommand ?? defaultRunPackCommand;
   const result = await Promise.resolve(run(command, deps.cwd ?? process.cwd(), stdin, commandEnvironment(deps.pack)));
-  if (result.status !== 0) return { ok: false, reason: "failed", status: result.status };
-  if (parseJourneyProofs(result.stdout, deps.pack.journeySpec).length === 0) {
-    return { ok: false, reason: "empty" };
+  const stdout = result.stdout ?? "";
+  if (result.status !== 0) return { ok: false, reason: "failed", status: result.status, stdout };
+  if (parseJourneyProofs(stdout, deps.pack.journeySpec).length === 0) {
+    return { ok: false, reason: "empty", stdout };
   }
-  return { ok: true, stdout: result.stdout };
+  return { ok: true, stdout };
 }
 
 function journeySpecText(deps: LoopDeps): string {
@@ -2412,6 +2413,7 @@ async function applyRecordedProof(
   }
   const printed = await journeyCommandProof(deps, evidence);
   if (!printed.ok) {
+    await healUnprovenJourney(deps, ticket, printed);
     await deps.tracker.comment(ticket.identifier, journeyTokenMissing(deps, ticket.identifier, printed));
     return {
       ok: false,
@@ -2443,6 +2445,26 @@ async function applyRecordedProof(
   }
   noteEngine(deps, "proof ok");
   return { ok: true, recorded: true, proofReceipt };
+}
+
+function journeyCommandOutput(printed: Extract<JourneyCommandPrint, { ok: false }>): string {
+  const body = printed.stdout.trim();
+  if (printed.reason === "failed") return [`exit ${printed.status ?? "null"}`, body].filter(Boolean).join("\n");
+  return body;
+}
+
+/** A recorded attempt at these landed SHAs, with no proof from the journey command, goes to heal. */
+async function healUnprovenJourney(deps: LoopDeps, ticket: Ticket, printed: Extract<JourneyCommandPrint, { ok: false }>): Promise<void> {
+  const proof = journeyProofReceiptState(deps, ticket);
+  if (!proof?.attempted) return;
+  const output = journeyCommandOutput(printed);
+  const reason = [
+    "A proof was recorded but the journey command returned none.",
+    `Command output: ${output || "(none)"}`,
+    `Receipt reference: ${proof.receipt.trim() || "(none)"}`,
+  ].join("\n");
+  const signature = shipNoSignature(reason) || "journey command returned none";
+  await applyOwnerHeal(deps, ticket, `heal:proof:${signature}`, reason);
 }
 
 async function publishCompletionProof(

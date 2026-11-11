@@ -2522,6 +2522,55 @@ describe("loop", () => {
     assert.equal(env.deliveryState().markers.filter((marker) => marker.kind === "proof-receipt").length, 1);
   });
 
+  it("heals when a recorded proof attempt gets no proof from the journey command", async () => {
+    const ground = BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded");
+    const env = harness(ground);
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => ({ status: 0, stdout: "no token\n" });
+    const prompts: string[] = [];
+    env.deps.ownerHeal = async ({ prompt }) => {
+      prompts.push(prompt);
+      return "**Heal:** wait";
+    };
+    const state = await env.deps.tracker.stateStore.readDeliveryState("API-1");
+    await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+      ...state,
+      markers: [{
+        kind: "proof-receipt",
+        body: JSON.stringify({
+          schemaVersion: 2,
+          criteriaRevision: ticket().criteriaRevision,
+          landed: [{ repo: "api", sha: "trunk" }],
+          pullRequests: [],
+          attempted: true,
+          validated: false,
+          receipt: "receipt-ref",
+        }),
+        createdAt: new Date(0).toISOString(),
+      }],
+    });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(result.detail, "recorded proof missing");
+    assert.equal(env.state(), "Todo");
+    assert.equal(prompts.length, 1);
+    assert.match(prompts[0] ?? "", /A proof was recorded but the journey command returned none/);
+    assert.match(prompts[0] ?? "", /Command output: no token/);
+    assert.match(prompts[0] ?? "", /Receipt reference: receipt-ref/);
+
+    const quiet = harness(ground);
+    quiet.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    quiet.deps.runPackCommand = () => ({ status: 0, stdout: "" });
+    let heals = 0;
+    quiet.deps.ownerHeal = async () => {
+      heals += 1;
+      return "**Heal:** wait";
+    };
+    const skipped = await runTicket(quiet.deps, ticket());
+    assert.equal(skipped.outcome, "journey-missing");
+    assert.equal(heals, 0);
+  });
+
   it("does not accept an api unit spec as journey proof", async () => {
     const ground = BUILDABLE.replace(
       "**Journey evidence:** not-applicable",
