@@ -8,7 +8,7 @@ import { DEFAULT_JOURNEY_SPEC } from "../../scripts/journey-proof.mjs";
 import { interpretMintOutput, runMintCommand } from "../adapters/github-mint.ts";
 import { noteMint } from "./credential-log.ts";
 import { transientReason, transientWaitMs } from "./step-outcome.ts";
-import type { CompareStatus, DeliveryState, DesignCheckProbe, FetchLike, ForgeAdapter, ListedPull, LinearProgramTracker, StageVerificationReceipt, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
+import { githubRepoFromUrl, type CompareStatus, type DeliveryState, type DesignCheckProbe, type FetchLike, type ForgeAdapter, type ListedPull, type LinearProgramTracker, type StageVerificationReceipt, type Ticket, type TrackerAdapter, type WorkerAdapter } from "../adapters/types.js";
 import { agentHome, holdStatus, repoByName, unblockingStates, workerKeyNames, type ProjectPack, type PromotionStage, type RepoSpec } from "../schema/pack.js";
 import {
   designRepairText,
@@ -462,7 +462,7 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "A missing line stays in intake. Reading a vendor's documentation is not the grant.",
     "Every BUILDABLE handoff includes **Journey evidence:** recorded | not-applicable | blocked.",
     "not-applicable means the done-state is not a journey a person walks.",
-    `recorded means it is. Web proof is **Journey proof:** an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. Mobile proof is **Journey proof:** a route test on the merged commit, \`repo/path_test.dart\` or \`repo/path.test.ts\`, whose path matches \`${deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC}\`. A sentence that names no token is not proof. A spec outside that pattern stays in intake.`,
+    `recorded means the done-state includes journey proof. Web proof is an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. The build handoff includes that raw URL in backticks and omits the **Journey proof:** prefix; the configured journey command prints the prefix. Mobile proof is **Journey proof:** a route test on the exact landed commit, \`repo/path_test.dart\` or \`repo/path.test.ts\`, whose path matches \`${deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC}\`. A sentence that names no token is not proof. A spec outside that pattern stays in intake. If the route test is not on the landed commit, the engine checks configured delivery-stage refs (or the repo trunk when refs are not configured); promotion receipts remain bound to the exact landed SHAs and criteria revision.`,
     "blocked means that proof cannot be produced in this run. A missing line or blocked stays in intake and does not mark the ticket complete.",
     `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
     landRepoLine(deps.pack),
@@ -509,7 +509,7 @@ function buildPrompt(
       ? `Push these branches from each repo trunk: ${branches.join(", ")}. Include repo and branch in the handoff. Do not merge.`
       : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
     "Stay inside the allowlist. Run the validation commands.",
-    "When the handoff says **Journey evidence:** recorded, the pack journey command prints **Journey proof:**. A web token is an https recording or screenshot URL. A mobile token is the route test on the commit whose path matches the journey-spec pattern. The author does not write that token. The runner does not mark the ticket complete without it.",
+    "When the handoff says **Journey evidence:** recorded, capture that journey on the running build and publish its evidence. A web journey is a screenshot or a short video of the done state with an https URL ending in png, jpg, jpeg, webp, gif, mp4, webm, or mov, or containing /artifacts/. Put that raw URL in backticks in BUILD_HANDOFF and omit only the **Journey proof:** prefix; the journey command prints that prefix. A mobile token is the route test on the exact landed commit whose path matches the journey-spec pattern. Use a non-mutating view or test data. The runner does not mark delivery complete without the required proof.",
     retry,
   ].filter((part) => part.length > 0).join("\n\n");
 }
@@ -880,12 +880,18 @@ async function executeTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResu
     if (joined.status === "running") {
       return { identifier: ticket.identifier, outcome: "worker-running", detail: lease.cursorRunId };
     }
+    if (joined.status === "finished" && joined.text.trim() && journeyProofReceiptState(deps, ticket)?.attempted) {
+      await rememberJourneyReceipt(deps, ticket, joined.text);
+    }
   }
   await writeMarker(deps, ticket, "delivery-lease", leaseMarkerBody(now, "ground", "pending"));
+  let keepLease = false;
   try {
-    return await runHeldTicket(deps, ticket, home);
+    const result = await runHeldTicket(deps, ticket, home);
+    keepLease = result.outcome === "worker-running";
+    return result;
   } finally {
-    await writeMarker(deps, ticket, "delivery-lease", RELEASE_LEASE).catch(() => undefined);
+    if (!keepLease) await writeMarker(deps, ticket, "delivery-lease", RELEASE_LEASE).catch(() => undefined);
   }
 }
 
@@ -945,12 +951,10 @@ async function runHeldTicket(
         trunkCommit: verdict === "ALREADY SHIPPED" ? trunkCommitFlag(commits) : null,
         journeyProven:
           verdict === "ALREADY SHIPPED"
-            ? journeyEvidenceProven(
+            ? await journeyEvidenceOnRefs(
+                deps,
                 ground.text,
-                ground.text,
-                (repo, path) =>
-                  journeyFileInCheckout(deps, repo, repoByName(deps.pack, repo)?.trunk ?? "", path),
-                deps.pack.journeySpec,
+                (repo) => repoByName(deps.pack, repo)?.trunk ?? "",
               )
             : null,
       });
@@ -1319,30 +1323,104 @@ function deployRefContains(deps: LoopDeps, repo: RepoSpec, ref: string, sha: str
 
 
 
-function proofReceiptBody(receipt: string, rows: { sha: string; url?: string }[]): string {
-  const lines = ["Validated proof receipt for the merged commit."];
-  for (const row of rows) {
-    const sha = row.sha.trim();
-    const url = row.url?.trim() ?? "";
-    if (sha && url) lines.push(`${sha} ${url}`);
-    else if (sha) lines.push(sha);
-    else if (url) lines.push(url);
+type JourneyCommit = { repo: string; sha: string };
+type JourneyProofReceipt = {
+  schemaVersion: 2;
+  criteriaRevision: string;
+  landed: JourneyCommit[];
+  pullRequests: { repo: string; sha: string; url: string }[];
+  attempted: boolean;
+  validated: boolean;
+  receipt: string;
+};
+
+function parseJourneyCommits(body: string | undefined): JourneyCommit[] | null {
+  if (!body) return null;
+  try {
+    const value: unknown = JSON.parse(body);
+    if (!Array.isArray(value) || !value.every((row) => row && typeof row === "object" && !Array.isArray(row) &&
+      typeof (row as Record<string, unknown>).repo === "string" && typeof (row as Record<string, unknown>).sha === "string")) return null;
+    return value as JourneyCommit[];
+  } catch {
+    return null;
   }
-  lines.push(receipt.trim());
-  return lines.join("\n");
+}
+
+function sameLandedCommits(left: readonly JourneyCommit[], right: readonly JourneyCommit[]): boolean {
+  if (left.length !== right.length) return false;
+  const key = (row: JourneyCommit) => `${row.repo} ${row.sha}`;
+  const a = left.map(key).sort();
+  const b = right.map(key).sort();
+  return a.every((value, index) => value === b[index]);
+}
+
+function journeyProofReceiptState(deps: LoopDeps, ticket: Ticket): JourneyProofReceipt | null {
+  const markers = deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers ?? [];
+  const marker = markers.find((item) => item.kind === "proof-receipt");
+  const current = parseJourneyCommits(markers.find((item) => item.kind === "landed-commits")?.body);
+  if (!marker || !current) return null;
+  try {
+    const value: unknown = JSON.parse(marker.body);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const proof = value as Record<string, unknown>;
+    const landed = Array.isArray(proof.landed) ? parseJourneyCommits(JSON.stringify(proof.landed)) : null;
+    const pullRequests = Array.isArray(proof.pullRequests) && proof.pullRequests.every((row) => row && typeof row === "object" && !Array.isArray(row) &&
+      typeof (row as Record<string, unknown>).repo === "string" && typeof (row as Record<string, unknown>).sha === "string" &&
+      typeof (row as Record<string, unknown>).url === "string")
+      ? proof.pullRequests as JourneyProofReceipt["pullRequests"]
+      : null;
+    if (proof.schemaVersion !== 2 || proof.criteriaRevision !== ticket.criteriaRevision || !landed || !pullRequests ||
+      typeof proof.attempted !== "boolean" || typeof proof.validated !== "boolean" || typeof proof.receipt !== "string" ||
+      !sameLandedCommits(landed, current)) return null;
+    return proof as unknown as JourneyProofReceipt;
+  } catch {
+    return null;
+  }
 }
 
 function publishedProofReceipt(deps: LoopDeps, ticket: Ticket): string | null {
-  return deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers.find((marker) => marker.kind === "proof-receipt")?.body ?? null;
+  const proof = journeyProofReceiptState(deps, ticket);
+  return proof?.validated ? proof.receipt : null;
+}
+
+async function writeJourneyProofAttempt(deps: LoopDeps, ticket: Ticket, landed: JourneyCommit[]): Promise<void> {
+  await writeMarker(deps, ticket, "proof-receipt", JSON.stringify({
+    schemaVersion: 2,
+    criteriaRevision: ticket.criteriaRevision,
+    landed,
+    pullRequests: [],
+    attempted: true,
+    validated: false,
+    receipt: "",
+  } satisfies JourneyProofReceipt));
+}
+
+async function rememberJourneyReceipt(deps: LoopDeps, ticket: Ticket, receipt: string): Promise<void> {
+  const saved = receipt.trim();
+  const proof = journeyProofReceiptState(deps, ticket);
+  if (!saved || !proof?.attempted || proof.receipt.split("\n").includes(saved)) return;
+  await writeMarker(deps, ticket, "proof-receipt", JSON.stringify({
+    ...proof,
+    receipt: [proof.receipt, saved].filter(Boolean).join("\n"),
+  } satisfies JourneyProofReceipt));
 }
 
 async function publishProofReceipt(
   deps: LoopDeps,
   ticket: Ticket,
-  proof: { receipt: string; rows: { sha: string; url?: string }[] } | null,
+  proof: { receipt: string; rows: { repo: string; sha: string; url?: string }[] } | null,
 ): Promise<void> {
   if (publishedProofReceipt(deps, ticket) || !proof?.receipt.trim()) return;
-  await writeMarker(deps, ticket, "proof-receipt", proofReceiptBody(proof.receipt, proof.rows));
+  const prior = journeyProofReceiptState(deps, ticket);
+  await writeMarker(deps, ticket, "proof-receipt", JSON.stringify({
+    schemaVersion: 2,
+    criteriaRevision: ticket.criteriaRevision,
+    landed: proof.rows.map(({ repo, sha }) => ({ repo, sha })),
+    pullRequests: proof.rows.flatMap(({ repo, sha, url }) => url ? [{ repo, sha, url }] : []),
+    attempted: prior?.attempted ?? false,
+    validated: true,
+    receipt: proof.receipt.trim(),
+  } satisfies JourneyProofReceipt));
 }
 
 function resumeProofTexts(deps: LoopDeps, ticket: Ticket): { declared: string; receipt: string } {
@@ -1362,7 +1440,7 @@ function resumeProofTexts(deps: LoopDeps, ticket: Ticket): { declared: string; r
     ground = "";
     buildReceipt = "";
   }
-  const receipt = [buildReceipt, publishedProofReceipt(deps, ticket) ?? ""].filter(Boolean).join("\n");
+  const receipt = [buildReceipt, journeyProofReceiptState(deps, ticket)?.receipt ?? ""].filter(Boolean).join("\n");
   return { declared: ground, receipt };
 }
 
@@ -1728,19 +1806,165 @@ async function trunkTip(
   return mergeSha;
 }
 
-function journeyFileInCheckout(deps: LoopDeps, repo: string, ref: string, path: string): boolean {
-  if (deps.journeyFileAt) return deps.journeyFileAt({ repo, ref, path });
+type JourneyFileState = "present" | "absent" | "unavailable";
+
+function noteJourneyFile(
+  deps: LoopDeps,
+  repo: string,
+  ref: string,
+  path: string,
+  reason: string,
+): void {
+  const clean = reason.replace(/\s+/g, " ").trim() || "unknown";
+  noteEngine(
+    deps,
+    `journey file repo=${repo} ref=${ref} path=${path} result=unavailable reason=${clean}`,
+  );
+}
+
+/**
+ * A route-test file on `ref`. The forge contents API is used when the forge
+ * has one. A missing file is `absent`. A check that cannot run is
+ * `unavailable` and the reason is logged. The two results stay distinct.
+ */
+async function journeyFileState(
+  deps: LoopDeps,
+  repo: string,
+  ref: string,
+  path: string,
+): Promise<{ state: JourneyFileState; reason: string }> {
+  if (deps.journeyFileAt) {
+    return deps.journeyFileAt({ repo, ref, path })
+      ? { state: "present", reason: "" }
+      : { state: "absent", reason: "" };
+  }
   const spec = repoByName(deps.pack, repo);
-  if (!spec || !ref) return false;
+  if (!spec || !ref || !path) {
+    const reason = "ref missing";
+    noteJourneyFile(deps, repo, ref, path, reason);
+    return { state: "unavailable", reason };
+  }
+  if (deps.forge.readTextFile) {
+    let slug = "";
+    try {
+      const parsed = githubRepoFromUrl(spec.url);
+      slug = `${parsed.owner}/${parsed.repo}`;
+    } catch {
+      slug = "";
+    }
+    if (slug) {
+      try {
+        const read = await deps.forge.readTextFile({
+          repo: slug,
+          branch: ref,
+          path,
+          endpoint: "contents",
+        });
+        if (read.status === 200) return { state: "present", reason: "" };
+        if (read.status === 404) return { state: "absent", reason: "" };
+        const reason = `contents status=${read.status}`;
+        noteJourneyFile(deps, repo, ref, path, reason);
+        return { state: "unavailable", reason };
+      } catch {
+        const reason = "contents error";
+        noteJourneyFile(deps, repo, ref, path, reason);
+        return { state: "unavailable", reason };
+      }
+    }
+  }
   const dir = repoCheckoutDir(deps.cwd ?? process.cwd(), spec, deps.pack);
-  if (!existsSync(join(dir, ".git")) || !ref) return false;
+  if (!existsSync(join(dir, ".git"))) {
+    const reason = "checkout missing";
+    noteJourneyFile(deps, repo, ref, path, reason);
+    return { state: "unavailable", reason };
+  }
   const present = (at: string) =>
     spawnSync("git", ["-C", dir, "cat-file", "-e", `${at}:${path}`], { encoding: "utf8" }).status === 0;
-  if (present(ref)) return true;
-  spawnSync("git", ["-C", dir, "fetch", "--depth=1", "origin", ref], { encoding: "utf8" });
-  if (present(ref)) return true;
-  spawnSync("git", ["-C", dir, "fetch", "origin", spec.trunk], { encoding: "utf8" });
-  return present(ref);
+  const commitHere = (at: string) =>
+    spawnSync("git", ["-C", dir, "cat-file", "-e", `${at}^{commit}`], { encoding: "utf8" }).status === 0;
+  if (present(ref)) return { state: "present", reason: "" };
+  const local = commitHere(ref);
+  const fetched = spawnSync("git", ["-C", dir, "fetch", "--depth=1", "origin", ref], {
+    encoding: "utf8",
+    timeout: 8000,
+  });
+  if (present(ref)) return { state: "present", reason: "" };
+  const fetchedTrunk = spawnSync("git", ["-C", dir, "fetch", "origin", spec.trunk], {
+    encoding: "utf8",
+    timeout: 8000,
+  });
+  if (present(ref)) return { state: "present", reason: "" };
+  if (commitHere(ref)) return { state: "absent", reason: "" };
+  if (!local && fetched.status !== 0 && fetchedTrunk.status !== 0) {
+    const reason = `fetch status=${fetched.status ?? "null"}`;
+    noteJourneyFile(deps, repo, ref, path, reason);
+    return { state: "unavailable", reason };
+  }
+  if (commitHere(ref)) return { state: "absent", reason: "" };
+  const reason = `fetch status=${fetched.status ?? "null"}`;
+  noteJourneyFile(deps, repo, ref, path, reason);
+  return { state: "unavailable", reason };
+}
+
+async function journeyEvidenceOnRefs(
+  deps: LoopDeps,
+  text: string,
+  refFor: (repo: string) => string,
+): Promise<boolean> {
+  const proofs = parseJourneyProofs(text, deps.pack.journeySpec);
+  const present = new Map<string, boolean>();
+  for (const proof of proofs) {
+    if (proof.kind !== "route-test") continue;
+    const ref = refFor(proof.repo);
+    const found = await journeyFileState(deps, proof.repo, ref, proof.path);
+    present.set(`${proof.repo}\n${ref}\n${proof.path}`, found.state === "present");
+  }
+  return journeyEvidenceProven(
+    text,
+    text,
+    (repo, path) => present.get(`${repo}\n${refFor(repo)}\n${path}`) === true,
+    deps.pack.journeySpec,
+  );
+}
+
+type JourneyFileLookup = {
+  onMerge: (repo: string, path: string) => boolean;
+  onTargets: (repo: string, path: string) => boolean;
+  unavailable: string[];
+};
+
+/** Resolve each route-test proof once against landed and configured delivery refs. */
+async function journeyFileLookup(
+  deps: LoopDeps,
+  evidence: string,
+  rows: { repo: RepoSpec; sha: string }[],
+): Promise<JourneyFileLookup> {
+  const proofs = parseJourneyProofs(evidence, deps.pack.journeySpec);
+  const cache = new Map<string, JourneyFileState>();
+  const unavailable: string[] = [];
+  const load = async (repo: string, ref: string, path: string) => {
+    const key = `${repo}\n${ref}\n${path}`;
+    if (cache.has(key)) return;
+    const found = await journeyFileState(deps, repo, ref, path);
+    cache.set(key, found.state);
+    if (found.state === "unavailable") unavailable.push(`${repo} ${path} @ ${ref}: ${found.reason}`);
+  };
+  for (const proof of proofs) {
+    if (proof.kind !== "route-test") continue;
+    const row = rows.find((item) => item.repo.name === proof.repo);
+    if (!row) continue;
+    await load(proof.repo, row.sha, proof.path);
+    for (const ref of promotionRefs(deps, proof.repo)) await load(proof.repo, ref, proof.path);
+  }
+  const onMerge = (repo: string, path: string) => {
+    const row = rows.find((item) => item.repo.name === repo);
+    return Boolean(row && cache.get(`${repo}\n${row.sha}\n${path}`) === "present");
+  };
+  const onTargets = (repo: string, path: string) => {
+    const refs = promotionRefs(deps, repo);
+    return refs.length > 0 && refs.every((ref) => cache.get(`${repo}\n${ref}\n${path}`) === "present");
+  };
+  return { onMerge, onTargets, unavailable };
 }
 
 function reposForMarker(
@@ -1759,33 +1983,16 @@ type RecordedProof =
   | { ok: true; recorded: boolean; proofReceipt: string }
   | { ok: false; result: TicketResult };
 
-function proofFileOnCommit(
-  deps: LoopDeps,
-  rows: { repo: RepoSpec; sha: string }[],
-): (repo: string, path: string) => boolean {
-  return (repo, path) => {
-    const row = rows.find((item) => item.repo.name === repo);
-    const ref = row?.sha || repoByName(deps.pack, repo)?.trunk || "";
-    return journeyFileInCheckout(deps, repo, ref, path);
-  };
-}
-
 /** Promotion refs when configured. Otherwise the repo trunk. */
 function promotionRefs(deps: LoopDeps, repoName: string): string[] {
   const named = deps.pack.promotionStages
-    .filter((stage) => stage.authorization === "deliver")
+    .filter((stage) => stage.authorization === "deliver" && stage.repos.includes(repoName))
     .flatMap((stage) => stage.refs?.[repoName] ?? []);
   if (named.length > 0) return named;
   const trunk = repoByName(deps.pack, repoName)?.trunk;
   return trunk ? [trunk] : [];
 }
 
-function proofFileOnPromotionTarget(deps: LoopDeps): (repo: string, path: string) => boolean {
-  return (repo, path) => {
-    const refs = promotionRefs(deps, repo);
-    return refs.length > 0 && refs.every((ref) => journeyFileInCheckout(deps, repo, ref, path));
-  };
-}
 
 function proofSatisfies(
   deps: LoopDeps,
@@ -1803,6 +2010,24 @@ function proofSatisfies(
  * target refs are checked; absent refs fall back to the repo trunk.
  * A spec outside the journey-spec pattern is not that proof.
  */
+function journeyMissComment(
+  deps: LoopDeps,
+  identifier: string,
+  evidence: string,
+  receipt: string,
+  unavailable: string[],
+): string {
+  const proofs = parseJourneyProofs(evidence, deps.pack.journeySpec);
+  const route = proofs.some((proof) => proof.kind === "route-test");
+  const recordingGap = proofs.some(
+    (proof) => proof.kind === "recording" && !receipt.includes(proof.url),
+  );
+  if (unavailable.length > 0 && route && !recordingGap) {
+    return `Journey evidence for ${identifier} is recorded. The route-test file check could not run: ${unavailable.join("; ")}. The ticket stays in intake.`;
+  }
+  return `Journey evidence for ${identifier} is recorded. The route test is absent from the landed commit and configured delivery-stage refs. A web journey needs the recording URL in the build receipt. A mobile journey needs the route test on those refs under \`${journeySpecText(deps)}\`. The ticket stays in intake.`;
+}
+
 async function applyRecordedProof(
   deps: LoopDeps,
   ticket: Ticket,
@@ -1813,19 +2038,18 @@ async function applyRecordedProof(
   const recorded =
     parseJourneyEvidence(declared) === "recorded" || parseJourneyEvidence(receipt) === "recorded";
   if (!recorded) return { ok: true, recorded: false, proofReceipt: receipt };
-  const onMerge = proofFileOnCommit(deps, rows);
-  const onTarget = proofFileOnPromotionTarget(deps);
   const evidence = `${declared}\n${receipt}`;
   const existing = publishedProofReceipt(deps, ticket);
+  let files = await journeyFileLookup(deps, `${evidence}\n${existing ?? ""}`, rows);
   if (
     existing &&
-    (proofSatisfies(deps, `${evidence}\n${existing}`, existing, onMerge) ||
-      proofSatisfies(deps, `${evidence}\n${existing}`, existing, onTarget))
+    (proofSatisfies(deps, `${evidence}\n${existing}`, existing, files.onMerge) ||
+      proofSatisfies(deps, `${evidence}\n${existing}`, existing, files.onTargets))
   ) {
     noteEngine(deps, "proof ok");
     return { ok: true, recorded: true, proofReceipt: existing };
   }
-  if (proofSatisfies(deps, evidence, receipt, onMerge) || proofSatisfies(deps, evidence, receipt, onTarget)) {
+  if (proofSatisfies(deps, evidence, receipt, files.onMerge) || proofSatisfies(deps, evidence, receipt, files.onTargets)) {
     noteEngine(deps, "proof ok");
     return { ok: true, recorded: true, proofReceipt: receipt.trim() ? receipt : declared };
   }
@@ -1843,20 +2067,20 @@ async function applyRecordedProof(
   }
   const combined = [receipt, printed.stdout].filter((part) => part.trim()).join("\n");
   const proofReceipt = combined.trim() ? combined : declared;
+  const provenText = `${declared}\n${proofReceipt}`;
+  if (printed.stdout.trim()) files = await journeyFileLookup(deps, `${provenText}\n${existing ?? ""}`, rows);
   const proven =
-    proofSatisfies(deps, `${declared}\n${proofReceipt}`, proofReceipt, onMerge) ||
-    proofSatisfies(deps, `${declared}\n${proofReceipt}`, proofReceipt, onTarget);
+    proofSatisfies(deps, provenText, proofReceipt, files.onMerge) ||
+    proofSatisfies(deps, provenText, proofReceipt, files.onTargets);
+  const note = proven ? "" : journeyMissComment(deps, ticket.identifier, provenText, proofReceipt, files.unavailable);
   if (!proven) {
-    await deps.tracker.comment(
-      ticket.identifier,
-      `Journey evidence for ${ticket.identifier} is recorded. The route test is absent from the merged commit and configured promotion targets. A web journey needs the recording URL in the build receipt. A mobile journey needs the route test on those refs under \`${journeySpecText(deps)}\`. The ticket stays in intake.`,
-    );
+    await deps.tracker.comment(ticket.identifier, note);
     return {
       ok: false,
       result: {
         identifier: ticket.identifier,
         outcome: "journey-missing",
-        detail: "recorded proof missing",
+        detail: note.includes("could not run") ? "journey file unavailable" : "recorded proof missing",
       },
     };
   }
@@ -1869,10 +2093,67 @@ async function publishCompletionProof(
   ticket: Ticket,
   recorded: boolean,
   proofReceipt: string,
-  rows: { sha: string; url?: string }[],
+  rows: { repo: string; sha: string; url?: string }[],
 ): Promise<void> {
   const existing = publishedProofReceipt(deps, ticket);
   await publishProofReceipt(deps, ticket, recorded ? { receipt: proofReceipt, rows } : existing ? { receipt: existing, rows } : null);
+}
+
+function proofPrompt(
+  ticket: Ticket,
+  declared: string,
+  rows: { repo: RepoSpec; sha: string }[],
+): string {
+  const landed = rows.map((row) => `${row.repo.name} landed commit \`${row.sha}\``).join("\n");
+  return [
+    universalConduct(),
+    `Capture journey proof for ${ticket.identifier}. The pull requests are already merged.`,
+    "The worker captures and publishes the journey proof; it does not change code, commit, push, open a pull request, or call the tracker.",
+    "Capture the journey on the running build for these exact landed commits. A web journey is a screenshot or short video of the done state. Publish an https URL ending in png, jpg, jpeg, webp, gif, mp4, webm, or mov, or containing /artifacts/. Put that raw URL in backticks in BUILD_HANDOFF and omit only the **Journey proof:** prefix. The journey command prints that prefix.",
+    "Use a non-mutating view or test data.",
+    landed,
+    declared,
+  ].filter((part) => part.trim().length > 0).join("\n\n");
+}
+
+async function runProofWorker(
+  deps: LoopDeps,
+  ticket: Ticket,
+  declared: string,
+  rows: { repo: RepoSpec; sha: string }[],
+): Promise<{ status: "text"; text: string } | { status: "running"; detail: string } | { status: "empty" }> {
+  const home = rows[0];
+  if (!home) return { status: "empty" };
+  let started: { runId: string };
+  try {
+    started = await deps.worker.start({
+      prompt: proofPrompt(ticket, declared, rows),
+      repoUrl: home.repo.url,
+      baseRef: home.sha,
+    });
+  } catch {
+    return { status: "empty" };
+  }
+  try {
+    await noteLiveRun(deps, ticket, "build", started.runId);
+  } catch {
+    return { status: "empty" };
+  }
+  let built: Awaited<ReturnType<WorkerAdapter["join"]>>;
+  try {
+    built = await deps.worker.join(started.runId);
+  } catch (error) {
+    const text = error instanceof Error ? error.message : "";
+    if (text.trim()) await rememberJourneyReceipt(deps, ticket, text);
+    return { status: "empty" };
+  }
+  const text = built.text ?? "";
+  if (built.status === "failed") {
+    if (text.trim()) await rememberJourneyReceipt(deps, ticket, text);
+    return { status: "empty" };
+  }
+  if (built.status === "running") return { status: "running", detail: `cursor_run=${started.runId}` };
+  return { status: "text", text };
 }
 
 async function settleTrunk(
@@ -1883,6 +2164,7 @@ async function settleTrunk(
   doneDetail: string,
   declared = "",
   receipt = "",
+  proofWorker = false,
 ): Promise<TicketResult> {
   const candidates = rows.map((row) => ({ repo: row.repo.name, sha: row.sha }));
   await writeMarker(deps, ticket, "landed-commits", JSON.stringify(candidates));
@@ -1915,9 +2197,38 @@ async function settleTrunk(
     }
     return { identifier: ticket.identifier, outcome: "blocked", detail: `stage ${stages.stage.id} parked: ${stages.reason}` };
   }
-  const gate = await applyRecordedProof(deps, ticket, rows, declared, receipt);
-  if (!gate.ok) return gate.result;
-  if (!hold) await publishCompletionProof(deps, ticket, gate.recorded, gate.proofReceipt, rows);
+  let gate = await applyRecordedProof(deps, ticket, rows, declared, receipt);
+  if (!gate.ok) {
+    if (proofWorker) {
+      const landed = rows.map((row) => ({ repo: row.repo.name, sha: row.sha }));
+      if (!journeyProofReceiptState(deps, ticket)?.attempted) {
+        await writeJourneyProofAttempt(deps, ticket, landed);
+        const captured = await runProofWorker(deps, ticket, declared, rows);
+        if (captured.status === "running") {
+          return { identifier: ticket.identifier, outcome: "worker-running", detail: captured.detail };
+        }
+        const extra = captured.status === "text" ? captured.text : "";
+        if (!extra.trim()) return gate.result;
+        await rememberJourneyReceipt(deps, ticket, extra);
+        const again = await applyRecordedProof(
+          deps,
+          ticket,
+          rows,
+          declared,
+          [receipt, extra].filter((part) => part.trim()).join("\n"),
+        );
+        if (!again.ok) return again.result;
+        gate = again;
+      } else {
+        return gate.result;
+      }
+    } else {
+      return gate.result;
+    }
+  }
+  if (!hold) {
+    await publishCompletionProof(deps, ticket, gate.recorded, gate.proofReceipt, rows.map((row) => ({ repo: row.repo.name, sha: row.sha, url: row.url })));
+  }
   await removeMarker(deps, ticket, "land-resume");
   await writeTicketStatus(deps, ticket, hold ? holdStatus(deps.pack) : deps.pack.status.complete);
   return { identifier: ticket.identifier, outcome: "landed", detail: doneDetail };
@@ -2112,6 +2423,7 @@ async function finishMerged(
   merged: MergedHead[],
   declared: string,
   receipt: string,
+  proofWorker = false,
 ): Promise<TicketResult> {
   return settleTrunk(
     deps,
@@ -2121,6 +2433,7 @@ async function finishMerged(
     merged.map((row) => row.url).join(" "),
     declared,
     receipt,
+    proofWorker,
   );
 }
 
@@ -2243,12 +2556,13 @@ async function resumeExistingPulls(deps: LoopDeps, ticket: Ticket): Promise<Tick
     if ("outcome" in landed) return landed;
     merged.push({ repo: pr.repo, sha: landed.mergedSha, url: pr.url });
   }
-  return finishMerged(deps, ticket, grant === "open", merged, texts.declared, texts.receipt);
+  return finishMerged(deps, ticket, grant === "open", merged, texts.declared, texts.receipt, true);
 }
 
 /**
  * A previous land already merged, or already saw there was nothing to merge.
- * Re-check that fact. Do not start a worker while the recorded commit is unchanged.
+ * Re-check that fact. A coding worker does not start while the recorded commit
+ * is unchanged. A missing recorded proof starts one proof worker for that commit.
  */
 async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket, body: string | null): Promise<TicketResult | null> {
   const marker = parseLandResume(body);
@@ -2267,7 +2581,16 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket, body: string | n
   if (rows.length !== marker.rows.length || rows.length === 0) return null;
   noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
   const texts = resumeProofTexts(deps, ticket);
-  return settleTrunk(deps, ticket, marker.hold, rows, "landed commits unchanged", marker.declared || texts.declared, marker.receipt || texts.receipt);
+  return settleTrunk(
+    deps,
+    ticket,
+    marker.hold,
+    rows,
+    "landed commits unchanged",
+    marker.declared || texts.declared,
+    marker.receipt || texts.receipt,
+    true,
+  );
 }
 
 let releaseTagCache: string[] | undefined | null = null;

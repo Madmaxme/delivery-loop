@@ -8,6 +8,7 @@ import { describe, it } from "node:test";
 import type { DeliveryState, ForgeAdapter, LinearProgramTracker, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack, PromotionStage } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
+import { proofLinesFor } from "../../scripts/journey-proof.mjs";
 import { auditEligibility, candidateFetchEnvironment, ciFixLimit, formatTicketProgress, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage, type LoopDeps } from "./loop.ts";
 import { classifyQualityCause } from "./quality-cause.ts";
 
@@ -274,6 +275,27 @@ function receiptFor(input: {
       evidence: outcome === "passed" ? ["verified on the deployed build"] : [],
     }],
   });
+}
+
+function commitCheckout(dir: string): string {
+  mkdirSync(dir, { recursive: true });
+  const git = (...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  spawnSync("git", ["init", dir], { encoding: "utf8" });
+  git("config", "user.email", "dev@example.test");
+  git("config", "user.name", "Dev");
+  writeFileSync(join(dir, "README.md"), "hi\n");
+  git("add", ".");
+  const committed = git("commit", "-m", "init");
+  if (committed.status !== 0) throw new Error(committed.stderr || "git commit failed");
+  git("branch", "-M", "main");
+  return git("rev-parse", "HEAD").stdout.trim();
+}
+
+function routeGround(): string {
+  return BUILDABLE.replace(
+    "**Journey evidence:** not-applicable",
+    "**Journey evidence:** recorded\n**Journey proof:** `api/e2e/signup.spec.ts`",
+  );
 }
 
 describe("loop", () => {
@@ -1045,7 +1067,7 @@ describe("loop", () => {
     assert.equal(env.state(), "Dev Complete");
   });
 
-  it("leaves the ticket in intake when the recording URL never reaches the build receipt", async () => {
+  it("leaves a recorded journey in intake when the build receipt omits the recording URL", async () => {
     const url = "https://example.test/artifacts/signup.mp4";
     const ground = BUILDABLE.replace(
       "**Journey evidence:** not-applicable",
@@ -1062,7 +1084,8 @@ describe("loop", () => {
     assert.equal(result.outcome, "journey-missing");
     assert.equal(env.merged(), true);
     assert.equal(env.state(), "Todo");
-    assert.equal(env.comments.some((body) => /LAND_WAIT/.test(body)), false);
+    assert.match(env.comments.join("\n"), /recording URL in the build receipt/);
+    assert.equal(env.comments.some((body) => /LAND_WAIT|JOURNEY_RECEIPT|PROOF_ATTEMPT/.test(body)), false);
   });
 
   it("marks completion when the route test is on the merge commit", async () => {
@@ -1089,6 +1112,199 @@ describe("loop", () => {
     assert.equal(result.outcome, "journey-missing");
     assert.equal(env.merged(), true);
     assert.equal(env.state(), "Todo");
+  });
+
+  it("tells the build worker to publish the journey URL and omit only the proof prefix", async () => {
+    const ground = BUILDABLE.replace(
+      "**Journey evidence:** not-applicable",
+      "**Journey evidence:** recorded",
+    );
+    const env = harness(ground);
+    const prompts: string[] = [];
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return { runId: "run-1" };
+    };
+    env.deps.worker.join = async () => ({
+      status: "finished" as const,
+      branch: "delivery/api-1",
+      head: "abc",
+      text: prompts.length < 2 ? ground : "Walked `https://example.test/artifacts/signup.png`",
+    });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "journey-missing");
+    const build = prompts[1] ?? "";
+    assert.match(build, /screenshot or a short video of the done state/);
+    assert.match(build, /\/artifacts\//);
+    assert.match(build, /Put that raw URL in backticks in BUILD_HANDOFF/);
+    assert.match(build, /omit only the \*\*Journey proof:\*\* prefix/i);
+    assert.match(build, /non-mutating view or test data/);
+    assert.doesNotMatch(build, /real booking/);
+  });
+
+  it("captures missing journey proof once after land in the v2 proof-receipt marker", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const env = harness(BUILDABLE);
+    const ground = audit("api", "**Journey evidence:** recorded");
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({ status: 0, stdout: proofLinesFor(stdin).join("\n") });
+    await seedLandResume(env, false, [{ repo: "api", sha: MERGED_SHA }], ground);
+    const prompts: string[] = [];
+    let starts = 0;
+    env.deps.worker.start = async (input) => {
+      starts += 1;
+      prompts.push(input.prompt);
+      return { runId: "proof-1" };
+    };
+    env.deps.worker.join = async () => ({ status: "finished" as const, text: `Walked \`${url}\`` });
+
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), pack.status.complete);
+    assert.equal(starts, 1);
+    assert.match(prompts[0] ?? "", /api landed commit `m{40}`/);
+    assert.match(prompts[0] ?? "", /does not change code, commit, push, open a pull request, or call the tracker/);
+    const body = env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "";
+    const proof = JSON.parse(body) as { schemaVersion: number; criteriaRevision: string; landed: { repo: string; sha: string }[]; attempted: boolean; validated: boolean; receipt: string };
+    assert.equal(proof.schemaVersion, 2);
+    assert.equal(proof.criteriaRevision, ticket().criteriaRevision);
+    assert.deepEqual(proof.landed, [{ repo: "api", sha: MERGED_SHA }]);
+    assert.equal(proof.attempted, true);
+    assert.equal(proof.validated, true);
+    assert.match(proof.receipt, /https:\/\/example\.test\/artifacts\/signup\.png/);
+    assert.equal(env.comments.some((body) => /LAND_WAIT|JOURNEY_RECEIPT|PROOF_ATTEMPT/.test(body)), false);
+
+    const again = await runTicket(env.deps, ticket({ stateName: pack.status.complete }));
+    assert.equal(again.outcome, "landed");
+    assert.equal(starts, 1);
+  });
+
+  it("reuses a failed capture receipt instead of starting a second worker", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const env = harness(BUILDABLE);
+    const ground = audit("api", "**Journey evidence:** recorded");
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({ status: 0, stdout: proofLinesFor(stdin).join("\n") });
+    await seedLandResume(env, false, [{ repo: "api", sha: MERGED_SHA }], ground);
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "proof-1" };
+    };
+    env.deps.worker.join = async () => ({ status: "failed" as const, text: `Walked \`${url}\`` });
+
+    const first = await runTicket(env.deps, ticket());
+    assert.equal(first.outcome, "journey-missing");
+    const captured = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}") as { attempted: boolean; validated: boolean; receipt: string };
+    assert.equal(captured.attempted, true);
+    assert.equal(captured.validated, false);
+    assert.match(captured.receipt, /https:\/\/example\.test\/artifacts\/signup\.png/);
+
+    const resumed = await runTicket(env.deps, ticket());
+    assert.equal(resumed.outcome, "landed");
+    assert.equal(env.state(), pack.status.complete);
+    assert.equal(starts, 1);
+    assert.equal(JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}").validated, true);
+    assert.equal(env.comments.some((body) => /LAND_WAIT|JOURNEY_RECEIPT|PROOF_ATTEMPT/.test(body)), false);
+  });
+
+  it("keeps a running capture lease and joins its exact landed proof on resume", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const env = harness(BUILDABLE);
+    const ground = audit("api", "**Journey evidence:** recorded");
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({ status: 0, stdout: proofLinesFor(stdin).join("\n") });
+    await seedLandResume(env, false, [{ repo: "api", sha: MERGED_SHA }], ground);
+    let starts = 0;
+    let joins = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "proof-1" };
+    };
+    env.deps.worker.join = async () => {
+      joins += 1;
+      return joins === 1
+        ? { status: "running" as const, text: "" }
+        : { status: "finished" as const, text: `Walked \`${url}\`` };
+    };
+
+    const first = await runTicket(env.deps, ticket());
+    assert.equal(first.outcome, "worker-running");
+    const lease = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "delivery-lease")?.body ?? "{}") as { cursorRunId?: string };
+    assert.equal(lease.cursorRunId, "proof-1");
+
+    env.deps.nowMs = Date.now() + 3 * 60 * 60 * 1000;
+    const resumed = await runTicket(env.deps, ticket());
+    assert.equal(resumed.outcome, "landed");
+    assert.equal(env.state(), pack.status.complete);
+    assert.equal(starts, 1);
+    assert.equal(joins, 2);
+    assert.equal(JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}").validated, true);
+  });
+  it("treats a contents 200 as the route test and a 404 as a missing file", async () => {
+    const present = harness(routeGround());
+    const seen: { repo: string; branch: string; path: string; endpoint: string }[] = [];
+    present.deps.forge.readTextFile = async (input) => {
+      seen.push(input);
+      return { status: 200, text: "test\n" };
+    };
+    const landed = await runTicket(present.deps, ticket());
+    assert.equal(landed.outcome, "landed");
+    assert.equal(present.state(), pack.status.complete);
+    assert.equal(seen[0]?.repo, "acme/api");
+    assert.equal(seen[0]?.branch, "trunk");
+    assert.equal(seen[0]?.path, "e2e/signup.spec.ts");
+    assert.equal(seen[0]?.endpoint, "contents");
+
+    const missing = harness(routeGround());
+    const logs: string[] = [];
+    missing.deps.engineLog = (line) => logs.push(line);
+    missing.deps.forge.readTextFile = async () => ({ status: 404, text: "" });
+    const absent = await runTicket(missing.deps, ticket());
+    assert.equal(absent.outcome, "journey-missing");
+    assert.equal(absent.detail, "recorded proof missing");
+    assert.match(missing.comments.join("\n"), /route test is absent/);
+    assert.equal(logs.some((line) => line.includes("result=unavailable")), false);
+  });
+
+  it("logs a contents status that is not a file result", async () => {
+    const env = harness(routeGround());
+    const logs: string[] = [];
+    env.deps.engineLog = (line) => logs.push(line);
+    env.deps.forge.readTextFile = async () => ({ status: 403, text: "" });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(result.detail, "journey file unavailable");
+    assert.match(env.comments.join("\n"), /could not run/);
+    assert.match(env.comments.join("\n"), /contents status=403/);
+    assert.ok(logs.some((line) => line.includes("result=unavailable") && line.includes("reason=contents status=403")));
+  });
+
+  it("logs a failed checkout fetch instead of calling the file missing", async () => {
+    const root = mkdtempSync(join(tmpdir(), "journey-file-"));
+    const sha = commitCheckout(join(root, "api"));
+    const unavailable = harness(routeGround());
+    unavailable.deps.cwd = root;
+    const missingRef = "c".repeat(40);
+    unavailable.deps.forge.squashMerge = async () => missingRef;
+    const logs: string[] = [];
+    unavailable.deps.engineLog = (line) => logs.push(line);
+    const failed = await runTicket(unavailable.deps, ticket());
+    assert.equal(failed.outcome, "journey-missing");
+    assert.equal(failed.detail, "journey file unavailable");
+    assert.match(unavailable.comments.join("\n"), /could not run/);
+    assert.ok(logs.some((line) => /result=unavailable reason=fetch status=/.test(line)));
+
+    const absent = harness(routeGround());
+    absent.deps.cwd = root;
+    absent.deps.forge.squashMerge = async () => sha;
+    const absentLogs: string[] = [];
+    absent.deps.engineLog = (line) => absentLogs.push(line);
+    const missingFile = await runTicket(absent.deps, ticket());
+    assert.equal(missingFile.outcome, "journey-missing");
+    assert.equal(missingFile.detail, "recorded proof missing");
+    assert.match(absent.comments.join("\n"), /route test is absent/);
+    assert.equal(absentLogs.some((line) => line.includes("result=unavailable")), false);
   });
 
   it("stays in intake when a buildable handoff omits the outside grant line", async () => {
@@ -1978,7 +2194,7 @@ describe("loop", () => {
     assert.equal(env.state(), pack.status.complete);
     const proof = env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "";
     assert.equal(proof.includes(url), true);
-    assert.match(proof, /trunk https:\/\/github\.com\/acme\/api\/pull\/4/);
+    assert.match(proof, /"sha":"trunk","url":"https:\/\/github\.com\/acme\/api\/pull\/4"/);
     assert.ok(order.indexOf("proof") >= 0);
     assert.ok(order.indexOf("proof") < order.indexOf(`state:${pack.status.complete}`));
     const again = await runTicket(env.deps, ticket());
@@ -2009,24 +2225,57 @@ describe("loop", () => {
     const waiting = await runTicket(env.deps, ticket());
     assert.equal(waiting.outcome, "journey-missing");
     assert.equal(env.state(), "Todo");
-    assert.equal(env.deliveryState().markers.some((marker) => marker.kind === "proof-receipt"), false);
+    const proof = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}") as { attempted?: boolean; validated?: boolean };
+    assert.equal(proof.attempted, true);
+    assert.equal(proof.validated, false);
   });
 
-  it("records journey evidence on a configured promotion target", async () => {
+  it("records route proof on an exact-SHA-verified delivery ref", async () => {
     const env = harness(BUILDABLE);
-    env.deps.lookupHead = () => "main-tip";
-    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
-    env.deps.runPackCommand = () => ({ status: 0, stdout: "**Journey proof:** `api/e2e/signup.spec.ts`" });
-    env.deps.journeyFileAt = ({ ref, path }) => ref === "main" && path === "e2e/signup.spec.ts";
-    const engine: string[] = [];
-    env.deps.engineLog = (line) => engine.push(line);
+    const stage: PromotionStage = {
+      id: "delivery-stage",
+      target: "opaque-target",
+      authorization: "deliver",
+      promoteCommand: "promote",
+      repos: ["api"],
+      refs: { api: ["canary-ref"] },
+      verifyCommand: "verify",
+    };
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs", promotionStages: [stage] };
+    const sequence: string[] = [];
+    env.deps.deployRefContains = ({ ref, sha }) => {
+      assert.equal(sha, "abc");
+      assert.equal(ref, "canary-ref");
+      return true;
+    };
+    env.deps.journeyFileAt = ({ ref, path }) => {
+      sequence.push(`file:${ref}`);
+      return ref === "canary-ref" && path === "e2e/signup.spec.ts";
+    };
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (command !== "verify") return { status: 0, stdout: "**Journey proof:** `api/e2e/signup.spec.ts`" };
+      sequence.push("verify");
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision ?? "",
+          deployed: input.landedShas ?? [],
+        }),
+      };
+    };
     await seedLandResume(env, false, [{ repo: "api", sha: "abc" }], audit("api", "**Journey evidence:** recorded"));
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
     assert.equal(env.state(), pack.status.complete);
-    const proof = env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "";
-    assert.match(proof, /api\/e2e\/signup\.spec\.ts/);
-    assert.ok(engine.includes("[delivery-loop] proof ok"));
+    assert.deepEqual(sequence, ["verify", "file:abc", "file:canary-ref"]);
+    assert.deepEqual(env.deliveryState().stageReceipts[0]?.deployed, [{ repo: "api", sha: "abc" }]);
+    const proof = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}") as { landed: { repo: string; sha: string }[]; validated: boolean; receipt: string };
+    assert.deepEqual(proof.landed, [{ repo: "api", sha: "abc" }]);
+    assert.equal(proof.validated, true);
+    assert.match(proof.receipt, /api\/e2e\/signup\.spec\.ts/);
   });
 
   it("reuses recorded proof that already matches the completion target", async () => {

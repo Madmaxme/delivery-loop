@@ -155,16 +155,27 @@ describe("engine heal release", () => {
     assert.equal(behind.action, "comment");
   });
 
-  it("accepts the planned breaking 2.0.0 release while routine bumps stay patch-only", () => {
-    assert.equal(engineHealBumpVersion(["v1.0.17"]), "1.0.18");
+  it("accepts an explicit major release over main and rejects duplicate tags", () => {
+    assert.equal(engineHealBumpVersion(["v4.7.11"]), "4.7.12");
     const release = planEngineHealRelease({
       ...open,
       qualityOnTip: "success",
-      mainVersion: "1.0.17",
+      mainVersion: "1.0.5",
       tipVersion: "2.0.0",
       branchTip: "def222",
     });
     assert.deepEqual(release, { action: "merge-and-tag", version: "2.0.0", tag: "v2.0.0" });
+
+    const duplicate = planEngineHealRelease({
+      ...open,
+      qualityOnTip: "success",
+      mainVersion: "1.0.5",
+      tipVersion: "2.0.0",
+      tagExists: true,
+      branchTip: "def222",
+    });
+    assert.equal(duplicate.action, "comment");
+    if (duplicate.action === "comment") assert.match(duplicate.body, /Tag v2\.0\.0 already exists/);
   });
 
   it("tags a merged pull request and does not open another bump", () => {

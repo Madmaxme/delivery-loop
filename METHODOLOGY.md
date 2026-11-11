@@ -42,7 +42,9 @@ A validated journey proof writes `[delivery-loop] proof ok`. A successful stage 
 
 ## Engine heal
 
-An engine heal opens a pull request on `engine-heal/<ticket>` with the `engine-heal` label. Routine heals use the next patch after the highest `v*` tag; `engineHealBumpVersion` remains patch-only. The planned breaking v2.0.0 release is a deliberate greater-version bump from main's v1.0.17 and uses this same pull-request workflow. The opener commits both package version files and pushes with the commit-actor token. The `pull_request` `quality` check gates the head. Only the engine-heal workflow squash-merges and writes the tag and GitHub release; no manual tag or release is created. Clients pin the resulting tag.
+An engine heal opens a pull request on `engine-heal/<ticket>` with the `engine-heal` label. Routine heals use the next patch after the highest `v*` tag; `engineHealBumpVersion` remains patch-only. The planned v2.0.0 release is an explicitly authorized greater-version bump over main's current package version, not output from the routine helper. The opener commits both package version files and pushes with the commit-actor token. The `pull_request` `quality` check gates the head. Only the engine-heal workflow squash-merges and writes the tag and GitHub release; no manual tag or release is created. Clients pin the resulting tag.
+
+A recorded journey that still lacks proof after landing may start one read-only capture worker for that exact landed SHA set on a later run. The one-shot attempt and captured receipt live in the existing v2 `DeliveryState` `proof-receipt` marker, bound to the current criteria revision and landed SHAs; resumes reuse it. Jira comments remain for user-visible blockers or Product decisions only.
 
 ## Run events
 
@@ -50,7 +52,7 @@ A worker run may write `delivery-loop.run.started` and `delivery-loop.run.finish
 
 ## Lease
 
-One runner holds the ticket with a `DELIVERY_LEASE` comment. The lease records the live agent id as soon as the worker starts.
+One runner holds the ticket with a `delivery-lease` marker in `DeliveryState`. The marker records the live agent id as soon as the worker starts.
 
 ## Bot definitions
 

@@ -42,6 +42,9 @@ Every tracker adapter provides a v2 `stateStore` for `DeliveryState { schemaVers
 
 The state store holds resumable work markers, the active promotion stage, landed SHAs, and stage receipts. Receipts are valid only for the current ticket `criteriaRevision`; when criteria change, stale work-order state and receipts are invalidated before continuing. A Jira status transition re-reads the issue and refuses to write if its criteria revision changed. Jira comments remain for user-visible blocker or product-decision messages, not Delivery Loop's run-state store.
 
+When `**Journey evidence:** recorded` lacks proof after landing, a later run may start one read-only capture worker for that exact landed SHA set. The attempt and captured text are stored in the existing `proof-receipt` marker in `DeliveryState`, bound to the current criteria revision and landed SHAs, then reused on resume. Route-test proof is checked on the exact landed commit and configured delivery-stage refs only after the corresponding current stage receipts pass. Do not write journey run state to Jira comments.
+
+
 ## Install and client overlays
 
 `delivery-loop init` writes a complete v2 pack and installs the canonical `delivery-loop` and `delivery-loop-conduct` skills under `.agents/skills`. Cursor and Claude skill entries are symlinks to those canonical directories. `delivery-loop update` refreshes generated skills, the Cursor rule, and runner workflow; it never edits `delivery-loop.yaml` or the invariants file. An unowned path collision is an error, not permission to overwrite client files.
@@ -64,7 +67,7 @@ Each credential call logs its slot, endpoint class, and status, success included
 
 A ship-stage promote, verification, or continue failure uses the same heal path after any configured transient retries. A note or a side watcher is not the fix.
 
-When the owner is this package, the edit opens a pull request on `engine-heal/<ticket>` with the `engine-heal` label. Routine heals use the next patch after the highest `v*` tag; `engineHealBumpVersion` remains patch-only. The planned breaking v2.0.0 release is an authorized greater-version bump from main's v1.0.17 and uses the same labeled pull-request workflow. The opener commits `package.json` and `package-lock.json` and pushes with the commit-actor token. The `pull_request` quality check gates that head. Only the engine-heal workflow squash-merges and writes the tag and GitHub release. A pull request without a greater version gets a comment and stops. Clients pin the tag when they need the change.
+When the owner is this package, the edit opens a pull request on `engine-heal/<ticket>` with the `engine-heal` label. Routine heals use the next patch after the highest `v*` tag; `engineHealBumpVersion` remains patch-only. The planned v2.0.0 release is the separately authorized greater-version bump over main's current package version, not output from the routine helper. The opener commits `package.json` and `package-lock.json` and pushes with the commit-actor token. The `pull_request` quality check gates that head. Only the engine-heal workflow squash-merges and writes the tag and GitHub release. A pull request without a greater version gets a comment and stops. Clients pin the tag when they need the change.
 
 Each failure type has a cap. The default is 3. `heal.maxAttempts` changes the default. `heal.caps.<type>` overrides one type. The count is the `OWNER_HEAL` comments of that type on the ticket, so it survives the next run. At the cap the engine writes the labels and the exhausted comment and stops. A failed write of the `OWNER_HEAL` comment fails the heal. The attempt is not counted, so the cap cannot be skipped by ignoring that error.
 
