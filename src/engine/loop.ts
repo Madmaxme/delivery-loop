@@ -3692,7 +3692,7 @@ export async function ship(
     return promise;
   });
   const action = mode === "continue" ? "continue" : "promote";
-  while (result.outcome === "failed") {
+  while (result.outcome === "failed" || result.outcome === "blocked") {
     let waiting = false;
     let login = false;
     for (const problem of result.problems) {
@@ -3715,15 +3715,12 @@ export async function ship(
       if (waits >= 40) throw new Error(`stage ${result.stage.id} failed: ${result.reason}`);
       waits += 1;
       await sleep(30_000);
+    } else if (result.outcome === "blocked") {
+      break;
     }
     result = await runPromotionStages(deps, ticket, "ship", landed, order?.criteria ?? [], { continueStageId });
   }
   if (result.outcome === "blocked") {
-    for (const problem of result.problems) {
-      if (problem.outcome === "parked") continue;
-      const signature = shipNoSignature(problem.reason) || problem.reason;
-      await applyOwnerHeal(deps, ticket, `install:${action}:${problem.stage.id}:${signature}`, stageProblemText(problem));
-    }
     return { exitCode: 1, lines: [`${id} BLOCKED ${result.reason}`], parked: false };
   }
   if (result.outcome === "parked") {

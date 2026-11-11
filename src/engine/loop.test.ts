@@ -3077,6 +3077,97 @@ describe("loop", () => {
     assert.equal(notSuccessful.parked, true);
     assert.equal(env.state(), "Delivery Complete");
   });
+  it("runs the ship path again when the heal says the fix is already on trunk", async () => {
+    const env = harness(BUILDABLE);
+    const stage: PromotionStage = {
+      id: "publish",
+      target: "artifact-zone",
+      authorization: "ship",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: false,
+      writeStatus: true,
+    };
+    env.deps.pack = {
+      ...pack,
+      status: { ...pack.status, complete: "Delivery Complete", shipped: "Shipped" },
+      promotionStages: [stage],
+    };
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    let verifies = 0;
+    let sleeps = 0;
+    env.deps.sleep = async () => { sleeps += 1; };
+    env.deps.ownerHeal = async () => "**Heal:** wait";
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (command !== "verify") return { status: 0, stdout: "" };
+      verifies += 1;
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision ?? "",
+          deployed: input.landedShas ?? [],
+          ...(verifies === 1 ? { outcome: "blocked" as const, reason: "back-merge conflict" } : {}),
+        }),
+      };
+    };
+    const result = await ship(env.deps, "API-1");
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.parked, false);
+    assert.equal(verifies, 2);
+    assert.equal(sleeps, 1);
+    assert.equal(env.state(), "Shipped");
+  });
+
+  it("stops a waiting ship after the heal budget", async () => {
+    const env = harness(BUILDABLE);
+    const stage: PromotionStage = {
+      id: "publish",
+      target: "artifact-zone",
+      authorization: "ship",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: false,
+      writeStatus: false,
+    };
+    env.deps.pack = {
+      ...pack,
+      status: { ...pack.status, complete: "Delivery Complete" },
+      promotionStages: [stage],
+    };
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    let sleeps = 0;
+    let heals = 0;
+    env.deps.sleep = async () => { sleeps += 1; };
+    env.deps.ownerHeal = async () => {
+      heals += 1;
+      return "**Heal:** wait";
+    };
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (command !== "verify") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision ?? "",
+          deployed: input.landedShas ?? [],
+          outcome: "blocked",
+          reason: "back-merge conflict",
+        }),
+      };
+    };
+    await assert.rejects(() => ship(env.deps, "API-1"), /stage publish failed: back-merge conflict/);
+    assert.equal(sleeps, 40);
+    assert.equal(heals, 1);
+    assert.equal(env.state(), "Delivery Complete");
+  });
+
   it("does not write shipped when every ship stage disables writeStatus", async () => {
     const env = harness(BUILDABLE);
     const stage: PromotionStage = {
