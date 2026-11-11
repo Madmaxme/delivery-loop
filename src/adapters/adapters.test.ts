@@ -1036,6 +1036,20 @@ describe("adapters", () => {
       };
       await jira.stateStore.writeDeliveryState("APP-1", state);
       assert.deepEqual(await jira.stateStore.readDeliveryState("APP-1"), state);
+      const skipped = {
+        ...state,
+        stageReceipts: [{
+          stageId: "mobile",
+          target: "mobile",
+          outcome: "not-applicable" as const,
+          reason: "stage mobile does not apply to the landed repos",
+          criteriaRevision: "a".repeat(64),
+          deployed: [],
+          criteria: [],
+        }],
+      };
+      await jira.stateStore.writeDeliveryState("APP-1", skipped);
+      assert.deepEqual(await jira.stateStore.readDeliveryState("APP-1"), skipped);
     });
   });
   it("stores v2 snapshots in Linear and GitHub comments", async () => {

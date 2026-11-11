@@ -14,7 +14,15 @@ export const VERDICTS = [
 
 export type Verdict = (typeof VERDICTS)[number];
 
-export type AcceptanceCriterion = { id: string; text: string; source: string };
+export type AcceptanceCriterion = {
+  id: string;
+  text: string;
+  source: string;
+  /** Stage ids this criterion applies to. Omitted means every stage. */
+  stages?: string[];
+  /** Repo names this criterion applies to. Omitted means every repo that stage landed. */
+  repos?: string[];
+};
 
 export type WorkOrder = {
   repos: string[];
@@ -77,25 +85,47 @@ function section(text: string, name: string): string {
   return body.join("\n").trim();
 }
 
+function scopeNames(cell: string): string[] | null {
+  const names = cell.split(/[,\s]+/).map((item) => item.trim()).filter(Boolean);
+  if (new Set(names).size !== names.length) return null;
+  return names;
+}
+
 function acceptanceCriteria(text: string): AcceptanceCriterion[] | null {
   const rows = section(text, "Acceptance criteria").split("\n")
     .map((line) => line.trim())
     .filter((line) => line.startsWith("|") && line.endsWith("|"));
   const cells = (row: string) => row.slice(1, -1).split("|").map((cell) => cell.trim());
-  const headers = cells(rows[0] ?? "");
+  const headers = cells(rows[0] ?? "").map((cell) => cell.toLowerCase());
   const divider = cells(rows[1] ?? "");
-  if (rows.length < 3 || headers.map((cell) => cell.toLowerCase()).join(",") !== "id,text,source" ||
-    divider.length !== 3 || divider.some((cell) => !/^:?-{3,}:?$/.test(cell))) return null;
+  const extra = headers.slice(3);
+  if (rows.length < 3 || headers.slice(0, 3).join(",") !== "id,text,source" ||
+    extra.some((name, index) => (name !== "stages" && name !== "repos") || extra.indexOf(name) !== index) ||
+    divider.length !== headers.length || divider.some((cell) => !/^:?-{3,}:?$/.test(cell))) return null;
   const criteria: AcceptanceCriterion[] = [];
   const ids = new Set<string>();
+  const stagesIndex = headers.indexOf("stages");
+  const reposIndex = headers.indexOf("repos");
   for (const row of rows.slice(2)) {
-    const [rawId, criterionText, rawSource, ...extra] = cells(row);
-    const id = rawId?.replace(/^`|`$/g, "").trim() ?? "";
-    const source = rawSource?.replace(/^`|`$/g, "").trim() ?? "";
+    const values = cells(row);
+    const id = values[0]?.replace(/^`|`$/g, "").trim() ?? "";
+    const criterionText = values[1]?.trim() ?? "";
+    const source = values[2]?.replace(/^`|`$/g, "").trim() ?? "";
     const key = id.toLowerCase();
-    if (!id || !criterionText || !source || extra.length || ids.has(key)) return null;
+    if (!id || !criterionText || !source || values.length !== headers.length || ids.has(key)) return null;
+    const criterion: AcceptanceCriterion = { id, text: criterionText, source };
+    if (stagesIndex >= 0) {
+      const names = scopeNames(values[stagesIndex] ?? "");
+      if (!names) return null;
+      if (names.length) criterion.stages = names;
+    }
+    if (reposIndex >= 0) {
+      const names = scopeNames(values[reposIndex] ?? "");
+      if (!names) return null;
+      if (names.length) criterion.repos = names;
+    }
     ids.add(key);
-    criteria.push({ id, text: criterionText, source });
+    criteria.push(criterion);
   }
   return criteria.length ? criteria : null;
 }
