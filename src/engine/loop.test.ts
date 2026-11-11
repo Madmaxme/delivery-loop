@@ -9,7 +9,7 @@ import type { DeliveryState, ForgeAdapter, LinearProgramTracker, Ticket, Tracker
 import type { ProjectPack, PromotionStage } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
 import { proofLinesFor } from "../../scripts/journey-proof.mjs";
-import { auditEligibility, candidateFetchEnvironment, ciFixLimit, formatTicketProgress, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage, type LoopDeps } from "./loop.ts";
+import { auditEligibility, candidateFetchEnvironment, ciFixLimit, formatTicketProgress, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage, type LoopDeps, type StageVerifyInput } from "./loop.ts";
 import { classifyQualityCause } from "./quality-cause.ts";
 
 const pack: ProjectPack = {
@@ -1793,6 +1793,67 @@ describe("loop", () => {
         else process.env[name] = value;
       }
     }
+  });
+
+  it("verifies a stage against the landed repos it lists and skips the rest", async () => {
+    const env = harness(BUILDABLE);
+    const mobile = { name: "mobile", url: "https://github.com/acme/mobile", trunk: "main" };
+    env.deps.pack = {
+      ...pack,
+      repos: [...pack.repos, mobile],
+      promotionStages: [
+        { id: "shared", target: "shared-ring", authorization: "deliver", promoteCommand: "promote-shared", repos: ["api", "mobile"], verifyCommand: "verify-shared" },
+        { id: "handset", target: "handset-ring", authorization: "deliver", promoteCommand: "promote-handset", repos: ["mobile"], verifyCommand: "verify-handset" },
+      ],
+    };
+    const commands: string[] = [];
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      commands.push(command);
+      const input = JSON.parse(stdin) as StageVerifyInput;
+      if (!command.startsWith("verify")) return { status: 0, stdout: "" };
+      assert.deepEqual(input.landedShas, [{ repo: "api", sha: "trunk" }]);
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision,
+          deployed: input.landedShas,
+        }),
+      };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.deepEqual(commands, ["promote-shared", "verify-shared"]);
+    const receipts = env.deliveryState().stageReceipts;
+    assert.equal(receipts.find((item) => item.stageId === "shared")?.outcome, "passed");
+    assert.deepEqual(receipts.find((item) => item.stageId === "shared")?.deployed, [{ repo: "api", sha: "trunk" }]);
+    assert.equal(receipts.find((item) => item.stageId === "handset")?.outcome, "not-applicable");
+    assert.deepEqual(receipts.find((item) => item.stageId === "handset")?.deployed, []);
+    assert.deepEqual(receipts.find((item) => item.stageId === "handset")?.criteria, []);
+    assert.equal(env.state(), pack.status.complete);
+  });
+
+  it("records a stage with no landed repos as not applicable", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.ownerHeal = async () => "**Heal:** wait";
+    env.deps.pack = {
+      ...pack,
+      promotionStages: [
+        { id: "handset", target: "handset-ring", authorization: "deliver", promoteCommand: "promote-handset", repos: ["mobile"], verifyCommand: "verify-handset" },
+      ],
+    };
+    const commands: string[] = [];
+    env.deps.runPackCommand = (command) => {
+      commands.push(command);
+      return { status: 0, stdout: "" };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "quality-failed");
+    assert.match(result.detail, /no promotion stage applies/);
+    assert.deepEqual(commands, []);
+    assert.equal(env.deliveryState().stageReceipts[0]?.outcome, "not-applicable");
+    assert.equal(env.state(), "Todo");
   });
 
   it("retries a transient v2 delivery-stage promotion within its budget", async () => {

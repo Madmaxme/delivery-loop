@@ -1495,6 +1495,79 @@ type StageRun =
   | { outcome: "complete" }
   | { outcome: "blocked" | "parked" | "failed"; stage: PromotionStage; reason: string };
 
+/** JSON on a stage verifier's stdin. `landedShas` is that stage's landed repos only. */
+export type StageVerifyInput = {
+  ticketId: string;
+  stageId: string;
+  target: string;
+  criteriaRevision: string;
+  landedShas: { repo: string; sha: string }[];
+  criteria: AcceptanceCriterion[];
+};
+
+function sortedLanded(rows: readonly { repo: string; sha: string }[]): { repo: string; sha: string }[] {
+  return [...rows].sort((a, b) => a.repo.localeCompare(b.repo));
+}
+
+/** Repos this stage lists that the ticket actually landed, in stage order, once each. */
+function stageLandedRows(
+  stage: PromotionStage,
+  landed: readonly { repo: string; sha: string }[],
+): { repo: string; sha: string }[] {
+  const seen = new Set<string>();
+  const rows: { repo: string; sha: string }[] = [];
+  for (const name of stage.repos) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const row = landed.find((item) => item.repo === name && item.sha);
+    if (row) rows.push({ repo: row.repo, sha: row.sha });
+  }
+  return rows;
+}
+
+function notApplicableReceipt(stage: PromotionStage, ticket: { criteriaRevision: string }): StageVerificationReceipt {
+  return {
+    stageId: stage.id,
+    target: stage.target,
+    outcome: "not-applicable",
+    reason: `stage ${stage.id} does not apply to the landed repos`,
+    criteriaRevision: ticket.criteriaRevision,
+    deployed: [],
+    criteria: [],
+  };
+}
+
+function currentStageReceipt(
+  receipt: StageVerificationReceipt | undefined,
+  stage: PromotionStage,
+  ticket: { criteriaRevision: string },
+  landed: readonly { repo: string; sha: string }[],
+  criteria: readonly AcceptanceCriterion[],
+): boolean {
+  const scoped = stageLandedRows(stage, landed);
+  if (scoped.length === 0) {
+    return Boolean(
+      receipt &&
+      receipt.outcome === "not-applicable" &&
+      receipt.stageId === stage.id &&
+      receipt.target === stage.target &&
+      receipt.criteriaRevision === ticket.criteriaRevision &&
+      receipt.deployed.length === 0 &&
+      receipt.criteria.length === 0 &&
+      receipt.reason.trim(),
+    );
+  }
+  return Boolean(receipt && stageReceiptPasses(receipt, stage, ticket, sortedLanded(scoped), criteria));
+}
+
+async function writeStageReceipt(deps: LoopDeps, ticket: Ticket, receipt: StageVerificationReceipt): Promise<void> {
+  const current = await readDeliveryState(deps, ticket);
+  await writeDeliveryState(deps, ticket, {
+    ...current,
+    stageReceipts: [...current.stageReceipts.filter((item) => item.stageId !== receipt.stageId), receipt],
+  });
+}
+
 function validateStageReceipt(
   value: unknown,
   stage: PromotionStage,
@@ -1592,62 +1665,71 @@ async function runPromotionStages(
   criteria: readonly AcceptanceCriterion[],
   options: { continueStageId?: string } = {},
 ): Promise<StageRun> {
-  const state = await readDeliveryState(deps, ticket);
   const stages = deps.pack.promotionStages.filter((stage) => stage.authorization === authorization);
-  const allLanded = [...landed].sort((a, b) => a.repo.localeCompare(b.repo));
+  const allLanded = sortedLanded(landed);
+  let applicable = 0;
   for (const stage of stages) {
-    const old = state.stageReceipts.find((receipt) => receipt.stageId === stage.id);
-    if (old && stageReceiptPasses(old, stage, ticket, allLanded, criteria)) continue;
-    const repos = stage.repos.map((name) => repoByName(deps.pack, name));
-    const missing = stage.repos.filter((name, index) => !repos[index] || !allLanded.some((row) => row.repo === name && row.sha));
-    if (missing.length) return { outcome: "failed", stage, reason: `stage ${stage.id} has no landed SHA for ${missing.join(", ")}` };
+    const scoped = stageLandedRows(stage, allLanded);
+    const fresh = await readDeliveryState(deps, ticket);
+    const old = fresh.stageReceipts.find((receipt) => receipt.stageId === stage.id);
+    if (scoped.length === 0) {
+      if (!currentStageReceipt(old, stage, ticket, allLanded, criteria)) {
+        await writeStageReceipt(deps, ticket, notApplicableReceipt(stage, ticket));
+      }
+      continue;
+    }
+    applicable += 1;
+    const landedHere = sortedLanded(scoped);
+    if (old && stageReceiptPasses(old, stage, ticket, landedHere, criteria)) continue;
+    const repos = scoped.map((row) => ({ name: row.repo, spec: repoByName(deps.pack, row.repo) }));
+    const missingSpec = repos.find((row) => !row.spec);
+    if (missingSpec) return { outcome: "failed", stage, reason: `stage ${stage.id} has no checkout for ${missingSpec.name}` };
     const active = { stageId: stage.id, target: stage.target, authorization, criteriaRevision: ticket.criteriaRevision };
     await writeMarker(deps, ticket, "active-promotion-stage", JSON.stringify(active));
     const current = await readDeliveryState(deps, ticket);
     if (old) await writeDeliveryState(deps, ticket, { ...current, stageReceipts: current.stageReceipts.filter((receipt) => receipt.stageId !== stage.id) });
     const command = options.continueStageId === stage.id ? stage.continueCommand : stage.promoteCommand;
     if (!command) return { outcome: "failed", stage, reason: `stage ${stage.id} has no continueCommand` };
-    for (let index = 0; index < stage.repos.length; index += 1) {
-      const repoName = stage.repos[index]!;
-      const repo = repos[index]!;
-      const source = allLanded.find((row) => row.repo === repoName)!;
-      const refs = stage.refs?.[repoName] ?? [];
+    for (const row of repos) {
+      const repo = row.spec!;
+      const source = scoped.find((item) => item.repo === row.name)!;
+      const refs = stage.refs?.[row.name] ?? [];
       if (options.continueStageId !== stage.id && refs.length > 0 && refs.every((ref) => deployRefContains(deps, repo, ref, source.sha))) continue;
       const promoted = await runStageCommand(deps, command, repo, {
         ticketId: ticket.identifier,
         stageId: stage.id,
         target: stage.target,
-        repo: repoName,
+        repo: row.name,
         sourceSha: source.sha,
       });
       if (promoted.failed) return { outcome: "failed", stage, reason: promoted.failed };
       noteEngine(deps, "promote ok");
     }
-    const verifyRepo = repos[0]!;
-    const verified = await runStageCommand(deps, stage.verifyCommand, verifyRepo, {
+    const verifyRepo = repos[0]!.spec!;
+    const verifyInput: StageVerifyInput = {
       ticketId: ticket.identifier,
       stageId: stage.id,
       target: stage.target,
       criteriaRevision: ticket.criteriaRevision,
-      landedShas: allLanded,
-      criteria,
-    });
+      landedShas: landedHere,
+      criteria: [...criteria],
+    };
+    const verified = await runStageCommand(deps, stage.verifyCommand, verifyRepo, verifyInput);
     if (verified.failed) return { outcome: "failed", stage, reason: verified.failed };
     let receipt: StageVerificationReceipt;
     try {
       const parsed: unknown = JSON.parse(verified.stdout.trim());
-      receipt = validateStageReceipt(parsed, stage, ticket, allLanded, criteria);
+      receipt = validateStageReceipt(parsed, stage, ticket, landedHere, criteria);
     } catch (error) {
       return { outcome: "failed", stage, reason: `invalid stage receipt: ${error instanceof Error ? error.message : String(error)}` };
     }
-    const after = await readDeliveryState(deps, ticket);
-    await writeDeliveryState(deps, ticket, {
-      ...after,
-      stageReceipts: [...after.stageReceipts.filter((item) => item.stageId !== stage.id), receipt],
-    });
+    await writeStageReceipt(deps, ticket, receipt);
     if (receipt.outcome !== "passed") return { outcome: receipt.outcome, stage, reason: receipt.reason };
     await removeMarker(deps, ticket, "active-promotion-stage");
     noteEngine(deps, "verify ok");
+  }
+  if (stages.length > 0 && applicable === 0) {
+    return { outcome: "failed", stage: stages[0]!, reason: "no promotion stage applies to the landed repos" };
   }
   return { outcome: "complete" };
 }
@@ -2418,7 +2500,7 @@ async function alreadyFinished(deps: LoopDeps, ticket: Ticket): Promise<boolean>
   }
   return stages.every((stage) => {
     const receipt = state.stageReceipts.find((item) => item.stageId === stage.id);
-    return Boolean(receipt && stageReceiptPasses(receipt, stage, ticket, landed, order.criteria));
+    return currentStageReceipt(receipt, stage, ticket, landed, order.criteria);
   });
 }
 
@@ -3251,13 +3333,13 @@ export async function ship(
   if ((deliveryStages.length > 0 || shipStages.length > 0) && !order) throw new Error("ship requires the saved acceptance matrix");
   if (deliveryStages.some((stage) => {
     const saved = state.stageReceipts.find((receipt) => receipt.stageId === stage.id);
-    return !saved || !stageReceiptPasses(saved, stage, ticket, landed, order!.criteria);
-  })) throw new Error("ship requires every delivery stage to have a current passed receipt");
+    return !currentStageReceipt(saved, stage, ticket, landed, order!.criteria);
+  })) throw new Error("ship requires every applicable delivery stage to have a current passed receipt");
   if (shipStages.length === 0) return { exitCode: 0, lines: [`${id} ${alreadyShipped ? "already shipped" : "has no ship stages"}`], parked: false };
   if (alreadyShipped) {
     const passed = shipStages.every((stage) => {
       const saved = state.stageReceipts.find((receipt) => receipt.stageId === stage.id);
-      return Boolean(saved && stageReceiptPasses(saved, stage, ticket, landed, order!.criteria));
+      return currentStageReceipt(saved, stage, ticket, landed, order!.criteria);
     });
     if (!passed) throw new Error("shipped ticket lacks current passed ship receipts");
     return { exitCode: 0, lines: [`${id} already shipped`], parked: false };
