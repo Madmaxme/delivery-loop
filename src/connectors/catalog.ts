@@ -31,6 +31,12 @@ export const CONNECTORS: Connector[] = [
     mcp: { url: "https://mcp.figma.com/mcp" },
   },
   {
+    name: "atlassian",
+    summary: "Read Jira issues and attachment evidence for delivery tickets.",
+    skill: "Use the Atlassian connector only for read-only Jira evidence. An organization admin must grant only `read_jira` (`read:jira:agent-interface`, including `downloadJiraIssueAttachment`) and `search_jira` (`search:jira:agent-interface`, for JQL discovery), and deny `write_jira`, `delete_jira`, and `manage_jira`; the package's MCP config does not enforce these permissions. For relevant attachment evidence, use the attachment read/download capability, fetch bytes from its returned short-lived URL, and block with an external-evidence blocker if the bytes cannot be retrieved. If network egress is restricted, allow `api.media.atlassian.com` and `*.frontend.public.atl-paas.net` for these downloads.",
+    mcp: { url: "https://mcp.atlassian.com/v2/mcp" },
+  },
+  {
     name: "database",
     summary: "Read the application database when a ticket names a live record.",
     skill: "Use the database connector when a ticket needs a live row. Do not invent the row.",

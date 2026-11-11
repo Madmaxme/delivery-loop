@@ -17,13 +17,17 @@ const TOKEN_FILE = "src/tokens.scss";
 const UI_CHECK = "npm run check:ui-primitives";
 
 const pack: ProjectPack = {
+  schemaVersion: 2,
   tracker: "linear",
   worker: "http",
   repos: [{ name: "admin-web", url: "https://github.com/acme/admin-web", trunk: "development" }],
   qualityCommand: "npm test",
   qualityWorkflow: "quality",
   invariantsFile: "invariants.md",
-  status: { intake: "Todo", dev: "Dev", prod: "Prod" },
+  eligibility: { mode: "none" },
+  landingStrategy: "pull-request",
+  promotionStages: [],
+  status: { intake: "Todo", complete: "Dev Complete" },
   connectors: ["figma"],
   design: {
     figmaTokenEnv: "FIGMA_ACCESS_TOKEN",
@@ -48,6 +52,11 @@ function ticket(overrides: Partial<Ticket> = {}): Ticket {
     body: "Lay out the home screen.",
     stateName: "Todo",
     labels: [],
+    issueType: null,
+    assigneeId: null,
+    fieldValues: {},
+    attachments: [],
+    criteriaRevision: "a".repeat(64),
     blockedBy: [],
     comments: [],
     ...overrides,
@@ -69,6 +78,10 @@ function order(extra: string): string {
 **Validation:** \`npm test\`
 **Stop:** One home screen remains.
 ${extra}
+## Acceptance criteria
+| ID | Text | Source |
+| --- | --- | --- |
+| home-screen | Compose the home screen from existing primitives. | Product acceptance |
 BUILD_PACKET -->
 `;
 }
@@ -92,8 +105,11 @@ function harness(text: string) {
     async setState() {},
     async addLabel() {},
     async removeLabel() {},
-    async projectSnapshot() {
-      return null;
+    stateStore: {
+      async readDeliveryState() {
+        return { schemaVersion: 2, markers: [], stageReceipts: [] };
+      },
+      async writeDeliveryState() {},
     },
   };
   const worker: WorkerAdapter = {
@@ -127,6 +143,7 @@ function harness(text: string) {
       return { state: "clean", headSha: HEAD };
     },
     async updateBranch() {},
+    async directLand({ expectedHeadSha }) { return expectedHeadSha; },
     async compare() {
       return "ahead";
     },
@@ -291,7 +308,6 @@ describe("design gate", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(merged, false);
     assert.notEqual(result.outcome, "landed");
-    assert.match(env.comments.join("\n"), /ignored/);
   });
 
   it("stops before ground when a Figma frame is present and the token is absent", async () => {

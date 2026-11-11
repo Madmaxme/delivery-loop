@@ -1,79 +1,28 @@
 # delivery-loop
 
-Versioned autonomous delivery loop. Four things are required. The vendor behind each one is an adapter.
+Delivery Loop v2 is an agent-assisted delivery engine for Linear, GitHub, and Jira. Clients pin a package tag and provide project policy, acceptance criteria, and deployment commands in their own repository.
 
-1. **Git** holds the code, the branch, and the merge. `forge: github` opens a pull request. `forge: git` merges with git on any remote.
-2. **A work queue** is a shared list of what is next, what is blocked, and what is done. `tracker: linear` or `tracker: github`. Files in the repo are not a queue.
-3. **A runner** executes commands with nobody sitting there. `runner: gha` is GitHub Actions. `runner: local` is this process. One of them is required.
-4. **A coding worker** edits the code. The runner starts it and waits. `worker` is `cursor`, `claude`, `codex`, `copilot`, or `http`.
+The v2 pack uses `schemaVersion: 2` and requires explicit eligibility, landing strategy, promotion stages, and completion status. The engine supports pull-request or fast-forward landing, runs ordered promotion stages, and records stage-verification receipts in tracker state. `audit` evaluates eligibility without delivery writes; `sweep` is an explicit serial run, not a scheduled job. See [METHODOLOGY.md](METHODOLOGY.md) for the index and [the master v2 procedure](conduct/methodology/SKILL.md) for behavior.
 
-`check: workflow` polls the named quality workflow on the github forge. `check: command` runs `qualityCommand` in the checkout. A workflow check requires `forge: github`.
-
-The orchestrator talks to the owner. The engineering bot owns the code and runs the loop: it dispatches sweeps, launches cloud agents, and merges, or leaves the merge to the lander or the engine-heal workflow. Any actor may squash-merge once quality is green on the head. A branch that is only behind is updated from trunk, then quality runs again on the new head. GitHub is the record.
-
-An install keeps its own `delivery-loop.yaml` and invariants file. This repository does not name those projects. [METHODOLOGY.md](METHODOLOGY.md) is the index. [conduct/methodology/SKILL.md](conduct/methodology/SKILL.md) is the master copy, versioned by git tags. Clients pin a tag and add overlays.
-
-Licensed under Apache-2.0. See `LICENSE`.
+## Install
 
 ```bash
 npm install -g github:<owner>/<repo>#vX.Y.Z
-delivery-loop init
-delivery-loop connector add sentry
+delivery-loop init --tracker github --eligibility none
 delivery-loop update
 ```
 
-`init` and `update` replace installed skills, the Cursor rule, and the runner workflow. They leave `delivery-loop.yaml` and the invariants file alone. The runner clones the pinned tag over HTTPS and installs dependencies in that checkout before the global install, because `npm install -g <dir>` only symlinks the directory.
+`init` requires an explicit `--eligibility none` or `--eligibility command --eligibility-command <command>` choice; a bare `delivery-loop init` is invalid. For Jira, use `--tracker jira` and explicitly provide `--jira-api-base-url`, `--jira-auth-header-env`, `--jira-intake-jql`, and `--jira-approval-field-id`. The API URL must be HTTPS; credentials stay in the named environment variable.
 
-`scripts/bootstrap-remote.sh` pushes `main` to `DELIVERY_LOOP_REMOTE` when the token's `GET /user` login is that remote's owner. An install names the same rule with `commitActors`: a write to a listed repo uses a token whose login is the actor.
+`init` writes the v2 project pack and installs the canonical `.agents/skills/delivery-loop` and `.agents/skills/delivery-loop-conduct` skills. Cursor and Claude skill entries are symlinks to those canonical directories. `update` refreshes generated skills, the Cursor rule, and runner workflow without changing `delivery-loop.yaml` or the invariants file.
 
-## Run events
+Use `delivery-loop audit` for a read-only eligibility review, `delivery-loop deliver <id>` for one ticket, and `delivery-loop sweep` for an explicitly dispatched intake run. `delivery-loop ship <id>` runs ship-authorized stages; `delivery-loop ship continue <id>` resumes the active ship stage. See the [v1-to-v2 migration guide](conduct/methodology/MIGRATION-V1-TO-V2.md) before upgrading a v1 client; v2 has no v1 pack or run-state compatibility path.
 
-A worker run may write `delivery-loop.run.started` and `delivery-loop.run.finished` as JSON files and upload them as a workflow artifact. The writer is `scripts/run-event.sh`. This repository does not post those files. A client posts one by setting `DELIVERY_LOOP_EVENT_URL`. The field contract is in [METHODOLOGY.md](METHODOLOGY.md). A failed post leaves the run's own exit code unless `DELIVERY_LOOP_EVENT_REQUIRED` is `true` or `1`.
+Optional run events are written by `scripts/run-event.sh` and posted only when `DELIVERY_LOOP_EVENT_URL` is set. Credential logs record the slot, endpoint class, and status, never tokens, headers, or request URLs.
 
-## Credential log
+Cursor credentials use `workerKeys.primary` and `workerKeys.fallback` (defaulting to `CURSOR_API_KEY` and `CURSOR_API_KEY_FALLBACK`); `workerModel` is optional. UI projects can configure `design.figmaTokenEnv`; the Figma token stays in the environment, not the pack.
 
-Each credential call writes one `[delivery-loop] credential` line with the slot, the endpoint class, and the status. Success is included. A re-mint near expiry adds `refresh=1`. The run ends with `[delivery-loop] credential summary` lines of counts by slot, endpoint class, and status. The field contract and the limits are in [METHODOLOGY.md](METHODOLOGY.md). The token, the headers, and the request URL are not written.
-
-A recorded proof that passes writes `[delivery-loop] proof ok`. A promote or ship command that exits 0 writes `[delivery-loop] promote ok` or `[delivery-loop] ship ok`. A squash that returns a commit writes `[delivery-loop] land ok`.
-
-## Bot definitions
-
-A leftover `bots` key is ignored with a warning.
-
-## Worker keys
-
-The cursor worker launches with the env var named by `workerKeys.primary`, then the env var named by `workerKeys.fallback`. The defaults are `CURSOR_API_KEY` and `CURSOR_API_KEY_FALLBACK`. The log records the slot in use, `primary` or `fallback`, and the launch status. A launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. The value stays in the environment.
-
-```yaml
-workerKeys:
-  primary: <primary-env>
-  fallback: <fallback-env>
-```
-
-A capacity or balance refusal on the primary slot retries that launch once on the fallback slot.
-An authentication failure stops on the slot that returned it.
-A rate limit stops on the slot that returned it.
-A network failure stops on the slot that returned it.
-A refusal from both slots fails the launch and reports that both slots are out of capacity.
-An empty fallback variable leaves that launch on the primary slot.
-
-A zero ship exit with no outcome lines is success, including a store wait. The pack prints `delivery-loop outcome <ticket> COMPLETE`, `PARKED`, or `BLOCKED`, and an optional reason. Exit 0 means every ticket is COMPLETE. Exit 2 means a PARKED ticket and no BLOCKED ticket, unless `ship.parkSuccess` is true. Any BLOCKED line exits 1. `ship.parkSuccess` defaults to false. Exit 75, or a non-zero exit plus `delivery-loop transient <reason>`, retries that ship or promote step. `transient.maxAttempts` defaults to 3. Waits start at one second and double. `transient.maxWaitMs` defaults to 60000 and caps the sum. A spent budget reports the reason and does not edit an owner.
-
-```yaml
-transient:
-  maxAttempts: 3
-  maxWaitMs: 60000
-ship:
-  parkSuccess: false
-```
-
-`workerModel` is the cursor model id. The launch passes `{ id }` and the credential line names that id. An absent `workerModel` omits the model and logs that the account default is in use.
-
-```yaml
-workerModel: <model-id>
-```
-
-A 5xx on a cursor launch waits one second and retries that slot once. A second 5xx uses the fallback slot. Each attempt logs its slot, `endpoint=cursor-launch`, and status.
+Licensed under Apache-2.0. See `LICENSE`.
 
 ## HTTP worker
 
@@ -145,37 +94,4 @@ Status response, HTTP 200:
 
 ## Contribute
 
-Clone this repo, branch from `main`, and open a pull request. The `quality` workflow runs the tests. Titles and bodies are in [CONTRIBUTING.md](CONTRIBUTING.md).
-
-A new tracker, forge, or worker is a file in `src/adapters` plus a test. Trackers implement `listIntake`, `get`, `comment`, and `setState`. Workers implement `start` and `join`. Forges implement `openPullRequest`, `quality`, `mergeability`, `compare`, `updateBranch`, and `squashMerge`. `squashMerge` returns the merge commit.
-
-An install keeps its repos, trunk branches, status names, and promote commands in its own `delivery-loop.yaml`.
-
-The runner prepends `conduct/conduct/SKILL.md` to every ground and build prompt. That file is the universal law: one code path, evidence before building, a work order that cites an invariant which already exists, a green quality check, `**Prior request:**`, `**Outside grant:**`, and `**Journey evidence:**`. A recorded journey marks dev-done with proof: an https recording or screenshot URL in the build receipt, or a route test on the merged commit whose path matches `journeySpec`. The build handoff includes that raw URL in backticks. The journey command prints the `**Journey proof:**` prefix. When that commit does not contain the route test, a resume checks the promoted dev ref and records the journey command token. A spec outside that pattern is not proof. A run that still lacks the proof saves the build receipt. When the pull requests are merged and the proof is still missing, the next run starts one proof worker on the landed trunk. The worker does not change code, and one attempt is recorded for that landed commit. A route-test file check uses the forge contents API when the forge has one. A missing file and a check that cannot run are different results. A check that cannot run logs the reason. An install's prompt files and invariants file hold the concrete proof.
-
-A rule about how any ticket moves belongs in this repository. An install's product names, repos, and proof belong in that install. `status.hold` is the install's name for the status that does not clear blockers after owned code lands and the grant is still outside the repo. The default is `Hold`. `status.dev` and `status.prod` stay the done states.
-
-`design` names UI repos. When a ticket has a `figma.com` frame in the description, a comment, or a tracker attachment, the work order includes `**Design source:**` with that URL. The runner reads the frame from the Figma REST API using the env var named by `design.figmaTokenEnv`. The package does not ship a token. When a frame is present and that variable is empty, the runner stops with `missing-credential: figma`. A frame URL is the `figma.com` address. Surrounding markdown and a trailing `)` `]` `>` `.` `,` `;` or quote are not part of it. `node-id=1-2` is read as `1:2`. A 400 includes Figma's `err` or `message` and stops as a rejected request. A 403 or 404 stops as access and names `design.figmaTokenEnv`. Token and secret values are never printed or stored. When the ticket has no frame and a land repo is listed under `design.repos`, Validation includes that repo's `check` command. After the pull request opens, the runner reads the check run named `checkName` on that pull request's head sha. That read uses the token printed by `DELIVERY_LOOP_GITHUB_MINT` when the command is set, and mints again when five minutes or less remain. When that command is set, each run mints once at startup and reads `/rate_limit` with that token. A failed mint or rate-limit read is logged and the run continues. A 401 or 403 from check-runs is a credential error. The runner does not read the check from another endpoint. A result recorded on a different sha is ignored. A missing or red check is a quality failure and uses the same heal cap.
-
-```yaml
-design:
-  figmaTokenEnv: <token-env>
-  repos:
-    - name: <repo>
-      check: <check-command>
-      checkName: <check-name>
-      tokenFile: <path>
-```
-
-`prompts.ground` and `prompts.build` are workspace-relative files the runner puts in the worker prompt after that law. `invariantHeadings` lists heading files that count as invariant ids beside `invariantsFile`. A heading in a file with `prefix` becomes the id `<prefix>/<slug>`.
-
-```yaml
-prompts:
-  ground:
-    - <ground-file>
-  build:
-    - <build-file>
-invariantHeadings:
-  - prefix: <prefix>
-    file: <headings-file>
-```
+Clone this repo, branch from `main`, and open a pull request. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance. Adapter changes belong in `src/adapters` with tests. The versioned procedure and code-conduct sources are `conduct/methodology/SKILL.md` and `conduct/conduct/SKILL.md`; clients keep project-specific policy and deployment instructions in their overlays.

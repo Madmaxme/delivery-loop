@@ -1,26 +1,29 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
-import type { ProjectPack } from "../schema/pack.ts";
+import type { DeliveryState, ForgeAdapter, LinearProgramTracker, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
+import type { ProjectPack, PromotionStage } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
 import { proofLinesFor } from "../../scripts/journey-proof.mjs";
-import { ciFixLimit, formatTicketProgress, latestLandMarker, repoCheckoutDir, runDevCommands, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage } from "./loop.ts";
+import { auditEligibility, candidateFetchEnvironment, ciFixLimit, formatTicketProgress, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage, type LoopDeps } from "./loop.ts";
 import { classifyQualityCause } from "./quality-cause.ts";
-import { ownerHealPrompt } from "./stall.ts";
 
 const pack: ProjectPack = {
+  schemaVersion: 2,
   tracker: "github",
   worker: "http",
   repos: [{ name: "api", url: "https://github.com/acme/api", trunk: "main" }],
   qualityCommand: "npm test",
   qualityWorkflow: "quality",
   invariantsFile: "invariants.md",
-  status: { intake: "Todo", dev: "Dev", prod: "Prod" },
+  eligibility: { mode: "none" },
+  landingStrategy: "pull-request",
+  promotionStages: [],
+  status: { intake: "Todo", complete: "Dev Complete" },
   connectors: ["sentry"],
 };
 
@@ -34,6 +37,11 @@ function ticket(overrides: Partial<Ticket> = {}): Ticket {
     body: "The charge ran twice.",
     stateName: "Todo",
     labels: [],
+    issueType: null,
+    assigneeId: null,
+    fieldValues: {},
+    attachments: [],
+    criteriaRevision: "a".repeat(64),
     blockedBy: [],
     comments: [],
     ...overrides,
@@ -43,27 +51,35 @@ function ticket(overrides: Partial<Ticket> = {}): Ticket {
 function harness(text: string, opts?: { quality?: "success" | "failure" | "pending"; branch?: string }) {
   const comments: string[] = [];
   const labels: string[] = [];
+  const statusRevisions: string[] = [];
   let state = "Todo";
+  let deliveryState: DeliveryState = { schemaVersion: 2, markers: [], stageReceipts: [] };
   const tracker: TrackerAdapter = {
     kind: "github",
     async listIntake() {
-      return [ticket()];
+      return [ticket({ stateName: state })];
     },
     async get(id) {
-      return ticket({ identifier: id, comments: comments.map((body) => ({ body })) });
+      return ticket({ identifier: id, stateName: state, comments: comments.map((body) => ({ body })) });
     },
     async comment(_id, body) {
       comments.push(body);
     },
-    async setState(_id, next) {
+    async setState(_id, next, expectedCriteriaRevision) {
+      statusRevisions.push(expectedCriteriaRevision);
       state = next;
     },
     async addLabel(_id, label) {
       labels.push(label);
     },
     async removeLabel() {},
-    async projectSnapshot() {
-      return null;
+    stateStore: {
+      async readDeliveryState() {
+        return deliveryState;
+      },
+      async writeDeliveryState(_id, next) {
+        deliveryState = next;
+      },
     },
   };
   const worker: WorkerAdapter = {
@@ -77,6 +93,7 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
   };
   let merged = false;
   const forge: ForgeAdapter = {
+    async directLand({ expectedHeadSha }) { return expectedHeadSha; },
     async openPullRequest() {
       return {
         number: 4,
@@ -117,6 +134,8 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
     labels,
     merged: () => merged,
     state: () => state,
+    deliveryState: () => deliveryState,
+    statusRevisions,
     deps: {
       pack,
       tracker,
@@ -127,6 +146,40 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
       report() {},
     },
   };
+}
+
+async function seedLandResume(
+  env: { deps: { tracker: TrackerAdapter } },
+  hold: boolean,
+  rows: { repo: string; sha: string }[],
+  ground = BUILDABLE,
+  receipt = "",
+): Promise<void> {
+  const state = await env.deps.tracker.stateStore.readDeliveryState("API-1");
+  const createdAt = new Date(0).toISOString();
+  await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+    ...state,
+    markers: [
+      ...state.markers.filter((marker) => marker.kind !== "work-order" && marker.kind !== "land-resume"),
+      { kind: "work-order", body: JSON.stringify({ ground, receipt, criteriaRevision: ticket().criteriaRevision }), createdAt },
+      { kind: "land-resume", body: JSON.stringify({ kind: "wait", hold, rows, declared: ground, receipt }), createdAt },
+    ],
+  });
+}
+
+async function seedWorkOrder(
+  env: { deps: { tracker: TrackerAdapter } },
+  ground: string,
+  receipt = "",
+): Promise<void> {
+  const state = await env.deps.tracker.stateStore.readDeliveryState("API-1");
+  await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+    ...state,
+    markers: [
+      ...state.markers.filter((marker) => marker.kind !== "work-order"),
+      { kind: "work-order", body: JSON.stringify({ ground, receipt, criteriaRevision: ticket().criteriaRevision }), createdAt: new Date(0).toISOString() },
+    ],
+  });
 }
 
 const MERGED_SHA = "m".repeat(40);
@@ -157,45 +210,24 @@ function listedPull(input: {
   };
 }
 
-function surfaceBoard(
-  env: ReturnType<typeof harness>,
-  opts?: { refs?: boolean; contained?: boolean },
-) {
+function surfaceBoard(env: { deps: LoopDeps }) {
   const api = { name: "api", url: "https://github.com/acme/api", trunk: "main" };
   const mobile = { name: "mobile", url: "https://github.com/acme/mobile", trunk: "main" };
-  const refs = opts?.refs === false ? undefined : { mobile: ["dev-a", "dev-b"] };
   env.deps.pack = {
     ...pack,
     repos: [api, mobile],
     branchTemplate: "cursor/{issue}-{repo}",
-    dev: {
-      promote: {
-        command: "promote {repo}",
-        repos: ["mobile"],
-        ...(refs ? { refs } : {}),
-      },
-    },
   };
   env.deps.lookupHead = () => MERGED_SHA;
   env.deps.sleep = async () => {};
-  env.deps.deployRefContains = () => opts?.contained ?? false;
   return {
     api,
     mobile,
     watch(events: string[]) {
-      env.deps.runCommand = (command) => {
-        events.push(command);
-        return { status: 0 };
-      };
       const setState = env.deps.tracker.setState.bind(env.deps.tracker);
-      env.deps.tracker.setState = async (id, next) => {
+      env.deps.tracker.setState = async (id, next, revision) => {
         events.push(`state:${next}`);
-        await setState(id, next);
-      };
-      const comment = env.deps.tracker.comment.bind(env.deps.tracker);
-      env.deps.tracker.comment = async (id, body) => {
-        if (body.includes("PROOF_RECEIPT")) events.push("proof");
-        await comment(id, body);
+        await setState(id, next, revision);
       };
     },
   };
@@ -214,8 +246,36 @@ const BUILDABLE = `
 **Symbols:** \`api/src/pay.ts#charge\`
 **Validation:** \`npm test\`
 **Stop:** One charge path remains.
+## Acceptance criteria
+| ID | Text | Source |
+| --- | --- | --- |
+| single-charge | Preserve one charge path. | Issue description |
 BUILD_PACKET -->
 `;
+
+function receiptFor(input: {
+  stageId: string;
+  target: string;
+  criteriaRevision: string;
+  deployed: { repo: string; sha: string }[];
+  outcome?: "passed" | "blocked" | "parked";
+  reason?: string;
+}): string {
+  const outcome = input.outcome ?? "passed";
+  return JSON.stringify({
+    stageId: input.stageId,
+    target: input.target,
+    outcome,
+    reason: input.reason ?? "",
+    criteriaRevision: input.criteriaRevision,
+    deployed: input.deployed,
+    criteria: [{
+      id: "single-charge",
+      outcome: outcome === "passed" ? "verified" : "blocked",
+      evidence: outcome === "passed" ? ["verified on the deployed build"] : [],
+    }],
+  });
+}
 
 function commitCheckout(dir: string): string {
   mkdirSync(dir, { recursive: true });
@@ -239,6 +299,174 @@ function routeGround(): string {
 }
 
 describe("loop", () => {
+  it("runs policy with normalized input but no mutation credentials before the lease and worker", async () => {
+    const env = harness("**Verdict:** NEEDS DIAGNOSIS");
+    env.deps.pack = {
+      ...pack,
+      eligibility: { mode: "command", command: "node policy.mjs" },
+      workerKeys: { primary: "CURSOR_API_KEY", fallback: "CURSOR_API_KEY_FALLBACK" },
+      jira: { apiBaseUrl: "https://jira.example", authHeaderEnv: "JIRA_AUTH_HEADER", intakeJql: "project = APP", approvalFieldId: "customfield_1" },
+    };
+    const secretNames = ["GH_TOKEN", "GITHUB_TOKEN", "LINEAR_API_KEY", "JIRA_AUTH_HEADER", "CURSOR_API_KEY", "CURSOR_API_KEY_FALLBACK", "WORKER_HTTP_TOKEN", "AWS_ACCESS_KEY_ID"];
+    const previous = new Map(secretNames.map((name) => [name, process.env[name]]));
+    for (const name of secretNames) process.env[name] = "must-not-leak";
+    try {
+      const events: string[] = [];
+      env.deps.runPackCommand = (command, _cwd, stdin, childEnv) => {
+        events.push("policy");
+        assert.equal(command, "node policy.mjs");
+        assert.deepEqual(JSON.parse(stdin), ticket());
+        for (const name of secretNames) assert.equal(childEnv?.[name], undefined);
+        assert.ok(childEnv?.PATH);
+        return {
+          status: 0,
+          stdout: JSON.stringify({ outcome: "eligible", reasonCode: "approved", reason: "approved" }),
+        };
+      };
+      const writeState = env.deps.tracker.stateStore.writeDeliveryState.bind(env.deps.tracker.stateStore);
+      env.deps.tracker.stateStore.writeDeliveryState = async (id, state) => {
+        if (state.markers.some((marker) => marker.kind === "delivery-lease")) events.push("lease");
+        await writeState(id, state);
+      };
+      const start = env.deps.worker.start.bind(env.deps.worker);
+      env.deps.worker.start = async (input) => {
+        events.push("worker");
+        return start(input);
+      };
+      const result = await runTicket(env.deps, ticket());
+      assert.equal(result.outcome, "verdict");
+      assert.deepEqual(events.slice(0, 3), ["policy", "lease", "worker"]);
+    } finally {
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
+  it("does not lease or start a worker for blocked and complete decisions", async () => {
+    for (const decision of [
+      { outcome: "blocked", reasonCode: "off-lane", reason: "ticket is off lane" },
+      { outcome: "already-complete", reasonCode: "done", reason: "ticket is complete" },
+    ]) {
+      const env = harness("**Verdict:** NEEDS DIAGNOSIS");
+      env.deps.pack = { ...pack, eligibility: { mode: "command", command: "policy" } };
+      env.deps.runPackCommand = () => ({ status: 0, stdout: JSON.stringify(decision) });
+      let starts = 0;
+      env.deps.worker.start = async () => {
+        starts += 1;
+        return { runId: "run-1" };
+      };
+
+      const result = await runTicket(env.deps, ticket());
+      assert.equal(result.outcome, decision.outcome);
+      assert.equal(result.reasonCode, decision.reasonCode);
+      assert.equal(starts, 0);
+      assert.deepEqual(env.comments, []);
+    }
+  });
+
+  it("fails closed on malformed, nonzero, or reasonless policy output", async () => {
+    const failures = [
+      { status: 0, stdout: "not json" },
+      { status: 2, stdout: JSON.stringify({ outcome: "eligible", reasonCode: "ok", reason: "ok" }) },
+      { status: 0, stdout: JSON.stringify({ outcome: "eligible", reasonCode: "ok" }) },
+      { status: 0, stdout: JSON.stringify({ outcome: "eligible", reasonCode: "ok", reason: "ok", extra: true }) },
+    ];
+    for (const failure of failures) {
+      const env = harness("**Verdict:** NEEDS DIAGNOSIS");
+      env.deps.pack = { ...pack, eligibility: { mode: "command", command: "policy" } };
+      env.deps.runPackCommand = () => failure;
+      let starts = 0;
+      env.deps.worker.start = async () => {
+        starts += 1;
+        return { runId: "run-1" };
+      };
+
+      const result = await runTicket(env.deps, ticket());
+      assert.equal(result.outcome, "policy-error");
+      assert.equal(result.reasonCode, "policy-error");
+      assert.equal(starts, 0);
+      assert.deepEqual(env.comments, []);
+    }
+  });
+
+  it("audits intake without calling tracker writes, state, or workers", async () => {
+    const env = harness("**Verdict:** NEEDS DIAGNOSIS");
+    env.deps.pack = { ...pack, eligibility: { mode: "command", command: "policy" } };
+    const tickets = [ticket(), ticket({ id: "2", identifier: "API-2" })];
+    let intakeReads = 0;
+    let policyRuns = 0;
+    let trackerReads = 0;
+    let trackerWrites = 0;
+    let workerStarts = 0;
+    let stateStoreCalls = 0;
+    env.deps.tracker.listIntake = async () => {
+      intakeReads += 1;
+      return tickets;
+    };
+    env.deps.tracker.get = async (identifier) => {
+      trackerReads += 1;
+      return ticket({ identifier });
+    };
+    env.deps.tracker.comment = async () => { trackerWrites += 1; };
+    env.deps.tracker.setState = async () => { trackerWrites += 1; };
+    env.deps.tracker.addLabel = async () => { trackerWrites += 1; };
+    env.deps.tracker.removeLabel = async () => { trackerWrites += 1; };
+    env.deps.tracker.stateStore.readDeliveryState = async () => {
+      stateStoreCalls += 1;
+      return { schemaVersion: 2, markers: [], stageReceipts: [] };
+    };
+    env.deps.tracker.stateStore.writeDeliveryState = async () => { stateStoreCalls += 1; };
+    env.deps.worker.start = async () => {
+      workerStarts += 1;
+      return { runId: "run-1" };
+    };
+    env.deps.runPackCommand = (_command: string, _cwd: string, stdin: string) => {
+      policyRuns += 1;
+      const identifier = (JSON.parse(stdin) as Ticket).identifier;
+      const result = identifier === "API-1"
+        ? { outcome: "eligible", reasonCode: "ok", reason: "ready" }
+        : { outcome: "blocked", reasonCode: "off-lane", reason: "off lane" };
+      return { status: 0, stdout: JSON.stringify(result) };
+    };
+
+    const results = await auditEligibility({
+      pack: env.deps.pack,
+      tracker: env.deps.tracker,
+      runPackCommand: env.deps.runPackCommand,
+    });
+    assert.deepEqual(results, [
+      { identifier: "API-1", outcome: "eligible", reasonCode: "ok", reason: "ready" },
+      { identifier: "API-2", outcome: "blocked", reasonCode: "off-lane", reason: "off lane" },
+    ]);
+    assert.equal(intakeReads, 1);
+    assert.equal(policyRuns, 2);
+    assert.equal(trackerReads, 0);
+    assert.equal(trackerWrites, 0);
+    assert.equal(stateStoreCalls, 0);
+    assert.equal(workerStarts, 0);
+  });
+
+  it("treats explicit mode none as eligible without running a command", async () => {
+    const env = harness("**Verdict:** NEEDS DIAGNOSIS");
+    env.deps.pack = { ...pack, eligibility: { mode: "none" } };
+    env.deps.tracker.listIntake = async () => [ticket()];
+    let commands = 0;
+    env.deps.runPackCommand = () => {
+      commands += 1;
+      return { status: 1, stdout: "" };
+    };
+
+    const results = await auditEligibility(env.deps);
+    assert.deepEqual(results, [{
+      identifier: "API-1",
+      outcome: "eligible",
+      reasonCode: "explicit-none",
+      reason: "Eligibility policy is explicitly disabled by the project pack.",
+    }]);
+    assert.equal(commands, 0);
+  });
   it("uses the checkout root for the agent repo and a subdirectory for the others", () => {
     const home = { name: "workspace", url: "https://github.com/acme/workspace", trunk: "main" };
     const child = { name: "api", url: "https://github.com/acme/api", trunk: "main" };
@@ -270,6 +498,8 @@ describe("loop", () => {
     assert.match(prompt, /prefix\/slug/);
     assert.match(prompt, /every caller uses that owner/);
     assert.match(prompt, /Prior request/);
+    assert.match(prompt, /Normalize every acceptance criterion into one table/);
+    assert.match(prompt, /Build and stage verification reuse the same IDs and text/);
     assert.match(prompt, /Journey evidence/);
     assert.match(prompt, /Land repos: api/);
     assert.match(prompt, /directory the agent was started in is not a land repo/);
@@ -447,7 +677,7 @@ describe("loop", () => {
       const waiting = ticket({
         identifier: "API-2",
         id: "2",
-        blockedBy: [{ identifier: "API-1", stateName: reads === 1 ? "Todo" : "Dev" }],
+        blockedBy: [{ identifier: "API-1", stateName: reads === 1 ? "Todo" : "Dev Complete" }],
       });
       return reads === 1 ? [waiting, blocker] : [waiting];
     };
@@ -474,6 +704,8 @@ describe("loop", () => {
     assert.equal(result.outcome, "landed");
     const build = prompts.find((text) => text.includes("INSTALL BUILD DOC"));
     assert.ok(build);
+    assert.match(build, /Acceptance matrix for implementation/);
+    assert.match(build, /\| single-charge \| Preserve one charge path\. \| Issue description \|/);
     assert.match(build, /The install owns the concrete proof/);
     assert.ok(build.indexOf("The install owns the concrete proof") < build.indexOf("INSTALL BUILD DOC"));
   });
@@ -482,7 +714,7 @@ describe("loop", () => {
     const env = harness("**Verdict:** NEEDS DIAGNOSIS");
     const program: CompileProgramResult = {
       warnings: [],
-      states: { "API-1": "Todo", "API-2": "Dev" },
+      states: { "API-1": "Todo", "API-2": "Dev Complete" },
       program: {
         id: "billing",
         spec: "https://example.test/project",
@@ -491,7 +723,7 @@ describe("loop", () => {
           {
             id: "stage-1",
             title: "Stage 1",
-            afkTo: "dev",
+            afkTo: "complete",
             intake: "auto",
             park: [],
             issues: [
@@ -706,7 +938,6 @@ describe("loop", () => {
     });
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
-    assert.match(env.comments.join("\n"), /no Actions runs yet/);
     assert.equal(env.deps.pageControl?.stop, true);
     assert.equal(sweepNeedsAnotherPage([result]), true);
     assert.equal(env.merged(), false);
@@ -787,7 +1018,7 @@ describe("loop", () => {
     const env = harness(BUILDABLE.replace("**Prior request:** none", "**Prior request:** replaced ACME-100"));
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
-    assert.equal(env.state(), "Dev");
+    assert.equal(env.state(), "Dev Complete");
   });
 
   it("stays in intake when a buildable handoff omits the prior request line", async () => {
@@ -817,7 +1048,7 @@ describe("loop", () => {
     assert.equal(env.state(), "Todo");
   });
 
-  it("marks dev-done when the recording URL is in the build receipt", async () => {
+  it("marks completion when the recording URL is in the build receipt", async () => {
     const url = "https://example.test/artifacts/signup.mp4";
     const ground = BUILDABLE.replace(
       "**Journey evidence:** not-applicable",
@@ -833,10 +1064,10 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
     assert.equal(env.merged(), true);
-    assert.equal(env.state(), "Dev");
+    assert.equal(env.state(), "Dev Complete");
   });
 
-  it("leaves the ticket in intake when the recording URL never reaches the build receipt", async () => {
+  it("leaves a recorded journey in intake when the build receipt omits the recording URL", async () => {
     const url = "https://example.test/artifacts/signup.mp4";
     const ground = BUILDABLE.replace(
       "**Journey evidence:** not-applicable",
@@ -853,13 +1084,11 @@ describe("loop", () => {
     assert.equal(result.outcome, "journey-missing");
     assert.equal(env.merged(), true);
     assert.equal(env.state(), "Todo");
-    assert.equal(env.comments.some((body) => /LAND_WAIT/.test(body)), false);
-    assert.match(env.comments.join("\n"), /JOURNEY_RECEIPT/);
-    assert.match(env.comments.join("\n"), /The journey was walked/);
-    assert.equal(env.comments.some((body) => body.includes("PROOF_ATTEMPT")), false);
+    assert.match(env.comments.join("\n"), /recording URL in the build receipt/);
+    assert.equal(env.comments.some((body) => /LAND_WAIT|JOURNEY_RECEIPT|PROOF_ATTEMPT/.test(body)), false);
   });
 
-  it("marks dev-done when the route test is on the merge commit", async () => {
+  it("marks completion when the route test is on the merge commit", async () => {
     const ground = BUILDABLE.replace(
       "**Journey evidence:** not-applicable",
       "**Journey evidence:** recorded\n**Journey proof:** `api/integration_test/signup_route_test.dart`",
@@ -869,7 +1098,7 @@ describe("loop", () => {
       repo === "api" && ref === "trunk" && path === "integration_test/signup_route_test.dart";
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
-    assert.equal(env.state(), "Dev");
+    assert.equal(env.state(), "Dev Complete");
   });
 
   it("leaves the ticket in intake when the route test is not on the merge commit", async () => {
@@ -908,184 +1137,110 @@ describe("loop", () => {
     assert.match(build, /screenshot or a short video of the done state/);
     assert.match(build, /\/artifacts\//);
     assert.match(build, /Put that raw URL in backticks in BUILD_HANDOFF/);
-    assert.match(build, /Omit only the \*\*Journey proof:\*\* prefix/);
+    assert.match(build, /omit only the \*\*Journey proof:\*\* prefix/i);
     assert.match(build, /non-mutating view or test data/);
     assert.doesNotMatch(build, /real booking/);
-    assert.match(env.comments.join("\n"), /https:\/\/example\.test\/artifacts\/signup\.png/);
   });
 
-  it("reads a saved build receipt on resume and does not start a proof worker", async () => {
+  it("captures missing journey proof once after land in the v2 proof-receipt marker", async () => {
     const url = "https://example.test/artifacts/signup.png";
-    const ground = BUILDABLE.replace(
-      "**Journey evidence:** not-applicable",
-      "**Journey evidence:** recorded",
-    );
-    const env = harness(ground);
-    let commandOn = false;
-    env.deps.pack = {
-      ...pack,
-      journeyCommand: "node scripts/journey-proof.mjs",
-      branchTemplate: "cursor/{issue}-{repo}",
-    };
-    env.deps.runPackCommand = (_command, _cwd, stdin) => {
-      if (!commandOn) return { status: 1, stdout: "" };
-      return { status: 0, stdout: proofLinesFor(stdin).join("\n") };
-    };
-    let joins = 0;
-    env.deps.worker.join = async () => {
-      joins += 1;
-      return {
-        status: "finished" as const,
-        branch: "delivery/api-1",
-        head: "abc",
-        text: joins === 1 ? ground : `Walked \`${url}\``,
-      };
-    };
-    const first = await runTicket(env.deps, ticket());
-    assert.equal(first.outcome, "journey-missing");
-    assert.equal(first.detail, "journey command");
-    assert.match(env.comments.join("\n"), /https:\/\/example\.test\/artifacts\/signup\.png/);
-    commandOn = true;
-    env.deps.lookupHead = () => MERGED_SHA;
-    env.deps.forge.listPullRequests = async (input) => [
-      listedPull({ number: 4, branch: input.head, base: input.base, state: "merged" }),
-    ];
-    let proofStarts = 0;
-    env.deps.worker.start = async (input) => {
-      if (input.prompt.includes("Capture journey proof")) proofStarts += 1;
-      return { runId: "run-2" };
-    };
-    const second = await runTicket(
-      env.deps,
-      ticket({ comments: env.comments.map((body) => ({ body })) }),
-    );
-    assert.equal(second.outcome, "landed");
-    assert.equal(env.state(), "Dev");
-    assert.equal(proofStarts, 0);
-  });
-
-  it("starts one proof worker for a landed commit and does not start a second", async () => {
     const env = harness(BUILDABLE);
-    env.deps.lookupHead = () => "trunk";
+    const ground = audit("api", "**Journey evidence:** recorded");
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({ status: 0, stdout: proofLinesFor(stdin).join("\n") });
+    await seedLandResume(env, false, [{ repo: "api", sha: MERGED_SHA }], ground);
     const prompts: string[] = [];
+    let starts = 0;
     env.deps.worker.start = async (input) => {
+      starts += 1;
       prompts.push(input.prompt);
       return { runId: "proof-1" };
     };
-    env.deps.worker.join = async () => ({ status: "finished" as const, text: "no capture" });
-    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
-    env.deps.runPackCommand = () => ({ status: 0, stdout: "no token" });
-    const prior = [
-      { body: "**Journey evidence:** recorded\n**Outside grant:** none\n**Repos:** `api`" },
-      { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
-    ];
-    const first = await runTicket(env.deps, ticket({ comments: prior }));
-    assert.equal(first.outcome, "journey-missing");
-    assert.equal(prompts.length, 1);
-    assert.match(
-      prompts[0] ?? "",
-      /The worker captures and publishes the journey proof; it does not change code, commit, push, open a pull request, or call the tracker\./,
-    );
-    assert.match(prompts[0] ?? "", /non-mutating view or test data/);
-    assert.doesNotMatch(prompts[0] ?? "", /real booking/);
-    assert.match(prompts[0] ?? "", /api trunk `main` commit `trunk`/);
-    assert.equal(env.state(), "Todo");
-    const second = await runTicket(
-      env.deps,
-      ticket({ comments: [...prior, ...env.comments.map((body) => ({ body }))] }),
-    );
-    assert.equal(second.outcome, "journey-missing");
-    assert.equal(prompts.length, 1);
-  });
-
-  it("moves the ticket to dev when the proof worker returns a recording URL", async () => {
-    const url = "https://example.test/artifacts/signup.png";
-    const env = harness(BUILDABLE);
-    env.deps.lookupHead = () => "trunk";
-    let starts = 0;
-    env.deps.worker.start = async () => {
-      starts += 1;
-      return { runId: "proof-1" };
-    };
     env.deps.worker.join = async () => ({ status: "finished" as const, text: `Walked \`${url}\`` });
-    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
-    env.deps.runPackCommand = (_command, _cwd, stdin) => ({
-      status: 0,
-      stdout: proofLinesFor(stdin).join("\n"),
-    });
-    const result = await runTicket(
-      env.deps,
-      ticket({
-        comments: [
-          { body: "**Journey evidence:** recorded\n**Outside grant:** none\n**Repos:** `api`" },
-          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
-        ],
-      }),
-    );
+
+    const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
-    assert.equal(env.state(), "Dev");
+    assert.equal(env.state(), pack.status.complete);
     assert.equal(starts, 1);
-    assert.match(env.comments.join("\n"), /https:\/\/example\.test\/artifacts\/signup\.png/);
+    assert.match(prompts[0] ?? "", /api landed commit `m{40}`/);
+    assert.match(prompts[0] ?? "", /does not change code, commit, push, open a pull request, or call the tracker/);
+    const body = env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "";
+    const proof = JSON.parse(body) as { schemaVersion: number; criteriaRevision: string; landed: { repo: string; sha: string }[]; attempted: boolean; validated: boolean; receipt: string };
+    assert.equal(proof.schemaVersion, 2);
+    assert.equal(proof.criteriaRevision, ticket().criteriaRevision);
+    assert.deepEqual(proof.landed, [{ repo: "api", sha: MERGED_SHA }]);
+    assert.equal(proof.attempted, true);
+    assert.equal(proof.validated, true);
+    assert.match(proof.receipt, /https:\/\/example\.test\/artifacts\/signup\.png/);
+    assert.equal(env.comments.some((body) => /LAND_WAIT|JOURNEY_RECEIPT|PROOF_ATTEMPT/.test(body)), false);
+
+    const again = await runTicket(env.deps, ticket({ stateName: pack.status.complete }));
+    assert.equal(again.outcome, "landed");
+    assert.equal(starts, 1);
   });
 
-  it("keeps a failed proof worker's recording and does not spend a second attempt", async () => {
+  it("reuses a failed capture receipt instead of starting a second worker", async () => {
     const url = "https://example.test/artifacts/signup.png";
     const env = harness(BUILDABLE);
-    env.deps.lookupHead = () => "trunk";
+    const ground = audit("api", "**Journey evidence:** recorded");
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({ status: 0, stdout: proofLinesFor(stdin).join("\n") });
+    await seedLandResume(env, false, [{ repo: "api", sha: MERGED_SHA }], ground);
     let starts = 0;
     env.deps.worker.start = async () => {
       starts += 1;
       return { runId: "proof-1" };
     };
     env.deps.worker.join = async () => ({ status: "failed" as const, text: `Walked \`${url}\`` });
-    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
-    env.deps.runPackCommand = (_command, _cwd, stdin) => ({
-      status: 0,
-      stdout: proofLinesFor(stdin).join("\n"),
-    });
-    const prior = [
-      { body: "**Journey evidence:** recorded\n**Outside grant:** none\n**Repos:** `api`" },
-      { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
-    ];
-    const first = await runTicket(env.deps, ticket({ comments: prior }));
+
+    const first = await runTicket(env.deps, ticket());
     assert.equal(first.outcome, "journey-missing");
-    assert.equal(env.state(), "Todo");
+    const captured = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}") as { attempted: boolean; validated: boolean; receipt: string };
+    assert.equal(captured.attempted, true);
+    assert.equal(captured.validated, false);
+    assert.match(captured.receipt, /https:\/\/example\.test\/artifacts\/signup\.png/);
+
+    const resumed = await runTicket(env.deps, ticket());
+    assert.equal(resumed.outcome, "landed");
+    assert.equal(env.state(), pack.status.complete);
     assert.equal(starts, 1);
-    assert.match(env.comments.join("\n"), /JOURNEY_RECEIPT/);
-    assert.match(env.comments.join("\n"), /https:\/\/example\.test\/artifacts\/signup\.png/);
-    const second = await runTicket(
-      env.deps,
-      ticket({ comments: [...prior, ...env.comments.map((body) => ({ body }))] }),
-    );
-    assert.equal(second.outcome, "landed");
-    assert.equal(env.state(), "Dev");
-    assert.equal(starts, 1);
+    assert.equal(JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}").validated, true);
+    assert.equal(env.comments.some((body) => /LAND_WAIT|JOURNEY_RECEIPT|PROOF_ATTEMPT/.test(body)), false);
   });
 
-  it("saves the proof text when joining throws after the worker wrote it", async () => {
+  it("keeps a running capture lease and joins its exact landed proof on resume", async () => {
     const url = "https://example.test/artifacts/signup.png";
     const env = harness(BUILDABLE);
-    env.deps.lookupHead = () => "trunk";
-    env.deps.worker.start = async () => ({ runId: "proof-1" });
-    env.deps.worker.join = async () => {
-      throw new Error(`Walked \`${url}\``);
-    };
+    const ground = audit("api", "**Journey evidence:** recorded");
     env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
-    env.deps.runPackCommand = () => ({ status: 0, stdout: "" });
-    const result = await runTicket(
-      env.deps,
-      ticket({
-        comments: [
-          { body: "**Journey evidence:** recorded\n**Outside grant:** none\n**Repos:** `api`" },
-          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
-        ],
-      }),
-    );
-    assert.equal(result.outcome, "journey-missing");
-    assert.equal(env.state(), "Todo");
-    assert.match(env.comments.join("\n"), /JOURNEY_RECEIPT[\s\S]*https:\/\/example\.test\/artifacts\/signup\.png/);
-  });
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({ status: 0, stdout: proofLinesFor(stdin).join("\n") });
+    await seedLandResume(env, false, [{ repo: "api", sha: MERGED_SHA }], ground);
+    let starts = 0;
+    let joins = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "proof-1" };
+    };
+    env.deps.worker.join = async () => {
+      joins += 1;
+      return joins === 1
+        ? { status: "running" as const, text: "" }
+        : { status: "finished" as const, text: `Walked \`${url}\`` };
+    };
 
+    const first = await runTicket(env.deps, ticket());
+    assert.equal(first.outcome, "worker-running");
+    const lease = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "delivery-lease")?.body ?? "{}") as { cursorRunId?: string };
+    assert.equal(lease.cursorRunId, "proof-1");
+
+    env.deps.nowMs = Date.now() + 3 * 60 * 60 * 1000;
+    const resumed = await runTicket(env.deps, ticket());
+    assert.equal(resumed.outcome, "landed");
+    assert.equal(env.state(), pack.status.complete);
+    assert.equal(starts, 1);
+    assert.equal(joins, 2);
+    assert.equal(JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}").validated, true);
+  });
   it("treats a contents 200 as the route test and a 404 as a missing file", async () => {
     const present = harness(routeGround());
     const seen: { repo: string; branch: string; path: string; endpoint: string }[] = [];
@@ -1095,7 +1250,7 @@ describe("loop", () => {
     };
     const landed = await runTicket(present.deps, ticket());
     assert.equal(landed.outcome, "landed");
-    assert.equal(present.state(), "Dev");
+    assert.equal(present.state(), pack.status.complete);
     assert.equal(seen[0]?.repo, "acme/api");
     assert.equal(seen[0]?.branch, "trunk");
     assert.equal(seen[0]?.path, "e2e/signup.spec.ts");
@@ -1175,7 +1330,7 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
     assert.equal(env.merged(), true);
-    assert.equal(env.state(), "Dev");
+    assert.equal(env.state(), "Dev Complete");
   });
 
   it("does not build when the verdict is not BUILDABLE", async () => {
@@ -1216,7 +1371,9 @@ describe("loop", () => {
     const env = harness("**Verdict:** NEEDS DIAGNOSIS");
     env.deps.tracker.listIntake = async () => [ticket({ projectName: "Billing" })];
     let saw = "";
-    env.deps.tracker.projectSnapshot = async (name) => {
+    const linearTracker = env.deps.tracker as TrackerAdapter & LinearProgramTracker;
+    linearTracker.kind = "linear";
+    linearTracker.projectSnapshot = async (name) => {
       saw = name;
       return {
         projectId: "p1",
@@ -1245,7 +1402,7 @@ describe("loop", () => {
     assert.match(prompt, /## Delivery program \(full project\)/);
     assert.match(prompt, /API-1 Todo/);
     assert.match(prompt, /Project: Billing/);
-    assert.match(prompt, /Hold \/ Dev/);
+    assert.match(prompt, /Hold \/ Dev Complete/);
   });
 
   it("stops one ticket when a connector is missing and continues the sweep", async () => {
@@ -1269,33 +1426,37 @@ describe("loop", () => {
     assert.equal(result.outcome, "skipped-graph");
   });
 
-  it("steals a pending lease from a finished parent and releases it", async () => {
+  it("steals a pending v2 lease from a finished parent and releases it", async () => {
     const env = harness("**Verdict:** NEEDS DIAGNOSIS");
     const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    const result = await runTicket(
-      env.deps,
-      ticket({
-        comments: [
-          { body: `<!-- DELIVERY_LEASE expires=${future} cursor_run=pending cursor_phase=ground -->` },
-        ],
-      }),
-    );
+    await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+      ...env.deliveryState(),
+      markers: [{
+        kind: "delivery-lease",
+        body: JSON.stringify({ schemaVersion: 2, expiresAt: future, ghaRunId: null, cursorAgentId: null, cursorRunId: "pending", cursorPhase: "ground" }),
+        createdAt: new Date(0).toISOString(),
+      }],
+    });
+    const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "verdict");
-    assert.equal(env.comments.at(-1), "<!-- DELIVERY_LEASE released=1 -->");
+    const lease = env.deliveryState().markers.filter((marker) => marker.kind === "delivery-lease").at(-1);
+    assert.equal(JSON.parse(lease?.body ?? "{}").released, true);
+    assert.equal(env.comments.some((body) => body.includes("DELIVERY_LEASE")), false);
   });
 
-  it("keeps a lease whose Actions run is still live", async () => {
+  it("keeps a v2 lease whose Actions run is still live", async () => {
     const env = harness("**Verdict:** NEEDS DIAGNOSIS");
     env.deps.githubRunActive = () => true;
     const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    const result = await runTicket(
-      env.deps,
-      ticket({
-        comments: [
-          { body: `<!-- DELIVERY_LEASE expires=${future} gha_run=42 cursor_run=run-9 cursor_phase=ground -->` },
-        ],
-      }),
-    );
+    await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+      ...env.deliveryState(),
+      markers: [{
+        kind: "delivery-lease",
+        body: JSON.stringify({ schemaVersion: 2, expiresAt: future, ghaRunId: "42", cursorAgentId: null, cursorRunId: "run-9", cursorPhase: "ground" }),
+        createdAt: new Date(0).toISOString(),
+      }],
+    });
+    const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "skipped-lease");
     assert.equal(env.comments.length, 0);
   });
@@ -1394,13 +1555,7 @@ describe("loop", () => {
     let opened = 0;
     env.deps.forge.openPullRequest = async () => {
       opened += 1;
-      return {
-        number: 1,
-        url: "https://github.com/acme/api/pull/1",
-        headSha: "abc1234",
-        branch: "cursor/api-1-api",
-        created: true,
-      };
+      return { number: 1, url: "https://github.com/acme/api/pull/1", headSha: "abc1234", branch: "cursor/api-1-api", created: true };
     };
     let starts = 0;
     env.deps.worker.start = async () => {
@@ -1413,37 +1568,34 @@ describe("loop", () => {
     assert.equal(starts, 1);
     assert.equal(env.state(), "Todo");
     assert.equal(sweepNeedsAnotherPage([first]), false);
-    const marker = env.comments.find((body) => body.includes("LAND_EMPTY")) ?? "";
-    assert.match(marker, /api abc1234/);
+    const marker = JSON.parse(env.deliveryState().markers.find((item) => item.kind === "land-resume")!.body) as { kind: string; rows: { repo: string; sha: string }[] };
+    assert.equal(marker.kind, "empty");
+    assert.deepEqual(marker.rows, [{ repo: "api", sha: "abc1234" }]);
     starts = 0;
-    const second = await runTicket(
-      env.deps,
-      ticket({ comments: [{ body: marker }] }),
-    );
+    const second = await runTicket(env.deps, ticket());
     assert.equal(second.outcome, "land-empty");
     assert.equal(starts, 0);
     assert.equal(env.state(), "Todo");
   });
 
-  it("waits for trunk quality before marking dev", async () => {
+  it("waits for trunk quality before writing completion", async () => {
     const env = harness(BUILDABLE);
     let starts = 0;
     env.deps.worker.start = async () => {
       starts += 1;
       return { runId: "run-1" };
     };
-    env.deps.forge.quality = async (input) =>
-      input.headSha === "trunk"
-        ? { state: "failure", detail: "trunk red" }
-        : { state: "success", detail: "quality success" };
+    env.deps.forge.quality = async (input) => input.headSha === "trunk"
+      ? { state: "failure", detail: "trunk red" }
+      : { state: "success", detail: "quality success" };
     const result = await runTicket(env.deps, ticket());
     assert.equal(starts, 2);
     assert.equal(result.outcome, "trunk-waiting");
     assert.equal(env.state(), "Todo");
     assert.equal(env.merged(), true);
-    assert.match(env.comments.join("\n"), /LAND_WAIT/);
-    assert.match(env.comments.join("\n"), /hold=0/);
-    assert.match(env.comments.join("\n"), /api trunk/);
+    const marker = JSON.parse(env.deliveryState().markers.find((item) => item.kind === "land-resume")!.body) as { hold: boolean; rows: { repo: string; sha: string }[] };
+    assert.equal(marker.hold, false);
+    assert.deepEqual(marker.rows, [{ repo: "api", sha: "trunk" }]);
     assert.equal(sweepNeedsAnotherPage([result]), true);
   });
 
@@ -1454,133 +1606,384 @@ describe("loop", () => {
       starts += 1;
       return { runId: "run-1" };
     };
+    await seedLandResume(env, false, [{ repo: "api", sha: "oldred" }]);
     env.deps.lookupHead = () => "green";
     env.deps.forge.compare = async () => "ahead";
-    env.deps.forge.quality = async (input) =>
-      input.headSha === "green"
-        ? { state: "success", detail: "quality success" }
-        : { state: "failure", detail: "old red" };
-    const result = await runTicket(
-      env.deps,
-      ticket({ comments: [{ body: "<!-- LAND_WAIT\nhold=0\napi oldred\n-->" }] }),
-    );
+    env.deps.forge.quality = async (input) => input.headSha === "green"
+      ? { state: "success", detail: "quality success" }
+      : { state: "failure", detail: "old red" };
+    const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
     assert.equal(starts, 0);
-    assert.equal(env.state(), "Dev");
+    assert.equal(env.state(), pack.status.complete);
   });
 
-  it("marks dev on the next sweep when the recorded trunk commit is green", async () => {
+  it("writes completion when the recorded trunk commit is green", async () => {
     const env = harness(BUILDABLE);
     let starts = 0;
     env.deps.worker.start = async () => {
       starts += 1;
       return { runId: "run-1" };
     };
-    const waiting = await runTicket(
-      env.deps,
-      ticket({ comments: [{ body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" }] }),
-    );
-    assert.equal(waiting.outcome, "landed");
+    await seedLandResume(env, false, [{ repo: "api", sha: "trunk" }]);
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
     assert.equal(starts, 0);
-    assert.equal(env.state(), "Dev");
-    assert.equal(env.comments.some((body) => body.includes("LAND_WAIT")), false);
+    assert.equal(env.state(), pack.status.complete);
+    assert.equal(env.deliveryState().markers.some((marker) => marker.kind === "land-resume"), false);
   });
 
-  it("leaves the trunk marker in place while quality is still red", async () => {
+  it("keeps the v2 resume marker while quality is still pending", async () => {
     const env = harness(BUILDABLE);
     let starts = 0;
     env.deps.worker.start = async () => {
       starts += 1;
       return { runId: "run-1" };
     };
+    await seedLandResume(env, true, [{ repo: "api", sha: "trunk" }]);
     const lines: string[] = [];
-    env.deps.report = (event) => {
-      lines.push(formatTicketProgress(event));
-    };
+    env.deps.report = (event) => lines.push(formatTicketProgress(event));
     env.deps.forge.quality = async () => ({ state: "pending", detail: "quality in_progress" });
-    const result = await runTicket(
-      env.deps,
-      ticket({ comments: [{ body: "<!-- LAND_WAIT\nhold=1\napi trunk\n-->" }] }),
-    );
+    const result = await runTicket(env.deps, ticket());
     assert.equal(starts, 0);
     assert.equal(result.outcome, "trunk-waiting");
     assert.deepEqual(lines, ["API-1 land", "API-1 trunk-waiting api trunk"]);
     assert.equal(env.state(), "Todo");
+    assert.equal(env.deliveryState().markers.some((marker) => marker.kind === "land-resume"), true);
     assert.equal(sweepNeedsAnotherPage([result]), true);
   });
 
-  it("promotes only the mobile repos this ticket landed", async () => {
-    const env = harness(
-      BUILDABLE.replace("**Repos:** `api`", "**Repos:** `customer-app, api`"),
-    );
-    const api = { name: "api", url: "https://github.com/acme/api", trunk: "development" };
-    const client = { name: "customer-app", url: "https://github.com/acme/customer-app", trunk: "main" };
-    const commands: string[] = [];
+  it("refuses an HTTP GitHub candidate URL before creating auth config", () => {
+    const previous = process.env.GH_TOKEN;
+    process.env.GH_TOKEN = "candidate-fetch-test-token";
+    try {
+      assert.throws(() => candidateFetchEnvironment(pack, "http://github.com/acme/api"), /HTTPS/);
+      const env = candidateFetchEnvironment(pack, "https://github.com/acme/api");
+      assert.equal(env.GIT_CONFIG_KEY_2, "http.https://github.com/.extraheader");
+      assert.ok(env.GIT_CONFIG_VALUE_3);
+    } finally {
+      if (previous === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = previous;
+    }
+  });
+
+  it("runs credential-scrubbed fast-forward quality in an exact candidate worktree", async () => {
+    const env = harness(BUILDABLE);
+    const root = mkdtempSync(join(tmpdir(), "delivery-loop-fast-forward-"));
+    const seed = join(root, "seed");
+    const checkout = join(root, "api");
+    mkdirSync(seed);
+    const git = (args: string[]) => {
+      const result = spawnSync("git", args, { cwd: seed, encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    const names = [
+      "GH_TOKEN", "GITHUB_TOKEN", "LINEAR_API_KEY", "JIRA_AUTH_HEADER", "CUSTOM_WORKER_KEY", "CUSTOM_WORKER_FALLBACK",
+      "WORKER_HTTP_TOKEN", "CUSTOM_PUSH_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "DELIVERY_LOOP_GITHUB_MINT",
+      "CI", "QUALITY_EVENT_FILE", "QUALITY_CWD_FILE",
+    ];
+    const previous = new Map(names.map((name) => [name, process.env[name]]));
+    try {
+      git(["init", "-b", "main"]);
+      git(["config", "user.name", "Delivery Loop Test"]);
+      git(["config", "user.email", "delivery-loop-test@example.test"]);
+      writeFileSync(join(seed, "candidate.txt"), "base\n");
+      git(["add", "candidate.txt"]);
+      git(["commit", "-m", "base"]);
+      const baseSha = git(["rev-parse", "HEAD"]);
+      git(["checkout", "-b", "delivery/api-1"]);
+      writeFileSync(join(seed, "candidate.txt"), "candidate\n");
+      git(["add", "candidate.txt"]);
+      git(["commit", "-m", "candidate"]);
+      const candidateSha = git(["rev-parse", "HEAD"]);
+      const remote = join(root, "remote.git");
+      const bare = spawnSync("git", ["clone", "--bare", seed, remote], { encoding: "utf8" });
+      assert.equal(bare.status, 0, bare.stderr);
+      const cloned = spawnSync("git", ["clone", "--branch", "main", "--single-branch", remote, checkout], { encoding: "utf8" });
+      assert.equal(cloned.status, 0, cloned.stderr);
+      const rewrite = spawnSync("git", ["-C", checkout, "config", `url.file://${remote}.insteadOf`, "https://github.com/acme/api"], { encoding: "utf8" });
+      assert.equal(rewrite.status, 0, rewrite.stderr);
+      const qualityEventFile = join(root, "quality-events");
+      const qualityCwdFile = join(root, "quality-cwd");
+      for (const name of names) process.env[name] = "must-not-leak";
+      process.env.CI = "1";
+      process.env.QUALITY_EVENT_FILE = qualityEventFile;
+      process.env.QUALITY_CWD_FILE = qualityCwdFile;
+      const qualityCommand = [
+        'test -z "$GH_TOKEN"',
+        'test -z "$GITHUB_TOKEN"',
+        'test -z "$LINEAR_API_KEY"',
+        'test -z "$JIRA_AUTH_HEADER"',
+        'test -z "$CUSTOM_WORKER_KEY"',
+        'test -z "$CUSTOM_WORKER_FALLBACK"',
+        'test -z "$WORKER_HTTP_TOKEN"',
+        'test -z "$CUSTOM_PUSH_TOKEN"',
+        'test -z "$AWS_ACCESS_KEY_ID"',
+        'test -z "$AWS_SECRET_ACCESS_KEY"',
+        'test -z "$DELIVERY_LOOP_GITHUB_MINT"',
+        'test "$CI" = "1"',
+        'test -n "$PATH"',
+        'test "$(cat candidate.txt)" = "candidate"',
+        'printf "quality\\n" >> "$QUALITY_EVENT_FILE"',
+        'pwd > "$QUALITY_CWD_FILE"',
+      ].join(" && ");
+      env.deps.pack = {
+        ...pack,
+        qualityCommand,
+        landingStrategy: "fast-forward",
+        workerKeys: { primary: "CUSTOM_WORKER_KEY", fallback: "CUSTOM_WORKER_FALLBACK" },
+        commitActorTokenEnv: "CUSTOM_PUSH_TOKEN",
+        jira: { apiBaseUrl: "https://jira.example", authHeaderEnv: "JIRA_AUTH_HEADER", intakeJql: "project = APP", approvalFieldId: "customfield_1" },
+        promotionStages: [
+          { id: "delivery", target: "opaque-target", authorization: "deliver", promoteCommand: "promote", repos: ["api"], verifyCommand: "verify" },
+        ],
+      };
+      env.deps.cwd = root;
+      const events: string[] = [];
+      let base = baseSha;
+      let workflowReads = 0;
+      env.deps.lookupHead = (_url, ref) => ref === "delivery/api-1" ? candidateSha : base;
+      env.deps.forge.compare = async () => "ahead";
+      env.deps.forge.directLand = async (input) => {
+        events.push("quality-command");
+        assert.equal(input.expectedBaseSha, baseSha);
+        assert.equal(input.expectedHeadSha, candidateSha);
+        assert.equal(readFileSync(qualityEventFile, "utf8"), "quality\n");
+        base = "newer-trunk-tip";
+        events.push(`land:${input.expectedBaseSha}:${input.expectedHeadSha}`);
+        return candidateSha;
+      };
+      env.deps.forge.quality = async ({ headSha }) => {
+        events.push(`workflow:${headSha}`);
+        if (headSha !== candidateSha) return { state: "failure", detail: `unexpected SHA ${headSha}` };
+        workflowReads += 1;
+        return workflowReads === 1
+          ? { state: "pending", detail: "workflow running" }
+          : { state: "success", detail: "workflow green" };
+      };
+      env.deps.runPackCommand = (command, _cwd, stdin) => {
+        const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+        events.push(command);
+        return command === "verify"
+          ? { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target, criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }) }
+          : { status: 0, stdout: "" };
+      };
+      const first = await runTicket(env.deps, ticket());
+      assert.equal(first.outcome, "quality-pending");
+      assert.deepEqual(events.slice(0, 3), ["quality-command", `land:${baseSha}:${candidateSha}`, `workflow:${candidateSha}`]);
+      assert.equal(events.includes("promote"), false);
+      const qualityCwd = readFileSync(qualityCwdFile, "utf8").trim();
+      assert.notEqual(qualityCwd, checkout);
+      assert.equal(existsSync(qualityCwd), false);
+      assert.equal(env.state(), "Todo");
+      const second = await runTicket(env.deps, ticket());
+      assert.equal(second.outcome, "landed");
+      assert.equal(env.state(), pack.status.complete);
+      assert.equal(events.includes("workflow:newer-trunk-tip"), false);
+      assert.ok(events.indexOf("promote") > events.lastIndexOf(`workflow:${candidateSha}`));
+      assert.equal(env.deliveryState().stageReceipts[0]?.deployed[0]?.sha, candidateSha);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
+  it("runs ordered opaque delivery stages with only stage-authorized credentials", async () => {
+    const env = harness(BUILDABLE);
+    const stages: PromotionStage[] = [
+      { id: "stage-one", target: "green-ring", authorization: "deliver", promoteCommand: "promote-one", repos: ["api"], verifyCommand: "verify-one" },
+      { id: "stage-two", target: "west-cluster", authorization: "deliver", promoteCommand: "promote-two", repos: ["api"], verifyCommand: "verify-two" },
+    ];
     env.deps.pack = {
       ...pack,
-      repos: [api, client],
-      branchTemplate: "cursor/{issue}-{repo}",
-      dev: {
-        promote: {
-          command: "./scripts/promote.sh dev --repo {repo}",
-          repos: ["customer-app", "operator-app"],
-        },
-      },
+      promotionStages: stages,
+      workerKeys: { primary: "CURSOR_API_KEY", fallback: "CURSOR_API_KEY_FALLBACK" },
+      commitActorTokenEnv: "COMMIT_ACTOR_TOKEN",
+      jira: { apiBaseUrl: "https://jira.example", authHeaderEnv: "JIRA_AUTH_HEADER", intakeJql: "project = APP", approvalFieldId: "customfield_1" },
     };
-    env.deps.lookupHead = () => "abc1234";
-    env.deps.runCommand = (command) => {
-      commands.push(command);
-      return { status: 0 };
+    const credentialNames = ["GH_TOKEN", "GITHUB_TOKEN", "AWS_ACCESS_KEY_ID", "LINEAR_API_KEY", "JIRA_AUTH_HEADER", "CURSOR_API_KEY", "CURSOR_API_KEY_FALLBACK", "WORKER_HTTP_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "COMMIT_ACTOR_TOKEN"];
+    const previous = new Map(credentialNames.map((name) => [name, process.env[name]]));
+    for (const name of credentialNames) process.env[name] = "stage-authorized-test-value";
+    const events: string[] = [];
+    env.deps.runPackCommand = (command, _cwd, stdin, childEnv) => {
+      assert.equal(childEnv?.GH_TOKEN, "stage-authorized-test-value");
+      assert.equal(childEnv?.GITHUB_TOKEN, "stage-authorized-test-value");
+      assert.equal(childEnv?.AWS_ACCESS_KEY_ID, "stage-authorized-test-value");
+      assert.equal(childEnv?.LINEAR_API_KEY, undefined);
+      assert.equal(childEnv?.JIRA_AUTH_HEADER, undefined);
+      assert.equal(childEnv?.CURSOR_API_KEY, undefined);
+      assert.equal(childEnv?.CURSOR_API_KEY_FALLBACK, undefined);
+      assert.equal(childEnv?.WORKER_HTTP_TOKEN, undefined);
+      assert.equal(childEnv?.ANTHROPIC_API_KEY, undefined);
+      assert.equal(childEnv?.OPENAI_API_KEY, undefined);
+      assert.equal(childEnv?.COMMIT_ACTOR_TOKEN, undefined);
+      const input = JSON.parse(stdin) as {
+        stageId: string;
+        target: string;
+        repo?: string;
+        criteriaRevision?: string;
+        landedShas?: { repo: string; sha: string }[];
+      };
+      if (command.startsWith("promote-")) {
+        events.push(`${command}:${input.stageId}:${input.repo}`);
+        return { status: 0, stdout: "" };
+      }
+      events.push(`${command}:${input.stageId}`);
+      return {
+        status: 0,
+        stdout: receiptFor({ stageId: input.stageId, target: input.target, criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }),
+      };
     };
-    env.deps.forge.openPullRequest = async (input) => ({
-      number: commands.length + 1,
-      url: `${input.repoUrl}/pull/1`,
-      headSha: "abc1234",
-      branch: input.head,
-      created: true,
-    });
+    try {
+      const result = await runTicket(env.deps, ticket());
+      assert.equal(result.outcome, "landed");
+      assert.deepEqual(events, ["promote-one:stage-one:api", "verify-one:stage-one", "promote-two:stage-two:api", "verify-two:stage-two"]);
+      assert.deepEqual(env.deliveryState().stageReceipts.map((receipt) => [receipt.stageId, receipt.target, receipt.outcome]), [
+        ["stage-one", "green-ring", "passed"],
+        ["stage-two", "west-cluster", "passed"],
+      ]);
+      assert.equal(env.state(), pack.status.complete);
+      assert.deepEqual(env.statusRevisions, [ticket().criteriaRevision]);
+    } finally {
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
+  it("retries a transient v2 delivery-stage promotion within its budget", async () => {
+    const env = harness(BUILDABLE);
+    const stage: PromotionStage = {
+      id: "deliver-stage",
+      target: "opaque-target",
+      authorization: "deliver",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+    };
+    env.deps.pack = { ...pack, promotionStages: [stage], transient: { maxAttempts: 2, maxWaitMs: 250 } };
+    const events: string[] = [];
+    let promotions = 0;
+    env.deps.sleep = async (ms) => { events.push(`sleep:${ms}`); };
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      events.push(command);
+      if (command === "promote" && ++promotions === 1) return { status: 75, stdout: "", stderr: "" };
+      if (command === "promote") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target, criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }) };
+    };
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
-    assert.deepEqual(commands, ["./scripts/promote.sh dev --repo customer-app"]);
-    assert.equal(env.state(), "Dev");
+    assert.deepEqual(events, ["promote", "sleep:250", "promote", "verify"]);
+    assert.equal(env.state(), pack.status.complete);
   });
 
-  it("retries promote on the next sweep without grounding again", async () => {
+  it("does not run a later delivery stage after a blocked receipt", async () => {
     const env = harness(BUILDABLE);
-    let fail = true;
-    const commands: string[] = [];
     env.deps.pack = {
       ...pack,
-      dev: {
-        promote: {
-          command: "./scripts/promote.sh dev --repo {repo}",
-          repos: ["api"],
-        },
-      },
+      promotionStages: [
+        { id: "first", target: "alpha", authorization: "deliver", promoteCommand: "promote-first", repos: ["api"], verifyCommand: "verify-first" },
+        { id: "later", target: "beta", authorization: "deliver", promoteCommand: "promote-later", repos: ["api"], verifyCommand: "verify-later" },
+      ],
     };
-    env.deps.runCommand = (command) => {
+    const commands: string[] = [];
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
       commands.push(command);
-      return { status: fail ? 1 : 0 };
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      if (command !== "verify-first") return { status: 0, stdout: "" };
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision ?? "",
+          deployed: input.landedShas ?? [],
+          outcome: "blocked",
+          reason: "live evidence is unavailable",
+        }),
+      };
     };
-    const first = await runTicket(env.deps, ticket());
-    assert.equal(first.outcome, "quality-failed");
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "blocked");
+    assert.deepEqual(commands, ["promote-first", "verify-first"]);
     assert.equal(env.state(), "Todo");
-    const marker = env.comments.find((body) => body.includes("LAND_WAIT")) ?? "";
-    assert.equal(latestLandMarker([{ body: marker }])?.kind, "wait");
-    fail = false;
-    commands.length = 0;
-    let starts = 0;
-    env.deps.worker.start = async () => {
-      starts += 1;
-      return { runId: "run-1" };
-    };
-    const second = await runTicket(env.deps, ticket({ comments: [{ body: marker }] }));
-    assert.equal(second.outcome, "landed");
-    assert.equal(starts, 0);
-    assert.deepEqual(commands, ["./scripts/promote.sh dev --repo api"]);
-    assert.equal(env.state(), "Dev");
+    assert.deepEqual(env.deliveryState().stageReceipts.map((receipt) => receipt.stageId), ["first"]);
   });
 
+  it("rejects stage receipts bound to another stage, target, revision, SHA, or matrix", async () => {
+    const invalidators: ((receipt: Record<string, unknown>) => void)[] = [
+      (receipt) => { receipt.stageId = "other-stage"; },
+      (receipt) => { receipt.target = "other-target"; },
+      (receipt) => { receipt.criteriaRevision = "b".repeat(64); },
+      (receipt) => { (receipt.deployed as { repo: string; sha: string }[])[0]!.sha = "other-sha"; },
+      (receipt) => { (receipt.criteria as { id: string }[])[0]!.id = "other-criterion"; },
+    ];
+    for (const invalidate of invalidators) {
+      const env = harness(BUILDABLE);
+      const stage: PromotionStage = {
+        id: "delivery",
+        target: "opaque-target",
+        authorization: "deliver",
+        promoteCommand: "promote",
+        repos: ["api"],
+        verifyCommand: "verify",
+      };
+      env.deps.pack = { ...pack, promotionStages: [stage] };
+      env.deps.ownerHeal = async () => "**Heal:** wait";
+      env.deps.runPackCommand = (command, _cwd, stdin) => {
+        if (command !== "verify") return { status: 0, stdout: "" };
+        const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+        const parsed = JSON.parse(receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision ?? "",
+          deployed: input.landedShas ?? [],
+        })) as Record<string, unknown>;
+        invalidate(parsed);
+        return { status: 0, stdout: JSON.stringify(parsed) };
+      };
+      const result = await runTicket(env.deps, ticket());
+      assert.equal(result.outcome, "quality-failed");
+      assert.equal(env.state(), "Todo");
+      assert.equal(env.deliveryState().stageReceipts.length, 0);
+    }
+  });
+
+  it("invalidates receipts when the criteria revision changes", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = {
+      ...pack,
+      promotionStages: [
+        { id: "single", target: "blue-ring", authorization: "deliver", promoteCommand: "promote", repos: ["api"], verifyCommand: "verify" },
+      ],
+    };
+    let verifies = 0;
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      if (command !== "verify") return { status: 0, stdout: "" };
+      verifies += 1;
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision ?? "",
+          deployed: input.landedShas ?? [],
+        }),
+      };
+    };
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    const changed = ticket({ criteriaRevision: "b".repeat(64) });
+    assert.equal((await runTicket(env.deps, changed)).outcome, "landed");
+    assert.equal(verifies, 2);
+    assert.deepEqual(env.deliveryState().stageReceipts.map((receipt) => receipt.criteriaRevision), [changed.criteriaRevision]);
+  });
   it("reports each phase before the wait and the result when the ticket finishes", async () => {
     const env = harness(BUILDABLE);
     const lines: string[] = [];
@@ -1704,7 +2107,7 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
     assert.match(result.detail, /next page resumes/);
-    assert.match(env.comments.join("\n"), /OWNER_HEAL/);
+    assert.equal(env.deliveryState().markers.some((marker) => marker.kind === "owner-heal"), true);
     assert.equal(starts, 3);
     assert.equal(env.merged(), false);
   });
@@ -1766,47 +2169,37 @@ describe("loop", () => {
     env.deps.runPackCommand = () => ({ status: 0, stdout: `**Journey proof:** \`${url}\`` });
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
-    assert.equal(env.state(), "Dev");
+    assert.equal(env.state(), "Dev Complete");
   });
 
-  it("posts the validated proof receipt before dev and reuses it on resume", async () => {
+  it("persists the validated proof receipt before the completion status", async () => {
     const url = "https://example.test/artifacts/signup.mp4";
     const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded"));
     env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
     env.deps.runPackCommand = () => ({ status: 0, stdout: `**Journey proof:** \`${url}\`` });
     env.deps.lookupHead = () => "trunk";
     const order: string[] = [];
-    const comment = env.deps.tracker.comment.bind(env.deps.tracker);
+    const writeState = env.deps.tracker.stateStore.writeDeliveryState.bind(env.deps.tracker.stateStore);
     const setState = env.deps.tracker.setState.bind(env.deps.tracker);
-    env.deps.tracker.comment = async (id, body) => {
-      if (body.includes("<!-- PROOF_RECEIPT -->")) order.push("proof");
-      await comment(id, body);
+    env.deps.tracker.stateStore.writeDeliveryState = async (id, value) => {
+      if (value.markers.some((marker) => marker.kind === "proof-receipt")) order.push("proof");
+      await writeState(id, value);
     };
-    env.deps.tracker.setState = async (id, next) => {
+    env.deps.tracker.setState = async (id, next, revision) => {
       order.push(`state:${next}`);
-      await setState(id, next);
+      await setState(id, next, revision);
     };
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
-    assert.equal(env.state(), "Dev");
-    const proof = env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->"));
-    assert.equal(proof.length, 1);
-    assert.match(proof[0], new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    assert.match(proof[0], /trunk https:\/\/github\.com\/acme\/api\/pull\/4/);
+    assert.equal(env.state(), pack.status.complete);
+    const proof = env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "";
+    assert.equal(proof.includes(url), true);
+    assert.match(proof, /"sha":"trunk","url":"https:\/\/github\.com\/acme\/api\/pull\/4"/);
     assert.ok(order.indexOf("proof") >= 0);
-    assert.ok(order.indexOf("proof") < order.indexOf("state:Dev"));
-    const again = await runTicket(
-      env.deps,
-      ticket({
-        comments: [
-          { body: proof[0] },
-          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
-        ],
-      }),
-    );
+    assert.ok(order.indexOf("proof") < order.indexOf(`state:${pack.status.complete}`));
+    const again = await runTicket(env.deps, ticket());
     assert.equal(again.outcome, "landed");
-    assert.equal(env.state(), "Dev");
-    assert.equal(env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->")).length, 1);
+    assert.equal(env.deliveryState().markers.filter((marker) => marker.kind === "proof-receipt").length, 1);
   });
 
   it("does not accept an api unit spec as journey proof", async () => {
@@ -1828,49 +2221,64 @@ describe("loop", () => {
     env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
     env.deps.runPackCommand = () => ({ status: 0, stdout: "**Journey proof:** `api/test/pay.spec.ts`" });
     env.deps.journeyFileAt = () => true;
-    const waiting = await runTicket(
-      env.deps,
-      ticket({
-        comments: [
-          { body: "**Journey evidence:** recorded\n**Journey proof:** `api/test/pay.spec.ts`" },
-          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
-        ],
-      }),
-    );
+    await seedLandResume(env, false, [{ repo: "api", sha: "trunk" }], audit("api", "**Journey evidence:** recorded\n**Journey proof:** `api/test/pay.spec.ts`"));
+    const waiting = await runTicket(env.deps, ticket());
     assert.equal(waiting.outcome, "journey-missing");
     assert.equal(env.state(), "Todo");
-    assert.equal(env.comments.some((body) => body.includes("<!-- PROOF_RECEIPT -->")), false);
+    const proof = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}") as { attempted?: boolean; validated?: boolean };
+    assert.equal(proof.attempted, true);
+    assert.equal(proof.validated, false);
   });
 
-  it("records a journey token from the promoted dev ref when the merge commit lacks it", async () => {
+  it("records route proof on an exact-SHA-verified delivery ref", async () => {
     const env = harness(BUILDABLE);
-    env.deps.lookupHead = () => "main-tip";
-    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
-    env.deps.runPackCommand = () => ({
-      status: 0,
-      stdout: "**Journey proof:** `api/e2e/signup.spec.ts`",
-    });
-    env.deps.journeyFileAt = ({ ref, path }) => ref === "main" && path === "e2e/signup.spec.ts";
-    const engine: string[] = [];
-    env.deps.engineLog = (line) => engine.push(line);
-    const result = await runTicket(
-      env.deps,
-      ticket({
-        comments: [
-          { body: "**Journey evidence:** recorded\n**Outside grant:** none" },
-          { body: "<!-- LAND_WAIT\nhold=0\napi abc\n-->" },
-        ],
-      }),
-    );
+    const stage: PromotionStage = {
+      id: "delivery-stage",
+      target: "opaque-target",
+      authorization: "deliver",
+      promoteCommand: "promote",
+      repos: ["api"],
+      refs: { api: ["canary-ref"] },
+      verifyCommand: "verify",
+    };
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs", promotionStages: [stage] };
+    const sequence: string[] = [];
+    env.deps.deployRefContains = ({ ref, sha }) => {
+      assert.equal(sha, "abc");
+      assert.equal(ref, "canary-ref");
+      return true;
+    };
+    env.deps.journeyFileAt = ({ ref, path }) => {
+      sequence.push(`file:${ref}`);
+      return ref === "canary-ref" && path === "e2e/signup.spec.ts";
+    };
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (command !== "verify") return { status: 0, stdout: "**Journey proof:** `api/e2e/signup.spec.ts`" };
+      sequence.push("verify");
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision ?? "",
+          deployed: input.landedShas ?? [],
+        }),
+      };
+    };
+    await seedLandResume(env, false, [{ repo: "api", sha: "abc" }], audit("api", "**Journey evidence:** recorded"));
+    const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
-    assert.equal(env.state(), "Dev");
-    const proof = env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->"));
-    assert.equal(proof.length, 1);
-    assert.match(proof[0], /api\/e2e\/signup\.spec\.ts/);
-    assert.ok(engine.includes("[delivery-loop] proof ok"));
+    assert.equal(env.state(), pack.status.complete);
+    assert.deepEqual(sequence, ["verify", "file:abc", "file:canary-ref"]);
+    assert.deepEqual(env.deliveryState().stageReceipts[0]?.deployed, [{ repo: "api", sha: "abc" }]);
+    const proof = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}") as { landed: { repo: string; sha: string }[]; validated: boolean; receipt: string };
+    assert.deepEqual(proof.landed, [{ repo: "api", sha: "abc" }]);
+    assert.equal(proof.validated, true);
+    assert.match(proof.receipt, /api\/e2e\/signup\.spec\.ts/);
   });
 
-  it("keeps recorded proof that already matches the promoted dev ref", async () => {
+  it("reuses recorded proof that already matches the completion target", async () => {
     const env = harness(BUILDABLE);
     env.deps.lookupHead = () => "main-tip";
     let runs = 0;
@@ -1879,28 +2287,13 @@ describe("loop", () => {
       runs += 1;
       return { status: 1, stdout: "" };
     };
-    env.deps.journeyFileAt = ({ ref, path }) => ref === "dev-a" && path === "e2e/signup.spec.ts";
-    env.deps.runCommand = () => ({ status: 0 });
-    env.deps.pack = {
-      ...env.deps.pack,
-      dev: { promote: { command: "promote {repo}", repos: ["api"], refs: { api: ["dev-a"] } } },
-    };
-    const result = await runTicket(
-      env.deps,
-      ticket({
-        comments: [
-          {
-            body: "**Journey evidence:** recorded\n**Journey proof:** `api/e2e/signup.spec.ts`\n**Outside grant:** none",
-          },
-          { body: "<!-- LAND_WAIT\nhold=0\napi abc\n-->" },
-        ],
-      }),
-    );
+    env.deps.journeyFileAt = ({ ref, path }) => ref === "main" && path === "e2e/signup.spec.ts";
+    const ground = audit("api", "**Journey evidence:** recorded\n**Journey proof:** `api/e2e/signup.spec.ts`");
+    await seedLandResume(env, false, [{ repo: "api", sha: "abc" }], ground);
+    const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
-    assert.equal(env.state(), "Dev");
+    assert.equal(env.state(), pack.status.complete);
     assert.equal(runs, 0);
-    const proof = env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->"));
-    assert.equal(proof.length, 1);
   });
 
   it("names the journey command when it prints no token", async () => {
@@ -1912,124 +2305,36 @@ describe("loop", () => {
       journeySpec: "{e2e,integration_test,journey}/**",
     };
     env.deps.runPackCommand = () => ({ status: 0, stdout: "no token\n" });
-    const result = await runTicket(
-      env.deps,
-      ticket({
-        comments: [
-          { body: "**Journey evidence:** recorded\n**Outside grant:** none" },
-          { body: "<!-- LAND_WAIT\nhold=0\napi abc\n-->" },
-        ],
-      }),
-    );
+    await seedLandResume(env, false, [{ repo: "api", sha: "abc" }], audit("api", "**Journey evidence:** recorded"));
+    const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "journey-missing");
-    assert.equal(result.detail, "journey command");
+    assert.equal(result.detail, "recorded proof missing");
     assert.equal(env.state(), "Todo");
     const note = env.comments.find((body) => body.includes("Journey command"));
     assert.ok(note);
     assert.match(note, /API-1/);
     assert.match(note, /node scripts\/journey-proof\.mjs/);
     assert.match(note, /\{e2e,integration_test,journey\}\/\*\*/);
-    assert.equal(env.comments.some((body) => body.includes("<!-- PROOF_RECEIPT -->")), false);
   });
 
-  it("advances a resumed land when recorded proof is present and posts that comment once", async () => {
+  it("advances a v2 resume after recording journey proof once", async () => {
     const env = harness(BUILDABLE);
     env.deps.lookupHead = () => "trunk";
     env.deps.journeyFileAt = ({ path }) => path === "e2e/signup.spec.ts";
     env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
     env.deps.runPackCommand = () => ({ status: 0, stdout: "**Journey proof:** `api/e2e/signup.spec.ts`" });
-    const first = await runTicket(
-      env.deps,
-      ticket({
-        comments: [
-          { body: "**Journey evidence:** recorded" },
-          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
-        ],
-      }),
-    );
+    await seedLandResume(env, false, [{ repo: "api", sha: "trunk" }], audit("api", "**Journey evidence:** recorded"));
+    const first = await runTicket(env.deps, ticket());
     assert.equal(first.outcome, "landed");
-    assert.equal(env.state(), "Dev");
-    const proof = env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->"));
-    assert.equal(proof.length, 1);
+    assert.equal(env.state(), pack.status.complete);
+    const proof = env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "";
+    assert.match(proof, /api\/e2e\/signup\.spec\.ts/);
     env.deps.runPackCommand = () => ({ status: 1, stdout: "" });
-    const again = await runTicket(
-      env.deps,
-      ticket({
-        comments: [
-          { body: "**Journey evidence:** recorded" },
-          { body: proof[0] },
-          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
-        ],
-      }),
-    );
+    const again = await runTicket(env.deps, ticket({ stateName: pack.status.complete }));
     assert.equal(again.outcome, "landed");
-    assert.equal(env.state(), "Dev");
-    assert.equal(env.comments.filter((body) => body.includes("<!-- PROOF_RECEIPT -->")).length, 1);
+    assert.equal(env.deliveryState().markers.filter((marker) => marker.kind === "proof-receipt").length, 1);
   });
 
-  it("keeps dev when ship fails, edits that owner once, and resumes the step", async () => {
-    const env = harness(BUILDABLE);
-    let runs = 0;
-    let heals = 0;
-    const start = env.deps.worker.start.bind(env.deps.worker);
-    env.deps.worker.start = async (input) => {
-      if (input.prompt.includes("Fix that owner")) heals += 1;
-      return start(input);
-    };
-    env.deps.pack = {
-      ...pack,
-      ship: { steps: ["ship"], markStatus: false, afterDev: true },
-    };
-    let shipArgs = "";
-    const engine: string[] = [];
-    env.deps.engineLog = (line) => engine.push(line);
-    env.deps.runCommand = () => {
-      runs += 1;
-      shipArgs = process.env.DELIVERY_LOOP_SHIP_ARGS ?? "";
-      return { status: runs === 1 ? 1 : 0 };
-    };
-    const first = await runTicket(env.deps, ticket());
-    assert.equal(first.outcome, "ship-blocked");
-    assert.equal(env.state(), "Dev");
-    assert.equal(sweepNeedsAnotherPage([first]), true);
-    const again = await runTicket(
-      env.deps,
-      ticket({ comments: env.comments.map((body) => ({ body })) }),
-    );
-    assert.equal(again.outcome, "landed");
-    assert.equal(again.detail, "ship resumed");
-    assert.equal(env.state(), "Dev");
-    assert.equal(shipArgs, "--issue API-1");
-    assert.equal(heals, 1);
-    assert.equal(engine.filter((line) => line === "[delivery-loop] ship ok").length, 1);
-  });
-
-  it("stops at dev and does not resume ship when afterDev is off", async () => {
-    const env = harness(BUILDABLE);
-    let runs = 0;
-    env.deps.pack = {
-      ...pack,
-      ship: { steps: ["ship"], markStatus: false },
-    };
-    env.deps.runCommand = () => {
-      runs += 1;
-      return { status: 0 };
-    };
-    const first = await runTicket(env.deps, ticket());
-    assert.equal(first.outcome, "landed");
-    assert.equal(env.state(), "Dev");
-    assert.equal(runs, 0);
-    const again = await runTicket(
-      env.deps,
-      ticket({
-        comments: [{ body: "<!-- SHIP_WAIT\nhold=0\napi abc\n-->" }],
-      }),
-    );
-    assert.equal(again.outcome, "landed");
-    assert.equal(again.detail, "dev only");
-    assert.equal(env.state(), "Dev");
-    assert.equal(runs, 0);
-  });
 
   it("edits the install once when the quality check does not match the workflow", async () => {
     const env = harness(BUILDABLE);
@@ -2073,213 +2378,6 @@ describe("loop", () => {
     assert.equal(heals.length, 1);
     assert.match(heals[0], /package that executes this loop/);
     assert.equal(env.merged(), false);
-  });
-
-  it("edits the install once when a ship step returns no, including continue", async () => {
-    const env = harness(BUILDABLE);
-    const prompts: string[] = [];
-    const start = env.deps.worker.start.bind(env.deps.worker);
-    env.deps.worker.start = async (input) => {
-      prompts.push(input.prompt);
-      return start(input);
-    };
-    env.deps.pack = {
-      ...pack,
-      commitActorTokenEnv: "COMMIT_ACTOR_TOKEN",
-      ship: { steps: ["false"], continue: ["false"], markStatus: false },
-    };
-    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed: false/);
-    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed: false/);
-    await assert.rejects(() => ship(env.deps, "API-1", "", "continue"), /ship step failed: false/);
-    await assert.rejects(() => ship(env.deps, "API-1", "", "continue"), /ship step failed: false/);
-    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
-    assert.equal(heals.length, 2);
-    assert.match(heals[0], /Ship step returned no: false/);
-    assert.match(heals[0], /repo the command ships/);
-    assert.match(heals[0], /An open pull request is not landed/);
-    assert.match(env.comments.join("\n"), /OWNER_HEAL type=ship-failed install:steps:false/);
-    assert.match(env.comments.join("\n"), /OWNER_HEAL type=ship-failed install:continue:false/);
-    assert.match(ownerHealPrompt({ reason: "no", tokenEnv: "COMMIT_ACTOR_TOKEN" }), /COMMIT_ACTOR_TOKEN/);
-  });
-
-  it("edits the owner again when the same ship command returns a different no", async () => {
-    const env = harness(BUILDABLE);
-    const prompts: string[] = [];
-    const start = env.deps.worker.start.bind(env.deps.worker);
-    env.deps.worker.start = async (input) => {
-      prompts.push(input.prompt);
-      return start(input);
-    };
-    const note = join(mkdtempSync(join(tmpdir(), "ship-no-")), "no.txt");
-    writeFileSync(note, "missing required attribute socialMedia\n");
-    const step = `cat ${note} >&2; exit 1`;
-    env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
-    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed/);
-    writeFileSync(note, "missing required attribute exportCompliance\n");
-    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed/);
-    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed/);
-    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
-    assert.equal(heals.length, 2);
-    assert.match(heals[0], /socialMedia/);
-    assert.match(heals[1], /exportCompliance/);
-  });
-
-  it("mints a new login after a rejected one and runs the step again", async () => {
-    const env = harness(BUILDABLE);
-    const prompts: string[] = [];
-    const start = env.deps.worker.start.bind(env.deps.worker);
-    env.deps.worker.start = async (input) => {
-      prompts.push(input.prompt);
-      return start(input);
-    };
-    env.deps.worker.join = async () => ({ status: "finished", branch: "delivery/api-1", head: "abc", text: "**Heal:** login" });
-    const marker = join(mkdtempSync(join(tmpdir(), "ship-login-")), "minted");
-    const previous = process.env.DELIVERY_LOOP_GITHUB_MINT;
-    process.env.DELIVERY_LOOP_GITHUB_MINT = `echo minted > ${marker}; echo replacement-token`;
-    const step = `if [ ! -s ${marker} ]; then echo 'HTTP 401: Bad credentials' >&2; exit 1; fi`;
-    env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
-    try {
-      await ship(env.deps, "API-1");
-    } finally {
-      if (previous === undefined) delete process.env.DELIVERY_LOOP_GITHUB_MINT;
-      else process.env.DELIVERY_LOOP_GITHUB_MINT = previous;
-    }
-    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 1);
-    assert.equal(env.comments.some((body) => body.includes("OWNER_HEAL")), false);
-  });
-
-  it("edits the same ship no again on the next page", async () => {
-    const env = harness(BUILDABLE);
-    const prompts: string[] = [];
-    const start = env.deps.worker.start.bind(env.deps.worker);
-    env.deps.worker.start = async (input) => {
-      prompts.push(input.prompt);
-      return start(input);
-    };
-    env.deps.pack = { ...pack, ship: { steps: ["false"], markStatus: false } };
-    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed: false/);
-    env.deps.pageControl = { stop: false, healed: [] };
-    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed: false/);
-    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
-    assert.equal(heals.length, 2);
-    assert.match(env.comments.join("\n"), /OWNER_HEAL type=ship-failed install:steps:false/);
-  });
-
-  it("waits out a ship check that is still running and does not edit an owner", async () => {
-    const env = harness(BUILDABLE);
-    const prompts: string[] = [];
-    const start = env.deps.worker.start.bind(env.deps.worker);
-    env.deps.worker.start = async (input) => {
-      prompts.push(input.prompt);
-      return start(input);
-    };
-    env.deps.worker.join = async () => ({ status: "finished", branch: "delivery/api-1", head: "abc", text: "**Heal:** wait" });
-    env.deps.sleep = async () => {};
-    const count = join(mkdtempSync(join(tmpdir(), "ship-wait-")), "n");
-    writeFileSync(count, "0\n");
-    const step = `n=$(cat ${count}); echo $((n+1)) > ${count}; if [ "$n" -lt 2 ]; then echo 'Required status check "quality" is in progress.' >&2; exit 1; fi`;
-    env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
-    await ship(env.deps, "API-1");
-    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 1);
-    assert.equal(env.comments.some((body) => body.includes("OWNER_HEAL")), false);
-  });
-
-  it("heals a ship no and continues when the retry is a check still running", async () => {
-    const env = harness(BUILDABLE);
-    const prompts: string[] = [];
-    const dir = mkdtempSync(join(tmpdir(), "ship-continue-"));
-    const note = join(dir, "note");
-    const count = join(dir, "n");
-    writeFileSync(note, "missing required attribute socialMedia\n");
-    writeFileSync(count, "0\n");
-    const start = env.deps.worker.start.bind(env.deps.worker);
-    env.deps.worker.start = async (input) => {
-      prompts.push(input.prompt);
-      writeFileSync(note, "fixed\n");
-      return start(input);
-    };
-    env.deps.worker.join = async () => {
-      const reason = prompts.at(-1)?.split("\n\n")[1] ?? "";
-      const signature = reason.trim().split("\n").at(-1) ?? "";
-      return {
-        status: "finished" as const,
-        branch: "delivery/api-1",
-        head: "abc",
-        text: signature.includes("in progress") ? "**Heal:** wait" : BUILDABLE,
-      };
-    };
-    env.deps.sleep = async () => {};
-    const step = `if grep -q socialMedia ${note}; then echo 'missing required attribute socialMedia' >&2; exit 1; fi; n=$(cat ${count}); echo $((n+1)) > ${count}; if [ "$n" -lt 1 ]; then echo 'Required status check "quality" is in progress.' >&2; exit 1; fi`;
-    env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
-    await ship(env.deps, "API-1");
-    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
-    assert.equal(heals.length, 2);
-    assert.match(heals[0], /socialMedia/);
-    assert.match(heals[1], /in progress/);
-    assert.equal(env.comments.filter((body) => body.includes("OWNER_HEAL")).length, 1);
-  });
-
-  it("heals the next ship no in the same run and continues", async () => {
-    const env = harness(BUILDABLE);
-    const prompts: string[] = [];
-    const phase = join(mkdtempSync(join(tmpdir(), "ship-next-no-")), "phase");
-    writeFileSync(phase, "0\n");
-    const start = env.deps.worker.start.bind(env.deps.worker);
-    env.deps.worker.start = async (input) => {
-      prompts.push(input.prompt);
-      const next = readFileSync(phase, "utf8").trim() === "0" ? "1\n" : "2\n";
-      writeFileSync(phase, next);
-      return start(input);
-    };
-    const step = `p=$(cat ${phase}); if [ "$p" = 0 ]; then echo 'missing required attribute socialMedia' >&2; exit 1; fi; if [ "$p" = 1 ]; then echo 'missing required attribute exportCompliance' >&2; exit 1; fi`;
-    env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
-    await ship(env.deps, "API-1");
-    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
-    assert.equal(heals.length, 2);
-    assert.match(heals[0], /socialMedia/);
-    assert.match(heals[1], /exportCompliance/);
-  });
-
-  it("stops a failure type after its cap and does not start another heal", async () => {
-    const env = harness(BUILDABLE);
-    const prompts: string[] = [];
-    const start = env.deps.worker.start.bind(env.deps.worker);
-    env.deps.worker.start = async (input) => {
-      prompts.push(input.prompt);
-      return start(input);
-    };
-    env.deps.pack = {
-      ...pack,
-      heal: { caps: { "ship-failed": 1 } },
-      ship: { steps: ["false"], markStatus: false },
-    };
-    await assert.rejects(() => ship(env.deps, "API-1"), /ship step failed: false/);
-    env.deps.pageControl = { stop: false, healed: [] };
-    await assert.rejects(() => ship(env.deps, "API-1"), /heal exhausted: ship-failed/);
-    const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
-    assert.equal(heals.length, 1);
-    assert.match(heals[0], /engine-heal\/API-1/);
-    assert.match(heals[0], /Do not merge it to main/);
-    assert.match(heals[0], /package\.json/);
-    assert.match(heals[0], /does not push a commit/);
-    assert.deepEqual(env.labels, ["heal-exhausted", "ship-failed"]);
-    assert.match(env.comments.join("\n"), /HEAL_EXHAUSTED heal-exhausted type=ship-failed/);
-    env.deps.pageControl = { stop: false, healed: [] };
-    const before = heals.length;
-    await assert.rejects(() => ship(env.deps, "API-1"), /heal exhausted: ship-failed/);
-    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, before);
-  });
-
-  it("does not record a heal when the marker comment fails", async () => {
-    const env = harness(BUILDABLE);
-    env.deps.pack = { ...pack, ship: { steps: ["false"], markStatus: false } };
-    env.deps.tracker.comment = async () => {
-      throw new Error("comment failed");
-    };
-    await assert.rejects(() => ship(env.deps, "API-1"), /comment failed/);
-    assert.equal(env.deps.pageControl?.healed?.length ?? 0, 0);
-    assert.equal(env.deps.pageControl?.stop ?? false, false);
-    assert.equal(env.deps.pageControl?.verdicts, undefined);
   });
 
   it("stops a red quality check at the heal cap and does not chain another page", async () => {
@@ -2342,16 +2440,17 @@ describe("loop", () => {
     };
     const engine: string[] = [];
     env.deps.engineLog = (line) => engine.push(line);
+    await seedWorkOrder(env, audit("api, mobile"));
     const result = await runTicket(
       env.deps,
       ticket({ comments: [{ body: audit("api, mobile") }] }),
     );
     assert.equal(result.outcome, "landed");
     assert.equal(starts, 0);
-    assert.deepEqual(events, ["update", "merge", "promote mobile", "state:Dev"]);
+    assert.deepEqual(events, ["update", "merge", "state:Dev Complete"]);
     assert.ok(engine.includes("[delivery-loop] land ok"));
-    assert.ok(engine.includes("[delivery-loop] promote ok"));
-    assert.equal(env.state(), "Dev");
+    assert.equal(engine.some((line) => line === "[delivery-loop] promote ok"), false);
+    assert.equal(env.state(), pack.status.complete);
   });
 
   it("does not merge a ready pull request while another open surface is not ready", async () => {
@@ -2394,6 +2493,7 @@ describe("loop", () => {
       starts += 1;
       return { runId: "run-1" };
     };
+    await seedWorkOrder(env, audit("api, web, mobile"));
     const result = await runTicket(
       env.deps,
       ticket({ comments: [{ body: audit("api, web, mobile") }] }),
@@ -2402,113 +2502,6 @@ describe("loop", () => {
     assert.equal(starts, 0);
     assert.equal(result.outcome, "land-blocked");
     assert.match(result.detail, /mobile quality unread/);
-  });
-
-  it("promotes a ticket whose pull requests are already merged and posts the proof", async () => {
-    const env = harness(BUILDABLE);
-    const board = surfaceBoard(env, { refs: false });
-    const events: string[] = [];
-    board.watch(events);
-    env.deps.journeyFileAt = ({ path, ref }) =>
-      path === "e2e/signup_route_test.dart" && ref === MERGED_SHA;
-    env.deps.forge.listPullRequests = async (input) => [
-      listedPull({ number: 1, branch: input.head, base: input.base, state: "merged" }),
-    ];
-    env.deps.forge.squashMerge = async () => {
-      events.push("merge");
-      return MERGED_SHA;
-    };
-    let starts = 0;
-    env.deps.worker.start = async () => {
-      starts += 1;
-      return { runId: "run-1" };
-    };
-    const result = await runTicket(
-      env.deps,
-      ticket({
-        comments: [
-          {
-            body: audit(
-              "api, mobile",
-              "**Journey evidence:** recorded\n**Journey proof:** `mobile/e2e/signup_route_test.dart`",
-            ),
-          },
-        ],
-      }),
-    );
-    assert.equal(result.outcome, "landed");
-    assert.equal(starts, 0);
-    assert.equal(events.includes("merge"), false);
-    assert.deepEqual(events, ["promote mobile", "proof", "state:Dev"]);
-    assert.equal(env.state(), "Dev");
-  });
-
-  it("skips promote when the deploy refs already contain the merge", async () => {
-    const env = harness(BUILDABLE);
-    const board = surfaceBoard(env, { contained: true });
-    const events: string[] = [];
-    board.watch(events);
-    env.deps.forge.listPullRequests = async (input) =>
-      input.repoUrl.endsWith("/mobile")
-        ? [listedPull({ number: 3, branch: input.head, base: input.base, state: "merged" })]
-        : [];
-    let starts = 0;
-    env.deps.worker.start = async () => {
-      starts += 1;
-      return { runId: "run-1" };
-    };
-    const result = await runTicket(
-      env.deps,
-      ticket({ comments: [{ body: audit("mobile") }] }),
-    );
-    assert.equal(result.outcome, "landed");
-    assert.equal(starts, 0);
-    assert.deepEqual(events, ["state:Dev"]);
-    assert.equal(env.state(), "Dev");
-  });
-
-  it("does nothing when the ticket is already dev and the deploy refs contain the merge", async () => {
-    const env = harness(BUILDABLE);
-    const board = surfaceBoard(env, { contained: true });
-    const events: string[] = [];
-    board.watch(events);
-    env.deps.forge.listPullRequests = async (input) =>
-      input.repoUrl.endsWith("/mobile")
-        ? [listedPull({ number: 3, branch: input.head, base: input.base, state: "merged" })]
-        : [];
-    let starts = 0;
-    env.deps.worker.start = async () => {
-      starts += 1;
-      return { runId: "run-1" };
-    };
-    const result = await runTicket(
-      env.deps,
-      ticket({ stateName: "Dev", comments: [{ body: audit("mobile") }] }),
-    );
-    assert.equal(result.outcome, "landed");
-    assert.equal(result.detail, "already finished");
-    assert.equal(starts, 0);
-    assert.deepEqual(events, []);
-    assert.deepEqual(env.comments, []);
-    assert.equal(env.state(), "Todo");
-  });
-
-  it("promotes a dev ticket whose deploy ref does not contain the merge", async () => {
-    const env = harness(BUILDABLE);
-    const board = surfaceBoard(env);
-    const events: string[] = [];
-    board.watch(events);
-    env.deps.forge.listPullRequests = async (input) =>
-      input.repoUrl.endsWith("/mobile")
-        ? [listedPull({ number: 3, branch: input.head, base: input.base, state: "merged" })]
-        : [];
-    const result = await runTicket(
-      env.deps,
-      ticket({ stateName: "Dev", comments: [{ body: audit("mobile") }] }),
-    );
-    assert.equal(result.outcome, "landed");
-    assert.deepEqual(events, ["promote mobile"]);
-    assert.equal(env.state(), "Todo");
   });
 
   it("leaves a named repo that still has its own commits on the ground path", async () => {
@@ -2524,6 +2517,7 @@ describe("loop", () => {
       starts += 1;
       return { runId: "run-1" };
     };
+    await seedWorkOrder(env, audit("api, mobile"));
     const result = await runTicket(
       env.deps,
       ticket({ comments: [{ body: audit("api, mobile") }] }),
@@ -2533,172 +2527,141 @@ describe("loop", () => {
     assert.equal(env.state(), "Todo");
   });
 
-  it("promotes before dev when the verdict is already shipped", async () => {
-    const env = harness(
-      "**Verdict:** ALREADY SHIPPED\n**Repos:** `mobile`\n**Outside grant:** none\n**Journey evidence:** not-applicable\n",
-    );
-    const mobile = { name: "mobile", url: "https://github.com/acme/mobile", trunk: "main" };
+  it("requires completed delivery before invoking a ship stage", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = {
+      ...pack,
+      status: { ...pack.status, complete: "Delivery Complete", shipped: "Shipped" },
+      promotionStages: [
+        { id: "publish", target: "artifact-zone", authorization: "ship", promoteCommand: "promote", repos: ["api"], verifyCommand: "verify", continueCommand: "continue", parkSuccess: true, writeStatus: true },
+      ],
+    };
+    let commands = 0;
+    env.deps.runPackCommand = () => {
+      commands += 1;
+      return { status: 0, stdout: "" };
+    };
+    await assert.rejects(() => ship(env.deps, "API-1"), /ship requires Delivery Complete/);
+    assert.equal(commands, 0);
+  });
+
+  it("uses continueCommand for the active ship stage and writes shipped after every receipt passes", async () => {
+    const env = harness(BUILDABLE);
+    const stage: PromotionStage = {
+      id: "publish",
+      target: "artifact-zone",
+      authorization: "ship",
+      promoteCommand: "promote",
+      continueCommand: "continue",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: false,
+      writeStatus: true,
+    };
+    env.deps.pack = {
+      ...pack,
+      status: { ...pack.status, complete: "Delivery Complete", shipped: "Shipped" },
+      promotionStages: [stage],
+    };
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    const state = await env.deps.tracker.stateStore.readDeliveryState("API-1");
+    await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+      ...state,
+      markers: [...state.markers, {
+        kind: "active-promotion-stage",
+        body: JSON.stringify({ stageId: stage.id, target: stage.target, authorization: "ship", criteriaRevision: ticket().criteriaRevision }),
+        createdAt: new Date(0).toISOString(),
+      }],
+    });
     const events: string[] = [];
-    env.deps.pack = {
-      ...pack,
-      repos: [mobile],
-      dev: {
-        promote: {
-          command: "promote {repo}",
-          repos: ["mobile"],
-          refs: { mobile: ["dev-a", "dev-b"] },
-        },
-      },
-    };
-    env.deps.lookupHead = () => MERGED_SHA;
-    env.deps.ticketOnTrunk = () => MERGED_SHA;
-    env.deps.deployRefContains = () => false;
-    env.deps.runCommand = (command) => {
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
       events.push(command);
-      return { status: 0 };
+      return command === "verify"
+        ? { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target, criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }) }
+        : { status: 0, stdout: "" };
     };
-    const setState = env.deps.tracker.setState.bind(env.deps.tracker);
-    env.deps.tracker.setState = async (id, next) => {
-      events.push(`state:${next}`);
-      await setState(id, next);
-    };
-    let starts = 0;
-    env.deps.worker.start = async () => {
-      starts += 1;
-      return { runId: "run-1" };
-    };
-    const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "landed");
-    assert.equal(result.detail, "already on trunk");
-    assert.equal(starts, 1);
-    assert.deepEqual(events, ["promote mobile", "state:Dev"]);
-    assert.equal(env.state(), "Dev");
-  });
-
-  it("retries a transient ship step once and records COMPLETE", async () => {
-    const env = harness(BUILDABLE);
-    const dir = mkdtempSync(join(tmpdir(), "ship-transient-"));
-    const count = join(dir, "n");
-    const step = `n=$(cat ${count} 2>/dev/null || echo 0); echo $((n+1)) > ${count}; if [ "$n" = "0" ]; then echo 'delivery-loop transient rate limit'; exit 75; fi; echo 'delivery-loop outcome API-1 COMPLETE'`;
-    const waits: number[] = [];
-    env.deps.sleep = async (ms) => {
-      waits.push(ms);
-    };
-    env.deps.pack = { ...pack, ship: { steps: [step], markStatus: false } };
-    const result = await ship(env.deps, "API-1");
-    assert.deepEqual(waits, [1000]);
+    const result = await ship(env.deps, "API-1", "continue");
     assert.equal(result.exitCode, 0);
-    assert.match(result.lines.join("\n"), /ship outcome API-1 COMPLETE/);
-    assert.match(result.lines.join("\n"), /ship outcomes complete=1 parked=0 blocked=0/);
-    assert.equal(env.state(), "Todo");
+    assert.equal(result.parked, false);
+    assert.deepEqual(events, ["continue", "verify"]);
+    assert.equal(env.state(), "Shipped");
+    assert.deepEqual(env.statusRevisions, [ticket().criteriaRevision, ticket().criteriaRevision]);
   });
 
-  it("exits 2 for a park, writes the summary, and does not edit an owner", async () => {
+  it("does not write shipped for a parked stage even when parkSuccess is true", async () => {
     const env = harness(BUILDABLE);
-    const prompts: string[] = [];
-    const start = env.deps.worker.start.bind(env.deps.worker);
-    env.deps.worker.start = async (input) => {
-      prompts.push(input.prompt);
-      return start(input);
+    const stage: PromotionStage = {
+      id: "approval",
+      target: "approval-gate",
+      authorization: "ship",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: true,
+      writeStatus: true,
     };
-    const summary = join(mkdtempSync(join(tmpdir(), "ship-summary-")), "summary.md");
-    const previous = process.env.GITHUB_STEP_SUMMARY;
-    process.env.GITHUB_STEP_SUMMARY = summary;
     env.deps.pack = {
       ...pack,
-      ship: { steps: ["echo 'delivery-loop outcome API-1 PARKED store gate'"], markStatus: true },
+      status: { ...pack.status, complete: "Delivery Complete", shipped: "Shipped" },
+      promotionStages: [stage],
     };
-    try {
-      const result = await ship(env.deps, "API-1");
-      assert.equal(result.exitCode, 2);
-      assert.match(result.lines.join("\n"), /ship outcome API-1 PARKED store gate/);
-      assert.match(readFileSync(summary, "utf8"), /PARKED/);
-      assert.equal(prompts.some((prompt) => prompt.includes("Fix that owner")), false);
-      assert.equal(env.state(), "Todo");
-    } finally {
-      if (previous === undefined) delete process.env.GITHUB_STEP_SUMMARY;
-      else process.env.GITHUB_STEP_SUMMARY = previous;
-    }
-  });
-
-  it("treats a blocked outcome as a failure exit", async () => {
-    const env = harness(BUILDABLE);
-    env.deps.pack = {
-      ...pack,
-      ship: { steps: ["echo 'delivery-loop outcome API-1 BLOCKED missing tip'; exit 0"], markStatus: false },
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (command !== "verify") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision ?? "",
+          deployed: input.landedShas ?? [],
+          outcome: "parked",
+          reason: "awaiting separate authority",
+        }),
+      };
     };
     const result = await ship(env.deps, "API-1");
-    assert.equal(result.exitCode, 1);
-    assert.match(result.lines.join("\n"), /ship outcome API-1 BLOCKED missing tip/);
-    assert.equal(env.state(), "Todo");
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.parked, true);
+    assert.equal(env.state(), "Delivery Complete");
+    assert.equal(env.deliveryState().stageReceipts[0]?.outcome, "parked");
+    assert.deepEqual(env.statusRevisions, [ticket().criteriaRevision]);
+    stage.parkSuccess = false;
+    const notSuccessful = await ship(env.deps, "API-1");
+    assert.equal(notSuccessful.exitCode, 2);
+    assert.equal(notSuccessful.parked, true);
+    assert.equal(env.state(), "Delivery Complete");
   });
-
-  it("retries a transient promote step and then records success", async () => {
+  it("does not write shipped when every ship stage disables writeStatus", async () => {
     const env = harness(BUILDABLE);
-    let calls = 0;
-    const waits: number[] = [];
-    env.deps.sleep = async (ms) => {
-      waits.push(ms);
+    const stage: PromotionStage = {
+      id: "manual-record",
+      target: "completion-record",
+      authorization: "ship",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: false,
+      writeStatus: false,
     };
-    env.deps.runCommand = () => {
-      calls += 1;
-      if (calls === 1) return { status: 75, stdout: "delivery-loop transient registry\n", stderr: "" };
-      return { status: 0, stdout: "", stderr: "" };
-    };
-    const run = await runDevCommands(env.deps, ["./scripts/promote.sh"], "promote");
-    assert.equal(run.failed, null);
-    assert.equal(calls, 2);
-    assert.deepEqual(waits, [1000]);
-  });
-
-  it("passes the ticket id to the ship step", async () => {
-    const env = harness(BUILDABLE);
-    const note = join(mkdtempSync(join(tmpdir(), "ship-id-")), "args");
     env.deps.pack = {
       ...pack,
-      ship: { steps: [`printf '%s' "$DELIVERY_LOOP_SHIP_ARGS" > '${note}'`], markStatus: false },
+      status: { intake: "Todo", complete: "Delivery Complete" },
+      promotionStages: [stage],
     };
-    await ship(env.deps, "API-1");
-    assert.equal(readFileSync(note, "utf8"), "--issue API-1");
-  });
-
-  it("keeps extra arguments after the ticket id", async () => {
-    const env = harness(BUILDABLE);
-    const note = join(mkdtempSync(join(tmpdir(), "ship-extra-")), "args");
-    const step = `printf '%s' "$DELIVERY_LOOP_SHIP_ARGS" > '${note}'`;
-    env.deps.pack = {
-      ...pack,
-      ship: { steps: ["true"], continue: [step], markStatus: false },
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (command !== "verify") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target, criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }) };
     };
-    await ship(env.deps, "API-1", " --dry-run ", "continue");
-    assert.equal(readFileSync(note, "utf8"), "--issue API-1 --dry-run");
-  });
-
-  it("stops before ship steps when the ticket id is missing", async () => {
-    const env = harness(BUILDABLE);
-    const note = join(mkdtempSync(join(tmpdir(), "ship-missing-")), "args");
-    env.deps.pack = {
-      ...pack,
-      ship: { steps: [`printf '%s' ran > '${note}'`], markStatus: false },
-    };
-    await assert.rejects(() => ship(env.deps), /ship needs a ticket id/);
-    await assert.rejects(() => ship(env.deps, "  ", "--dry-run"), /ship needs a ticket id/);
-    await assert.rejects(() => ship(env.deps, undefined, "--dry-run", "continue"), /ship needs a ticket id/);
-    assert.equal(existsSync(note), false);
-  });
-
-  it("leaves prod status to the pack when markStatus is false", async () => {
-    const env = harness(BUILDABLE);
-    let state = "Dev";
-    env.deps.tracker.setState = async (_id, next) => {
-      state = next;
-    };
-    env.deps.pack = {
-      ...env.deps.pack,
-      ship: { steps: ["true"], markStatus: false },
-    };
-    await ship(env.deps, "API-1");
-    assert.equal(state, "Dev");
+    const result = await ship(env.deps, "API-1");
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.parked, false);
+    assert.equal(env.state(), "Delivery Complete");
+    assert.deepEqual(env.statusRevisions, [ticket().criteriaRevision]);
   });
 });
 

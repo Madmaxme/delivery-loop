@@ -49,7 +49,7 @@ describe("ported policy", () => {
     assert.equal(isSweepIntakeState("In Progress"), false);
   });
 
-  it("accepts a pack's dev and prod states as unblocking", () => {
+  it("accepts pack completion and shipped statuses as unblocking", () => {
     const blocked = evaluateGraphReady(
       "APP-1",
       [{ identifier: "APP-2", stateName: "Shipped" }],
@@ -62,9 +62,9 @@ describe("ported policy", () => {
       ["Shipped", "Live", "Canceled", "Duplicate"],
     );
     assert.equal(waiting.ready, false);
-    const pack = { status: { intake: "Todo", dev: "Dev", prod: "Prod", hold: "Waiting" } } as ProjectPack;
+    const pack = { status: { intake: "Todo", complete: "Delivery Complete", shipped: "Shipped", hold: "Waiting" } } as ProjectPack;
     assert.equal(holdStatus(pack), "Waiting");
-    assert.equal(unblockingStates(pack).includes("Waiting"), false);
+    assert.deepEqual(unblockingStates(pack), ["Delivery Complete", "Shipped", "Canceled", "Duplicate"]);
   });
 
   it("counts only the quality workflow", () => {
@@ -109,9 +109,13 @@ describe("ported policy", () => {
     );
   });
 
-  it("steals an expired lease and keeps a live one", () => {
-    const body = "<!-- DELIVERY_LEASE expires=2026-01-01T00:00:00.000Z cursor_run=run-1 cursor_phase=ground -->";
-    const stamp = latestDeliveryLeaseStamp([body]);
+  it("steals an expired v2 lease and keeps a live one", () => {
+    const markers = [{
+      kind: "delivery-lease",
+      body: JSON.stringify({ schemaVersion: 2, expiresAt: "2026-01-01T00:00:00.000Z", ghaRunId: null, cursorAgentId: null, cursorRunId: "run-1", cursorPhase: "ground" }),
+      createdAt: "2025-12-01T00:00:00.000Z",
+    }];
+    const stamp = latestDeliveryLeaseStamp(markers);
     assert.equal(stamp.expiresAt, Date.parse("2026-01-01T00:00:00.000Z"));
     assert.equal(stamp.cursorRunId, "run-1");
     assert.equal(
@@ -134,10 +138,10 @@ describe("ported policy", () => {
     );
   });
 
-  it("lets a later release supersede a longer lease", () => {
+  it("lets a v2 release marker supersede a longer lease", () => {
     const stamp = latestDeliveryLeaseStamp([
-      "<!-- DELIVERY_LEASE expires=2026-06-01T00:00:00.000Z cursor_run=run-1 cursor_phase=ground -->",
-      "<!-- DELIVERY_LEASE released=1 -->",
+      { kind: "delivery-lease", body: JSON.stringify({ schemaVersion: 2, expiresAt: "2026-06-01T00:00:00.000Z", cursorRunId: "run-1", cursorPhase: "ground" }), createdAt: "2026-01-01T00:00:00.000Z" },
+      { kind: "delivery-lease", body: JSON.stringify({ schemaVersion: 2, released: true }), createdAt: "2026-02-01T00:00:00.000Z" },
     ]);
     assert.equal(stamp.expiresAt, null);
   });

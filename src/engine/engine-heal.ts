@@ -41,7 +41,7 @@ function versionParts(version: string): [number, number, number] {
   return [Number(match[1]), Number(match[2]), Number(match[3])];
 }
 
-/** The greater of two patch versions. Equal versions return the first. */
+/** The greater of two semantic versions. Equal versions return the first. */
 export function laterVersion(a: string, b: string): string {
   const left = versionParts(a);
   const right = versionParts(b);
@@ -118,7 +118,7 @@ export function engineHealTagCollisionComment(version: string): string {
 }
 
 export function engineHealReleaseNotes(prNumber: number): string {
-  return `Automated patch on the merge commit of engine-heal pull request #${prNumber}. Quality was green on the bumped tip before the squash merge. Clients install this tag.`;
+  return `Automated release on the merge commit of engine-heal pull request #${prNumber}. Quality was green on the bumped tip before the squash merge. Clients install this tag.`;
 }
 
 export type EngineHealCheck = "success" | "failure" | "pending" | "none";
@@ -180,7 +180,7 @@ function versionIsBump(mainVersion: string, tipVersion: string): boolean {
 
 /**
  * What to do after a green pull_request quality run on an engine-heal pull request.
- * The opener already committed the patch. This plan never pushes a commit.
+ * The opener already committed the version bump. This plan never pushes a commit.
  * A head without a bump, or a version whose tag already exists, gets a comment and stops.
  */
 export function planEngineHealRelease(input: {
