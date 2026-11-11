@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
-import { failForPolicyErrors, init, installConnector, update, writeProject } from "./main.ts";
+import { failForPolicyErrors, init, installConnector, update, validateStageReceipt, writeProject, type StageVerificationReceipt, type StageVerifyInput } from "./main.ts";
 import { loadPack } from "../schema/pack.ts";
 
 describe("installer", () => {
@@ -241,6 +241,42 @@ describe("installer", () => {
 
     assert.throws(() => init(["--dir", dir, "--eligibility", "none"]), /refusing to overwrite/);
     assert.equal(readFileSync(packPath, "utf8"), "user pack\n");
+  });
+});
+
+describe("stage receipt export", () => {
+  it("validates a verifier receipt against the stage input", () => {
+    const input: StageVerifyInput = {
+      ticketId: "API-1",
+      stageId: "delivery",
+      target: "opaque-target",
+      criteriaRevision: "a".repeat(64),
+      landedShas: [{ repo: "api", sha: "abc" }],
+      criteria: [{ id: "single-charge", text: "Preserve one charge path.", source: "Issue description" }],
+    };
+    const receipt: StageVerificationReceipt = {
+      stageId: input.stageId,
+      target: input.target,
+      outcome: "passed",
+      reason: "",
+      criteriaRevision: input.criteriaRevision,
+      deployed: input.landedShas,
+      criteria: [{ id: "single-charge", outcome: "verified", evidence: ["verified on the deployed build"] }],
+    };
+    assert.deepEqual(
+      validateStageReceipt(receipt, { id: input.stageId, target: input.target }, { criteriaRevision: input.criteriaRevision }, input.landedShas, input.criteria),
+      receipt,
+    );
+    assert.throws(
+      () => validateStageReceipt(
+        { ...receipt, criteria: [{ id: "other", outcome: "verified", evidence: ["x"] }] },
+        { id: input.stageId, target: input.target },
+        { criteriaRevision: input.criteriaRevision },
+        input.landedShas,
+        input.criteria,
+      ),
+      /criteria/,
+    );
   });
 });
 

@@ -37,6 +37,8 @@ import type { ForgeAdapter, LinearProgramTracker, TrackerAdapter, WorkerAdapter 
 import { findConnector } from "../connectors/catalog.js";
 import { writeCredentialSummary } from "../engine/credential-log.js";
 import { auditEligibility, deliver, repoCheckoutDir, ship, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
+export { validateStageReceipt, type StageVerifyInput } from "../engine/loop.js";
+export type { StageVerificationReceipt } from "../adapters/types.js";
 import { shipInvocationDeps } from "./ship-deps.js";
 import { ghaDispatchFields, planDeliveryInvocation } from "../engine/delivery-runtime.js";
 import { defaultStatus, loadPack, workerKeyNames, type ProjectPack } from "../schema/pack.js";

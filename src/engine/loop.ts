@@ -1570,12 +1570,12 @@ async function writeStageReceipt(deps: LoopDeps, ticket: Ticket, receipt: StageV
   });
 }
 
-function validateStageReceipt(
+export function validateStageReceipt(
   value: unknown,
-  stage: PromotionStage,
-  ticket: Ticket,
-  landed: { repo: string; sha: string }[],
-  criteria: readonly AcceptanceCriterion[],
+  stage: { id: string; target: string },
+  ticket: { criteriaRevision: string },
+  landed: readonly { repo: string; sha: string }[],
+  criteria: readonly { id: string }[],
 ): StageVerificationReceipt {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid receipt");
   const receipt = value as Record<string, unknown>;
