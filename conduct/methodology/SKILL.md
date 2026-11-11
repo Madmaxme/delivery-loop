@@ -42,7 +42,7 @@ Every tracker adapter provides a v2 `stateStore` for `DeliveryState { schemaVers
 
 The state store holds resumable work markers, the active promotion stage, landed SHAs, and stage receipts. Receipts are valid only for the current ticket `criteriaRevision`; when criteria change, stale work-order state and receipts are invalidated before continuing. A Jira status transition re-reads the issue and refuses to write if its criteria revision changed. Jira comments remain for user-visible blocker or product-decision messages, not Delivery Loop's run-state store.
 
-When `**Journey evidence:** recorded` lacks proof after landing, a later run may start one read-only capture worker for that exact landed SHA set. The attempt and captured text are stored in the existing `proof-receipt` marker in `DeliveryState`, bound to the current criteria revision and landed SHAs, then reused on resume. Route-test proof is checked on the exact landed commit and configured delivery-stage refs only after the corresponding current stage receipts pass. Do not write journey run state to Jira comments.
+Missing recorded journey proof after landing blocks completion. Evidence must come from the original build receipt or a client-owned verifier; the engine does not start a generic worker to capture missing proof. An existing validated `proof-receipt` marker may be reused only when bound to the current criteria revision and exact landed SHAs. Route-test proof is checked on the exact landed commit and configured delivery-stage refs only after the corresponding current stage receipts pass. Do not write journey run state to Jira comments.
 
 
 ## Install and client overlays
