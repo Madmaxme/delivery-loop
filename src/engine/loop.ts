@@ -1383,17 +1383,6 @@ function publishedProofReceipt(deps: LoopDeps, ticket: Ticket): string | null {
   return proof?.validated ? proof.receipt : null;
 }
 
-async function writeJourneyProofAttempt(deps: LoopDeps, ticket: Ticket, landed: JourneyCommit[]): Promise<void> {
-  await writeMarker(deps, ticket, "proof-receipt", JSON.stringify({
-    schemaVersion: 2,
-    criteriaRevision: ticket.criteriaRevision,
-    landed,
-    pullRequests: [],
-    attempted: true,
-    validated: false,
-    receipt: "",
-  } satisfies JourneyProofReceipt));
-}
 
 async function rememberJourneyReceipt(deps: LoopDeps, ticket: Ticket, receipt: string): Promise<void> {
   const saved = receipt.trim();
@@ -2099,62 +2088,6 @@ async function publishCompletionProof(
   await publishProofReceipt(deps, ticket, recorded ? { receipt: proofReceipt, rows } : existing ? { receipt: existing, rows } : null);
 }
 
-function proofPrompt(
-  ticket: Ticket,
-  declared: string,
-  rows: { repo: RepoSpec; sha: string }[],
-): string {
-  const landed = rows.map((row) => `${row.repo.name} landed commit \`${row.sha}\``).join("\n");
-  return [
-    universalConduct(),
-    `Capture journey proof for ${ticket.identifier}. The pull requests are already merged.`,
-    "The worker captures and publishes the journey proof; it does not change code, commit, push, open a pull request, or call the tracker.",
-    "Capture the journey on the running build for these exact landed commits. A web journey is a screenshot or short video of the done state. Publish an https URL ending in png, jpg, jpeg, webp, gif, mp4, webm, or mov, or containing /artifacts/. Put that raw URL in backticks in BUILD_HANDOFF and omit only the **Journey proof:** prefix. The journey command prints that prefix.",
-    "Use a non-mutating view or test data.",
-    landed,
-    declared,
-  ].filter((part) => part.trim().length > 0).join("\n\n");
-}
-
-async function runProofWorker(
-  deps: LoopDeps,
-  ticket: Ticket,
-  declared: string,
-  rows: { repo: RepoSpec; sha: string }[],
-): Promise<{ status: "text"; text: string } | { status: "running"; detail: string } | { status: "empty" }> {
-  const home = rows[0];
-  if (!home) return { status: "empty" };
-  let started: { runId: string };
-  try {
-    started = await deps.worker.start({
-      prompt: proofPrompt(ticket, declared, rows),
-      repoUrl: home.repo.url,
-      baseRef: home.sha,
-    });
-  } catch {
-    return { status: "empty" };
-  }
-  try {
-    await noteLiveRun(deps, ticket, "build", started.runId);
-  } catch {
-    return { status: "empty" };
-  }
-  let built: Awaited<ReturnType<WorkerAdapter["join"]>>;
-  try {
-    built = await deps.worker.join(started.runId);
-  } catch (error) {
-    const text = error instanceof Error ? error.message : "";
-    if (text.trim()) await rememberJourneyReceipt(deps, ticket, text);
-    return { status: "empty" };
-  }
-  const text = built.text ?? "";
-  if (built.status === "failed") {
-    if (text.trim()) await rememberJourneyReceipt(deps, ticket, text);
-    return { status: "empty" };
-  }
-  if (built.status === "running") return { status: "running", detail: `cursor_run=${started.runId}` };
-  return { status: "text", text };
-}
 
 async function settleTrunk(
   deps: LoopDeps,
@@ -2164,7 +2097,6 @@ async function settleTrunk(
   doneDetail: string,
   declared = "",
   receipt = "",
-  proofWorker = false,
 ): Promise<TicketResult> {
   const candidates = rows.map((row) => ({ repo: row.repo.name, sha: row.sha }));
   await writeMarker(deps, ticket, "landed-commits", JSON.stringify(candidates));
@@ -2197,35 +2129,8 @@ async function settleTrunk(
     }
     return { identifier: ticket.identifier, outcome: "blocked", detail: `stage ${stages.stage.id} parked: ${stages.reason}` };
   }
-  let gate = await applyRecordedProof(deps, ticket, rows, declared, receipt);
-  if (!gate.ok) {
-    if (proofWorker) {
-      const landed = rows.map((row) => ({ repo: row.repo.name, sha: row.sha }));
-      if (!journeyProofReceiptState(deps, ticket)?.attempted) {
-        await writeJourneyProofAttempt(deps, ticket, landed);
-        const captured = await runProofWorker(deps, ticket, declared, rows);
-        if (captured.status === "running") {
-          return { identifier: ticket.identifier, outcome: "worker-running", detail: captured.detail };
-        }
-        const extra = captured.status === "text" ? captured.text : "";
-        if (!extra.trim()) return gate.result;
-        await rememberJourneyReceipt(deps, ticket, extra);
-        const again = await applyRecordedProof(
-          deps,
-          ticket,
-          rows,
-          declared,
-          [receipt, extra].filter((part) => part.trim()).join("\n"),
-        );
-        if (!again.ok) return again.result;
-        gate = again;
-      } else {
-        return gate.result;
-      }
-    } else {
-      return gate.result;
-    }
-  }
+  const gate = await applyRecordedProof(deps, ticket, rows, declared, receipt);
+  if (!gate.ok) return gate.result;
   if (!hold) {
     await publishCompletionProof(deps, ticket, gate.recorded, gate.proofReceipt, rows.map((row) => ({ repo: row.repo.name, sha: row.sha, url: row.url })));
   }
@@ -2423,7 +2328,6 @@ async function finishMerged(
   merged: MergedHead[],
   declared: string,
   receipt: string,
-  proofWorker = false,
 ): Promise<TicketResult> {
   return settleTrunk(
     deps,
@@ -2433,7 +2337,6 @@ async function finishMerged(
     merged.map((row) => row.url).join(" "),
     declared,
     receipt,
-    proofWorker,
   );
 }
 
@@ -2556,13 +2459,13 @@ async function resumeExistingPulls(deps: LoopDeps, ticket: Ticket): Promise<Tick
     if ("outcome" in landed) return landed;
     merged.push({ repo: pr.repo, sha: landed.mergedSha, url: pr.url });
   }
-  return finishMerged(deps, ticket, grant === "open", merged, texts.declared, texts.receipt, true);
+  return finishMerged(deps, ticket, grant === "open", merged, texts.declared, texts.receipt);
 }
 
 /**
  * A previous land already merged, or already saw there was nothing to merge.
  * Re-check that fact. A coding worker does not start while the recorded commit
- * is unchanged. A missing recorded proof starts one proof worker for that commit.
+ * is unchanged; missing proof remains blocked until valid evidence is supplied.
  */
 async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket, body: string | null): Promise<TicketResult | null> {
   const marker = parseLandResume(body);
@@ -2589,7 +2492,6 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket, body: string | n
     "landed commits unchanged",
     marker.declared || texts.declared,
     marker.receipt || texts.receipt,
-    true,
   );
 }
 
