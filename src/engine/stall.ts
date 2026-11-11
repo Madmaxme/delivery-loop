@@ -69,17 +69,12 @@ export const DEFAULT_HEAL_CAP = 3;
 
 export const HEAL_EXHAUSTED_LABEL = "heal-exhausted";
 
-const HEAL_FAILURE_TYPE_SET = new Set<string>(HEAL_FAILURE_TYPES);
-
-export function isHealFailureType(value: string): value is HealFailureType {
-  return HEAL_FAILURE_TYPE_SET.has(value);
-}
 
 /** The durable failure type for a heal key. Signature stays in the key. The cap is this type. */
 export function failureTypeForHealKey(key: string): HealFailureType {
   if (key.startsWith("heal:quality:")) return "quality-red";
   if (key.startsWith("heal:merge:")) return "merge-conflict";
-  if (key.startsWith("heal:dev:")) return "promote-failed";
+  if (key.startsWith("heal:promote:")) return "promote-failed";
   if (key.startsWith("install:")) return "ship-failed";
   if (key.startsWith("heal:pending:")) return "quality-pending";
   if (key.startsWith("heal:unscheduled:")) return "quality-unscheduled";
@@ -100,50 +95,10 @@ export function healCapFor(
   return DEFAULT_HEAL_CAP;
 }
 
-/** One owner edit per key on this page. The marker is the cross-run count for its failure type. */
-export function ownerHealMarker(key: string): string {
-  return `<!-- OWNER_HEAL type=${failureTypeForHealKey(key)} ${key} -->`;
-}
-
-export function ownerHealRecords(body: string): { key: string; type: HealFailureType }[] {
-  const records: { key: string; type: HealFailureType }[] = [];
-  for (const match of body.matchAll(/<!--\s*OWNER_HEAL\b([^>]*)-->/gi)) {
-    const attrs = (match[1] ?? "").trim();
-    const named = attrs.match(/\btype=([a-z0-9-]+)\b/i)?.[1]?.toLowerCase() ?? "";
-    const key = attrs.replace(/\btype=[a-z0-9-]+\b/i, "").trim();
-    const type = isHealFailureType(named) ? named : failureTypeForHealKey(key);
-    records.push({ key, type });
-  }
-  return records;
-}
-
-export function countOwnerHeals(
-  comments: readonly { body: string }[],
-  type: string,
-): number {
-  let count = 0;
-  for (const comment of comments) {
-    for (const record of ownerHealRecords(comment.body)) {
-      if (record.type === type) count += 1;
-    }
-  }
-  return count;
-}
-
-export function healExhaustedMarker(type: string): string {
-  return `<!-- HEAL_EXHAUSTED ${HEAL_EXHAUSTED_LABEL} type=${type} -->`;
-}
-
-/** The failure type already stopped on this ticket. Null when the cap has not been recorded. */
+/** The failure type already stopped on this ticket. Null when the cap label is absent. */
 export function exhaustedFailureType(input: {
   labels?: readonly string[];
-  comments?: readonly { body: string }[];
 }): HealFailureType | "heal-exhausted" | null {
-  for (const comment of input.comments ?? []) {
-    const named = comment.body.match(/<!--\s*HEAL_EXHAUSTED\b[^>]*\btype=([a-z0-9-]+)/i)?.[1]?.toLowerCase() ?? "";
-    if (isHealFailureType(named)) return named;
-    if (/<!--\s*HEAL_EXHAUSTED\b/i.test(comment.body)) return "heal-exhausted";
-  }
   const labels = (input.labels ?? []).map((label) => label.toLowerCase());
   if (!labels.includes(HEAL_EXHAUSTED_LABEL)) return null;
   return HEAL_FAILURE_TYPES.find((type) => labels.includes(type)) ?? "heal-exhausted";

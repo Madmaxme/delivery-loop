@@ -1,7 +1,13 @@
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { interpretDesignChecks, type DesignCheckRun } from "../engine/design-gate.ts";
 import {
   credentialFetch,
   githubEndpointClass,
+  noteMint,
+  noteCredential,
   type CredentialNoteFn,
 } from "../engine/credential-log.ts";
 import {
@@ -20,8 +26,56 @@ import {
   githubUserLogin,
   type CommitActor,
 } from "./github-actor.js";
+import { gitForge, type GitRun } from "./forge-git.js";
 import type { CompareStatus, FetchLike, ForgeAdapter, ListedPull, PullMerge, PullRequest } from "./types.js";
 import { githubRepoFromUrl } from "./types.js";
+
+function runGitCommand(
+  args: string[],
+  cwd: string,
+  env?: Record<string, string | undefined>,
+): { status: number | null; stdout: string } {
+  const capture = args[0] === "rev-parse" || args[0] === "merge-base";
+  const result = spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    env: env ?? process.env,
+    stdio: capture ? ["ignore", "pipe", "pipe"] : "ignore",
+  });
+  return { status: result.status, stdout: typeof result.stdout === "string" ? result.stdout : "" };
+}
+
+function isolatedGitEnvironment(tempDir: string): Record<string, string | undefined> {
+  const globalConfig = join(tempDir, "global.gitconfig");
+  writeFileSync(globalConfig, "", { mode: 0o600 });
+  return {
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    HOME: tempDir,
+    XDG_CONFIG_HOME: tempDir,
+    TMPDIR: tempDir,
+    TEMP: tempDir,
+    TMP: tempDir,
+    HTTP_PROXY: process.env.HTTP_PROXY,
+    HTTPS_PROXY: process.env.HTTPS_PROXY,
+    ALL_PROXY: process.env.ALL_PROXY,
+    NO_PROXY: process.env.NO_PROXY,
+    SSL_CERT_FILE: process.env.SSL_CERT_FILE,
+    SSL_CERT_DIR: process.env.SSL_CERT_DIR,
+    SYSTEMROOT: process.env.SYSTEMROOT,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: globalConfig,
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "credential.helper",
+    GIT_CONFIG_VALUE_0: "",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_TRACE: "0",
+    GIT_TRACE_CURL: "0",
+    GIT_CURL_VERBOSE: "0",
+    GIT_TRACE_PACKET: "0",
+    GIT_TRACE2: "0",
+    GIT_TRACE2_EVENT: "0",
+  };
+}
 
 async function readCommit(
   call: (path: string, init?: RequestInit) => Promise<Response>,
@@ -142,6 +196,8 @@ export function githubForge(opts: {
   runMint?: (command: string) => MintRun;
   /** Defaults to the process credential log. */
   credentialNote?: CredentialNoteFn;
+  /** Injection seam for credential-safe direct-land pushes. */
+  runGit?: GitRun;
   /**
    * Shared mint cache. Absent builds one from `mintCommand`.
    * The token is not written.
@@ -150,6 +206,7 @@ export function githubForge(opts: {
 }): ForgeAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const note = opts.credentialNote;
+  const gitRun = opts.runGit ?? runGitCommand;
   const headers = {
     Authorization: `Bearer ${opts.token}`,
     Accept: "application/vnd.github+json",
@@ -462,6 +519,67 @@ export function githubForge(opts: {
       if (!response.ok) return "unknown";
       const json = (await response.json()) as { status?: string };
       return interpretCompare(json.status);
+    },
+    async directLand(input) {
+      await requireActor(input.repoUrl);
+      const { owner, repo } = githubRepoFromUrl(input.repoUrl);
+      const remote = `https://github.com/${owner}/${repo}.git`;
+      const tempDir = mkdtempSync(join(tmpdir(), "delivery-loop-direct-land-"));
+      try {
+        const templateDir = join(tempDir, "template");
+        const hooksDir = join(tempDir, "hooks");
+        mkdirSync(templateDir, { mode: 0o700 });
+        mkdirSync(hooksDir, { mode: 0o700 });
+        const bareRepo = join(tempDir, "repo.git");
+        const isolatedEnv = isolatedGitEnvironment(tempDir);
+        const initialized = gitRun(
+          ["init", "--bare", `--template=${templateDir}`, bareRepo],
+          tempDir,
+          isolatedEnv,
+        );
+        if (initialized.status !== 0) {
+          throw new Error("GitHub direct land could not initialize its isolated repository");
+        }
+        for (const args of [
+          ["config", "--local", "core.hooksPath", hooksDir],
+          ["config", "--local", "credential.helper", ""],
+          ["remote", "add", "origin", remote],
+        ]) {
+          if (gitRun(args, bareRepo, isolatedEnv).status !== 0) {
+            throw new Error("GitHub direct land could not configure its isolated repository");
+          }
+        }
+        const localGit = gitForge({
+          cwd: bareRepo,
+          run: (args, cwd) => {
+            const gitArgs = [...args];
+            if (gitArgs[0] === "push") gitArgs.splice(1, 0, "--atomic", "--no-verify");
+            const network = gitArgs[0] === "fetch" || gitArgs[0] === "push";
+            const env = network
+              ? {
+                  ...isolatedEnv,
+                  GIT_CONFIG_COUNT: "2",
+                  GIT_CONFIG_KEY_1: "http.https://github.com/.extraheader",
+                  GIT_CONFIG_VALUE_1: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${opts.token}`).toString("base64")}`,
+                }
+              : isolatedEnv;
+            const record = note ?? noteCredential;
+            try {
+              const result = gitRun(gitArgs, cwd, env);
+              if (network) {
+                record({ slot: "gh-token", endpoint: "git", status: result.status === 0 ? 200 : result.status ?? 0 });
+              }
+              return result;
+            } catch (error) {
+              if (network) record({ slot: "gh-token", endpoint: "git", status: 0 });
+              throw error;
+            }
+          },
+        });
+        return await localGit.directLand(input);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
     },
     async listPullRequests(input) {
       const { owner, repo } = githubRepoFromUrl(input.repoUrl);

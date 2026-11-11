@@ -1,5 +1,5 @@
-import type { ForgeAdapter, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
-import { githubIssuesTracker, linearTracker } from "../adapters/trackers.js";
+import type { ForgeAdapter, LinearProgramTracker, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
+import { githubIssuesTracker, jiraTracker, linearTracker } from "../adapters/trackers.js";
 import type { LoopDeps } from "../engine/loop.js";
 import type { ProjectPack } from "../schema/pack.js";
 
@@ -21,30 +21,6 @@ function idleWorker(): WorkerAdapter {
   };
 }
 
-function idleTracker(): TrackerAdapter {
-  return {
-    kind: "ship-idle",
-    listIntake: async () => {
-      throw new Error("ship pack owns status");
-    },
-    get: async () => {
-      throw new Error("ship pack owns status");
-    },
-    comment: async () => {
-      throw new Error("ship pack owns status");
-    },
-    setState: async () => {
-      throw new Error("ship pack owns status");
-    },
-    addLabel: async () => {
-      throw new Error("ship pack owns status");
-    },
-    removeLabel: async () => {
-      throw new Error("ship pack owns status");
-    },
-    projectSnapshot: async () => null,
-  };
-}
 
 function idleForge(): ForgeAdapter {
   return {
@@ -63,6 +39,7 @@ function idleForge(): ForgeAdapter {
     updateBranch: async () => {
       throw new Error("ship does not open pull requests");
     },
+    directLand: async () => { throw new Error("ship does not land branches"); },
     compare: async () => {
       throw new Error("ship does not open pull requests");
     },
@@ -75,8 +52,11 @@ function idleForge(): ForgeAdapter {
   };
 }
 
-function trackerFor(pack: ProjectPack): TrackerAdapter {
-  const token = requireEnv("GH_TOKEN");
+function trackerFor(pack: ProjectPack): TrackerAdapter & Partial<LinearProgramTracker> {
+  if (pack.tracker === "jira") {
+    if (!pack.jira) throw new Error("Jira tracker configuration is missing");
+    return jiraTracker(pack.jira);
+  }
   if (pack.tracker === "linear") {
     return linearTracker({
       apiKey: requireEnv("LINEAR_API_KEY"),
@@ -85,26 +65,19 @@ function trackerFor(pack: ProjectPack): TrackerAdapter {
     });
   }
   return githubIssuesTracker({
-    token,
+    token: requireEnv("GH_TOKEN"),
     repo: pack.githubRepo ?? "",
     intakeLabel: pack.status.intake,
   });
 }
 
-/**
- * Ship runs pack steps. A successful run does not start the coding worker
- * and does not need tracker credentials when the pack owns prod status.
- * A failed step opens the tracker to record one owner edit, then starts
- * the worker.
- */
+/** Ship uses the tracker for stage receipts and the ticket's current revision. */
 export function shipInvocationDeps(pack: ProjectPack, cwd: string): LoopDeps {
-  const needsTracker = pack.ship?.markStatus !== false;
   return {
     pack,
     cwd,
     worker: idleWorker(),
     forge: idleForge(),
-    tracker: needsTracker ? trackerFor(pack) : idleTracker(),
-    openTracker: () => trackerFor(pack),
+    tracker: trackerFor(pack),
   };
 }

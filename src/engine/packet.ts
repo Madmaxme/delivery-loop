@@ -14,6 +14,8 @@ export const VERDICTS = [
 
 export type Verdict = (typeof VERDICTS)[number];
 
+export type AcceptanceCriterion = { id: string; text: string; source: string };
+
 export type WorkOrder = {
   repos: string[];
   allowlist: string[];
@@ -21,6 +23,7 @@ export type WorkOrder = {
   decision: string;
   symbols: string[];
   validation: string[];
+  criteria: AcceptanceCriterion[];
   stop: string;
   connector?: string;
 };
@@ -74,6 +77,29 @@ function section(text: string, name: string): string {
   return body.join("\n").trim();
 }
 
+function acceptanceCriteria(text: string): AcceptanceCriterion[] | null {
+  const rows = section(text, "Acceptance criteria").split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("|") && line.endsWith("|"));
+  const cells = (row: string) => row.slice(1, -1).split("|").map((cell) => cell.trim());
+  const headers = cells(rows[0] ?? "");
+  const divider = cells(rows[1] ?? "");
+  if (rows.length < 3 || headers.map((cell) => cell.toLowerCase()).join(",") !== "id,text,source" ||
+    divider.length !== 3 || divider.some((cell) => !/^:?-{3,}:?$/.test(cell))) return null;
+  const criteria: AcceptanceCriterion[] = [];
+  const ids = new Set<string>();
+  for (const row of rows.slice(2)) {
+    const [rawId, criterionText, rawSource, ...extra] = cells(row);
+    const id = rawId?.replace(/^`|`$/g, "").trim() ?? "";
+    const source = rawSource?.replace(/^`|`$/g, "").trim() ?? "";
+    const key = id.toLowerCase();
+    if (!id || !criterionText || !source || extra.length || ids.has(key)) return null;
+    ids.add(key);
+    criteria.push({ id, text: criterionText, source });
+  }
+  return criteria.length ? criteria : null;
+}
+
 /** Every name in a Repos field. Separate backticks and a comma-separated tick are the same list. */
 export function repoNames(value: string): string[] {
   const ticks = [...value.matchAll(/`([^`]+)`/g)].map((match) => match[1].trim()).filter(Boolean);
@@ -89,6 +115,7 @@ export function repoNames(value: string): string[] {
 
 export function parseWorkOrder(text: string): WorkOrder | null {
   const block = packetBody(text);
+  const criteria = acceptanceCriteria(block);
   const invariant = field(block, "Invariant").replace(/^`|`$/g, "");
   const decision = field(block, "Decision");
   const stop = field(block, "Stop") || section(block, "Stop").split("\n")[0]?.trim() || "";
@@ -110,7 +137,7 @@ export function parseWorkOrder(text: string): WorkOrder | null {
     }
   }
   const connector = field(block, "Connector").replace(/^`|`$/g, "") || undefined;
-  if (!invariant || !decision || !stop || repos.length === 0) return null;
+  if (!criteria || !invariant || !decision || !stop || repos.length === 0) return null;
   return {
     repos,
     allowlist,
@@ -118,6 +145,7 @@ export function parseWorkOrder(text: string): WorkOrder | null {
     decision,
     symbols,
     validation,
+    criteria,
     stop,
     connector,
   };
@@ -252,7 +280,7 @@ export function parkStateForVerdict(input: {
   verdict: Verdict;
   text: string;
   priorComments: readonly string[];
-  devStatus: string;
+  completeStatus: string;
   /** Status that does not clear blockers. Defaults to Hold. */
   holdStatus?: string;
   /** True when this ticket's commits are already on the named trunks. */
@@ -275,7 +303,7 @@ export function parkStateForVerdict(input: {
     if (journey === "recorded" && input.journeyProven !== true) return null;
     const repos = words(field(input.text, "Repos"));
     if (repos.length === 0) return "Canceled";
-    if (input.trunkCommit === true) return input.devStatus;
+    if (input.trunkCommit === true) return input.completeStatus;
     if (input.trunkCommit === false) return "Canceled";
     return null;
   }

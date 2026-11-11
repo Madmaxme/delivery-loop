@@ -65,6 +65,92 @@ describe("git forge", () => {
     );
   });
 
+  it("lands only the expected fast-forward head with an atomic base lease", async () => {
+    const headSha = "a".repeat(40);
+    const baseSha = "b".repeat(40);
+    const calls: string[][] = [];
+    const forge = gitForge({
+      cwd: "/work",
+      checkoutDir: () => "/work/api",
+      run: (args) => {
+        calls.push(args);
+        if (args[0] === "rev-parse") {
+          return { status: 0, stdout: args[1]?.includes("/feature") ? `${headSha}\n` : `${baseSha}\n` };
+        }
+        return { status: 0, stdout: "" };
+      },
+    });
+    assert.equal(
+      await forge.directLand({
+        repoUrl: "https://github.com/acme/api",
+        branch: "feature",
+        base: "main",
+        expectedHeadSha: headSha,
+        expectedBaseSha: baseSha,
+      }),
+      headSha,
+    );
+    assert.deepEqual(calls.at(-1), [
+      "push",
+      "--porcelain",
+      `--force-with-lease=refs/heads/main:${baseSha}`,
+      "origin",
+      `${headSha}:refs/heads/main`,
+    ]);
+  });
+
+  it("does not push stale source/target, divergent, or concurrently changed refs", async () => {
+    const headSha = "a".repeat(40);
+    const baseSha = "b".repeat(40);
+    const changedBaseSha = "c".repeat(40);
+    const calls: string[][] = [];
+    let remoteHeadSha = headSha;
+    let remoteBaseSha = changedBaseSha;
+    let ancestor = true;
+    let pushStatus = 0;
+    const forge = gitForge({
+      cwd: "/work",
+      checkoutDir: () => "/work/api",
+      run: (args) => {
+        calls.push(args);
+        if (args[0] === "rev-parse") {
+          return {
+            status: 0,
+            stdout: args[1]?.includes("/feature") ? `${remoteHeadSha}\n` : `${remoteBaseSha}\n`,
+          };
+        }
+        if (args[0] === "merge-base") return { status: ancestor ? 0 : 1, stdout: "" };
+        if (args[0] === "push") return { status: pushStatus, stdout: "" };
+        return { status: 0, stdout: "" };
+      },
+    });
+    const input = {
+      repoUrl: "https://github.com/acme/api",
+      branch: "feature",
+      base: "main",
+      expectedHeadSha: headSha,
+      expectedBaseSha: baseSha,
+    };
+    await assert.rejects(forge.directLand(input), /target branch main no longer matches expected base/);
+    assert.equal(calls.some((args) => args[0] === "push"), false);
+    remoteBaseSha = baseSha;
+    remoteHeadSha = "c".repeat(40);
+    await assert.rejects(forge.directLand(input), /source branch feature no longer matches expected head/);
+    assert.equal(calls.some((args) => args[0] === "push"), false);
+    remoteHeadSha = headSha;
+    ancestor = false;
+    await assert.rejects(forge.directLand(input), /not a fast-forward/);
+    assert.equal(calls.some((args) => args[0] === "push"), false);
+    ancestor = true;
+    pushStatus = 1;
+    await assert.rejects(forge.directLand(input), /expected base may have changed/);
+    assert.deepEqual(calls.at(-1)?.slice(0, 3), [
+      "push",
+      "--porcelain",
+      `--force-with-lease=refs/heads/main:${baseSha}`,
+    ]);
+  });
+
   it("uses a nested clone when that repo is checked out", () => {
     assert.equal(gitCheckoutDir("/nowhere", "ssh://git.example/acme/api.git"), "/nowhere");
   });

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdirSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import { createCredentialRecorder } from "../engine/credential-log.ts";
@@ -18,6 +19,90 @@ describe("github mergeability", () => {
       interpretMergeability({ mergeable: null, mergeable_state: "unknown" }).state,
       "unknown",
     );
+  });
+
+  it("lands from a temporary bare repo with isolated Git config", async () => {
+    const headSha = "a".repeat(40);
+    const baseSha = "b".repeat(40);
+    const calls: string[][] = [];
+    const cwdPaths: string[] = [];
+    const envs: (Record<string, string | undefined> | undefined)[] = [];
+    const bareRepos: string[] = [];
+    const credentialCalls: { slot: string; endpoint: string; status: number }[] = [];
+    let pushStatus = 0;
+    const forge = githubForge({
+      token: "secret-token",
+      credentialNote: (call) => credentialCalls.push({ slot: call.slot, endpoint: call.endpoint, status: call.status }),
+      runGit: (args, cwd, env) => {
+        calls.push(args);
+        cwdPaths.push(cwd);
+        envs.push(env);
+        if (args[0] === "init") {
+          const path = args.at(-1) ?? "";
+          bareRepos.push(path);
+          mkdirSync(path);
+        }
+        if (args[0] === "rev-parse") {
+          return { status: 0, stdout: args[1]?.includes("/feature") ? `${headSha}\n` : `${baseSha}\n` };
+        }
+        if (args[0] === "push") return { status: pushStatus, stdout: "" };
+        return { status: 0, stdout: "" };
+      },
+    });
+    const input = {
+      repoUrl: "https://github.com/acme/api",
+      branch: "feature",
+      base: "main",
+      expectedHeadSha: headSha,
+      expectedBaseSha: baseSha,
+    };
+    assert.equal(await forge.directLand(input), headSha);
+    const push = calls.at(-1) ?? [];
+    assert.deepEqual(push, [
+      "push",
+      "--atomic",
+      "--no-verify",
+      "--porcelain",
+      `--force-with-lease=refs/heads/main:${baseSha}`,
+      "origin",
+      `${headSha}:refs/heads/main`,
+    ]);
+    assert.equal(push.some((arg) => arg.includes("secret-token")), false);
+    const pushEnv = envs.at(-1) ?? {};
+    const auth = pushEnv.GIT_CONFIG_VALUE_1 ?? "";
+    assert.match(auth, /AUTHORIZATION: basic/);
+    assert.equal(auth.includes("secret-token"), false);
+    assert.equal(pushEnv.GIT_CONFIG_NOSYSTEM, "1");
+    assert.equal(pushEnv.GIT_CONFIG_VALUE_0, "");
+    assert.ok(pushEnv.GIT_CONFIG_GLOBAL?.includes("delivery-loop-direct-land-"));
+    const revParseEnv = envs[calls.findIndex((args) => args[0] === "rev-parse")] ?? {};
+    assert.equal(revParseEnv.GIT_CONFIG_COUNT, "1");
+    assert.equal(revParseEnv.GIT_CONFIG_KEY_1, undefined);
+    for (const [index, args] of calls.entries()) {
+      const env = envs[index] ?? {};
+      const network = args[0] === "fetch" || args[0] === "push";
+      assert.equal(env.GIT_CONFIG_KEY_1, network ? "http.https://github.com/.extraheader" : undefined);
+    }
+    const template = calls[0]?.find((arg) => arg.startsWith("--template="))?.slice("--template=".length);
+    assert.ok(template?.includes("delivery-loop-direct-land-"));
+    assert.notEqual(template, "/dev/null");
+    const hooksPath = calls.find((args) => args[0] === "config" && args[2] === "core.hooksPath")?.[3];
+    assert.ok(hooksPath?.includes("delivery-loop-direct-land-"));
+    assert.notEqual(hooksPath, "/dev/null");
+    assert.ok(calls.some((args) => args[0] === "config" && args[2] === "credential.helper" && args[3] === ""));
+    assert.equal(calls.some((args) => args[0] === "credential" || args[0] === "pre-push"), false);
+    assert.ok(cwdPaths.every((cwd) => cwd.includes("delivery-loop-direct-land-") && cwd !== process.cwd()));
+    assert.equal(existsSync(bareRepos[0] ?? ""), false);
+    assert.deepEqual(credentialCalls.slice(0, 3), [
+      { slot: "gh-token", endpoint: "git", status: 200 },
+      { slot: "gh-token", endpoint: "git", status: 200 },
+      { slot: "gh-token", endpoint: "git", status: 200 },
+    ]);
+
+    pushStatus = 1;
+    await assert.rejects(forge.directLand(input), /expected base may have changed/);
+    assert.equal(existsSync(bareRepos.at(-1) ?? ""), false);
+    assert.deepEqual(credentialCalls.at(-1), { slot: "gh-token", endpoint: "git", status: 1 });
   });
 
   it("treats an already up-to-date branch as updated", async () => {

@@ -1,16 +1,18 @@
 # Methodology
 
-[conduct/methodology/SKILL.md](conduct/methodology/SKILL.md) is the master copy of the harness. [.cursor/rules/delivery-loop.mdc](.cursor/rules/delivery-loop.mdc) is the Cursor rule. [AGENTS.md](AGENTS.md) points agents at both. [conduct/conduct/SKILL.md](conduct/conduct/SKILL.md) is the code conduct those files reference. Clients pin a tag, for example `github:<owner>/<repo>#vX.Y.Z`, and add overlays: `delivery-loop.yaml`, the invariants file, and prompt files. Product names stay in the client repo.
+The versioned master procedure is [the Delivery Loop v2 skill](conduct/methodology/SKILL.md). Its companion code-conduct source is [conduct/conduct/SKILL.md](conduct/conduct/SKILL.md). [AGENTS.md](AGENTS.md) and [.cursor/rules](.cursor/rules) point agents to these canonical sources. Clients pin a package tag and keep eligibility, Jira policy, acceptance meaning, deployment commands, and environment instructions in their own overlays.
 
-`delivery-loop init` and `delivery-loop update` copy the skills, the Cursor rule, and the runner workflow from the pinned package. The runner clones that same tag.
+`delivery-loop init` writes a complete v2 pack and installs the canonical skills under `.agents/skills`; Cursor and Claude skill entries link to those targets. `delivery-loop update` refreshes generated skills, the Cursor rule, and runner workflow without changing the pack or invariants.
+
+Before upgrading a v1 client, follow the [v1-to-v2 migration guide](conduct/methodology/MIGRATION-V1-TO-V2.md). V2 has no v1 pack or run-state compatibility path.
 
 ## Roles
 
-The orchestrator talks to the owner. The engineering bot owns the code and runs the loop. It dispatches sweeps, launches cloud agents, and merges, or leaves the merge to the lander or the engine-heal workflow. The lander opens one pull request per land repo and squash-merges it. A later sweep resumes pull requests the ticket already has. A merged pull request counts as landed. An open one uses the same quality and merge path, and a branch that is only behind is updated from trunk. Every open pull request is ready before the first squash. One that is not ready leaves the others unmerged. Before `status.dev`, the engine promotes each landed repo listed for dev whose deploy ref does not already contain that commit, including when the pull request merged earlier and when the verdict is already shipped, then posts one comment with the validated proof receipt, the merged SHA, and the pull request URL. A resume reuses that comment. A ticket already in the dev or prod status, with those refs containing the commits, is left as it is. A resume applies the same recorded-proof check, and when the merged commit does not contain the route test it checks the promoted dev ref. A route-test proof matches `journeySpec`. A spec outside that pattern is not proof. The build handoff includes a web recording URL in backticks and omits the `**Journey proof:**` prefix. The journey command prints that prefix. A run that still lacks the proof saves the build receipt. When the pull requests are merged and the proof is still missing, the next run starts one proof worker on the landed trunk. The worker does not change code. One attempt is recorded for that landed commit. A route-test file check uses the forge contents API when the forge has one. A missing file and a check that cannot run are different results, and a check that cannot run logs the reason. A contents status other than 200 or 404 means the check did not run. GitHub is the record of the pull request, the checks, and the merge.
+The orchestrator talks to the owner; the engineering bot runs explicit audit, deliver, sweep, and ship commands. Delivery and ship promotion stages execute in configured order, with receipts bound to the exact landed SHAs and acceptance criteria. Clients provide deployment policy in their overlays. GitHub records pull requests, checks, and merges.
 
 ## Merge
 
-Any actor may squash-merge once quality is green on the head. A branch that is only behind is updated from trunk, then quality runs again on the new head. Two updates are the limit. When the install lists `commitActors` for that repo, the token's login is that actor.
+Any actor may squash-merge an ordinary pull request once quality is green on the head. Engine-heal pull requests are merged by their workflow. A branch that is only behind is updated from trunk, then quality runs again on the new head. Two updates are the limit. When the install lists `commitActors` for that repo, the token's login is that actor.
 
 Check-runs use the token printed by `DELIVERY_LOOP_GITHUB_MINT` when that command is set. Other forge calls keep the forge token. A bare token expires 60 minutes after the mint. JSON with `token` and `expires_at` uses that expiry. The forge mints again when five minutes or less remain. A 401 or 403 from check-runs is a credential error. The forge does not read that check from another endpoint.
 
@@ -34,13 +36,15 @@ The run line is `[delivery-loop] credential slot=<slot> endpoint=<endpoint> stat
 [delivery-loop] credential summary slot=gh-token endpoint=pulls status=200 count=1
 ```
 
-The token, the headers, and the request URL are not written. A slot or endpoint class outside the known set is logged as `unknown`. A usable mint is logged as `status=200`. A mint that exits 0 without a usable token logs `status=0`. A worker launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. A GraphQL error carried on HTTP 200 stays `status=200`. A promote that does not run, because the deploy ref already contains the commit, does not add a promote line. The promote and ship lines do not include the command.
+The token, the headers, and the request URL are not written. A slot or endpoint class outside the known set is logged as `unknown`. A usable mint is logged as `status=200`. A mint that exits 0 without a usable token logs `status=0`. A worker launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. A GraphQL error carried on HTTP 200 stays `status=200`. A stage promotion skipped because its configured refs already contain the commit does not add a promotion-success line. Success messages name the result, never the command.
 
-A recorded proof that passes writes `[delivery-loop] proof ok`. A promote or ship command that exits 0 writes `[delivery-loop] promote ok` or `[delivery-loop] ship ok`. A dev step that is not a promote writes `[delivery-loop] dev ok`. A squash that returns a commit writes `[delivery-loop] land ok`.
+A validated journey proof writes `[delivery-loop] proof ok`. A successful stage promotion writes `[delivery-loop] promote ok`; a passing stage receipt writes `[delivery-loop] verify ok`. A squash that returns a commit writes `[delivery-loop] land ok`.
 
 ## Engine heal
 
-An engine heal of this package opens a pull request on `engine-heal/<ticket>` with the label `engine-heal`. The opener commits the next patch of `package.json` and `package-lock.json`, computed from the highest `v*` tag, and pushes with the commit-actor token. The first heal after `v1.0.0` is `1.0.1`. If that tag already exists, the opener stops. The `pull_request` `quality` check gates that head. The workflow squash-merges, reads the version from the merged `package.json`, tags that commit, and publishes the GitHub release. A pull request without the bump gets a comment and stops. A head from another repository is left unmerged. A client pins the tag when it needs the change.
+An engine heal opens a pull request on `engine-heal/<ticket>` with the `engine-heal` label. Routine heals use the next patch after the highest `v*` tag; `engineHealBumpVersion` remains patch-only. The planned v2.0.0 release is an explicitly authorized greater-version bump over main's current package version, not output from the routine helper. The opener commits both package version files and pushes with the commit-actor token. The `pull_request` `quality` check gates the head. Only the engine-heal workflow squash-merges and writes the tag and GitHub release; no manual tag or release is created. Clients pin the resulting tag.
+
+A recorded journey that still lacks proof after landing may start one read-only capture worker for that exact landed SHA set on a later run. The one-shot attempt and captured receipt live in the existing v2 `DeliveryState` `proof-receipt` marker, bound to the current criteria revision and landed SHAs; resumes reuse it. Jira comments remain for user-visible blockers or Product decisions only.
 
 ## Run events
 
@@ -48,7 +52,7 @@ A worker run may write `delivery-loop.run.started` and `delivery-loop.run.finish
 
 ## Lease
 
-One runner holds the ticket with a `DELIVERY_LEASE` comment. The lease records the live agent id as soon as the worker starts.
+One runner holds the ticket with a `delivery-lease` marker in `DeliveryState`. The marker records the live agent id as soon as the worker starts.
 
 ## Bot definitions
 
@@ -56,7 +60,7 @@ A leftover `bots` key is ignored with a warning.
 
 ## Ship outcomes
 
-A zero ship exit with no outcome lines is success, including a store wait. The pack reports `delivery-loop outcome <ticket> COMPLETE`, `PARKED`, or `BLOCKED`, plus an optional reason. The engine prints `ship outcome <ticket> <state> [reason]` and `ship outcomes complete=<n> parked=<n> blocked=<n>`. Exit 0 means every ticket is COMPLETE. Exit 2 means a PARKED ticket and no BLOCKED ticket, unless `ship.parkSuccess` is true. Any BLOCKED line exits 1. `ship.parkSuccess` defaults to false. Exit 75, or a non-zero exit with `delivery-loop transient <reason>`, retries that ship or promote step. `transient.maxAttempts` defaults to 3. Waits start at one second and double. `transient.maxWaitMs` defaults to 60000 and caps the sum. A spent budget reports the reason and does not edit an owner. A non-transient failure still edits the owner. `$GITHUB_STEP_SUMMARY`, when set, receives the same rows as Markdown.
+Promotion stages run in configured order. Delivery stages run during `deliver` and `sweep`; ship-authorized stages run only through explicit `ship` commands after delivery completion and current delivery receipts. A stage verifier must return a complete receipt for the exact target, landed SHAs, criteria revision, and acceptance IDs. A parked ship stage exits 0 only when `parkSuccess` is true; otherwise it exits 2 and never writes `status.shipped`. Blocked stages fail. Exit 75 or a non-zero result with `delivery-loop transient <reason>` retries a stage's promote, verify, or continue command. `transient.maxAttempts` defaults to 3, waits start at one second and double, and `transient.maxWaitMs` defaults to 60000 and caps the total wait. Exhausting that budget reports the stage failure to the regular heal flow.
 
 ## Worker keys
 

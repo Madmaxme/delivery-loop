@@ -5,6 +5,49 @@ export type TicketComment = {
   createdAt?: string;
 };
 
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+export type TicketAttachment = {
+  /** Jira attachment ID. */
+  id: string;
+  filename: string;
+  mimeType: string;
+  sourceUrl: string;
+};
+
+export type DeliveryStateMarker = { kind: string; body: string; createdAt: string };
+
+export type StageVerificationReceipt = {
+  stageId: string;
+  target: string;
+  outcome: "passed" | "blocked" | "parked";
+  reason: string;
+  criteriaRevision: string;
+  deployed: Array<{ repo: string; sha: string }>;
+  criteria: Array<{ id: string; outcome: "verified" | "blocked"; evidence: string[] }>;
+};
+
+export type DeliveryState = {
+  schemaVersion: 2;
+  markers: DeliveryStateMarker[];
+  stageReceipts: StageVerificationReceipt[];
+};
+
+export type TrackerStateStore = {
+  readDeliveryState(identifier: string): Promise<DeliveryState>;
+  writeDeliveryState(identifier: string, state: DeliveryState): Promise<void>;
+};
+
+export type LinearProgramTracker = {
+  projectSnapshot(name: string): Promise<LinearProgramSnapshot | null>;
+};
+
 export type Ticket = {
   id: string;
   identifier: string;
@@ -12,6 +55,11 @@ export type Ticket = {
   body: string;
   stateName: string;
   labels: string[];
+  issueType: string | null;
+  assigneeId: string | null;
+  fieldValues: Record<string, JsonValue>;
+  attachments: TicketAttachment[];
+  criteriaRevision: string;
   /** Set when the tracker groups tickets into a project. */
   projectName?: string;
   blockedBy: { identifier: string; stateName: string }[];
@@ -21,6 +69,17 @@ export type Ticket = {
    * The engine also reads URLs still sitting in the text.
    */
   figmaUrls?: string[];
+};
+
+export type TrackerAdapter = {
+  kind: string;
+  listIntake(opts?: { project?: string }): Promise<Ticket[]>;
+  get(identifier: string): Promise<Ticket>;
+  comment(identifier: string, body: string): Promise<void>;
+  setState(identifier: string, state: string, expectedCriteriaRevision: string): Promise<void>;
+  addLabel(identifier: string, label: string): Promise<void>;
+  removeLabel(identifier: string, label: string): Promise<void>;
+  stateStore: TrackerStateStore;
 };
 
 export type WorkerStart = {
@@ -44,20 +103,6 @@ export type WorkerAdapter = {
   join(runId: string): Promise<WorkerResult>;
 };
 
-export type TrackerAdapter = {
-  kind: string;
-  listIntake(opts?: { project?: string }): Promise<Ticket[]>;
-  get(identifier: string): Promise<Ticket>;
-  comment(identifier: string, body: string): Promise<void>;
-  setState(identifier: string, state: string): Promise<void>;
-  addLabel(identifier: string, label: string): Promise<void>;
-  removeLabel(identifier: string, label: string): Promise<void>;
-  /**
-   * Milestones, issues, and blockers for a named project.
-   * Trackers without projects return null.
-   */
-  projectSnapshot(name: string): Promise<LinearProgramSnapshot | null>;
-};
 
 export type PullRequest = {
   number: number;
@@ -141,6 +186,14 @@ export type ForgeAdapter = {
   mergeability(input: { repoUrl: string; number: number }): Promise<PullMerge>;
   /** Compare trunk (`base`) to the branch or commit (`head`). */
   compare(input: { repoUrl: string; base: string; head: string }): Promise<CompareStatus>;
+  /** Atomically advance `base` from expectedBaseSha to the verified source head. */
+  directLand(input: {
+    repoUrl: string;
+    branch: string;
+    base: string;
+    expectedHeadSha: string;
+    expectedBaseSha: string;
+  }): Promise<string>;
   /**
    * Pull requests for one head branch. Forges without a pull-request list omit this.
    */
