@@ -359,6 +359,36 @@ journeyCommand: node scripts/journey-proof.mjs
     assert.throws(() => loadPack(write(base.replace("promotionStages: []", stage.replace("timeoutMs: 3500", "limit: 3500")))), /continue only allows timeoutMs/);
   });
 
+  it("accepts dependsOn inside one authorization and rejects cycles and unknown ids", () => {
+    const stage = (id: string, extra = "") => `  - id: ${id}
+    target: ${id}-target
+    authorization: deliver
+    promoteCommand: ./scripts/promote.sh
+    repos:
+      - api
+    verifyCommand: ./scripts/verify.sh${extra}`;
+    const linked = loadPack(write(base.replace("promotionStages: []", `promotionStages:\n${stage("first")}\n${stage("second", "\n    dependsOn:\n      - first")}`)));
+    assert.deepEqual(linked.promotionStages[1]?.dependsOn, ["first"]);
+    assert.equal(linked.promotionStages[0]?.dependsOn, undefined);
+    const cycle = base.replace("promotionStages: []", `promotionStages:\n${stage("first", "\n    dependsOn:\n      - second")}\n${stage("second", "\n    dependsOn:\n      - first")}`);
+    assert.throws(() => loadPack(write(cycle)), /cycle/);
+    const unknown = base.replace("promotionStages: []", `promotionStages:\n${stage("first", "\n    dependsOn:\n      - missing")}`);
+    assert.throws(() => loadPack(write(unknown)), /unknown stage/);
+    const ship = `  - id: ship-stage
+    target: ship-target
+    authorization: ship
+    promoteCommand: ./scripts/promote.sh
+    repos:
+      - api
+    verifyCommand: ./scripts/verify.sh
+    parkSuccess: false
+    writeStatus: false
+    dependsOn:
+      - first`;
+    const shipped = base.replace("  complete: Dev Complete", "  complete: Dev Complete\n  shipped: Shipped");
+    assert.throws(() => loadPack(write(shipped.replace("promotionStages: []", `promotionStages:\n${stage("first")}\n${ship}`))), /another authorization/);
+  });
+
   it("keeps heal caps and leaves an absent cap at the runner default", () => {
     const pack = loadPack(
       write(`${base}

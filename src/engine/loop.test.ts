@@ -1737,7 +1737,7 @@ describe("loop", () => {
     const env = harness(BUILDABLE);
     const stages: PromotionStage[] = [
       { id: "stage-one", target: "green-ring", authorization: "deliver", promoteCommand: "promote-one", repos: ["api"], verifyCommand: "verify-one" },
-      { id: "stage-two", target: "west-cluster", authorization: "deliver", promoteCommand: "promote-two", repos: ["api"], verifyCommand: "verify-two" },
+      { id: "stage-two", target: "west-cluster", authorization: "deliver", promoteCommand: "promote-two", repos: ["api"], verifyCommand: "verify-two", dependsOn: ["stage-one"] },
     ];
     env.deps.pack = {
       ...pack,
@@ -1894,7 +1894,7 @@ describe("loop", () => {
       ...pack,
       promotionStages: [
         { id: "stage-one", target: "green-ring", authorization: "deliver", promoteCommand: "promote-one", repos: ["api"], verifyCommand: "verify-one" },
-        { id: "stage-two", target: "west-cluster", authorization: "deliver", promoteCommand: "promote-two", repos: ["api"], verifyCommand: "verify-two" },
+        { id: "stage-two", target: "west-cluster", authorization: "deliver", promoteCommand: "promote-two", repos: ["api"], verifyCommand: "verify-two", dependsOn: ["stage-one"] },
       ],
     };
     const criteriaSeen: string[][] = [];
@@ -2108,7 +2108,7 @@ describe("loop", () => {
       ...pack,
       promotionStages: [
         { id: "first", target: "alpha", authorization: "deliver", promoteCommand: "promote-first", repos: ["api"], verifyCommand: "verify-first" },
-        { id: "later", target: "beta", authorization: "deliver", promoteCommand: "promote-later", repos: ["api"], verifyCommand: "verify-later" },
+        { id: "later", target: "beta", authorization: "deliver", promoteCommand: "promote-later", repos: ["api"], verifyCommand: "verify-later", dependsOn: ["first"] },
       ],
     };
     const commands: string[] = [];
@@ -2133,6 +2133,107 @@ describe("loop", () => {
     assert.deepEqual(commands, ["promote-first", "verify-first"]);
     assert.equal(env.state(), "Todo");
     assert.deepEqual(env.deliveryState().stageReceipts.map((receipt) => receipt.stageId), ["first"]);
+  });
+
+  it("verifies independent stages together and heals every blocked receipt", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = {
+      ...pack,
+      promotionStages: [
+        { id: "first", target: "alpha", authorization: "deliver", promoteCommand: "promote-first", repos: ["api"], verifyCommand: "verify-first" },
+        { id: "second", target: "beta", authorization: "deliver", promoteCommand: "promote-second", repos: ["api"], verifyCommand: "verify-second" },
+      ],
+    };
+    const prompts: string[] = [];
+    env.deps.ownerHeal = async ({ prompt }) => {
+      prompts.push(prompt);
+      return "**Heal:** wait";
+    };
+    let releaseFirst: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let started = 0;
+    let bothStarted: () => void = () => {};
+    const opened = new Promise<void>((resolve) => { bothStarted = resolve; });
+    const verifies: string[] = [];
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (!command.startsWith("verify")) return { status: 0, stdout: "" };
+      verifies.push(command);
+      const input = JSON.parse(stdin) as StageVerifyInput;
+      started += 1;
+      if (started === 2) bothStarted();
+      const blocked = command === "verify-second";
+      const receipt = JSON.stringify({
+        stageId: input.stageId,
+        target: input.target,
+        outcome: blocked ? "blocked" : "passed",
+        reason: blocked ? "live evidence is unavailable" : "",
+        criteriaRevision: input.criteriaRevision,
+        deployed: input.landedShas,
+        criteria: [{
+          id: "single-charge",
+          outcome: blocked ? "blocked" : "verified",
+          evidence: blocked ? ["live log"] : ["verified single-charge"],
+        }],
+      });
+      if (command === "verify-first") return gate.then(() => ({ status: 0, stdout: receipt }));
+      return { status: 0, stdout: receipt };
+    };
+    const running = runTicket(env.deps, ticket());
+    const overlapped = await Promise.race([
+      opened.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 500)),
+    ]);
+    releaseFirst();
+    const result = await running;
+    assert.equal(overlapped, true);
+    assert.equal(result.outcome, "blocked");
+    assert.deepEqual(verifies.sort(), ["verify-first", "verify-second"]);
+    assert.match(prompts.join("\n"), /live evidence is unavailable/);
+    assert.match(prompts.join("\n"), /single-charge: live log/);
+    assert.equal(env.state(), "Todo");
+
+    verifies.length = 0;
+    const again = await runTicket(env.deps, ticket());
+    assert.equal(again.outcome, "blocked");
+    assert.deepEqual(verifies, ["verify-second"]);
+  });
+
+  it("sends a parked delivery stage to the heal path", async () => {
+    const env = harness(BUILDABLE);
+    const prompts: string[] = [];
+    env.deps.ownerHeal = async ({ prompt }) => {
+      prompts.push(prompt);
+      return "**Heal:** wait";
+    };
+    env.deps.pack = {
+      ...pack,
+      promotionStages: [
+        { id: "delivery", target: "opaque-target", authorization: "deliver", promoteCommand: "promote", repos: ["api"], verifyCommand: "verify" },
+      ],
+    };
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (command !== "verify") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as StageVerifyInput;
+      return {
+        status: 0,
+        stdout: JSON.stringify({
+          stageId: input.stageId,
+          target: input.target,
+          outcome: "parked",
+          reason: "waiting on the delivery gate",
+          criteriaRevision: input.criteriaRevision,
+          deployed: input.landedShas,
+          criteria: [{ id: "single-charge", outcome: "blocked", evidence: ["gate log"] }],
+        }),
+      };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "blocked");
+    assert.match(result.detail, /waiting on the delivery gate/);
+    assert.equal(env.deliveryState().stageReceipts[0]?.outcome, "parked");
+    assert.match(prompts.join("\n"), /waiting on the delivery gate/);
+    assert.match(prompts.join("\n"), /single-charge: gate log/);
+    assert.equal(env.state(), "Todo");
   });
 
   it("rejects stage receipts bound to another stage, target, revision, SHA, or matrix", async () => {
@@ -2824,7 +2925,7 @@ describe("loop", () => {
       ...state,
       markers: [...state.markers, {
         kind: "active-promotion-stage",
-        body: JSON.stringify({ stageId: stage.id, target: stage.target, authorization: "ship", criteriaRevision: ticket().criteriaRevision }),
+        body: JSON.stringify({ stages: [{ stageId: stage.id, target: stage.target, authorization: "ship", criteriaRevision: ticket().criteriaRevision }] }),
         createdAt: new Date(0).toISOString(),
       }],
     });
@@ -2862,6 +2963,11 @@ describe("loop", () => {
       promotionStages: [stage],
     };
     assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    let heals = 0;
+    env.deps.ownerHeal = async () => {
+      heals += 1;
+      return "**Heal:** wait";
+    };
     env.deps.runPackCommand = (command, _cwd, stdin) => {
       if (command !== "verify") return { status: 0, stdout: "" };
       const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
@@ -2880,6 +2986,7 @@ describe("loop", () => {
     const result = await ship(env.deps, "API-1");
     assert.equal(result.exitCode, 0);
     assert.equal(result.parked, true);
+    assert.equal(heals, 0);
     assert.equal(env.state(), "Delivery Complete");
     assert.equal(env.deliveryState().stageReceipts[0]?.outcome, "parked");
     assert.deepEqual(env.statusRevisions, [ticket().criteriaRevision]);
