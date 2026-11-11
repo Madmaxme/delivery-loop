@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -7,6 +8,7 @@ import { describe, it } from "node:test";
 import type { ForgeAdapter, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
+import { proofLinesFor } from "../../scripts/journey-proof.mjs";
 import { ciFixLimit, formatTicketProgress, latestLandMarker, repoCheckoutDir, runDevCommands, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage } from "./loop.ts";
 import { classifyQualityCause } from "./quality-cause.ts";
 import { ownerHealPrompt } from "./stall.ts";
@@ -214,6 +216,27 @@ const BUILDABLE = `
 **Stop:** One charge path remains.
 BUILD_PACKET -->
 `;
+
+function commitCheckout(dir: string): string {
+  mkdirSync(dir, { recursive: true });
+  const git = (...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  spawnSync("git", ["init", dir], { encoding: "utf8" });
+  git("config", "user.email", "dev@example.test");
+  git("config", "user.name", "Dev");
+  writeFileSync(join(dir, "README.md"), "hi\n");
+  git("add", ".");
+  const committed = git("commit", "-m", "init");
+  if (committed.status !== 0) throw new Error(committed.stderr || "git commit failed");
+  git("branch", "-M", "main");
+  return git("rev-parse", "HEAD").stdout.trim();
+}
+
+function routeGround(): string {
+  return BUILDABLE.replace(
+    "**Journey evidence:** not-applicable",
+    "**Journey evidence:** recorded\n**Journey proof:** `api/e2e/signup.spec.ts`",
+  );
+}
 
 describe("loop", () => {
   it("uses the checkout root for the agent repo and a subdirectory for the others", () => {
@@ -831,6 +854,9 @@ describe("loop", () => {
     assert.equal(env.merged(), true);
     assert.equal(env.state(), "Todo");
     assert.equal(env.comments.some((body) => /LAND_WAIT/.test(body)), false);
+    assert.match(env.comments.join("\n"), /JOURNEY_RECEIPT/);
+    assert.match(env.comments.join("\n"), /The journey was walked/);
+    assert.equal(env.comments.some((body) => body.includes("PROOF_ATTEMPT")), false);
   });
 
   it("marks dev-done when the route test is on the merge commit", async () => {
@@ -857,6 +883,273 @@ describe("loop", () => {
     assert.equal(result.outcome, "journey-missing");
     assert.equal(env.merged(), true);
     assert.equal(env.state(), "Todo");
+  });
+
+  it("tells the build worker to publish the journey URL and omit only the proof prefix", async () => {
+    const ground = BUILDABLE.replace(
+      "**Journey evidence:** not-applicable",
+      "**Journey evidence:** recorded",
+    );
+    const env = harness(ground);
+    const prompts: string[] = [];
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return { runId: "run-1" };
+    };
+    env.deps.worker.join = async () => ({
+      status: "finished" as const,
+      branch: "delivery/api-1",
+      head: "abc",
+      text: prompts.length < 2 ? ground : "Walked `https://example.test/artifacts/signup.png`",
+    });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "journey-missing");
+    const build = prompts[1] ?? "";
+    assert.match(build, /screenshot or a short video of the done state/);
+    assert.match(build, /\/artifacts\//);
+    assert.match(build, /Put that raw URL in backticks in BUILD_HANDOFF/);
+    assert.match(build, /Omit only the \*\*Journey proof:\*\* prefix/);
+    assert.match(build, /non-mutating view or test data/);
+    assert.doesNotMatch(build, /real booking/);
+    assert.match(env.comments.join("\n"), /https:\/\/example\.test\/artifacts\/signup\.png/);
+  });
+
+  it("reads a saved build receipt on resume and does not start a proof worker", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const ground = BUILDABLE.replace(
+      "**Journey evidence:** not-applicable",
+      "**Journey evidence:** recorded",
+    );
+    const env = harness(ground);
+    let commandOn = false;
+    env.deps.pack = {
+      ...pack,
+      journeyCommand: "node scripts/journey-proof.mjs",
+      branchTemplate: "cursor/{issue}-{repo}",
+    };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => {
+      if (!commandOn) return { status: 1, stdout: "" };
+      return { status: 0, stdout: proofLinesFor(stdin).join("\n") };
+    };
+    let joins = 0;
+    env.deps.worker.join = async () => {
+      joins += 1;
+      return {
+        status: "finished" as const,
+        branch: "delivery/api-1",
+        head: "abc",
+        text: joins === 1 ? ground : `Walked \`${url}\``,
+      };
+    };
+    const first = await runTicket(env.deps, ticket());
+    assert.equal(first.outcome, "journey-missing");
+    assert.equal(first.detail, "journey command");
+    assert.match(env.comments.join("\n"), /https:\/\/example\.test\/artifacts\/signup\.png/);
+    commandOn = true;
+    env.deps.lookupHead = () => MERGED_SHA;
+    env.deps.forge.listPullRequests = async (input) => [
+      listedPull({ number: 4, branch: input.head, base: input.base, state: "merged" }),
+    ];
+    let proofStarts = 0;
+    env.deps.worker.start = async (input) => {
+      if (input.prompt.includes("Capture journey proof")) proofStarts += 1;
+      return { runId: "run-2" };
+    };
+    const second = await runTicket(
+      env.deps,
+      ticket({ comments: env.comments.map((body) => ({ body })) }),
+    );
+    assert.equal(second.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+    assert.equal(proofStarts, 0);
+  });
+
+  it("starts one proof worker for a landed commit and does not start a second", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "trunk";
+    const prompts: string[] = [];
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return { runId: "proof-1" };
+    };
+    env.deps.worker.join = async () => ({ status: "finished" as const, text: "no capture" });
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => ({ status: 0, stdout: "no token" });
+    const prior = [
+      { body: "**Journey evidence:** recorded\n**Outside grant:** none\n**Repos:** `api`" },
+      { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
+    ];
+    const first = await runTicket(env.deps, ticket({ comments: prior }));
+    assert.equal(first.outcome, "journey-missing");
+    assert.equal(prompts.length, 1);
+    assert.match(
+      prompts[0] ?? "",
+      /The worker captures and publishes the journey proof; it does not change code, commit, push, open a pull request, or call the tracker\./,
+    );
+    assert.match(prompts[0] ?? "", /non-mutating view or test data/);
+    assert.doesNotMatch(prompts[0] ?? "", /real booking/);
+    assert.match(prompts[0] ?? "", /api trunk `main` commit `trunk`/);
+    assert.equal(env.state(), "Todo");
+    const second = await runTicket(
+      env.deps,
+      ticket({ comments: [...prior, ...env.comments.map((body) => ({ body }))] }),
+    );
+    assert.equal(second.outcome, "journey-missing");
+    assert.equal(prompts.length, 1);
+  });
+
+  it("moves the ticket to dev when the proof worker returns a recording URL", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "trunk";
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "proof-1" };
+    };
+    env.deps.worker.join = async () => ({ status: "finished" as const, text: `Walked \`${url}\`` });
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({
+      status: 0,
+      stdout: proofLinesFor(stdin).join("\n"),
+    });
+    const result = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          { body: "**Journey evidence:** recorded\n**Outside grant:** none\n**Repos:** `api`" },
+          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
+        ],
+      }),
+    );
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+    assert.equal(starts, 1);
+    assert.match(env.comments.join("\n"), /https:\/\/example\.test\/artifacts\/signup\.png/);
+  });
+
+  it("keeps a failed proof worker's recording and does not spend a second attempt", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "trunk";
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "proof-1" };
+    };
+    env.deps.worker.join = async () => ({ status: "failed" as const, text: `Walked \`${url}\`` });
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({
+      status: 0,
+      stdout: proofLinesFor(stdin).join("\n"),
+    });
+    const prior = [
+      { body: "**Journey evidence:** recorded\n**Outside grant:** none\n**Repos:** `api`" },
+      { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
+    ];
+    const first = await runTicket(env.deps, ticket({ comments: prior }));
+    assert.equal(first.outcome, "journey-missing");
+    assert.equal(env.state(), "Todo");
+    assert.equal(starts, 1);
+    assert.match(env.comments.join("\n"), /JOURNEY_RECEIPT/);
+    assert.match(env.comments.join("\n"), /https:\/\/example\.test\/artifacts\/signup\.png/);
+    const second = await runTicket(
+      env.deps,
+      ticket({ comments: [...prior, ...env.comments.map((body) => ({ body }))] }),
+    );
+    assert.equal(second.outcome, "landed");
+    assert.equal(env.state(), "Dev");
+    assert.equal(starts, 1);
+  });
+
+  it("saves the proof text when joining throws after the worker wrote it", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "trunk";
+    env.deps.worker.start = async () => ({ runId: "proof-1" });
+    env.deps.worker.join = async () => {
+      throw new Error(`Walked \`${url}\``);
+    };
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => ({ status: 0, stdout: "" });
+    const result = await runTicket(
+      env.deps,
+      ticket({
+        comments: [
+          { body: "**Journey evidence:** recorded\n**Outside grant:** none\n**Repos:** `api`" },
+          { body: "<!-- LAND_WAIT\nhold=0\napi trunk\n-->" },
+        ],
+      }),
+    );
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(env.state(), "Todo");
+    assert.match(env.comments.join("\n"), /JOURNEY_RECEIPT[\s\S]*https:\/\/example\.test\/artifacts\/signup\.png/);
+  });
+
+  it("treats a contents 200 as the route test and a 404 as a missing file", async () => {
+    const present = harness(routeGround());
+    const seen: { repo: string; branch: string; path: string; endpoint: string }[] = [];
+    present.deps.forge.readTextFile = async (input) => {
+      seen.push(input);
+      return { status: 200, text: "test\n" };
+    };
+    const landed = await runTicket(present.deps, ticket());
+    assert.equal(landed.outcome, "landed");
+    assert.equal(present.state(), "Dev");
+    assert.equal(seen[0]?.repo, "acme/api");
+    assert.equal(seen[0]?.branch, "trunk");
+    assert.equal(seen[0]?.path, "e2e/signup.spec.ts");
+    assert.equal(seen[0]?.endpoint, "contents");
+
+    const missing = harness(routeGround());
+    const logs: string[] = [];
+    missing.deps.engineLog = (line) => logs.push(line);
+    missing.deps.forge.readTextFile = async () => ({ status: 404, text: "" });
+    const absent = await runTicket(missing.deps, ticket());
+    assert.equal(absent.outcome, "journey-missing");
+    assert.equal(absent.detail, "recorded proof missing");
+    assert.match(missing.comments.join("\n"), /route test is absent/);
+    assert.equal(logs.some((line) => line.includes("result=unavailable")), false);
+  });
+
+  it("logs a contents status that is not a file result", async () => {
+    const env = harness(routeGround());
+    const logs: string[] = [];
+    env.deps.engineLog = (line) => logs.push(line);
+    env.deps.forge.readTextFile = async () => ({ status: 403, text: "" });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(result.detail, "journey file unavailable");
+    assert.match(env.comments.join("\n"), /could not run/);
+    assert.match(env.comments.join("\n"), /contents status=403/);
+    assert.ok(logs.some((line) => line.includes("result=unavailable") && line.includes("reason=contents status=403")));
+  });
+
+  it("logs a failed checkout fetch instead of calling the file missing", async () => {
+    const root = mkdtempSync(join(tmpdir(), "journey-file-"));
+    const sha = commitCheckout(join(root, "api"));
+    const unavailable = harness(routeGround());
+    unavailable.deps.cwd = root;
+    const missingRef = "c".repeat(40);
+    unavailable.deps.forge.squashMerge = async () => missingRef;
+    const logs: string[] = [];
+    unavailable.deps.engineLog = (line) => logs.push(line);
+    const failed = await runTicket(unavailable.deps, ticket());
+    assert.equal(failed.outcome, "journey-missing");
+    assert.equal(failed.detail, "journey file unavailable");
+    assert.match(unavailable.comments.join("\n"), /could not run/);
+    assert.ok(logs.some((line) => /result=unavailable reason=fetch status=/.test(line)));
+
+    const absent = harness(routeGround());
+    absent.deps.cwd = root;
+    absent.deps.forge.squashMerge = async () => sha;
+    const absentLogs: string[] = [];
+    absent.deps.engineLog = (line) => absentLogs.push(line);
+    const missingFile = await runTicket(absent.deps, ticket());
+    assert.equal(missingFile.outcome, "journey-missing");
+    assert.equal(missingFile.detail, "recorded proof missing");
+    assert.match(absent.comments.join("\n"), /route test is absent/);
+    assert.equal(absentLogs.some((line) => line.includes("result=unavailable")), false);
   });
 
   it("stays in intake when a buildable handoff omits the outside grant line", async () => {
