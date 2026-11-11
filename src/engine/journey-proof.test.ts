@@ -26,6 +26,18 @@ describe("journey proof", () => {
     assert.equal(matchesJourneySpec("e2e/signup.spec.ts", "test/e2e"), false);
   });
 
+  it("keeps a recording url that sits inside a fenced handoff", () => {
+    const url = "https://example.test/dl/calendar-journey.webm";
+    const text = [
+      "```text",
+      "<!-- BUILD_HANDOFF",
+      `\`${url}\``,
+      "BUILD_HANDOFF -->",
+      "```",
+    ].join("\n");
+    assert.deepEqual(proofLinesFor(text), [`**Journey proof:** \`${url}\``]);
+  });
+
   it("prints a journey spec and leaves an api unit spec out", () => {
     const text = [
       "**Journey proof:** `api/test/pay.spec.ts`",
