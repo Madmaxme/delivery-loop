@@ -146,6 +146,11 @@ export type Eligibility = { mode: "command"; command: string } | { mode: "none" 
 
 export type LandingStrategy = "pull-request" | "fast-forward";
 
+export type StageCommandTimeout = {
+  /** Stop the command after this many milliseconds. Omitted means the command has no timeout. */
+  timeoutMs: number;
+};
+
 export type PromotionStage = {
   id: string;
   target: string;
@@ -153,8 +158,14 @@ export type PromotionStage = {
   promoteCommand: string;
   repos: string[];
   refs?: Record<string, string[]>;
+  /** Timeout for `promoteCommand`. Absent means that command has no timeout. */
+  promote?: StageCommandTimeout;
   verifyCommand: string;
+  /** Timeout for `verifyCommand`. Absent means that command has no timeout. */
+  verify?: StageCommandTimeout;
   continueCommand?: string;
+  /** Timeout for `continueCommand`. Absent means that command has no timeout. */
+  continue?: StageCommandTimeout;
   parkSuccess?: boolean;
   writeStatus?: boolean;
 };
@@ -457,6 +468,9 @@ function loadPromotionStages(value: unknown, path: string): PromotionStage[] {
       Object.values(stage.refs).some((refs) => !Array.isArray(refs) || refs.some((ref) => typeof ref !== "string" || !ref.trim())))) {
       throw new Error(`${path} promotionStages[${index}].refs must map repos to ref lists`);
     }
+    const promote = loadCommandTimeout(stage.promote, path, index, "promote");
+    const verify = loadCommandTimeout(stage.verify, path, index, "verify");
+    const continued = loadCommandTimeout(stage.continue, path, index, "continue");
     return {
       ...stage,
       id,
@@ -464,8 +478,28 @@ function loadPromotionStages(value: unknown, path: string): PromotionStage[] {
       promoteCommand,
       verifyCommand,
       repos: stage.repos.map((repo) => repo.trim()),
+      ...(promote ? { promote } : { promote: undefined }),
+      ...(verify ? { verify } : { verify: undefined }),
+      ...(continued ? { continue: continued } : { continue: undefined }),
     } as PromotionStage;
   });
+}
+
+function loadCommandTimeout(
+  value: unknown,
+  path: string,
+  index: number,
+  name: "promote" | "verify" | "continue",
+): { timeoutMs: number } | undefined {
+  if (value === undefined) return undefined;
+  const where = `${path} promotionStages[${index}].${name}`;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${where} must be an object`);
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => key !== "timeoutMs")) throw new Error(`${where} only allows timeoutMs`);
+  if (!Number.isInteger(record.timeoutMs) || (record.timeoutMs as number) < 1) {
+    throw new Error(`${where}.timeoutMs must be a positive integer`);
+  }
+  return { timeoutMs: record.timeoutMs as number };
 }
 
 function loadTransient(

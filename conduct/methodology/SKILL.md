@@ -36,6 +36,8 @@ For each landed repository in the stage, `promoteCommand` receives one JSON inpu
 
 The engine removes credential environment names before promote, verify, and continue. The deployment names that command is allowed to receive stay. A verifier obtains any other credential inside its own command, for example by exchanging a workload identity with a secret store. The engine does not pass a removed credential value into the verifier.
 
+`verify.timeoutMs`, `promote.timeoutMs`, and `continue.timeoutMs` are optional positive integers on the stage. The named command stops when that many milliseconds pass, and the stage is blocked with that reason. An omitted timeout does not impose one, and it does not copy another command's value.
+
 A passing receipt must identify the exact stage and target, the current criteria revision, the stage's landed commit set, and every acceptance-criterion ID with verified evidence. A blocked or parked receipt needs a reason. Invalid, incomplete, stale, or mismatched receipts fail closed. Stages run in list order; a failed or non-passing stage prevents later stages from running.
 
 The worker's acceptance matrix is grounded once as ordered criteria with stable IDs, text, and source. Build and stage verification reuse those IDs and text; clients own the product meaning of each criterion. Do not replace criterion-level proof with a health check or a general claim that the deployment succeeded.

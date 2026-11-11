@@ -132,7 +132,8 @@ export type LoopDeps = {
     cwd: string,
     stdin: string,
     env?: NodeJS.ProcessEnv,
-  ) => { status: number | null; stdout: string; stderr?: string };
+    timeoutMs?: number,
+  ) => { status: number | null; stdout: string; stderr?: string; timedOut?: boolean };
   /**
    * Second read of a red SHA, the trunk tip, and whether the worker image
    * matches the workflow. Null fields mean this install did not measure them.
@@ -1465,7 +1466,7 @@ function commandOutput(result: { status: number | null; stdout?: string; stderr?
   return { status: result.status, stdout, stderr, output: `${stdout}\n${stderr}` };
 }
 
-async function runWithTransient<T extends { status: number | null; output: string }>(
+async function runWithTransient<T extends { status: number | null; output: string; timedOut?: boolean }>(
   deps: LoopDeps,
   runOnce: () => Promise<T>,
 ): Promise<T> {
@@ -1478,6 +1479,7 @@ async function runWithTransient<T extends { status: number | null; output: strin
   for (;;) {
     last = await runOnce();
     completed += 1;
+    if (last.timedOut) return last;
     const reason = transientReason(last.status, last.output);
     if (!reason) return last;
     const wait = transientWaitMs({ completedAttempts: completed, spentMs: spent, maxAttempts, maxWaitMs });
@@ -1642,19 +1644,44 @@ async function runStageCommand(
   command: string,
   repo: RepoSpec,
   input: object,
-): Promise<{ stdout: string; failed: string | null }> {
+  timeoutMs?: number,
+): Promise<{ stdout: string; failed: string | null; timedOut: boolean }> {
   const run = deps.runPackCommand ?? defaultRunPackCommand;
   try {
     const result = await runWithTransient(deps, async () => {
-      const value = run(command, repoCheckoutDir(deps.cwd ?? process.cwd(), repo, deps.pack), `${JSON.stringify(input)}\n`, commandEnvironment(deps.pack, true));
-      return { status: value.status, output: `${value.stdout}\n${value.stderr ?? ""}`, stdout: value.stdout };
+      const value = run(command, repoCheckoutDir(deps.cwd ?? process.cwd(), repo, deps.pack), `${JSON.stringify(input)}\n`, commandEnvironment(deps.pack, true), timeoutMs);
+      return { status: value.status, output: `${value.stdout}\n${value.stderr ?? ""}`, stdout: value.stdout, timedOut: value.timedOut === true };
     });
+    if (result.timedOut) return { stdout: result.stdout, failed: null, timedOut: true };
     return result.status === 0
-      ? { stdout: result.stdout, failed: null }
-      : { stdout: result.stdout, failed: `${command} exited ${result.status ?? "unknown"}` };
+      ? { stdout: result.stdout, failed: null, timedOut: false }
+      : { stdout: result.stdout, failed: `${command} exited ${result.status ?? "unknown"}`, timedOut: false };
   } catch (error) {
-    return { stdout: "", failed: `${command} ${error instanceof Error ? error.message : String(error)}` };
+    return { stdout: "", failed: `${command} ${error instanceof Error ? error.message : String(error)}`, timedOut: false };
   }
+}
+
+async function blockTimedOutStage(
+  deps: LoopDeps,
+  ticket: Ticket,
+  stage: PromotionStage,
+  kind: "promote" | "verify" | "continue",
+  timeoutMs: number,
+  landedHere: { repo: string; sha: string }[],
+  criteria: readonly AcceptanceCriterion[],
+): Promise<StageRun> {
+  const reason = `stage ${stage.id} ${kind} timed out after ${timeoutMs}ms`;
+  const receipt = validateStageReceipt({
+    stageId: stage.id,
+    target: stage.target,
+    outcome: "blocked",
+    reason,
+    criteriaRevision: ticket.criteriaRevision,
+    deployed: landedHere,
+    criteria: criteria.map((item) => ({ id: item.id, outcome: "blocked", evidence: [] })),
+  }, stage, ticket, landedHere, criteria);
+  await writeStageReceipt(deps, ticket, receipt);
+  return { outcome: "blocked", stage, reason };
 }
 
 async function runPromotionStages(
@@ -1688,20 +1715,24 @@ async function runPromotionStages(
     await writeMarker(deps, ticket, "active-promotion-stage", JSON.stringify(active));
     const current = await readDeliveryState(deps, ticket);
     if (old) await writeDeliveryState(deps, ticket, { ...current, stageReceipts: current.stageReceipts.filter((receipt) => receipt.stageId !== stage.id) });
-    const command = options.continueStageId === stage.id ? stage.continueCommand : stage.promoteCommand;
+    const continuing = options.continueStageId === stage.id;
+    const command = continuing ? stage.continueCommand : stage.promoteCommand;
+    const commandKind = continuing ? "continue" : "promote";
+    const commandTimeout = continuing ? stage.continue?.timeoutMs : stage.promote?.timeoutMs;
     if (!command) return { outcome: "failed", stage, reason: `stage ${stage.id} has no continueCommand` };
     for (const row of repos) {
       const repo = row.spec!;
       const source = scoped.find((item) => item.repo === row.name)!;
       const refs = stage.refs?.[row.name] ?? [];
-      if (options.continueStageId !== stage.id && refs.length > 0 && refs.every((ref) => deployRefContains(deps, repo, ref, source.sha))) continue;
+      if (!continuing && refs.length > 0 && refs.every((ref) => deployRefContains(deps, repo, ref, source.sha))) continue;
       const promoted = await runStageCommand(deps, command, repo, {
         ticketId: ticket.identifier,
         stageId: stage.id,
         target: stage.target,
         repo: row.name,
         sourceSha: source.sha,
-      });
+      }, commandTimeout);
+      if (promoted.timedOut) return blockTimedOutStage(deps, ticket, stage, commandKind, commandTimeout!, landedHere, criteria);
       if (promoted.failed) return { outcome: "failed", stage, reason: promoted.failed };
       noteEngine(deps, "promote ok");
     }
@@ -1714,7 +1745,8 @@ async function runPromotionStages(
       landedShas: landedHere,
       criteria: [...criteria],
     };
-    const verified = await runStageCommand(deps, stage.verifyCommand, verifyRepo, verifyInput);
+    const verified = await runStageCommand(deps, stage.verifyCommand, verifyRepo, verifyInput, stage.verify?.timeoutMs);
+    if (verified.timedOut) return blockTimedOutStage(deps, ticket, stage, "verify", stage.verify!.timeoutMs, landedHere, criteria);
     if (verified.failed) return { outcome: "failed", stage, reason: verified.failed };
     let receipt: StageVerificationReceipt;
     try {
@@ -1768,9 +1800,18 @@ function defaultRunPackCommand(
   cwd: string,
   stdin: string,
   env: NodeJS.ProcessEnv,
-): { status: number | null; stdout: string; stderr: string } {
-  const result = spawnSync(command, { shell: true, cwd, input: stdin, encoding: "utf8", env });
-  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+  timeoutMs?: number,
+): { status: number | null; stdout: string; stderr: string; timedOut: boolean } {
+  const result = spawnSync(command, {
+    shell: true,
+    cwd,
+    input: stdin,
+    encoding: "utf8",
+    env,
+    ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
+  });
+  const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
+  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "", timedOut };
 }
 
 /** A symbol command that is unset accepts every line. A failing command does not. */

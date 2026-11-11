@@ -330,6 +330,33 @@ journeyCommand: node scripts/journey-proof.mjs
     const loaded = loadPack(write(source));
     assert.equal(loaded.promotionStages[0]?.promoteCommand, "./scripts/promote.sh {repo}");
     assert.deepEqual(loaded.promotionStages[0]?.refs, { "customer-app": ["dev-a", "dev-b"] });
+    assert.equal(loaded.promotionStages[0]?.verify, undefined);
+    assert.equal(loaded.promotionStages[0]?.promote, undefined);
+  });
+
+  it("accepts a positive command timeout and rejects any other timeout value", () => {
+    const stage = `promotionStages:
+  - id: dev
+    target: dev
+    authorization: deliver
+    promoteCommand: ./scripts/promote.sh
+    promote:
+      timeoutMs: 1500
+    repos:
+      - api
+    verifyCommand: ./scripts/verify.sh
+    verify:
+      timeoutMs: 2500
+    continueCommand: ./scripts/continue.sh
+    continue:
+      timeoutMs: 3500`;
+    const loaded = loadPack(write(base.replace("promotionStages: []", stage)));
+    assert.deepEqual(loaded.promotionStages[0]?.promote, { timeoutMs: 1500 });
+    assert.deepEqual(loaded.promotionStages[0]?.verify, { timeoutMs: 2500 });
+    assert.deepEqual(loaded.promotionStages[0]?.continue, { timeoutMs: 3500 });
+    assert.throws(() => loadPack(write(base.replace("promotionStages: []", stage.replace("timeoutMs: 2500", "timeoutMs: 0")))), /verify\.timeoutMs/);
+    assert.throws(() => loadPack(write(base.replace("promotionStages: []", stage.replace("timeoutMs: 1500", "timeoutMs: 1.5")))), /promote\.timeoutMs/);
+    assert.throws(() => loadPack(write(base.replace("promotionStages: []", stage.replace("timeoutMs: 3500", "limit: 3500")))), /continue only allows timeoutMs/);
   });
 
   it("keeps heal caps and leaves an absent cap at the runner default", () => {

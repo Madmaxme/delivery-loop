@@ -1856,6 +1856,104 @@ describe("loop", () => {
     assert.equal(env.state(), "Todo");
   });
 
+  it("blocks the stage that exceeds its own command timeout", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = {
+      ...pack,
+      promotionStages: [{
+        id: "delivery",
+        target: "opaque-target",
+        authorization: "deliver",
+        promoteCommand: "promote",
+        promote: { timeoutMs: 1500 },
+        repos: ["api"],
+        verifyCommand: "verify",
+        verify: { timeoutMs: 2500 },
+      }],
+    };
+    const timeouts: { command: string; timeoutMs: number | undefined }[] = [];
+    env.deps.runPackCommand = (command, _cwd, stdin, _env, timeoutMs) => {
+      timeouts.push({ command, timeoutMs });
+      if (command === "promote") return { status: null, stdout: "", timedOut: true };
+      return { status: 0, stdout: "" };
+    };
+    const promoted = await runTicket(env.deps, ticket());
+    assert.equal(promoted.outcome, "blocked");
+    assert.match(promoted.detail, /promote timed out after 1500ms/);
+    assert.deepEqual(timeouts, [{ command: "promote", timeoutMs: 1500 }]);
+    assert.equal(env.deliveryState().stageReceipts[0]?.outcome, "blocked");
+    assert.equal(env.state(), "Todo");
+
+    const verifyEnv = harness(BUILDABLE);
+    verifyEnv.deps.pack = {
+      ...pack,
+      promotionStages: [{
+        id: "delivery",
+        target: "opaque-target",
+        authorization: "deliver",
+        promoteCommand: "promote",
+        repos: ["api"],
+        verifyCommand: "verify",
+        verify: { timeoutMs: 2500 },
+      }],
+    };
+    const seen: { command: string; timeoutMs: number | undefined }[] = [];
+    verifyEnv.deps.runPackCommand = (command, _cwd, stdin, _env, timeoutMs) => {
+      seen.push({ command, timeoutMs });
+      if (command !== "verify") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as StageVerifyInput;
+      return {
+        status: null,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision,
+          deployed: input.landedShas,
+        }),
+        timedOut: true,
+      };
+    };
+    const verified = await runTicket(verifyEnv.deps, ticket());
+    assert.equal(verified.outcome, "blocked");
+    assert.match(verified.detail, /verify timed out after 2500ms/);
+    assert.deepEqual(seen, [
+      { command: "promote", timeoutMs: undefined },
+      { command: "verify", timeoutMs: 2500 },
+    ]);
+    assert.equal(verifyEnv.deliveryState().stageReceipts[0]?.reason, "stage delivery verify timed out after 2500ms");
+  });
+
+  it("stops a verify command at timeoutMs", async () => {
+    const env = harness(BUILDABLE);
+    const root = mkdtempSync(join(tmpdir(), "stage-timeout-"));
+    env.deps.cwd = root;
+    env.deps.ownerHeal = async () => "**Heal:** wait";
+    env.deps.pack = {
+      ...pack,
+      agent: { url: pack.repos[0]!.url, trunk: "main" },
+      promotionStages: [{
+        id: "delivery",
+        target: "opaque-target",
+        authorization: "deliver",
+        promoteCommand: "true",
+        repos: ["api"],
+        verifyCommand: "sleep 30",
+        verify: { timeoutMs: 200 },
+      }],
+    };
+    try {
+      const started = Date.now();
+      const result = await runTicket(env.deps, ticket());
+      assert.equal(result.outcome, "blocked");
+      assert.match(result.detail, /verify timed out after 200ms/);
+      assert.ok(Date.now() - started < 10_000);
+      assert.equal(env.deliveryState().stageReceipts[0]?.outcome, "blocked");
+      assert.equal(env.state(), "Todo");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("retries a transient v2 delivery-stage promotion within its budget", async () => {
     const env = harness(BUILDABLE);
     const stage: PromotionStage = {
