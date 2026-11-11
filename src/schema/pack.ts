@@ -146,6 +146,11 @@ export type Eligibility = { mode: "command"; command: string } | { mode: "none" 
 
 export type LandingStrategy = "pull-request" | "fast-forward";
 
+export type StageCommandTimeout = {
+  /** Stop the command after this many milliseconds. Omitted means the command has no timeout. */
+  timeoutMs: number;
+};
+
 export type PromotionStage = {
   id: string;
   target: string;
@@ -153,8 +158,16 @@ export type PromotionStage = {
   promoteCommand: string;
   repos: string[];
   refs?: Record<string, string[]>;
+  /** Timeout for `promoteCommand`. Absent means that command has no timeout. */
+  promote?: StageCommandTimeout;
   verifyCommand: string;
+  /** Timeout for `verifyCommand`. Absent means that command has no timeout. */
+  verify?: StageCommandTimeout;
   continueCommand?: string;
+  /** Timeout for `continueCommand`. Absent means that command has no timeout. */
+  continue?: StageCommandTimeout;
+  /** Stage ids in the same authorization that must pass or be not-applicable first. */
+  dependsOn?: string[];
   parkSuccess?: boolean;
   writeStatus?: boolean;
 };
@@ -424,7 +437,7 @@ function loadPromotionStages(value: unknown, path: string): PromotionStage[] {
   const ids = new Set<string>();
   const targets = new Set<string>();
   let shipStageSeen = false;
-  return value.map((item, index) => {
+  const stages = value.map((item, index) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`${path} promotionStages[${index}] must be an object`);
     const stage = item as Partial<PromotionStage>;
     const id = typeof stage.id === "string" ? stage.id.trim() : "";
@@ -457,6 +470,10 @@ function loadPromotionStages(value: unknown, path: string): PromotionStage[] {
       Object.values(stage.refs).some((refs) => !Array.isArray(refs) || refs.some((ref) => typeof ref !== "string" || !ref.trim())))) {
       throw new Error(`${path} promotionStages[${index}].refs must map repos to ref lists`);
     }
+    const promote = loadCommandTimeout(stage.promote, path, index, "promote");
+    const verify = loadCommandTimeout(stage.verify, path, index, "verify");
+    const continued = loadCommandTimeout(stage.continue, path, index, "continue");
+    const dependsOn = loadDependsOn(stage.dependsOn, path, index);
     return {
       ...stage,
       id,
@@ -464,8 +481,70 @@ function loadPromotionStages(value: unknown, path: string): PromotionStage[] {
       promoteCommand,
       verifyCommand,
       repos: stage.repos.map((repo) => repo.trim()),
+      ...(promote ? { promote } : { promote: undefined }),
+      ...(verify ? { verify } : { verify: undefined }),
+      ...(continued ? { continue: continued } : { continue: undefined }),
+      ...(dependsOn ? { dependsOn } : { dependsOn: undefined }),
     } as PromotionStage;
   });
+  assertStageDependencies(stages, path);
+  return stages;
+}
+
+function loadDependsOn(value: unknown, path: string, index: number): string[] | undefined {
+  if (value === undefined) return undefined;
+  const where = `${path} promotionStages[${index}].dependsOn`;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+    throw new Error(`${where} must be a list of stage ids`);
+  }
+  const ids = value.map((item) => item.trim());
+  if (new Set(ids).size !== ids.length) throw new Error(`${where} lists a stage more than once`);
+  return ids.length > 0 ? ids : undefined;
+}
+
+function assertStageDependencies(stages: PromotionStage[], path: string): void {
+  const known = new Map(stages.map((stage) => [stage.id, stage]));
+  for (const stage of stages) {
+    for (const dep of stage.dependsOn ?? []) {
+      const other = known.get(dep);
+      if (!other) throw new Error(`${path} promotion stage ${stage.id} depends on unknown stage ${dep}`);
+      if (other.authorization !== stage.authorization) {
+        throw new Error(`${path} promotion stage ${stage.id} depends on ${dep}, which has another authorization`);
+      }
+    }
+  }
+  const state = new Map<string, "open" | "done">();
+  const visit = (id: string): boolean => {
+    const mark = state.get(id);
+    if (mark === "open") return true;
+    if (mark === "done") return false;
+    state.set(id, "open");
+    for (const dep of known.get(id)?.dependsOn ?? []) {
+      if (visit(dep)) return true;
+    }
+    state.set(id, "done");
+    return false;
+  };
+  if (stages.some((stage) => visit(stage.id))) {
+    throw new Error(`${path} promotion stage dependencies contain a cycle`);
+  }
+}
+
+function loadCommandTimeout(
+  value: unknown,
+  path: string,
+  index: number,
+  name: "promote" | "verify" | "continue",
+): { timeoutMs: number } | undefined {
+  if (value === undefined) return undefined;
+  const where = `${path} promotionStages[${index}].${name}`;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${where} must be an object`);
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => key !== "timeoutMs")) throw new Error(`${where} only allows timeoutMs`);
+  if (!Number.isInteger(record.timeoutMs) || (record.timeoutMs as number) < 1) {
+    throw new Error(`${where}.timeoutMs must be a positive integer`);
+  }
+  return { timeoutMs: record.timeoutMs as number };
 }
 
 function loadTransient(

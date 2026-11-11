@@ -186,6 +186,21 @@ The prompt says BUILDABLE, NEEDS DIAGNOSIS.
     assert.deepEqual(order?.criteria, [
       { id: "commission", text: "Keep the single commission snapshot.", source: "Grounding decision" },
     ]);
+    const scoped = handoff.replace(
+      `| ID | Text | Source |
+| --- | --- | --- |
+| commission | Keep the single commission snapshot. | Grounding decision`,
+      `| ID | Text | Source | Stages | Repos |
+| --- | --- | --- | --- | --- |
+| commission | Keep the single commission snapshot. | Grounding decision | dev | api |
+| handset | Keep the handset path. | Grounding decision |  | mobile`,
+    );
+    assert.deepEqual(parseWorkOrder(scoped)?.criteria, [
+      { id: "commission", text: "Keep the single commission snapshot.", source: "Grounding decision", stages: ["dev"], repos: ["api"] },
+      { id: "handset", text: "Keep the handset path.", source: "Grounding decision", repos: ["mobile"] },
+    ]);
+    const duplicate = scoped.replace("| dev | api |", "| dev dev | api |");
+    assert.equal(parseWorkOrder(duplicate), null);
     assert.equal(order?.validation[0], "npm test");
     assert.equal(parseVerdict("The prompt lists BUILDABLE as a choice."), null);
   });

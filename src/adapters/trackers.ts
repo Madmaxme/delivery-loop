@@ -47,7 +47,7 @@ function validateDeliveryState(value: unknown): DeliveryState {
     if (!receipt || typeof receipt !== "object" || Array.isArray(receipt) ||
       !("stageId" in receipt) || typeof receipt.stageId !== "string" ||
       !("target" in receipt) || typeof receipt.target !== "string" ||
-      !("outcome" in receipt) || !["passed", "blocked", "parked"].includes(String(receipt.outcome)) ||
+      !("outcome" in receipt) || !["passed", "blocked", "parked", "not-applicable"].includes(String(receipt.outcome)) ||
       !("reason" in receipt) || typeof receipt.reason !== "string" ||
       !("criteriaRevision" in receipt) || typeof receipt.criteriaRevision !== "string" ||
       !("deployed" in receipt) || !Array.isArray(receipt.deployed) ||
