@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { createCredentialRecorder } from "../engine/credential-log.ts";
 import { githubForge } from "./forge-github.ts";
 import { githubIssuesTracker, jiraTracker, linearTracker } from "./trackers.ts";
 import {
@@ -281,23 +282,498 @@ describe("adapters", () => {
     );
   });
 
-  it("starts and joins a self-hosted worker", async () => {
+  it("waits out pending status and returns the finished result", async () => {
+    const rec = createCredentialRecorder();
+    const sleeps: number[] = [];
+    const bodies: unknown[] = [];
+    const urls: string[] = [];
+    const statuses = ["pending", "pending", "finished"];
     const worker = httpWorker({
       startUrl: "https://host.example/start",
-      statusUrl: "https://host.example/status",
-      fetch: async (url) => {
-        if (String(url).endsWith("/start")) return jsonResponse({ runId: "r1" });
-        return jsonResponse({ status: "finished", branch: "b", head: "h", text: "done" });
+      statusUrl: "https://host.example/status?run={id}",
+      model: "model-4.7",
+      pollMs: 1000,
+      maxWaitMs: 60_000,
+      newId: () => "req-1",
+      nowMs: () => sleeps.reduce((sum, ms) => sum + ms, 0),
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      credentialNote: rec.note,
+      env: { START_TOKEN: "start-secret" },
+      startHeaders: { Authorization: "START_TOKEN" },
+      fetch: async (url, init) => {
+        urls.push(String(url));
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        if (init?.method === "POST") {
+          assert.equal(headers.Authorization, "Bearer start-secret");
+          bodies.push(JSON.parse(String(init.body)));
+          return jsonResponse({ runId: "ignored" }, 202);
+        }
+        const status = statuses.shift();
+        return jsonResponse({
+          status,
+          branch: "cursor/api-1",
+          head: "abc",
+          text: "done",
+          branches: [{ repoUrl: "https://github.com/acme/api", branch: "cursor/api-1" }],
+        });
       },
     });
     const started = await worker.start({
-      prompt: "go",
+      prompt: "ground the ticket",
       repoUrl: "https://github.com/acme/api",
       baseRef: "main",
     });
-    assert.equal(started.runId, "r1");
-    const joined = await worker.join("r1");
-    assert.equal(joined.branch, "b");
+    assert.equal(started.runId, "req-1");
+    assert.deepEqual(bodies[0], {
+      id: "req-1",
+      prompt: "ground the ticket",
+      repoUrl: "https://github.com/acme/api",
+      baseRef: "main",
+      model: { id: "model-4.7" },
+    });
+    const joined = await worker.join(started.runId);
+    assert.equal(joined.status, "finished");
+    assert.equal(joined.branch, "cursor/api-1");
+    assert.equal(joined.head, "abc");
+    assert.equal(joined.text, "done");
+    assert.equal(joined.branches?.[0]?.branch, "cursor/api-1");
+    assert.deepEqual(sleeps, [1000, 1000]);
+    assert.equal(urls.at(-1), "https://host.example/status?run=req-1");
+    assert.deepEqual(rec.lines(), [
+      "credential slot=worker-http endpoint=worker-http-start status=202",
+      "credential slot=worker-http endpoint=worker-http-status status=200",
+      "credential slot=worker-http endpoint=worker-http-status status=200",
+      "credential slot=worker-http endpoint=worker-http-status status=200",
+    ]);
+    const text = rec.lines().join("\n");
+    assert.equal(text.includes("start-secret"), false);
+    assert.equal(text.includes("Bearer"), false);
+    assert.equal(text.includes("host.example"), false);
+    assert.equal(text.includes("run="), false);
+  });
+
+  it("fails the join when maxWaitMs passes", async () => {
+    let now = 0;
+    const worker = httpWorker({
+      startUrl: "https://host.example/start",
+      statusUrl: "https://host.example/status/{id}",
+      pollMs: 1000,
+      maxWaitMs: 2500,
+      newId: () => "req-2",
+      nowMs: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+      fetch: async (_url, init) => {
+        if (init?.method === "POST") return jsonResponse({}, 200);
+        return jsonResponse({ status: "running", text: "" });
+      },
+    });
+    const started = await worker.start({ prompt: "go", repoUrl: "https://github.com/acme/api", baseRef: "main" });
+    const joined = await worker.join(started.runId);
+    assert.equal(joined.status, "failed");
+    assert.equal(joined.text, "http worker join exceeded maxWaitMs");
+    assert.equal(now, 2500);
+  });
+
+  it("fails a non-2xx start and does not read status or start again", async () => {
+    const rec = createCredentialRecorder();
+    const calls: string[] = [];
+    const worker = httpWorker({
+      startUrl: "https://host.example/start?token=start-secret",
+      statusUrl: "https://host.example/status/{id}",
+      credentialNote: rec.note,
+      fetch: async (url, init) => {
+        calls.push(`${init?.method ?? "GET"} ${url}`);
+        return jsonResponse({ message: "no" }, 400);
+      },
+    });
+    await assert.rejects(
+      () => worker.start({ prompt: "go", repoUrl: "https://github.com/acme/api", baseRef: "main" }),
+      /HTTP worker start failed: 400/,
+    );
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.startsWith("POST "), true);
+    assert.equal(calls.some((call) => call.startsWith("GET ")), false);
+    assert.deepEqual(rec.lines(), ["credential slot=worker-http endpoint=worker-http-start status=400"]);
+    assert.equal(rec.lines().join("\n").includes("start-secret"), false);
+    assert.equal(rec.lines().join("\n").includes("token="), false);
+  });
+
+  it("resolves header env vars and the minted token without writing them", async () => {
+    const rec = createCredentialRecorder();
+    const seen: Record<string, string>[] = [];
+    const worker = httpWorker({
+      startUrl: "https://host.example/start",
+      statusUrl: "https://host.example/status/{id}",
+      newId: () => "req-3",
+      credentialNote: rec.note,
+      env: { START_TOKEN: "start-secret", STATUS_ACCEPT: "application/vnd.github+json" },
+      startHeaders: { Authorization: "START_TOKEN" },
+      statusHeaders: { Authorization: "mint", Accept: "STATUS_ACCEPT" },
+      tokens: {
+        async mint() {
+          return { token: "mint-secret", slot: "mint" };
+        },
+        forge() {
+          return { token: "forge-secret", slot: "gh-token" };
+        },
+      },
+      fetch: async (_url, init) => {
+        seen.push({ ...(init?.headers as Record<string, string>) });
+        if (init?.method === "POST") return jsonResponse({}, 201);
+        const file = Buffer.from(
+          JSON.stringify({ status: "finished", branch: "b", head: "h", text: "from-file" }),
+          "utf8",
+        ).toString("base64");
+        return jsonResponse({ encoding: "base64", content: `${file.slice(0, 8)}\n${file.slice(8)}` });
+      },
+    });
+    const started = await worker.start({ prompt: "go", repoUrl: "https://github.com/acme/api", baseRef: "main" });
+    const joined = await worker.join(started.runId);
+    assert.equal(seen[0]?.Authorization, "Bearer start-secret");
+    assert.equal(seen[1]?.Authorization, "Bearer mint-secret");
+    assert.equal(seen[1]?.Accept, "application/vnd.github+json");
+    assert.equal(joined.status, "finished");
+    assert.equal(joined.text, "from-file");
+    assert.deepEqual(rec.lines(), [
+      "credential slot=worker-http endpoint=worker-http-start status=201",
+      "credential slot=mint endpoint=worker-http-status status=200",
+    ]);
+    const text = rec.lines().join("\n");
+    for (const secret of ["start-secret", "mint-secret", "forge-secret"]) {
+      assert.equal(text.includes(secret), false);
+    }
+    await assert.rejects(
+      () =>
+        httpWorker({
+          startUrl: "https://host.example/start",
+          statusUrl: "https://host.example/status/{id}",
+          env: {},
+          startHeaders: { Authorization: "START_TOKEN" },
+          fetch: async () => jsonResponse({}),
+        }).start({ prompt: "go", repoUrl: "https://github.com/acme/api", baseRef: "main" }),
+      /missing source START_TOKEN/,
+    );
+  });
+
+  it("seeds a forge file before start and reads that file", async () => {
+    const rec = createCredentialRecorder();
+    const calls: string[] = [];
+    const reads = ["pending", "running", "finished"];
+    let seeded = "";
+    let startBody: Record<string, unknown> | undefined;
+    const forge = githubForge({
+      token: "forge-token",
+      mintCommand: "mint-installation-token",
+      runMint: () => ({ status: 0, stdout: "mint-token\n" }),
+      credentialNote: rec.note,
+      fetch: async (url, init) => {
+        const method = init?.method ?? "GET";
+        const href = String(url);
+        calls.push(`${method} ${href}`);
+        const headers = init?.headers as Record<string, string>;
+        assert.equal(headers.Authorization, "Bearer mint-token");
+        if (href.includes("/git/matching-refs/heads/results")) return jsonResponse([]);
+        if (href.endsWith("/repos/acme/store")) return jsonResponse({ default_branch: "main" });
+        if (href.includes("/git/matching-refs/heads/main")) {
+          return jsonResponse([{ ref: "refs/heads/main", object: { sha: "abc123" } }]);
+        }
+        if (method === "POST" && href.endsWith("/git/refs")) {
+          assert.deepEqual(JSON.parse(String(init?.body)), { ref: "refs/heads/results", sha: "abc123" });
+          return jsonResponse({}, 201);
+        }
+        if (method === "PUT" && href.includes("/contents/")) {
+          seeded = String(init?.body);
+          return jsonResponse({}, 201);
+        }
+        if (method === "GET" && href.includes("/contents/")) {
+          assert.match(href, /\/contents\/worker-results\/req-9\.json\?ref=results$/);
+          const text = JSON.stringify({ status: reads.shift(), branch: "b", head: "h", text: "done" });
+          return jsonResponse({ encoding: "base64", content: Buffer.from(text).toString("base64") });
+        }
+        return jsonResponse({}, 500);
+      },
+    });
+    const worker = httpWorker({
+      startUrl: "https://host.example/start",
+      model: "model-4.7",
+      pollMs: 1000,
+      maxWaitMs: 60_000,
+      newId: () => "req-9",
+      nowMs: () => Date.parse("2026-11-10T22:00:00.000Z"),
+      sleep: async () => {},
+      credentialNote: rec.note,
+      statusStore: {
+        kind: "forge",
+        repo: "acme/store",
+        branch: "results",
+        path: "worker-results/{id}.json",
+      },
+      files: {
+        write: (input) =>
+          forge.writeTextFile!({
+            ...input,
+            message: "record a pending worker result",
+            endpoint: "worker-http-seed",
+          }),
+        read: (input) => forge.readTextFile!({ ...input, endpoint: "worker-http-status" }),
+      },
+      fetch: async (_url, init) => {
+        calls.push("START");
+        startBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse({}, 202);
+      },
+    });
+    const started = await worker.start({
+      prompt: "ground the ticket",
+      repoUrl: "https://github.com/acme/api",
+      baseRef: "main",
+    });
+    assert.equal(calls.at(-1), "START");
+    assert.deepEqual(startBody, {
+      id: "req-9",
+      prompt: "ground the ticket",
+      repoUrl: "https://github.com/acme/api",
+      baseRef: "main",
+      model: { id: "model-4.7" },
+      statusStore: { repo: "acme/store", branch: "results", path: "worker-results/req-9.json" },
+    });
+    assert.equal(calls.some((call) => call.startsWith("START") && calls.indexOf(call) < calls.findIndex((item) => item.startsWith("PUT"))), false);
+    const sent = JSON.parse(seeded) as { message: string; content: string; branch: string };
+    assert.equal(sent.message, "record a pending worker result");
+    assert.equal(sent.branch, "results");
+    assert.deepEqual(JSON.parse(Buffer.from(sent.content, "base64").toString("utf8")), {
+      status: "pending",
+      id: "req-9",
+      repoUrl: "https://github.com/acme/api",
+      baseRef: "main",
+      requestedAt: "2026-11-10T22:00:00.000Z",
+    });
+    const joined = await worker.join(started.runId);
+    assert.equal(joined.status, "finished");
+    assert.equal(joined.head, "h");
+    const endpoints = rec.lines().map((line) => line.split(" endpoint=")[1]?.split(" ")[0]);
+    const startAt = endpoints.indexOf("worker-http-start");
+    const before = endpoints.slice(0, startAt).filter((name) => name !== "mint");
+    assert.ok(before.length > 0);
+    assert.ok(before.every((name) => name === "worker-http-seed"));
+    assert.ok(endpoints.slice(startAt + 1).every((name) => name === "worker-http-status"));
+    const text = rec.lines().join("\n");
+    assert.equal(text.includes("mint-token"), false);
+    assert.equal(text.includes("forge-token"), false);
+    assert.equal(text.includes("ref="), false);
+    assert.equal(text.includes("worker-results"), false);
+    assert.ok(rec.lines().some((line) => line === "credential slot=mint endpoint=worker-http-seed status=201"));
+    assert.ok(rec.lines().some((line) => line === "credential slot=mint endpoint=worker-http-status status=200"));
+  });
+
+  it("does not start when the forge seed fails", async () => {
+    const calls: string[] = [];
+    const worker = httpWorker({
+      startUrl: "https://host.example/start",
+      newId: () => "req-10",
+      statusStore: { kind: "forge", repo: "acme/store", branch: "results", path: "worker-results/{id}.json" },
+      files: {
+        async write() {
+          return { status: 403, actor: "" };
+        },
+        async read() {
+          return { status: 200, text: "" };
+        },
+      },
+      fetch: async () => {
+        calls.push("START");
+        return jsonResponse({}, 202);
+      },
+    });
+    await assert.rejects(
+      () => worker.start({ prompt: "go", repoUrl: "https://github.com/acme/api", baseRef: "main" }),
+      /http worker seed failed: 403/,
+    );
+    assert.deepEqual(calls, []);
+  });
+
+  it("opens a forge issue after the seed and assigns it", async () => {
+    const rec = createCredentialRecorder();
+    const calls: string[] = [];
+    const forge = githubForge({
+      token: "forge-token",
+      mintCommand: "mint-installation-token",
+      runMint: () => ({ status: 0, stdout: "mint-token\n" }),
+      credentialNote: rec.note,
+      fetch: async (url, init) => {
+        const method = init?.method ?? "GET";
+        const href = String(url);
+        calls.push(`${method} ${href.split("?")[0]}`);
+        const headers = init?.headers as Record<string, string>;
+        assert.equal(headers.Authorization, "Bearer mint-token");
+        if (href.includes("/git/matching-refs/")) {
+          return jsonResponse([{ ref: "refs/heads/results", object: { sha: "abc123" } }]);
+        }
+        if (method === "PUT" && href.includes("/contents/")) {
+          return jsonResponse(
+            {
+              commit: { author: { name: "loop", email: "1+loop-bot[bot]@users.noreply.github.com" } },
+            },
+            201,
+          );
+        }
+        if (method === "POST" && href.endsWith("/issues")) {
+          const body = JSON.parse(String(init?.body)) as { title: string; body: string; labels?: string[]; assignees?: string[] };
+          assert.equal(body.title, "worker-request req-11");
+          assert.deepEqual(body.labels, ["run"]);
+          assert.equal(body.assignees, undefined);
+          const fenced = body.body.replace(/^```json\n/, "").replace(/\n```$/, "");
+          assert.deepEqual(JSON.parse(fenced), {
+            id: "req-11",
+            prompt: "ground the ticket",
+            repoUrl: "https://github.com/acme/api",
+            baseRef: "main",
+            model: { id: "model-4.7" },
+            statusStore: { repo: "acme/store", branch: "results", path: "worker-results/req-11.json" },
+            requestedBy: "loop-bot[bot]",
+          });
+          return jsonResponse({ number: 7 }, 201);
+        }
+        if (method === "POST" && href.endsWith("/assignees")) {
+          assert.equal(href.endsWith("/issues/7/assignees"), true);
+          assert.deepEqual(JSON.parse(String(init?.body)), { assignees: ["relay-login"] });
+          return jsonResponse({}, 201);
+        }
+        return jsonResponse({}, 500);
+      },
+    });
+    const worker = httpWorker({
+      model: "model-4.7",
+      newId: () => "req-11",
+      nowMs: () => Date.parse("2026-11-10T22:00:00.000Z"),
+      statusStore: { kind: "forge", repo: "acme/store", branch: "results", path: "worker-results/{id}.json" },
+      request: { kind: "forge-issue", repo: "acme/signals", assignee: "relay-login", labels: ["run"] },
+      files: {
+        write: (input) =>
+          forge.writeTextFile!({
+            repo: input.repo,
+            branch: input.branch,
+            path: input.path,
+            text: input.text,
+            message: input.message ?? "record a pending worker result",
+            endpoint: "worker-http-seed",
+          }),
+        read: (input) => forge.readTextFile!({ ...input, endpoint: "worker-http-status" }),
+      },
+      issues: {
+        open: (input) => forge.createIssue!({ ...input, endpoint: "worker-request-issue" }),
+        assign: (input) => forge.assignIssue!({ ...input, endpoint: "worker-request-assign" }),
+        actor: () => forge.actorLogin!(),
+      },
+      fetch: async () => {
+        calls.push("START");
+        return jsonResponse({}, 202);
+      },
+    });
+    const started = await worker.start({
+      prompt: "ground the ticket",
+      repoUrl: "https://github.com/acme/api",
+      baseRef: "main",
+    });
+    assert.equal(started.runId, "req-11");
+    assert.equal(calls.includes("START"), false);
+    const put = calls.findIndex((call) => call.startsWith("PUT "));
+    const issue = calls.findIndex((call) => call.endsWith("/issues"));
+    const assign = calls.findIndex((call) => call.endsWith("/assignees"));
+    assert.ok(put >= 0 && issue > put && assign > issue);
+    assert.ok(rec.lines().includes("credential slot=mint endpoint=worker-request-issue status=201"));
+    assert.ok(rec.lines().includes("credential slot=mint endpoint=worker-request-assign status=201"));
+    assert.equal(rec.lines().join("\n").includes("mint-token"), false);
+  });
+
+  it("does not assign when the forge issue is refused", async () => {
+    const steps: string[] = [];
+    const worker = httpWorker({
+      newId: () => "req-12",
+      statusStore: { kind: "forge", repo: "acme/store", branch: "results", path: "worker-results/{id}.json" },
+      request: { kind: "forge-issue", repo: "acme/signals", assignee: "relay-login" },
+      files: {
+        async write() {
+          steps.push("seed");
+          return { status: 201, actor: "loop-bot[bot]" };
+        },
+        async read() {
+          return { status: 200, text: "{}" };
+        },
+      },
+      issues: {
+        async open() {
+          steps.push("issue");
+          return { status: 422, number: 0 };
+        },
+        async assign() {
+          steps.push("assign");
+          return 201;
+        },
+        async actor() {
+          return "";
+        },
+      },
+    });
+    await assert.rejects(
+      () => worker.start({ prompt: "go", repoUrl: "https://github.com/acme/api", baseRef: "main" }),
+      /http worker request failed: 422/,
+    );
+    assert.deepEqual(steps, ["seed", "issue"]);
+  });
+
+  it("stores a large start body beside the record and puts that path on the issue", async () => {
+    const writes: { path: string; text: string }[] = [];
+    let issueBody = "";
+    const steps: string[] = [];
+    const worker = httpWorker({
+      model: "model-4.7",
+      newId: () => "req-13",
+      statusStore: { kind: "forge", repo: "acme/store", branch: "results", path: "worker-results/{id}.json" },
+      request: { kind: "forge-issue", repo: "acme/signals", assignee: "relay-login" },
+      files: {
+        async write(input) {
+          writes.push({ path: input.path, text: input.text });
+          steps.push(input.path.endsWith(".request.json") ? "request-file" : "seed");
+          return { status: 201, actor: "loop-bot[bot]" };
+        },
+        async read() {
+          return { status: 200, text: "{}" };
+        },
+      },
+      issues: {
+        async open(input) {
+          steps.push("issue");
+          issueBody = input.body;
+          return { status: 201, number: 4 };
+        },
+        async assign() {
+          steps.push("assign");
+          return 201;
+        },
+        async actor() {
+          steps.push("actor");
+          return "other";
+        },
+      },
+    });
+    const prompt = "p".repeat(70_000);
+    const started = await worker.start({
+      prompt,
+      repoUrl: "https://github.com/acme/api",
+      baseRef: "main",
+    });
+    assert.equal(started.runId, "req-13");
+    assert.deepEqual(steps, ["seed", "request-file", "issue", "assign"]);
+    assert.equal(issueBody, "worker-results/req-13.request.json");
+    const stored = JSON.parse(writes[1]?.text ?? "") as { prompt: string; requestedBy: string; statusStore: { path: string } };
+    assert.equal(stored.prompt, prompt);
+    assert.equal(stored.requestedBy, "loop-bot[bot]");
+    assert.equal(stored.statusStore.path, "worker-results/req-13.json");
   });
 
   it("starts a Copilot cloud task", async () => {

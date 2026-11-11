@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 
+import { GHA_HOSTED_PAGE_BUDGET_MINUTES } from "../engine/linear-harness-policy.ts";
 import { journeySpecPattern } from "../../scripts/journey-proof.mjs";
 
 /** Writes to `repos` are refused unless the token's GitHub login is `login`. */
@@ -57,6 +58,66 @@ export type WorkerKeys = {
 
 export const DEFAULT_CURSOR_PRIMARY_ENV = "CURSOR_API_KEY";
 export const DEFAULT_CURSOR_FALLBACK_ENV = "CURSOR_API_KEY_FALLBACK";
+
+/** Pause between http worker status reads. A coding run is tens of minutes. */
+export const DEFAULT_WORKER_HTTP_POLL_MS = 15_000;
+
+/**
+ * Stop waiting for an http worker after this long.
+ * One hour stays inside the hosted job budget and covers a coding run.
+ */
+export const DEFAULT_WORKER_HTTP_MAX_WAIT_MS = 60 * 60 * 1000;
+
+/** Hosted job budget. `workerHttp.maxWaitMs` cannot exceed this. */
+export const WORKER_HTTP_JOB_BUDGET_MS = GHA_HOSTED_PAGE_BUDGET_MINUTES * 60_000;
+
+/** Header name to an env var, or the source `mint` or `gh-token`. Values are not secrets. */
+export type WorkerHttpHeaders = Record<string, string>;
+
+/**
+ * File the loop writes before start, then reads until the worker finishes.
+ * `path` contains `{id}`. The loop replaces it and sends the resolved path.
+ */
+export type WorkerHttpStatusStore = {
+  kind: "forge";
+  /** `owner/name`. */
+  repo: string;
+  branch: string;
+  path: string;
+};
+
+/**
+ * Start signal written as a forge issue. Requires `statusStore`.
+ * `assignee` is applied in a second call so the forge emits an assignment.
+ */
+export type WorkerHttpRequest = {
+  kind: "forge-issue";
+  /** `owner/name`. */
+  repo: string;
+  assignee: string;
+  labels?: string[];
+};
+
+export type WorkerHttp = {
+  /** Absent when `request` opens a forge issue instead. */
+  startUrl?: string;
+  /**
+   * `{id}` is replaced with the request id. Without it, the id is the last path segment.
+   * Absent when `statusStore` is set. Reads then use the store.
+   */
+  statusUrl?: string;
+  pollMs?: number;
+  maxWaitMs?: number;
+  startHeaders?: WorkerHttpHeaders;
+  statusHeaders?: WorkerHttpHeaders;
+  /** When set, the loop seeds and reads this file through the forge. */
+  statusStore?: WorkerHttpStatusStore;
+  /**
+   * When set, start opens a forge issue instead of posting `startUrl`.
+   * Requires `statusStore`.
+   */
+  request?: WorkerHttpRequest;
+};
 
 /**
  * Where the branch is published and merged.
@@ -146,7 +207,16 @@ export type ProjectPack = {
    * on the primary slot.
    */
   workerKeys?: WorkerKeys;
-  workerHttp?: { startUrl: string; statusUrl: string };
+  /**
+   * HTTP worker. `pollMs` defaults to 15000. `maxWaitMs` defaults to 3600000.
+   * `maxWaitMs` stays inside the hosted job budget (360 minutes).
+   * Header maps name an env var, or the source `mint` or `gh-token`.
+   * The header value is not stored here.
+   * `statusStore` seeds a pending file through the forge before start.
+   * Without it, status reads use `statusUrl`.
+   * `request` opens a forge issue after that seed. It replaces `startUrl`.
+   */
+  workerHttp?: WorkerHttp;
   repos: RepoSpec[];
   /**
    * Repos whose commits must show a person. Absent repos keep the token's
@@ -307,6 +377,7 @@ export function loadPack(path: string): ProjectPack {
   raw.design = loadDesign(raw.design, path);
   raw.workerKeys = loadWorkerKeys(raw.workerKeys, path);
   raw.workerModel = loadWorkerModel(raw.workerModel, path);
+  raw.workerHttp = loadWorkerHttp(raw.workerHttp, raw.worker, path);
   raw.transient = loadTransient(raw.transient, path);
   return raw;
 }
@@ -429,6 +500,124 @@ export function workerKeyNames(pack: Pick<ProjectPack, "workerKeys">): WorkerKey
     primary: pack.workerKeys?.primary?.trim() || DEFAULT_CURSOR_PRIMARY_ENV,
     fallback: pack.workerKeys?.fallback?.trim() || DEFAULT_CURSOR_FALLBACK_ENV,
   };
+}
+
+const HEADER_NAME = /^[A-Za-z0-9-]+$/;
+const HEADER_SOURCE = /^(?:mint|gh-token|[A-Za-z_][A-Za-z0-9_]*)$/;
+
+function loadHeaderMap(
+  value: WorkerHttpHeaders | undefined,
+  path: string,
+  key: string,
+): WorkerHttpHeaders | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${path} workerHttp.${key} maps a header to an env var`);
+  }
+  const out: WorkerHttpHeaders = {};
+  for (const [name, source] of Object.entries(value)) {
+    if (!HEADER_NAME.test(name) || typeof source !== "string" || !HEADER_SOURCE.test(source.trim())) {
+      throw new Error(`${path} workerHttp.${key} maps a header to an env var or mint or gh-token`);
+    }
+    out[name] = source.trim();
+  }
+  return out;
+}
+
+function loadWorkerHttp(
+  value: WorkerHttp | undefined,
+  worker: WorkerKind,
+  path: string,
+): WorkerHttp | undefined {
+  if (!value) {
+    if (worker === "http") throw new Error(`${path} worker http needs workerHttp.startUrl and workerHttp.statusUrl`);
+    return undefined;
+  }
+  const startUrl = value.startUrl?.trim() ?? "";
+  const statusUrl = value.statusUrl?.trim() ?? "";
+  const statusStore = loadStatusStore(value.statusStore, path);
+  const request = loadWorkerRequest(value.request, statusStore, path);
+  if (worker === "http" && !startUrl && !request) {
+    throw new Error(`${path} worker http needs workerHttp.startUrl or workerHttp.request`);
+  }
+  if (worker === "http" && !statusUrl && !statusStore) {
+    throw new Error(`${path} worker http needs workerHttp.statusUrl or workerHttp.statusStore`);
+  }
+  if (statusUrl.includes("?") && !statusUrl.includes("{id}")) {
+    throw new Error(`${path} workerHttp.statusUrl needs {id} when it has a query`);
+  }
+  const pollMs = value.pollMs ?? DEFAULT_WORKER_HTTP_POLL_MS;
+  const maxWaitMs = value.maxWaitMs ?? DEFAULT_WORKER_HTTP_MAX_WAIT_MS;
+  if (!Number.isInteger(pollMs) || pollMs < 1) {
+    throw new Error(`${path} workerHttp.pollMs is a positive integer`);
+  }
+  if (!Number.isInteger(maxWaitMs) || maxWaitMs < 1) {
+    throw new Error(`${path} workerHttp.maxWaitMs is a positive integer`);
+  }
+  if (maxWaitMs < pollMs) {
+    throw new Error(`${path} workerHttp.maxWaitMs is at least workerHttp.pollMs`);
+  }
+  if (maxWaitMs > WORKER_HTTP_JOB_BUDGET_MS) {
+    throw new Error(`${path} workerHttp.maxWaitMs stays inside the job budget`);
+  }
+  return {
+    ...(startUrl ? { startUrl } : {}),
+    ...(statusUrl ? { statusUrl } : {}),
+    pollMs,
+    maxWaitMs,
+    startHeaders: loadHeaderMap(value.startHeaders, path, "startHeaders"),
+    statusHeaders: loadHeaderMap(value.statusHeaders, path, "statusHeaders"),
+    ...(statusStore ? { statusStore } : {}),
+    ...(request ? { request } : {}),
+  };
+}
+
+const FORGE_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+
+function loadWorkerRequest(
+  value: WorkerHttpRequest | undefined,
+  statusStore: WorkerHttpStatusStore | undefined,
+  path: string,
+): WorkerHttpRequest | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!statusStore) throw new Error(`${path} workerHttp.request needs workerHttp.statusStore`);
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${path} workerHttp.request is a forge issue`);
+  }
+  const kind = value.kind?.trim();
+  const repo = value.repo?.trim() ?? "";
+  const assignee = value.assignee?.trim() ?? "";
+  if (kind !== "forge-issue" || !STORE_REPO.test(repo) || !FORGE_LOGIN.test(assignee)) {
+    throw new Error(`${path} workerHttp.request is a forge issue`);
+  }
+  const labels = (value.labels ?? []).map((label) => (typeof label === "string" ? label.trim() : ""));
+  if (labels.some((label) => !label || /[\r\n]/.test(label))) {
+    throw new Error(`${path} workerHttp.request labels are names`);
+  }
+  return { kind: "forge-issue", repo, assignee, ...(labels.length ? { labels } : {}) };
+}
+
+const STORE_REPO = /^[^/\s]+\/[^/\s]+$/;
+
+function loadStatusStore(
+  value: WorkerHttpStatusStore | undefined,
+  path: string,
+): WorkerHttpStatusStore | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${path} workerHttp.statusStore is a forge file`);
+  }
+  const kind = value.kind?.trim();
+  const repo = value.repo?.trim() ?? "";
+  const branch = value.branch?.trim() ?? "";
+  const file = value.path?.trim() ?? "";
+  if (kind !== "forge" || !STORE_REPO.test(repo) || !branch || /\s/.test(branch) || branch.includes("..")) {
+    throw new Error(`${path} workerHttp.statusStore is a forge file`);
+  }
+  if (!file.includes("{id}") || file.startsWith("/") || file.split("/").some((part) => part === ".." || part === "")) {
+    throw new Error(`${path} workerHttp.statusStore.path contains {id}`);
+  }
+  return { kind: "forge", repo, branch, path: file };
 }
 
 function loadWorkerKeys(keys: WorkerKeys | undefined, path: string): WorkerKeys {

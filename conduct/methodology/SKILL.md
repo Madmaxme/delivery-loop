@@ -49,3 +49,38 @@ The state store holds resumable work markers, the active promotion stage, landed
 Client overlays provide project eligibility, ticket authority, acceptance meaning, tracker settings, deployment and environment procedure, and any product-specific restrictions. They may add policy, but do not replace this skill, weaken the explicit audit/authorization gates, or create another orchestration implementation.
 
 See [MIGRATION-V1-TO-V2.md](MIGRATION-V1-TO-V2.md) before upgrading a v1 client.
+
+A Figma frame URL is the `figma.com` address. Surrounding markdown and a trailing `)` `]` `>` `.` `,` `;` or quote are not part of it. `node-id=1-2` is read as `1:2`. A 400 includes Figma's `err` or `message` and stops as a rejected request. A 403 or 404 stops as access and names `design.figmaTokenEnv`. The token, the headers, and a URL that contains a token are not written.
+
+Each credential call logs its slot, endpoint class, and status, success included. A re-mint near expiry adds `refresh=1`. The run ends with a count by slot, endpoint class, and status. The token, the headers, and the request URL are not written. A worker launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. `workerModel` is the cursor model id. The launch passes `{ id }` and the credential line names that id. An absent `workerModel` omits the model and logs that the account default is in use. A 5xx on a cursor launch waits one second and retries that slot once. A second 5xx uses the fallback slot. A recorded proof that passes, a promote or ship command that exits 0, and a squash that returns a commit each write one success line.
+
+`worker: http` posts that same prompt to `workerHttp.startUrl` with an id the loop generates, and `model: { id }` when `workerModel` is set. Without `workerHttp.statusStore`, it reads `workerHttp.statusUrl`, replacing `{id}`, every `workerHttp.pollMs` until the status is `finished` or `failed`, or `workerHttp.maxWaitMs` passes. With `statusStore`, the loop writes `{"status":"pending","id","repoUrl","baseRef","requestedAt"}` through the forge before start, creating `branch` from the default branch when it is missing, and reads that file the same way. The credential is the minted token, or the forge token when the mint command is unset. A non-2xx seed fails the worker and does not start. `workerHttp.request` replaces `startUrl`: the loop opens one forge issue titled `worker-request <id>` whose body is a fenced JSON block of the start record plus `requestedBy`, then assigns `assignee`. A block longer than 65536 characters is stored beside the pending file and the issue body is only that path. A non-2xx issue create or assign fails the worker and does not start another launcher. Those calls log `endpoint=worker-request-issue` and `endpoint=worker-request-assign`. The defaults are 15000 and 3600000. `maxWaitMs` stays inside the hosted job budget of 360 minutes. `pending` and `running` are not terminal. A non-2xx start fails the worker and does not start another launcher. Header maps name an env var, or the source `mint` or `gh-token`. Start logs `endpoint=worker-http-start`. Status logs `endpoint=worker-http-status`. A seed logs `endpoint=worker-http-seed`. A spent wait fails the worker with detail `http worker join exceeded maxWaitMs`.
+
+## Promote and ship
+
+`deliver` and `sweep` run all configured delivery-authorized stages in order. `ship <id>` and `ship continue <id>` run only ship-authorized stages after delivery completion and current delivery receipts. Each verifier returns a complete receipt bound to its exact stage, target, criteria revision, landed SHAs, and acceptance IDs. A blocked or parked receipt prevents completion; a parked ship stage succeeds only when `parkSuccess: true` and never writes `status.shipped`. Exit 75 or a non-zero result with `delivery-loop transient <reason>` retries the stage's promote, verify, or active continue command within `transient.maxAttempts` (default 3) and `transient.maxWaitMs` (default 60000), using one-second waits that double. Exhaustion reports the stage failure to the regular heal flow.
+
+## Self-heal
+
+A ship-stage promote, verification, or continue failure uses the same heal path after any configured transient retries. A note or a side watcher is not the fix.
+
+When the owner is this package, the edit opens a pull request on `engine-heal/<ticket>` with the `engine-heal` label. Routine heals use the next patch after the highest `v*` tag; `engineHealBumpVersion` remains patch-only. The planned breaking v2.0.0 release is an authorized greater-version bump from main's v1.0.17 and uses the same labeled pull-request workflow. The opener commits `package.json` and `package-lock.json` and pushes with the commit-actor token. The `pull_request` quality check gates that head. Only the engine-heal workflow squash-merges and writes the tag and GitHub release. A pull request without a greater version gets a comment and stops. Clients pin the tag when they need the change.
+
+Each failure type has a cap. The default is 3. `heal.maxAttempts` changes the default. `heal.caps.<type>` overrides one type. The count is the `OWNER_HEAL` comments of that type on the ticket, so it survives the next run. At the cap the engine writes the labels and the exhausted comment and stops. A failed write of the `OWNER_HEAL` comment fails the heal. The attempt is not counted, so the cap cannot be skipped by ignoring that error.
+
+```yaml
+heal:
+  maxAttempts: 3
+  caps:
+    quality-red: 3
+    merge-conflict: 3
+    promote-failed: 3
+    ship-failed: 3
+    quality-pending: 3
+    quality-unscheduled: 3
+    runner-blocked: 3
+```
+
+## What a client adds
+
+The client keeps `delivery-loop.yaml`, the invariants file, and its prompt files. `delivery-loop init` and `delivery-loop update` refresh skills, the Cursor rule, and the runner workflow from a pinned tag. They leave the project file and the invariants file alone. An overlay may add a rule. It does not replace this skill or the conduct skill.

@@ -115,15 +115,15 @@ describe("journey evidence", () => {
 
   it("keeps an already-shipped journey in intake until the proof is real", () => {
     const text = "**Verdict:** ALREADY SHIPPED\n**Repos:** `api`\n**Journey evidence:** recorded\n";
-    const input = { verdict: "ALREADY SHIPPED" as const, text, priorComments: [], devStatus: "Dev", trunkCommit: true };
+    const input = { verdict: "ALREADY SHIPPED" as const, text, priorComments: [], completeStatus: "Delivery Complete", trunkCommit: true };
     assert.equal(parkStateForVerdict(input), null);
-    assert.equal(parkStateForVerdict({ ...input, journeyProven: true }), "Dev");
+    assert.equal(parkStateForVerdict({ ...input, journeyProven: true }), "Delivery Complete");
     assert.equal(
       parkStateForVerdict({
         ...input,
         text: text.replace("recorded", "not-applicable"),
       }),
-      "Dev",
+      "Delivery Complete",
     );
   });
 });

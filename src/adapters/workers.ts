@@ -1,8 +1,18 @@
+import { randomUUID } from "node:crypto";
+
 import { credentialFetch, noteCredential, type CredentialNoteFn } from "../engine/credential-log.ts";
 import {
   isAgentCapacityRefusal,
   orderedCursorApiKeys,
 } from "../engine/linear-harness-policy.js";
+import {
+  DEFAULT_WORKER_HTTP_MAX_WAIT_MS,
+  DEFAULT_WORKER_HTTP_POLL_MS,
+  type WorkerHttpHeaders,
+  type WorkerHttpRequest,
+  type WorkerHttpStatusStore,
+} from "../schema/pack.ts";
+import type { InstallationToken } from "./github-mint.ts";
 import type { FetchLike, WorkerAdapter, WorkerResult, WorkerStart } from "./types.js";
 
 async function poll(
@@ -18,39 +28,381 @@ async function poll(
   return { status: "failed", text: "worker join timed out" };
 }
 
+const HTTP_PENDING = new Set(["pending", "running"]);
+
+export type WorkerHttpToken = {
+  /** Minted installation token when that command is set, otherwise the forge token. */
+  mint(): Promise<InstallationToken>;
+  /** Forge token. The value is not written. */
+  forge(): InstallationToken;
+};
+
+function headerToken(name: string, value: string): string {
+  if (name.toLowerCase() !== "authorization") return value;
+  if (/^(Bearer|Basic|Token)\s+\S+/i.test(value)) return value;
+  return `Bearer ${value}`;
+}
+
+function credentialSlot(slots: string[]): string {
+  if (slots.includes("mint")) return "mint";
+  if (slots.includes("gh-token")) return "gh-token";
+  return "worker-http";
+}
+
+async function resolveHeaderMap(
+  map: WorkerHttpHeaders | undefined,
+  legacyToken: string | undefined,
+  env: Record<string, string | undefined>,
+  tokens: WorkerHttpToken | undefined,
+): Promise<{ headers: Record<string, string>; slot: string }> {
+  const headers: Record<string, string> = {};
+  const slots: string[] = [];
+  for (const [name, source] of Object.entries(map ?? {})) {
+    let value = "";
+    let slot = "worker-http";
+    if (source === "mint") {
+      const minted = await tokens?.mint();
+      value = minted?.token ?? "";
+      slot = minted?.slot ?? "mint";
+    } else if (source === "gh-token") {
+      const forge = tokens?.forge();
+      value = forge?.token ?? "";
+      slot = "gh-token";
+    } else {
+      value = env[source] ?? "";
+    }
+    if (!value) throw new Error(`worker http header ${name} is missing source ${source}`);
+    headers[name] = headerToken(name, value);
+    slots.push(slot);
+  }
+  if (!Object.keys(headers).some((name) => name.toLowerCase() === "authorization") && legacyToken) {
+    headers.Authorization = headerToken("Authorization", legacyToken);
+    slots.push("worker-http");
+  }
+  return { headers, slot: credentialSlot(slots) };
+}
+
+/** `{id}` is replaced. A path with no placeholder gains the id as its last segment. */
+export function workerHttpStatusUrl(template: string, id: string): string {
+  const encoded = encodeURIComponent(id);
+  if (template.includes("{id}")) return template.replaceAll("{id}", encoded);
+  return `${template.replace(/\/$/, "")}/${encoded}`;
+}
+
+function parseBranches(value: unknown): WorkerResult["branches"] {
+  if (!Array.isArray(value)) return undefined;
+  const rows: { repoUrl: string; branch: string }[] = [];
+  for (const row of value) {
+    if (!row || typeof row !== "object") continue;
+    const record = row as { repoUrl?: unknown; branch?: unknown };
+    if (typeof record.repoUrl !== "string" || typeof record.branch !== "string") continue;
+    rows.push({ repoUrl: record.repoUrl, branch: record.branch });
+  }
+  return rows.length > 0 ? rows : undefined;
+}
+
+function resultRecord(value: unknown): Record<string, unknown> | null {
+  let record = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+  if (!record) return null;
+  if (typeof record.status !== "string" && record.encoding === "base64" && typeof record.content === "string") {
+    try {
+      const decoded = Buffer.from(record.content.replace(/\s+/g, ""), "base64").toString("utf8");
+      const parsed = JSON.parse(decoded) as unknown;
+      record =
+        parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+  return record;
+}
+
+export type WorkerHttpFiles = {
+  /** Returns the write status and the forge login recorded on the commit, when it has one. */
+  write(input: {
+    repo: string;
+    branch: string;
+    path: string;
+    text: string;
+    message?: string;
+  }): Promise<{ status: number; actor: string }>;
+  read(input: { repo: string; branch: string; path: string }): Promise<{ status: number; text: string }>;
+};
+
+export type WorkerHttpIssueClient = {
+  open(input: {
+    repo: string;
+    title: string;
+    body: string;
+    labels?: string[];
+  }): Promise<{ status: number; number: number }>;
+  assign(input: { repo: string; number: number; assignee: string }): Promise<number>;
+  /** Login when the seed commit did not record one. */
+  actor(): Promise<string>;
+};
+
+/** GitHub issue body limit. A larger start record is stored as a file. */
+export const WORKER_REQUEST_BODY_MAX = 65536;
+
+export function workerHttpRequestPath(recordPath: string): string {
+  if (recordPath.endsWith(".json")) return `${recordPath.slice(0, -".json".length)}.request.json`;
+  return `${recordPath}.request.json`;
+}
+
+export function fencedJson(value: unknown): string {
+  return "```json\n" + JSON.stringify(value) + "\n```";
+}
+
+export function workerHttpStorePath(template: string, id: string): string {
+  const safe = /^[A-Za-z0-9._-]+$/.test(id) ? id : encodeURIComponent(id);
+  return template.replaceAll("{id}", safe);
+}
+
+function pendingWorkerRecord(input: {
+  id: string;
+  repoUrl: string;
+  baseRef: string;
+  requestedAt: string;
+}): string {
+  return JSON.stringify({
+    status: "pending",
+    id: input.id,
+    repoUrl: input.repoUrl,
+    baseRef: input.baseRef,
+    requestedAt: input.requestedAt,
+  });
+}
+
+/** A terminal result, or null while the status is still pending or running. */
+function classifyHttpResult(parsed: unknown): WorkerResult | null {
+  const result = workerResultFromStatusBody(parsed);
+  if (!result) return { status: "failed", text: "http worker status is not a result" };
+  if (HTTP_PENDING.has(result.status)) return null;
+  if (result.status === "finished" || result.status === "failed") return result;
+  return { status: "failed", text: `http worker status ${result.status}` };
+}
+
+function statusOf(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const value = (error as { httpStatus?: unknown }).httpStatus;
+  return typeof value === "number" ? value : undefined;
+}
+
+/** Status body, or the decoded document when the store wraps it. */
+export function workerResultFromStatusBody(body: unknown): WorkerResult | null {
+  const record = resultRecord(body);
+  if (!record || typeof record.status !== "string") return null;
+  return {
+    status: record.status as WorkerResult["status"],
+    branch: typeof record.branch === "string" ? record.branch : undefined,
+    head: typeof record.head === "string" ? record.head : undefined,
+    branches: parseBranches(record.branches),
+    text: typeof record.text === "string" ? record.text : "",
+  };
+}
+
 export function httpWorker(opts: {
-  startUrl: string;
-  statusUrl: string;
+  startUrl?: string;
+  statusUrl?: string;
+  /** `workerModel`. Absent omits `model` from the start body. */
+  model?: string;
+  pollMs?: number;
+  maxWaitMs?: number;
+  /** Legacy Authorization when the header maps omit it. */
   token?: string;
+  startHeaders?: WorkerHttpHeaders;
+  statusHeaders?: WorkerHttpHeaders;
+  statusStore?: WorkerHttpStatusStore;
+  /** Forge issue that replaces `startUrl`. Requires `statusStore`. */
+  request?: WorkerHttpRequest;
+  /** Forge file reads and writes. Required when `statusStore` is set. */
+  files?: WorkerHttpFiles;
+  /** Forge issue create and assign. Required when `request` is set. */
+  issues?: WorkerHttpIssueClient;
+  env?: Record<string, string | undefined>;
+  tokens?: WorkerHttpToken;
   fetch?: FetchLike;
+  credentialNote?: CredentialNoteFn;
+  nowMs?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  newId?: () => string;
 }): WorkerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
+  const env = opts.env ?? process.env;
+  const pollMs = opts.pollMs ?? DEFAULT_WORKER_HTTP_POLL_MS;
+  const maxWaitMs = opts.maxWaitMs ?? DEFAULT_WORKER_HTTP_MAX_WAIT_MS;
+  const nowMs = opts.nowMs ?? Date.now;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const modelId = opts.model?.trim() || "";
+  const note = opts.credentialNote;
   return {
     kind: "http",
     async start(input: WorkerStart) {
-      const response = await credentialFetch("worker-http", "worker-http", () =>
-        fetchImpl(opts.startUrl, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(input),
-        }),
+      const id = (opts.newId ?? randomUUID)();
+      const storePath = opts.statusStore ? workerHttpStorePath(opts.statusStore.path, id) : "";
+      let actor = "";
+      if (opts.statusStore) {
+        if (!opts.files) throw new Error("http worker seed failed: forge has no file store");
+        let written: { status: number; actor: string };
+        try {
+          written = await opts.files.write({
+            repo: opts.statusStore.repo,
+            branch: opts.statusStore.branch,
+            path: storePath,
+            text: pendingWorkerRecord({
+              id,
+              repoUrl: input.repoUrl,
+              baseRef: input.baseRef,
+              requestedAt: new Date(nowMs()).toISOString(),
+            }),
+          });
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith("http worker seed failed")) throw error;
+          const failed = statusOf(error);
+          throw new Error(failed ? `http worker seed failed: ${failed}` : "http worker seed failed");
+        }
+        if (written.status < 200 || written.status > 299) throw new Error(`http worker seed failed: ${written.status}`);
+        actor = written.actor;
+      }
+      if (opts.request) {
+        if (!opts.statusStore || !opts.files || !opts.issues) {
+          throw new Error("http worker request failed: forge issue needs a status store");
+        }
+        if (!actor) actor = await opts.issues.actor();
+        const payload: Record<string, unknown> = {
+          id,
+          prompt: input.prompt,
+          repoUrl: input.repoUrl,
+          baseRef: input.baseRef,
+        };
+        if (modelId) payload.model = { id: modelId };
+        payload.statusStore = {
+          repo: opts.statusStore.repo,
+          branch: opts.statusStore.branch,
+          path: storePath,
+        };
+        payload.requestedBy = actor;
+        let issueBody = fencedJson(payload);
+        if (issueBody.length > WORKER_REQUEST_BODY_MAX) {
+          const requestPath = workerHttpRequestPath(storePath);
+          const stored = await opts.files.write({
+            repo: opts.statusStore.repo,
+            branch: opts.statusStore.branch,
+            path: requestPath,
+            text: JSON.stringify(payload),
+            message: "record a worker request",
+          });
+          if (stored.status < 200 || stored.status > 299) {
+            throw new Error(`http worker request failed: ${stored.status}`);
+          }
+          issueBody = requestPath;
+        }
+        const opened = await opts.issues.open({
+          repo: opts.request.repo,
+          title: `worker-request ${id}`,
+          body: issueBody,
+          labels: opts.request.labels,
+        });
+        if (opened.status < 200 || opened.status > 299 || !opened.number) {
+          throw new Error(`http worker request failed: ${opened.status}`);
+        }
+        const assigned = await opts.issues.assign({
+          repo: opts.request.repo,
+          number: opened.number,
+          assignee: opts.request.assignee,
+        });
+        if (assigned < 200 || assigned > 299) throw new Error(`http worker request failed: ${assigned}`);
+        return { runId: id };
+      }
+      if (!opts.startUrl) throw new Error("http worker start failed: no start");
+      const auth = await resolveHeaderMap(opts.startHeaders, opts.token, env, opts.tokens);
+      const body: Record<string, unknown> = {
+        id,
+        prompt: input.prompt,
+        repoUrl: input.repoUrl,
+        baseRef: input.baseRef,
+      };
+      if (modelId) body.model = { id: modelId };
+      if (opts.statusStore) {
+        body.statusStore = {
+          repo: opts.statusStore.repo,
+          branch: opts.statusStore.branch,
+          path: storePath,
+        };
+      }
+      const response = await credentialFetch(
+        auth.slot,
+        "worker-http-start",
+        () =>
+          fetchImpl(opts.startUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...auth.headers },
+            body: JSON.stringify(body),
+          }),
+        note ?? noteCredential,
       );
+      await response.text().catch(() => undefined);
       if (!response.ok) throw new Error(`HTTP worker start failed: ${response.status}`);
-      const json = (await response.json()) as { runId: string };
-      return { runId: json.runId };
+      return { runId: id };
     },
     async join(runId: string) {
-      return poll(async () => {
-        const response = await credentialFetch("worker-http", "worker-http", () =>
-          fetchImpl(`${opts.statusUrl.replace(/\/$/, "")}/${runId}`, {
-            headers,
-          }),
+      const url = workerHttpStatusUrl(opts.statusUrl ?? "", runId);
+      const storePath = opts.statusStore ? workerHttpStorePath(opts.statusStore.path, runId) : "";
+      const started = nowMs();
+      for (;;) {
+        if (opts.statusStore && opts.files) {
+          const read = await opts.files.read({
+            repo: opts.statusStore.repo,
+            branch: opts.statusStore.branch,
+            path: storePath,
+          });
+          if (read.status < 200 || read.status > 299) {
+            return { status: "failed", text: `http worker status failed: ${read.status}` };
+          }
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(read.text);
+          } catch {
+            return { status: "failed", text: "http worker status is not a result" };
+          }
+          const stored = classifyHttpResult(parsed);
+          if (stored) return stored;
+          if (nowMs() - started >= maxWaitMs) {
+            return { status: "failed", text: "http worker join exceeded maxWaitMs" };
+          }
+          const remaining = maxWaitMs - (nowMs() - started);
+          await sleep(Math.min(pollMs, remaining));
+          continue;
+        }
+        const auth = await resolveHeaderMap(opts.statusHeaders, opts.token, env, opts.tokens);
+        const response = await credentialFetch(
+          auth.slot,
+          "worker-http-status",
+          () => fetchImpl(url, { headers: auth.headers }),
+          note ?? noteCredential,
         );
-        if (!response.ok) throw new Error(`HTTP worker status failed: ${response.status}`);
-        return (await response.json()) as WorkerResult;
-      });
+        if (!response.ok) {
+          await response.text().catch(() => undefined);
+          return { status: "failed", text: `http worker status failed: ${response.status}` };
+        }
+        let parsed: unknown;
+        try {
+          parsed = await response.json();
+        } catch {
+          return { status: "failed", text: "http worker status is not a result" };
+        }
+        const result = workerResultFromStatusBody(parsed);
+        if (!result) return { status: "failed", text: "http worker status is not a result" };
+        if (!HTTP_PENDING.has(result.status)) {
+          if (result.status === "finished" || result.status === "failed") return result;
+          return { status: "failed", text: `http worker status ${result.status}` };
+        }
+        if (nowMs() - started >= maxWaitMs) {
+          return { status: "failed", text: "http worker join exceeded maxWaitMs" };
+        }
+        const remaining = maxWaitMs - (nowMs() - started);
+        await sleep(Math.min(pollMs, remaining));
+      }
     },
   };
 }

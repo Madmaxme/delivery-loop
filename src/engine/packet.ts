@@ -280,7 +280,7 @@ export function parkStateForVerdict(input: {
   verdict: Verdict;
   text: string;
   priorComments: readonly string[];
-  devStatus: string;
+  completeStatus: string;
   /** Status that does not clear blockers. Defaults to Hold. */
   holdStatus?: string;
   /** True when this ticket's commits are already on the named trunks. */
@@ -303,7 +303,7 @@ export function parkStateForVerdict(input: {
     if (journey === "recorded" && input.journeyProven !== true) return null;
     const repos = words(field(input.text, "Repos"));
     if (repos.length === 0) return "Canceled";
-    if (input.trunkCommit === true) return input.devStatus;
+    if (input.trunkCommit === true) return input.completeStatus;
     if (input.trunkCommit === false) return "Canceled";
     return null;
   }

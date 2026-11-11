@@ -138,6 +138,141 @@ workerKeys:
     assert.throws(() => loadPack(write(`${base}transient:\n  maxWaitMs: -1\n`)), /transient.maxWaitMs/);
   });
 
+  it("defaults the http worker wait inside the job budget", () => {
+    const httpBase = base.replace("worker: cursor", "worker: http");
+    const pack = loadPack(
+      write(`${httpBase}
+workerHttp:
+  startUrl: https://host.example/start
+  statusUrl: https://host.example/status/{id}
+  startHeaders:
+    Authorization: START_TOKEN
+  statusHeaders:
+    Authorization: mint
+`),
+    );
+    assert.equal(pack.workerHttp?.pollMs, 15_000);
+    assert.equal(pack.workerHttp?.maxWaitMs, 3_600_000);
+    assert.equal(pack.workerHttp?.startHeaders?.Authorization, "START_TOKEN");
+    assert.equal(pack.workerHttp?.statusHeaders?.Authorization, "mint");
+    const named = loadPack(
+      write(`${httpBase}
+workerHttp:
+  startUrl: https://host.example/start
+  statusUrl: https://host.example/runs/{id}
+  pollMs: 5000
+  maxWaitMs: 120000
+`),
+    );
+    assert.equal(named.workerHttp?.pollMs, 5000);
+    assert.equal(named.workerHttp?.maxWaitMs, 120_000);
+  });
+
+  it("refuses an http worker wait outside the job budget", () => {
+    const httpBase = base.replace("worker: cursor", "worker: http");
+    const http = `
+workerHttp:
+  startUrl: https://host.example/start
+  statusUrl: https://host.example/status/{id}
+`;
+    assert.throws(() => loadPack(write(`${httpBase}${http}  pollMs: 0\n`)), /workerHttp.pollMs/);
+    assert.throws(
+      () => loadPack(write(`${httpBase}${http}  pollMs: 2000\n  maxWaitMs: 1000\n`)),
+      /workerHttp.maxWaitMs/,
+    );
+    assert.throws(
+      () => loadPack(write(`${httpBase}${http}  maxWaitMs: 21600001\n`)),
+      /job budget/,
+    );
+    assert.throws(
+      () =>
+        loadPack(
+          write(`${httpBase}
+workerHttp:
+  startUrl: https://host.example/start
+  statusUrl: https://host.example/status?run=1
+`),
+        ),
+      /\{id\}/,
+    );
+    assert.throws(() => loadPack(write(httpBase)), /workerHttp.startUrl/);
+    const stored = loadPack(
+      write(`${httpBase}
+workerHttp:
+  startUrl: https://host.example/start
+  statusStore:
+    kind: forge
+    repo: acme/store
+    branch: results
+    path: worker-results/{id}.json
+`),
+    );
+    assert.equal(stored.workerHttp?.statusUrl, undefined);
+    assert.equal(stored.workerHttp?.statusStore?.repo, "acme/store");
+    assert.equal(stored.workerHttp?.statusStore?.path, "worker-results/{id}.json");
+    const issue = loadPack(
+      write(`${httpBase}
+workerHttp:
+  statusStore:
+    kind: forge
+    repo: acme/store
+    branch: results
+    path: worker-results/{id}.json
+  request:
+    kind: forge-issue
+    repo: acme/signals
+    assignee: relay-login
+    labels:
+      - run
+`),
+    );
+    assert.equal(issue.workerHttp?.startUrl, undefined);
+    assert.equal(issue.workerHttp?.request?.assignee, "relay-login");
+    assert.deepEqual(issue.workerHttp?.request?.labels, ["run"]);
+    assert.throws(
+      () =>
+        loadPack(
+          write(`${httpBase}
+workerHttp:
+  startUrl: https://host.example/start
+  request:
+    kind: forge-issue
+    repo: acme/signals
+    assignee: relay-login
+`),
+        ),
+      /request needs workerHttp.statusStore/,
+    );
+    assert.throws(
+      () =>
+        loadPack(
+          write(`${httpBase}
+workerHttp:
+  startUrl: https://host.example/start
+  statusStore:
+    kind: forge
+    repo: acme/store
+    branch: results
+    path: worker-results/result.json
+`),
+        ),
+      /statusStore.path/,
+    );
+    assert.throws(
+      () =>
+        loadPack(
+          write(`${httpBase}
+workerHttp:
+  startUrl: https://host.example/start
+  statusUrl: https://host.example/status/{id}
+  startHeaders:
+    Authorization: "not a source"
+`),
+        ),
+      /startHeaders/,
+    );
+  });
+
   it("refuses a workerModel value that is not a model id", () => {
     assert.throws(() => loadPack(write(`${base}workerModel: "not a model"\n`)), /workerModel/);
     assert.throws(() => loadPack(write(`${base}workerModel: 4\n`)), /workerModel/);

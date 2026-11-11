@@ -155,6 +155,18 @@ describe("engine heal release", () => {
     assert.equal(behind.action, "comment");
   });
 
+  it("accepts the planned breaking 2.0.0 release while routine bumps stay patch-only", () => {
+    assert.equal(engineHealBumpVersion(["v1.0.17"]), "1.0.18");
+    const release = planEngineHealRelease({
+      ...open,
+      qualityOnTip: "success",
+      mainVersion: "1.0.17",
+      tipVersion: "2.0.0",
+      branchTip: "def222",
+    });
+    assert.deepEqual(release, { action: "merge-and-tag", version: "2.0.0", tag: "v2.0.0" });
+  });
+
   it("tags a merged pull request and does not open another bump", () => {
     const tag = planEngineHealRelease({
       ...open,

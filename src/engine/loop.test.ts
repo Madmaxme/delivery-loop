@@ -1640,6 +1640,33 @@ describe("loop", () => {
     }
   });
 
+  it("retries a transient v2 delivery-stage promotion within its budget", async () => {
+    const env = harness(BUILDABLE);
+    const stage: PromotionStage = {
+      id: "deliver-stage",
+      target: "opaque-target",
+      authorization: "deliver",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+    };
+    env.deps.pack = { ...pack, promotionStages: [stage], transient: { maxAttempts: 2, maxWaitMs: 250 } };
+    const events: string[] = [];
+    let promotions = 0;
+    env.deps.sleep = async (ms) => { events.push(`sleep:${ms}`); };
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      events.push(command);
+      if (command === "promote" && ++promotions === 1) return { status: 75, stdout: "", stderr: "" };
+      if (command === "promote") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target, criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }) };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.deepEqual(events, ["promote", "sleep:250", "promote", "verify"]);
+    assert.equal(env.state(), pack.status.complete);
+  });
+
   it("does not run a later delivery stage after a blocked receipt", async () => {
     const env = harness(BUILDABLE);
     env.deps.pack = {
@@ -1776,6 +1803,27 @@ describe("loop", () => {
     );
     assert.equal(result.outcome, "skipped-graph");
     assert.deepEqual(lines, ["API-1 skipped-graph blocked by API-2 (Todo)"]);
+  });
+
+  it("reports worker-failed when the worker start is refused and does not start again", async () => {
+    const env = harness(BUILDABLE);
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      throw new Error("HTTP worker start failed: 400");
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "worker-failed");
+    assert.match(result.detail ?? "", /HTTP worker start failed: 400/);
+    assert.equal(starts, 1);
+  });
+
+  it("reports worker-failed when the worker join exceeds its wait", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.worker.join = async () => ({ status: "failed", text: "http worker join exceeded maxWaitMs" });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "worker-failed");
+    assert.match(result.detail ?? "", /exceeded maxWaitMs/);
   });
 
   it("keeps a progress line on one line", () => {

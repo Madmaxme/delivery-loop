@@ -31,9 +31,10 @@ export async function githubUserLogin(
   fetchImpl: FetchLike,
   token: string,
   note?: CredentialNoteFn,
+  slot = "gh-token",
 ): Promise<string | null> {
   const response = await credentialFetch(
-    "gh-token",
+    slot,
     githubEndpointClass("/user"),
     () =>
       fetchImpl("https://api.github.com/user", {

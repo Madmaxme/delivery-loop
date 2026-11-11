@@ -217,6 +217,46 @@ export type ForgeAdapter = {
     headSha?: string;
   }): Promise<string>;
   dispatch(input: { workflow: string; ref: string; inputs: Record<string, string> }): Promise<void>;
+  /**
+   * Read one text file on a branch. The credential line uses `endpoint`.
+   * Absent when this forge has no file API.
+   */
+  readTextFile?(input: {
+    repo: string;
+    branch: string;
+    path: string;
+    endpoint: string;
+  }): Promise<{ status: number; text: string }>;
+  /**
+   * Write one text file on a branch, creating the branch from the default
+   * branch when it is missing. Returns the write status. The credential
+   * line uses `endpoint`.
+   */
+  writeTextFile?(input: {
+    repo: string;
+    branch: string;
+    path: string;
+    text: string;
+    message: string;
+    endpoint: string;
+  }): Promise<{ status: number; actor: string }>;
+  /** Open one issue. The credential line uses `endpoint`. Returns the issue number on 2xx. */
+  createIssue?(input: {
+    repo: string;
+    title: string;
+    body: string;
+    labels?: string[];
+    endpoint: string;
+  }): Promise<{ status: number; number: number }>;
+  /** Assign one issue. A separate call so the forge emits an assignment event. */
+  assignIssue?(input: {
+    repo: string;
+    number: number;
+    assignee: string;
+    endpoint: string;
+  }): Promise<number>;
+  /** Login for the credential that writes issues. Empty when the credential has no user. */
+  actorLogin?(): Promise<string>;
 };
 
 export type FetchLike = (
