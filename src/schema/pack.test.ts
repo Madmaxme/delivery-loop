@@ -14,8 +14,15 @@ function write(body: string): string {
 }
 
 const base = `
+schemaVersion: 2
 tracker: linear
 worker: cursor
+eligibility:
+  mode: none
+landingStrategy: pull-request
+promotionStages: []
+status:
+  complete: Dev Complete
 repos:
   - name: api
     url: https://git.example/acme/api.git
@@ -24,6 +31,70 @@ qualityCommand: npm test
 `;
 
 describe("pack requirements", () => {
+  it("requires schemaVersion 2 and explicit v2 choices", () => {
+    const migrationError = /delivery-loop.yaml requires schemaVersion: 2; migrate the client pack before running Delivery Loop v2/;
+    assert.throws(() => loadPack(write(base.replace("schemaVersion: 2\n", ""))), migrationError);
+    assert.throws(() => loadPack(write(base.replace("schemaVersion: 2", "schemaVersion: 1"))), migrationError);
+    assert.throws(() => loadPack(write(base.replace("eligibility:\n  mode: none\n", ""))), /eligibility/);
+    assert.throws(() => loadPack(write(base.replace("landingStrategy: pull-request\n", ""))), /landingStrategy/);
+    assert.throws(() => loadPack(write(base.replace("promotionStages: []\n", ""))), /promotionStages/);
+    assert.throws(() => loadPack(write(base.replace("  complete: Dev Complete\n", ""))), /status.complete/);
+    assert.deepEqual(loadPack(write(base)).eligibility, { mode: "none" });
+    const commandPack = loadPack(write(base.replace("mode: none", "mode: command\n  command: node scripts/policy.mjs")));
+    assert.deepEqual(commandPack.eligibility, { mode: "command", command: "node scripts/policy.mjs" });
+    assert.throws(() => loadPack(write(base.replace("mode: none", "mode: command"))), /eligibility/);
+  });
+
+  it("validates Jira configuration without embedding credentials", () => {
+    const jira = base.replace("tracker: linear", "tracker: jira") + `jira:
+  apiBaseUrl: https://jira.example.test
+  authHeaderEnv: JIRA_AUTH_HEADER
+  intakeJql: project = APP AND status = Open
+  approvalFieldId: customfield_12345
+`;
+    const pack = loadPack(write(jira));
+    assert.equal(pack.jira?.apiBaseUrl, "https://jira.example.test");
+    assert.equal(pack.jira?.approvalFieldId, "customfield_12345");
+    assert.throws(() => loadPack(write(jira.replace("https://jira.example.test", "http://jira.example.test"))), /apiBaseUrl/);
+    assert.throws(() => loadPack(write(jira.replace("JIRA_AUTH_HEADER", "not an env"))), /authHeaderEnv/);
+    assert.throws(() => loadPack(write(jira.replace("project = APP AND status = Open", "  "))), /intakeJql/);
+    assert.throws(() => loadPack(write(jira.replace("customfield_12345", "not-a-field"))), /approvalFieldId/);
+  });
+
+  it("requires explicit ship-stage flags and a shipped status before writing status", () => {
+    const stage = `promotionStages:
+  - id: release
+    target: production
+    authorization: ship
+    promoteCommand: ./scripts/promote.sh
+    repos:
+      - api
+    verifyCommand: ./scripts/verify.sh
+`;
+    assert.throws(() => loadPack(write(base.replace("promotionStages: []", stage))), /parkSuccess and writeStatus/);
+    const writesStatus = stage.replace("verifyCommand: ./scripts/verify.sh", "verifyCommand: ./scripts/verify.sh\n    parkSuccess: false\n    writeStatus: true");
+    assert.throws(() => loadPack(write(base.replace("promotionStages: []", writesStatus))), /status.shipped/);
+    const shipped = base.replace("  complete: Dev Complete", "  complete: Dev Complete\n  shipped: Shipped");
+    assert.equal(loadPack(write(shipped.replace("promotionStages: []", writesStatus))).status.shipped, "Shipped");
+  });
+
+  it("rejects ambiguous stage IDs, reversed authorization order, and v1 promotion fields", () => {
+    const stage = (id: string, target: string, authorization: "deliver" | "ship") => `  - id: ${id}
+    target: ${target}
+    authorization: ${authorization}
+    promoteCommand: ./scripts/promote.sh
+    repos:
+      - api
+    verifyCommand: ./scripts/verify.sh${authorization === "ship" ? "\n    parkSuccess: false\n    writeStatus: false" : ""}`;
+    const duplicateId = base.replace("promotionStages: []", `promotionStages:\n${stage("dev", "dev", "deliver")}\n${stage("dev", "qa", "deliver")}`);
+    assert.throws(() => loadPack(write(duplicateId)), /unique/);
+    const duplicateTarget = base.replace("promotionStages: []", `promotionStages:\n${stage("dev", "dev", "deliver")}\n${stage("qa", "dev", "deliver")}`);
+    assert.throws(() => loadPack(write(duplicateTarget)), /unique/);
+    const reversed = base.replace("promotionStages: []", `promotionStages:\n${stage("ship", "prod", "ship")}\n${stage("dev", "dev", "deliver")}`);
+    assert.throws(() => loadPack(write(reversed)), /deliver stages must precede ship stages/);
+    assert.throws(() => loadPack(write(`${base}dev:\n  steps: []\n`)), /v1 promotion fields/);
+    assert.throws(() => loadPack(write(base.replace("  complete: Dev Complete", "  complete: Dev Complete\n  prod: Prod"))), /v1 promotion fields/);
+  });
   it("defaults the cursor key slot env names", () => {
     const pack = loadPack(write(base));
     assert.equal(pack.workerKeys?.primary, "CURSOR_API_KEY");
@@ -53,17 +124,13 @@ workerKeys:
     assert.equal(pack.workerModel, "model-4.7");
   });
 
-  it("defaults transient retries and keeps a park from counting as success", () => {
+  it("defaults transient retries", () => {
     const pack = loadPack(write(base));
     assert.equal(pack.transient?.maxAttempts, 3);
     assert.equal(pack.transient?.maxWaitMs, 60_000);
-    assert.equal(pack.ship?.parkSuccess, undefined);
-    const named = loadPack(
-      write(`${base}transient:\n  maxAttempts: 4\n  maxWaitMs: 1000\nship:\n  parkSuccess: true\n  steps: []\n`),
-    );
+    const named = loadPack(write(`${base}transient:\n  maxAttempts: 4\n  maxWaitMs: 1000\n`));
     assert.equal(named.transient?.maxAttempts, 4);
     assert.equal(named.transient?.maxWaitMs, 1000);
-    assert.equal(named.ship?.parkSuccess, true);
   });
 
   it("refuses a transient budget that is not a count or a wait", () => {
@@ -97,24 +164,14 @@ workerKeys:
     assert.throws(() => loadPack(write(`${base}\nforge: git\ncheck: workflow\n`)), /forge github/);
   });
 
-  it("keeps optional symbol, journey, and ship-after-dev commands", () => {
-    const pack = loadPack(
-      write(`${base}
+  it("keeps optional symbols and journey commands", () => {
+    const pack = loadPack(write(`${base}
 symbolsCommand: node scripts/code-graph.mjs --check
 journeyCommand: node scripts/journey-proof.mjs
-ship:
-  markStatus: false
-  afterDev: true
-  steps:
-    - ./scripts/ship.sh
-`),
-    );
+`));
     assert.equal(pack.symbolsCommand, "node scripts/code-graph.mjs --check");
     assert.equal(pack.journeyCommand, "node scripts/journey-proof.mjs");
     assert.equal(pack.journeySpec, "{e2e,integration_test,journey}/**");
-    assert.equal(pack.ship?.afterDev, true);
-    assert.equal(pack.ship?.markStatus, false);
-    assert.deepEqual(pack.ship?.steps, ["./scripts/ship.sh"]);
   });
 
   it("keeps a journey spec pattern and treats a directory as that tree", () => {
@@ -122,29 +179,22 @@ ship:
     assert.equal(loadPack(write(`${base}\njourneySpec: test/e2e\n`)).journeySpec, "test/e2e/**");
   });
 
-  it("keeps a scoped promote command on the dev block", () => {
-    const pack = loadPack(
-      write(`${base}\ndev:\n  promote:\n    command: ./scripts/promote.sh dev --repo {repo}\n    repos:\n      - customer-app\n`),
-    );
-    assert.equal(pack.dev?.promote?.command, "./scripts/promote.sh dev --repo {repo}");
-    assert.deepEqual(pack.dev?.promote?.repos, ["customer-app"]);
-  });
-
-  it("keeps the deploy refs a promote command moves", () => {
-    const loaded = loadPack(
-      write(`${base}
-dev:
-  promote:
-    command: promote {repo}
+  it("keeps a scoped promotion stage and its deploy refs", () => {
+    const source = base.replace("promotionStages: []", `promotionStages:
+  - id: dev
+    target: dev
+    authorization: deliver
+    promoteCommand: ./scripts/promote.sh {repo}
     repos:
-      - mobile
+      - customer-app
+    verifyCommand: ./scripts/verify.sh
     refs:
-      mobile:
+      customer-app:
         - dev-a
-        - dev-b
-`),
-    );
-    assert.deepEqual(loaded.dev?.promote?.refs, { mobile: ["dev-a", "dev-b"] });
+        - dev-b`);
+    const loaded = loadPack(write(source));
+    assert.equal(loaded.promotionStages[0]?.promoteCommand, "./scripts/promote.sh {repo}");
+    assert.deepEqual(loaded.promotionStages[0]?.refs, { "customer-app": ["dev-a", "dev-b"] });
   });
 
   it("keeps heal caps and leaves an absent cap at the runner default", () => {

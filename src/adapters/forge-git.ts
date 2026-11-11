@@ -4,13 +4,22 @@ import { join } from "node:path";
 
 import type { CompareStatus, ForgeAdapter } from "./types.js";
 
-export type GitRun = (args: string[], cwd: string) => { status: number | null; stdout?: string };
+export type GitRun = (
+  args: string[],
+  cwd: string,
+  env?: Record<string, string | undefined>,
+) => { status: number | null; stdout?: string };
 
-function defaultGit(args: string[], cwd: string): { status: number | null; stdout: string } {
+function defaultGit(
+  args: string[],
+  cwd: string,
+  env?: Record<string, string | undefined>,
+): { status: number | null; stdout: string } {
   const capture = args[0] === "rev-parse" || args[0] === "merge-base";
   const result = spawnSync("git", args, {
     cwd,
     encoding: "utf8",
+    env: env ? { ...process.env, ...env } : process.env,
     stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
   });
   return {
@@ -73,6 +82,61 @@ export function gitForge(opts: {
       const baseContainsHead = run(["merge-base", "--is-ancestor", headSha, baseSha], cwd);
       if (baseContainsHead.status === 0) return "behind";
       return "diverged";
+    },
+    async directLand(input) {
+      const branch = input.branch.trim();
+      const base = input.base.trim();
+      const headSha = input.expectedHeadSha.trim().toLowerCase();
+      const baseSha = input.expectedBaseSha.trim().toLowerCase();
+      const cwd = dirFor(input.repoUrl);
+      if (!branch || !base || branch === base) {
+        throw new Error("git direct land needs distinct source and target branches");
+      }
+      if (
+        !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(headSha) ||
+        !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(baseSha)
+      ) {
+        throw new Error("git direct land needs full expected commit shas");
+      }
+      for (const ref of [branch, base]) {
+        if (run(["check-ref-format", `refs/heads/${ref}`], cwd).status !== 0) {
+          throw new Error(`git direct land received an invalid branch: ${ref}`);
+        }
+      }
+      for (const ref of [branch, base]) {
+        const fetched = run(
+          ["fetch", "--no-tags", "origin", `+refs/heads/${ref}:refs/remotes/origin/${ref}`],
+          cwd,
+        );
+        if (fetched.status !== 0) throw new Error(`git fetch failed for ${ref}`);
+      }
+      const remoteHead = run(["rev-parse", `refs/remotes/origin/${branch}^{commit}`], cwd);
+      const remoteBase = run(["rev-parse", `refs/remotes/origin/${base}^{commit}`], cwd);
+      if (remoteHead.status !== 0 || remoteHead.stdout?.trim().toLowerCase() !== headSha) {
+        throw new Error(`git direct land source branch ${branch} no longer matches expected head`);
+      }
+      if (remoteBase.status !== 0 || remoteBase.stdout?.trim().toLowerCase() !== baseSha) {
+        throw new Error(`git direct land target branch ${base} no longer matches expected base`);
+      }
+      const fastForward = run(["merge-base", "--is-ancestor", baseSha, headSha], cwd);
+      if (fastForward.status !== 0) {
+        throw new Error(`git direct land candidate is not a fast-forward of ${base}`);
+      }
+      // The explicit lease is the atomic CAS; the ancestry check makes its update a fast-forward.
+      const pushed = run(
+        [
+          "push",
+          "--porcelain",
+          `--force-with-lease=refs/heads/${base}:${baseSha}`,
+          "origin",
+          `${headSha}:refs/heads/${base}`,
+        ],
+        cwd,
+      );
+      if (pushed.status !== 0) {
+        throw new Error(`git direct land push refused for ${base}; its expected base may have changed`);
+      }
+      return headSha;
     },
     async squashMerge(input) {
       const branch = input.branch?.trim();

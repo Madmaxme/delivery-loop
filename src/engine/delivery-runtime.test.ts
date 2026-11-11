@@ -118,4 +118,46 @@ describe("planDeliveryInvocation", () => {
     assert.equal(plan.runtime, "local");
     assert.equal(plan.issue, "APP-1");
   });
+  it("dispatches audit to the runner by default", () => {
+    const plan = planDeliveryInvocation({
+      githubActions: false,
+      mode: "audit",
+      argv: ["--project", "Payments"],
+    });
+    assert.equal(plan.runtime, "gha");
+    assert.deepEqual(ghaDispatchFields(plan), { mode: "audit", project: "Payments" });
+  });
+
+  it("serializes ship continuation separately from the ship mode", () => {
+    const plan = planDeliveryInvocation({
+      githubActions: false,
+      mode: "ship",
+      argv: ["SKL-22"],
+      shipAction: "continue",
+    });
+    assert.equal(plan.runtime, "gha");
+    assert.deepEqual(ghaDispatchFields(plan), {
+      mode: "ship",
+      issue: "SKL-22",
+      ship_action: "continue",
+    });
+  });
+
+  it("runs audit locally inside the workflow or when requested", () => {
+    const plan = planDeliveryInvocation({
+      githubActions: true,
+      mode: "audit",
+      argv: ["--project", "Payments"],
+    });
+    assert.equal(plan.runtime, "local");
+    assert.deepEqual(plan.localArgs, ["--project", "Payments"]);
+    const requested = planDeliveryInvocation({
+      githubActions: false,
+      mode: "audit",
+      argv: ["--local", "--project", "Payments"],
+    });
+    assert.equal(requested.runtime, "local");
+    assert.deepEqual(requested.localArgs, ["--project", "Payments"]);
+  });
+
 });

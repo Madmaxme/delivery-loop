@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { githubForge } from "./forge-github.ts";
-import { githubIssuesTracker, linearTracker } from "./trackers.ts";
+import { githubIssuesTracker, jiraTracker, linearTracker } from "./trackers.ts";
 import {
   copilotWorker,
   cursorKeySlots,
@@ -13,9 +13,79 @@ import {
   httpWorker,
   type CursorSdk,
 } from "./workers.ts";
+import { createCredentialRecorder } from "../engine/credential-log.ts";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+}
+
+const JIRA_AUTH_ENV = "DELIVERY_LOOP_TEST_JIRA_AUTH";
+const JIRA_AUTH = "Basic jira-test-secret";
+const JIRA_CONFIG = {
+  apiBaseUrl: "https://jira.example.test",
+  authHeaderEnv: JIRA_AUTH_ENV,
+  intakeJql: "project = APP AND status = Open",
+  approvalFieldId: "customfield_12345",
+};
+
+async function withJiraAuth<T>(run: () => Promise<T>): Promise<T> {
+  const previous = process.env[JIRA_AUTH_ENV];
+  process.env[JIRA_AUTH_ENV] = JIRA_AUTH;
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) delete process.env[JIRA_AUTH_ENV];
+    else process.env[JIRA_AUTH_ENV] = previous;
+  }
+}
+
+function jiraIssue(key = "APP-1", changes: {
+  summary?: string;
+  description?: unknown;
+  approval?: unknown;
+  issueType?: string;
+  issueTypeId?: string;
+  statusName?: string;
+  linkedKey?: string;
+  attachmentId?: string;
+  omitApproval?: boolean;
+} = {}) {
+  return {
+    id: key === "APP-1" ? "101" : "102",
+    key,
+    fields: {
+      summary: changes.summary ?? "Apply approved change",
+      description: changes.description ?? {
+        type: "doc",
+        version: 1,
+        content: [{ type: "paragraph", content: [{ type: "text", text: "Preserve the current behavior." }] }],
+      },
+      issuetype: { id: changes.issueTypeId ?? "10001", name: changes.issueType ?? "Task" },
+      assignee: { accountId: "account-1" },
+      status: { name: changes.statusName ?? "Open" },
+      labels: ["delivery"],
+      issuelinks: [{
+        id: "201",
+        type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
+        inwardIssue: { key: changes.linkedKey ?? "APP-9", fields: { status: { name: "Done" } } },
+      }],
+      attachment: [{
+        id: changes.attachmentId ?? "301",
+        filename: "acceptance.pdf",
+        mimeType: "application/pdf",
+        content: `https://jira.example.test/secure/attachment/${changes.attachmentId ?? "301"}/acceptance.pdf`,
+      }],
+      ...(!changes.omitApproval ? { [JIRA_CONFIG.approvalFieldId]: changes.approval ?? { value: "Approved" } } : {}),
+    },
+  };
+}
+
+function jiraCommentPage() {
+  return { startAt: 0, total: 1, maxResults: 100, comments: [{
+    id: "401",
+    created: "2026-10-01T12:00:00.000Z",
+    body: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "A ticket comment." }] }] },
+  }] };
 }
 
 describe("adapters", () => {
@@ -332,6 +402,254 @@ describe("adapters", () => {
     });
     const issues = await github.listIntake();
     assert.equal(issues[0]?.blockedBy[0]?.identifier, "API-1");
+  });
+  it("pages Jira intake, normalizes issue evidence, and redacts credentials", async () => {
+    await withJiraAuth(async () => {
+      const searchBodies: Record<string, unknown>[] = [];
+      const recorder = createCredentialRecorder();
+      const jira = jiraTracker({
+        ...JIRA_CONFIG,
+        credentialNote: recorder.note,
+        fetch: async (url, init) => {
+          const request = new URL(String(url));
+          assert.equal(new Headers(init?.headers).get("Authorization"), JIRA_AUTH);
+          if (request.pathname.endsWith("/search/jql")) {
+            const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+            searchBodies.push(body);
+            return body.nextPageToken
+              ? jsonResponse({ issues: [jiraIssue("APP-2")], isLast: true })
+              : jsonResponse({ issues: [jiraIssue()], isLast: false, nextPageToken: "page-2" });
+          }
+          if (request.pathname.endsWith("/comment")) return jsonResponse(jiraCommentPage());
+          throw new Error(`Unexpected Jira request ${request.pathname}`);
+        },
+      });
+      const tickets = await jira.listIntake();
+      assert.equal(tickets.length, 2);
+      assert.equal(searchBodies.length, 2);
+      assert.deepEqual(searchBodies[1]?.nextPageToken, "page-2");
+      assert.deepEqual(searchBodies[0]?.fields, ["summary", "description", "issuetype", "assignee", "status", "labels", "issuelinks", "attachment", "customfield_12345"]);
+      assert.equal(tickets[0]?.body, "Preserve the current behavior.\n");
+      assert.equal(tickets[0]?.issueType, "Task");
+      assert.equal(tickets[0]?.assigneeId, "account-1");
+      assert.deepEqual(tickets[0]?.fieldValues, { customfield_12345: { value: "Approved" } });
+      assert.deepEqual(tickets[0]?.blockedBy, [{ identifier: "APP-9", stateName: "Done" }]);
+      assert.deepEqual(tickets[0]?.attachments, [{
+        id: "301",
+        filename: "acceptance.pdf",
+        mimeType: "application/pdf",
+        sourceUrl: "https://jira.example.test/secure/attachment/301/acceptance.pdf",
+      }]);
+      assert.equal(tickets[0]?.comments[0]?.body, "A ticket comment.\n");
+      assert.match(tickets[0]?.criteriaRevision ?? "", /^[a-f0-9]{64}$/);
+      const logs = recorder.lines().join("\n");
+      assert.match(logs, /slot=jira endpoint=jira-rest/);
+      assert.doesNotMatch(logs, /jira\.example\.test|jira-test-secret|Basic /);
+    });
+  });
+
+  it("hashes normalized Jira criteria deterministically", async () => {
+    await withJiraAuth(async () => {
+      let issue = jiraIssue();
+      const jira = jiraTracker({
+        ...JIRA_CONFIG,
+        fetch: async (url) => {
+          const request = new URL(String(url));
+          if (request.pathname.endsWith("/comment")) return jsonResponse(jiraCommentPage());
+          return jsonResponse(issue);
+        },
+      });
+      const first = await jira.get("APP-1");
+      assert.equal((await jira.get("APP-1")).criteriaRevision, first.criteriaRevision);
+      issue = jiraIssue("APP-1", { summary: "  Apply approved change  " });
+      assert.equal((await jira.get("APP-1")).criteriaRevision, first.criteriaRevision);
+      issue = jiraIssue("APP-1", { statusName: "Done" });
+      assert.equal((await jira.get("APP-1")).criteriaRevision, first.criteriaRevision);
+      const changes = [
+        { summary: "Changed title" },
+        { description: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Changed description." }] }] } },
+        { approval: { value: "Rejected" } },
+        { issueType: "Bug" },
+        { issueTypeId: "10002" },
+        { linkedKey: "APP-10" },
+        { attachmentId: "302" },
+      ];
+      for (const change of changes) {
+        issue = jiraIssue("APP-1", change);
+        assert.notEqual((await jira.get("APP-1")).criteriaRevision, first.criteriaRevision);
+      }
+    });
+  });
+
+  it("selects the exact Jira status transition and refuses stale or ambiguous writes", async () => {
+    await withJiraAuth(async () => {
+      let issue = jiraIssue();
+      let ambiguous = false;
+      const transitionWrites: Record<string, unknown>[] = [];
+      const jira = jiraTracker({
+        ...JIRA_CONFIG,
+        fetch: async (url, init) => {
+          const request = new URL(String(url));
+          if (request.pathname.endsWith("/transitions") && init?.method !== "POST") {
+            return jsonResponse({ transitions: ambiguous
+              ? [{ id: "10", to: { name: "Done" } }, { id: "12", to: { name: "Done" } }]
+              : [{ id: "10", to: { name: "Done" } }, { id: "11", to: { name: "Done - Automatic" } }] });
+          }
+          if (request.pathname.endsWith("/transitions")) {
+            transitionWrites.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+            return new Response(null, { status: 204 });
+          }
+          if (request.pathname.endsWith("/comment")) return jsonResponse(jiraCommentPage());
+          return jsonResponse(issue);
+        },
+      });
+      const ticket = await jira.get("APP-1");
+      await jira.setState("APP-1", "Done", ticket.criteriaRevision);
+      assert.deepEqual(transitionWrites, [{ transition: { id: "10" } }]);
+      ambiguous = true;
+      await assert.rejects(() => jira.setState("APP-1", "Done", ticket.criteriaRevision), /ambiguous/);
+      ambiguous = false;
+      await assert.rejects(() => jira.setState("APP-1", "Done", ""), /expected criteriaRevision/);
+      const staleTicket = await jira.get("APP-1");
+      issue = jiraIssue("APP-1", { summary: "Changed after review" });
+      await assert.rejects(
+        () => jira.setState("APP-1", "Done", staleTicket.criteriaRevision),
+        /criteria revision changed/,
+      );
+      assert.equal(transitionWrites.length, 1);
+    });
+  });
+
+  it("round-trips v2 Jira delivery state through the issue property", async () => {
+    await withJiraAuth(async () => {
+      let stored: unknown;
+      const jira = jiraTracker({
+        ...JIRA_CONFIG,
+        fetch: async (url, init) => {
+          const request = new URL(String(url));
+          if (request.pathname.endsWith("/properties") && !request.pathname.endsWith("/delivery-loop.state.v2")) {
+            return jsonResponse({ keys: stored ? [{ key: "delivery-loop.state.v2" }] : [] });
+          }
+          if (request.pathname.endsWith("/delivery-loop.state.v2") && init?.method === "PUT") {
+            stored = JSON.parse(String(init.body));
+            return new Response(null, { status: 204 });
+          }
+          if (request.pathname.endsWith("/delivery-loop.state.v2")) {
+            return jsonResponse({ key: "delivery-loop.state.v2", value: stored });
+          }
+          throw new Error(`Unexpected Jira state request ${request.pathname}`);
+        },
+      });
+      assert.deepEqual(await jira.stateStore.readDeliveryState("APP-1"), {
+        schemaVersion: 2,
+        markers: [],
+        stageReceipts: [],
+      });
+      const state = {
+        schemaVersion: 2 as const,
+        markers: [{ kind: "LEASE", body: "active", createdAt: "2026-10-01T12:00:00.000Z" }],
+        stageReceipts: [{
+          stageId: "dev",
+          target: "dev",
+          outcome: "passed" as const,
+          reason: "",
+          criteriaRevision: "a".repeat(64),
+          deployed: [{ repo: "api", sha: "b".repeat(40) }],
+          criteria: [{ id: "one-charge", outcome: "verified" as const, evidence: ["test passed"] }],
+        }],
+      };
+      await jira.stateStore.writeDeliveryState("APP-1", state);
+      assert.deepEqual(await jira.stateStore.readDeliveryState("APP-1"), state);
+    });
+  });
+  it("stores v2 snapshots in Linear and GitHub comments", async () => {
+    const state = {
+      schemaVersion: 2 as const,
+      markers: [{ kind: "LEASE", body: "active", createdAt: "2026-10-01T12:00:00.000Z" }],
+      stageReceipts: [],
+    };
+    let linearComment = "";
+    const linear = linearTracker({
+      apiKey: "k",
+      team: "APP",
+      intakeState: "Todo",
+      fetch: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+        if (body.query.includes("commentCreate")) {
+          linearComment = String(body.variables.body);
+          return jsonResponse({ data: { commentCreate: { success: true } } });
+        }
+        return jsonResponse({ data: { issues: { nodes: [{
+          id: "linear-1",
+          identifier: "APP-1",
+          title: "Fix",
+          description: "",
+          state: { name: "Todo" },
+          labels: { nodes: [] },
+          comments: { nodes: linearComment ? [{ body: linearComment, createdAt: "2026-10-01T12:00:00.000Z" }] : [] },
+          attachments: { nodes: [] },
+          inverseRelations: { nodes: [] },
+        }] } } });
+      },
+    });
+    linearComment = "<!-- delivery-loop-state:v1:old-snapshot -->";
+    assert.deepEqual(await linear.stateStore.readDeliveryState("APP-1"), {
+      schemaVersion: 2,
+      markers: [],
+      stageReceipts: [],
+    });
+    await linear.stateStore.writeDeliveryState("APP-1", state);
+    assert.match(linearComment, /^<!-- delivery-loop-state:v2:[A-Za-z0-9_-]+ -->$/);
+    assert.deepEqual(await linear.stateStore.readDeliveryState("APP-1"), state);
+
+    const githubComments: { id: string; body: string; created_at: string }[] = [];
+    const github = githubIssuesTracker({
+      token: "t",
+      repo: "acme/api",
+      intakeLabel: "todo",
+      fetch: async (url, init) => {
+        const request = new URL(String(url));
+        if (request.pathname.endsWith("/comments")) {
+          if (init?.method === "POST") {
+            const payload: unknown = JSON.parse(String(init.body));
+            if (!payload || typeof payload !== "object" || !("body" in payload) || typeof payload.body !== "string") {
+              throw new Error("Unexpected GitHub comment body");
+            }
+            githubComments.push({ id: String(githubComments.length + 1), body: payload.body, created_at: "2026-10-01T12:00:00.000Z" });
+            return jsonResponse({ id: 1 });
+          }
+          return jsonResponse(githubComments);
+        }
+        return jsonResponse({ number: 1, title: "Fix", body: "", labels: [], state: "open" });
+      },
+    });
+    await github.stateStore.writeDeliveryState("API-1", state);
+    assert.match(githubComments[0]?.body ?? "", /^<!-- delivery-loop-state:v2:[A-Za-z0-9_-]+ -->$/);
+    assert.deepEqual(await github.stateStore.readDeliveryState("API-1"), state);
+  });
+
+  it("fails closed when Jira pagination cannot advance", async () => {
+    await withJiraAuth(async () => {
+      const jira = jiraTracker({
+        ...JIRA_CONFIG,
+        fetch: async () => jsonResponse({ issues: [], isLast: false }),
+      });
+      await assert.rejects(() => jira.listIntake(), /pagination did not advance/);
+    });
+  });
+
+  it("fails closed when the configured Jira approval field is absent", async () => {
+    await withJiraAuth(async () => {
+      const issue = jiraIssue("APP-1", { omitApproval: true });
+      const jira = jiraTracker({
+        ...JIRA_CONFIG,
+        fetch: async (url) => {
+          const request = new URL(String(url));
+          return request.pathname.endsWith("/comment") ? jsonResponse(jiraCommentPage()) : jsonResponse(issue);
+        },
+      });
+      await assert.rejects(() => jira.get("APP-1"), /missing configured field customfield_12345/);
+    });
   });
 
   it("adds a Linear label and keeps labels already on the issue", async () => {

@@ -2,13 +2,11 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
-  countOwnerHeals,
   DEFAULT_HEAL_CAP,
   exhaustedFailureType,
   failureTypeForHealKey,
   healCapFor,
   healVerdict,
-  ownerHealMarker,
   shipNoSignature,
   stallOwner,
 } from "./stall.ts";
@@ -31,14 +29,10 @@ describe("stall", () => {
     assert.equal(stallOwner({ kind: "quality", cause: "environment", healsAlready: 1 }), "install");
   });
 
-  it("names the heal in a marker the next page can read", () => {
-    assert.equal(
-      ownerHealMarker("install:steps:ship"),
-      "<!-- OWNER_HEAL type=ship-failed install:steps:ship -->",
-    );
+  it("maps owner-edit keys to failure caps", () => {
     assert.equal(failureTypeForHealKey("heal:quality:api:red"), "quality-red");
     assert.equal(failureTypeForHealKey("heal:merge:conflict"), "merge-conflict");
-    assert.equal(failureTypeForHealKey("heal:dev:promote"), "promote-failed");
+    assert.equal(failureTypeForHealKey("heal:promote:stage-one"), "promote-failed");
     assert.equal(failureTypeForHealKey("install:continue:store"), "ship-failed");
     assert.equal(failureTypeForHealKey("heal:pending:still"), "quality-pending");
     assert.equal(failureTypeForHealKey("heal:unscheduled:none"), "quality-unscheduled");
@@ -46,25 +40,16 @@ describe("stall", () => {
     assert.equal(failureTypeForHealKey("custom:key"), "other");
   });
 
-  it("counts a failure type across runs, including an older marker", () => {
-    const comments = [
-      { body: "<!-- OWNER_HEAL install:steps:false -->" },
-      { body: ownerHealMarker("install:continue:false") },
-      { body: ownerHealMarker("heal:quality:api:red") },
-    ];
-    assert.equal(countOwnerHeals(comments, "ship-failed"), 2);
-    assert.equal(countOwnerHeals(comments, "quality-red"), 1);
+  it("keeps configured caps and label-based exhaustion", () => {
     assert.equal(healCapFor(undefined, "ship-failed"), DEFAULT_HEAL_CAP);
     assert.equal(healCapFor({ maxAttempts: 5 }, "ship-failed"), 5);
     assert.equal(healCapFor({ maxAttempts: 5, caps: { "ship-failed": 1 } }, "ship-failed"), 1);
     assert.equal(healCapFor({ caps: { "quality-red": 0 } }, "quality-red"), 0);
-    assert.equal(
-      exhaustedFailureType({ comments: [{ body: "<!-- HEAL_EXHAUSTED heal-exhausted type=promote-failed -->" }] }),
-      "promote-failed",
-    );
     assert.equal(exhaustedFailureType({ labels: ["heal-exhausted", "merge-conflict"] }), "merge-conflict");
-    assert.equal(exhaustedFailureType({ labels: [], comments: [] }), null);
+    assert.equal(exhaustedFailureType({ labels: ["heal-exhausted"] }), "heal-exhausted");
+    assert.equal(exhaustedFailureType({ labels: [] }), null);
   });
+
 
   it("treats a different failure of the same command as a new no", () => {
     const social = shipNoSignature("waiting for build\nmissing required attribute socialMedia");

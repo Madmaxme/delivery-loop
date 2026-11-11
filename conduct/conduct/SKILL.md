@@ -1,6 +1,6 @@
 ---
-name: conduct
-description: Universal code conduct for every install. One code path, evidence before building, a work order that cites an existing invariant, and no one-off patch. The install owns type safety and named sources of truth.
+name: delivery-loop-conduct
+description: Universal code conduct for every Delivery Loop v2 install. One code path, evidence before building, a work order that cites an existing invariant, and no one-off patch. The install owns type safety and named sources of truth.
 ---
 
 # Conduct

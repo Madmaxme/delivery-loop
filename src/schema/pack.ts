@@ -44,7 +44,7 @@ export type InvariantHeading = {
 };
 
 /** A real shared list of next, blocked, and done. Not files dropped in the repo. */
-export type TrackerKind = "linear" | "github";
+export type TrackerKind = "linear" | "github" | "jira";
 
 /** Who edits the code. The runner starts this and waits. */
 export type WorkerKind = "cursor" | "claude" | "codex" | "copilot" | "http";
@@ -76,13 +76,38 @@ export type CheckKind = "workflow" | "command";
  */
 export type RunnerKind = "gha" | "local";
 
-const TRACKERS: readonly TrackerKind[] = ["linear", "github"];
+const TRACKERS: readonly TrackerKind[] = ["linear", "github", "jira"];
 const WORKERS: readonly WorkerKind[] = ["cursor", "claude", "codex", "copilot", "http"];
 const FORGES: readonly ForgeKind[] = ["github", "git"];
 const CHECKS: readonly CheckKind[] = ["workflow", "command"];
 const RUNNERS: readonly RunnerKind[] = ["gha", "local"];
+export type Eligibility = { mode: "command"; command: string } | { mode: "none" };
+
+export type LandingStrategy = "pull-request" | "fast-forward";
+
+export type PromotionStage = {
+  id: string;
+  target: string;
+  authorization: "deliver" | "ship";
+  promoteCommand: string;
+  repos: string[];
+  refs?: Record<string, string[]>;
+  verifyCommand: string;
+  continueCommand?: string;
+  parkSuccess?: boolean;
+  writeStatus?: boolean;
+};
+
+export type JiraConfig = {
+  apiBaseUrl: string;
+  /** Env var containing the full Authorization header value; passed through unchanged. */
+  authHeaderEnv: string;
+  intakeJql: string;
+  approvalFieldId: string;
+};
 
 export type ProjectPack = {
+  schemaVersion: 2;
   tracker: TrackerKind;
   worker: WorkerKind;
   /**
@@ -98,6 +123,8 @@ export type ProjectPack = {
   runner?: RunnerKind;
   /** owner/repo used when the tracker is GitHub Issues. */
   githubRepo?: string;
+  /** Jira REST settings. Secrets remain in `authHeaderEnv`'s environment value. */
+  jira?: JiraConfig;
   /**
    * Documents the install wants in the worker prompt, relative to the
    * workspace. The package does not name project files itself.
@@ -139,17 +166,13 @@ export type ProjectPack = {
    */
   branchTemplate?: string;
   invariantsFile: string;
-  /**
-   * `hold` is the status after owned code lands when the ticket still needs
-   * something this repo cannot obtain. It does not clear blockers.
-   * Installs name it. The default is Hold.
-   * `backlog` is a status that does not count as remaining work.
-   * `closed` clears blockers besides dev and prod. The default is Canceled and Duplicate.
-   */
+  eligibility: Eligibility;
+  landingStrategy: LandingStrategy;
+  promotionStages: PromotionStage[];
   status: {
     intake: string;
-    dev: string;
-    prod: string;
+    complete: string;
+    shipped?: string;
     hold?: string;
     backlog?: string;
     closed?: string[];
@@ -168,17 +191,6 @@ export type ProjectPack = {
    */
   design?: DesignSpec;
   /**
-   * After trunk quality is green. `promote` runs `command` once per landed
-   * repo that is also listed in `repos`, with `{repo}` replaced. A pull
-   * request that merged before this sweep still counts as landed. When
-   * `refs` names the deploy branches, a repo whose refs already contain
-   * the landed commit is skipped. When `promote` is set, `steps` are not run.
-   */
-  dev?: {
-    steps?: string[];
-    promote?: { command: string; repos: string[]; refs?: Record<string, string[]> };
-  };
-  /**
    * Resolves `**Symbols:**` lines. The engine passes one `repo/path#symbol`
    * per line on stdin. A non-zero exit is an incomplete packet.
    */
@@ -196,35 +208,13 @@ export type ProjectPack = {
    */
   journeySpec?: string;
   /**
-   * Pack-owned production steps. `markStatus` defaults to true.
-   * Set it false when a step already moves the ticket to the prod state
-   * (for example a store park that must not be marked shipped early).
-   * `afterDev` runs `steps` once the dev gate has passed. When it is
-   * absent, sweep stops at the dev state and does not run `steps`,
-   * including a later page that still has a ship marker. The ship
-   * command passes `--issue <id>` in `DELIVERY_LOOP_SHIP_ARGS`, then any
-   * extra arguments. A command without a ticket id stops before the
-   * steps run. A failed step leaves the dev state. The ship command
-   * edits that step's owner once, then the next run retries it.
-   * `continue` is the store-continue command and takes the same ticket id.
-   * A zero exit with no outcome lines is success, including a store wait.
-   * `parkSuccess` defaults to false. A PARKED outcome is exit 2 unless it is true.
-   */
-  ship?: {
-    steps: string[];
-    continue?: string[];
-    markStatus?: boolean;
-    afterDev?: boolean;
-    parkSuccess?: boolean;
-  };
-  /**
    * Retries a ship or promote step that reports transient.
    * `maxAttempts` defaults to 3. `maxWaitMs` defaults to 60000.
    * Waits start at one second and double. The sum stops at `maxWaitMs`.
    */
   transient?: { maxAttempts?: number; maxWaitMs?: number };
   /**
-   * Heal attempts per failure type, counted from OWNER_HEAL comments on the ticket.
+   * Heal attempts per failure type, counted from v2 `owner-heal` state markers.
    * `maxAttempts` is the default. `caps` overrides one type.
    * Types: quality-red, merge-conflict, promote-failed, ship-failed,
    * quality-pending, quality-unscheduled, runner-blocked, other.
@@ -236,16 +226,11 @@ export type ProjectPack = {
   };
 };
 
-export function defaultStatus(): ProjectPack["status"] {
-  return {
-    intake: "Todo",
-    dev: "Dev",
-    prod: "Prod",
-    hold: "Hold",
-  };
+export function defaultStatus(): { intake: string; hold: string } {
+  return { intake: "Todo", hold: "Hold" };
 }
 
-/** Status that keeps a ticket off dev-done. Installs override `status.hold`. */
+/** Status that keeps a ticket incomplete. Installs override `status.hold`. */
 export function holdStatus(pack: ProjectPack): string {
   const named = pack.status.hold?.trim();
   return named || defaultStatus().hold;
@@ -257,16 +242,46 @@ export function closedStates(pack: ProjectPack): string[] {
 }
 
 export function loadPack(path: string): ProjectPack {
-  const raw = parse(readFileSync(path, "utf8")) as ProjectPack;
-  if (!raw || !Array.isArray(raw.repos) || raw.repos.length === 0) {
+  const parsed = parse(readFileSync(path, "utf8")) as { schemaVersion?: unknown } | null;
+  if (!parsed || parsed.schemaVersion !== 2) {
+    throw new Error("delivery-loop.yaml requires schemaVersion: 2; migrate the client pack before running Delivery Loop v2");
+  }
+  const raw = parsed as ProjectPack;
+  const legacy = raw as unknown as Record<string, unknown>;
+  const legacyStatus = legacy.status && typeof legacy.status === "object" ? legacy.status as Record<string, unknown> : {};
+  if (legacy.dev !== undefined || legacy.ship !== undefined || "dev" in legacyStatus || "prod" in legacyStatus) {
+    throw new Error(`${path} contains v1 promotion fields; migrate them to promotionStages`);
+  }
+  if (!Array.isArray(raw.repos) || raw.repos.length === 0) {
     throw new Error(`${path} needs at least one repo`);
   }
   ignoreBots(raw, path);
   if (!TRACKERS.includes(raw.tracker)) {
-    throw new Error(`${path} tracker must be linear or github`);
+    throw new Error(`${path} tracker must be linear, github, or jira`);
   }
   if (!WORKERS.includes(raw.worker)) {
     throw new Error(`${path} worker must be cursor, claude, codex, copilot, or http`);
+  }
+  if (raw.tracker === "jira") raw.jira = loadJira(raw.jira, path);
+  if (!raw.eligibility) throw new Error(`${path} needs an explicit eligibility choice`);
+  raw.eligibility = loadEligibility(raw.eligibility, path);
+  if (raw.landingStrategy !== "pull-request" && raw.landingStrategy !== "fast-forward") {
+    throw new Error(`${path} needs landingStrategy: pull-request or fast-forward`);
+  }
+  if (!Array.isArray(raw.promotionStages)) {
+    throw new Error(`${path} needs an explicit promotionStages list`);
+  }
+  raw.promotionStages = loadPromotionStages(raw.promotionStages, path);
+  if (!raw.status || typeof raw.status.complete !== "string" || !raw.status.complete.trim()) {
+    throw new Error(`${path} needs status.complete`);
+  }
+  if (raw.status.shipped !== undefined &&
+    (typeof raw.status.shipped !== "string" || !raw.status.shipped.trim())) {
+    throw new Error(`${path} status.shipped must be a non-empty status`);
+  }
+  if (raw.promotionStages.some((stage) => stage.authorization === "ship" && stage.writeStatus) &&
+    !raw.status.shipped?.trim()) {
+    throw new Error(`${path} needs status.shipped when a ship stage writes status`);
   }
   raw.forge = raw.forge ?? "github";
   raw.check = raw.check ?? "workflow";
@@ -293,8 +308,93 @@ export function loadPack(path: string): ProjectPack {
   raw.workerKeys = loadWorkerKeys(raw.workerKeys, path);
   raw.workerModel = loadWorkerModel(raw.workerModel, path);
   raw.transient = loadTransient(raw.transient, path);
-  if (raw.ship) raw.ship.parkSuccess = raw.ship.parkSuccess === true;
   return raw;
+}
+
+function loadEligibility(value: unknown, path: string): Eligibility {
+  if (value && typeof value === "object" && "mode" in value && value.mode === "none") {
+    return { mode: "none" };
+  }
+  if (value && typeof value === "object" && "mode" in value && value.mode === "command" &&
+    "command" in value && typeof value.command === "string" && value.command.trim()) {
+    return { mode: "command", command: value.command.trim() };
+  }
+  throw new Error(`${path} eligibility must be { mode: command, command } or { mode: none }`);
+}
+
+function loadJira(value: unknown, path: string): JiraConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${path} tracker jira needs jira settings`);
+  const config = value as Partial<JiraConfig>;
+  const apiBaseUrl = typeof config.apiBaseUrl === "string" ? config.apiBaseUrl.trim() : "";
+  const authHeaderEnv = typeof config.authHeaderEnv === "string" ? config.authHeaderEnv.trim() : "";
+  const intakeJql = typeof config.intakeJql === "string" ? config.intakeJql.trim() : "";
+  const approvalFieldId = typeof config.approvalFieldId === "string" ? config.approvalFieldId.trim() : "";
+  let base: URL;
+  try {
+    base = new URL(apiBaseUrl);
+  } catch {
+    throw new Error(`${path} jira.apiBaseUrl must be an HTTPS URL`);
+  }
+  if (base.protocol !== "https:" || !base.host || base.username || base.password || base.search || base.hash) {
+    throw new Error(`${path} jira.apiBaseUrl must be an HTTPS URL without credentials, query, or fragment`);
+  }
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(authHeaderEnv)) {
+    throw new Error(`${path} jira.authHeaderEnv must name an environment variable`);
+  }
+  if (!intakeJql) throw new Error(`${path} jira.intakeJql must be non-empty`);
+  if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(approvalFieldId)) {
+    throw new Error(`${path} jira.approvalFieldId must be a Jira field ID`);
+  }
+  return { apiBaseUrl: base.toString().replace(/\/$/, ""), authHeaderEnv, intakeJql, approvalFieldId };
+}
+
+function loadPromotionStages(value: unknown, path: string): PromotionStage[] {
+  if (!Array.isArray(value)) throw new Error(`${path} promotionStages must be a list`);
+  const ids = new Set<string>();
+  const targets = new Set<string>();
+  let shipStageSeen = false;
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`${path} promotionStages[${index}] must be an object`);
+    const stage = item as Partial<PromotionStage>;
+    const id = typeof stage.id === "string" ? stage.id.trim() : "";
+    const target = typeof stage.target === "string" ? stage.target.trim() : "";
+    const promoteCommand = typeof stage.promoteCommand === "string" ? stage.promoteCommand.trim() : "";
+    const verifyCommand = typeof stage.verifyCommand === "string" ? stage.verifyCommand.trim() : "";
+    if (!id || !target || !promoteCommand || !verifyCommand || !Array.isArray(stage.repos) ||
+      stage.repos.length === 0 || stage.repos.some((repo) => typeof repo !== "string" || !repo.trim())) {
+      throw new Error(`${path} promotionStages[${index}] needs id, target, commands, and repos`);
+    }
+    if (ids.has(id) || targets.has(target)) throw new Error(`${path} promotion stage IDs and targets must be unique`);
+    ids.add(id);
+    targets.add(target);
+    if (stage.authorization !== "deliver" && stage.authorization !== "ship") {
+      throw new Error(`${path} promotionStages[${index}].authorization must be deliver or ship`);
+    }
+    if (stage.authorization === "ship") {
+      shipStageSeen = true;
+      if (typeof stage.parkSuccess !== "boolean" || typeof stage.writeStatus !== "boolean") {
+        throw new Error(`${path} ship stages require parkSuccess and writeStatus`);
+      }
+    } else if (shipStageSeen) {
+      throw new Error(`${path} deliver stages must precede ship stages`);
+    }
+    if (stage.continueCommand !== undefined &&
+      (typeof stage.continueCommand !== "string" || !stage.continueCommand.trim())) {
+      throw new Error(`${path} promotionStages[${index}].continueCommand must be non-empty`);
+    }
+    if (stage.refs !== undefined && (!stage.refs || typeof stage.refs !== "object" || Array.isArray(stage.refs) ||
+      Object.values(stage.refs).some((refs) => !Array.isArray(refs) || refs.some((ref) => typeof ref !== "string" || !ref.trim())))) {
+      throw new Error(`${path} promotionStages[${index}].refs must map repos to ref lists`);
+    }
+    return {
+      ...stage,
+      id,
+      target,
+      promoteCommand,
+      verifyCommand,
+      repos: stage.repos.map((repo) => repo.trim()),
+    } as PromotionStage;
+  });
 }
 
 function loadTransient(
@@ -366,7 +466,11 @@ function loadDesign(design: DesignSpec | undefined, path: string): DesignSpec | 
 }
 
 export function unblockingStates(pack: ProjectPack): string[] {
-  return [pack.status.dev, pack.status.prod, ...closedStates(pack)];
+  return [
+    pack.status.complete,
+    ...(pack.status.shipped ? [pack.status.shipped] : []),
+    ...closedStates(pack),
+  ];
 }
 
 export function repoByName(pack: ProjectPack, name: string): RepoSpec | undefined {

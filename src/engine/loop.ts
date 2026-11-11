@@ -1,21 +1,15 @@
-import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DEFAULT_JOURNEY_SPEC } from "../../scripts/journey-proof.mjs";
 import { interpretMintOutput, runMintCommand } from "../adapters/github-mint.ts";
 import { noteMint } from "./credential-log.ts";
-import {
-  parseOutcomeLines,
-  shipExitCode,
-  shipSummaryLines,
-  shipSummaryMarkdown,
-  transientReason,
-  transientWaitMs,
-} from "./step-outcome.ts";
-import type { CompareStatus, DesignCheckProbe, FetchLike, ForgeAdapter, ListedPull, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
-import { agentHome, holdStatus, repoByName, unblockingStates, type ProjectPack, type RepoSpec } from "../schema/pack.js";
+import { transientReason, transientWaitMs } from "./step-outcome.ts";
+import type { CompareStatus, DeliveryState, DesignCheckProbe, FetchLike, ForgeAdapter, ListedPull, LinearProgramTracker, StageVerificationReceipt, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
+import { agentHome, holdStatus, repoByName, unblockingStates, workerKeyNames, type ProjectPack, type PromotionStage, type RepoSpec } from "../schema/pack.js";
 import {
   designRepairText,
   designRepo,
@@ -58,7 +52,7 @@ import {
   parseWorkOrder,
   priorRequestBlocksBuild,
   repoNames,
-  type Verdict,
+  type AcceptanceCriterion,
 } from "./packet.js";
 import {
   parseHypothesis,
@@ -67,15 +61,12 @@ import {
   type QualitySample,
 } from "./quality-cause.js";
 import {
-  countOwnerHeals,
   exhaustedFailureType,
   failureTypeForHealKey,
   healCapFor,
-  healExhaustedMarker,
   HealExhaustedError,
   HEAL_EXHAUSTED_LABEL,
   healVerdict,
-  ownerHealMarker,
   ownerHealPrompt,
   shipNoSignature,
   type HealVerdict,
@@ -83,7 +74,7 @@ import {
 
 export type LoopDeps = {
   pack: ProjectPack;
-  tracker: TrackerAdapter;
+  tracker: TrackerAdapter & Partial<LinearProgramTracker>;
   worker: WorkerAdapter;
   forge: ForgeAdapter;
   nowMs?: number;
@@ -114,16 +105,14 @@ export type LoopDeps = {
    */
   pageControl?: { stop: boolean; healed: string[]; verdicts?: Record<string, HealVerdict> };
   /**
-   * Starts the owner edit. Ship sets this so a successful ship does not
-   * construct a coding worker. Sweep uses `worker` when this is absent.
+   * An explicit command may open the same owner edit; sweep otherwise uses
    */
   ownerHeal?: (input: { prompt: string; repoUrl: string; baseRef: string }) => Promise<void | string>;
-  /** Builds the real tracker after a ship step returns no. Success does not call it. */
-  openTracker?: () => TrackerAdapter;
   /** Runs `qualityCommand` when `check` is `command`. Default runs it in the checkout. */
   runCommand?: (
     command: string,
     cwd: string,
+    env?: NodeJS.ProcessEnv,
   ) => { status: number | null; stdout?: string; stderr?: string };
   /**
    * Figma REST token. `null` means the token is absent. Unset reads
@@ -142,7 +131,8 @@ export type LoopDeps = {
     command: string,
     cwd: string,
     stdin: string,
-  ) => { status: number | null; stdout: string };
+    env?: NodeJS.ProcessEnv,
+  ) => { status: number | null; stdout: string; stderr?: string };
   /**
    * Second read of a red SHA, the trunk tip, and whether the worker image
    * matches the workflow. Null fields mean this install did not measure them.
@@ -184,6 +174,60 @@ export type LoopDeps = {
   engineLog?: (line: string) => void;
 };
 
+const deliveryStateCache = new WeakMap<LoopDeps, Map<string, DeliveryState>>();
+
+async function readDeliveryState(deps: LoopDeps, ticket: Ticket): Promise<DeliveryState> {
+  let states = deliveryStateCache.get(deps);
+  if (!states) deliveryStateCache.set(deps, (states = new Map()));
+  const cached = states.get(ticket.identifier);
+  if (cached) return cached;
+  const stored = await deps.tracker.stateStore.readDeliveryState(ticket.identifier);
+  const workOrder = stored.markers.find((marker) => marker.kind === "work-order");
+  let savedRevision: string | null = null;
+  if (workOrder) {
+    try {
+      const parsed: unknown = JSON.parse(workOrder.body);
+      if (parsed !== null && typeof parsed === "object" && "criteriaRevision" in parsed && typeof parsed.criteriaRevision === "string") {
+        savedRevision = parsed.criteriaRevision;
+      }
+    } catch {
+      savedRevision = null;
+    }
+  }
+  const staleWorkOrder = Boolean(workOrder && savedRevision !== ticket.criteriaRevision);
+  const markers = staleWorkOrder
+    ? stored.markers.filter((marker) => !["work-order", "land-resume", "landed-commits", "proof-receipt", "active-promotion-stage"].includes(marker.kind))
+    : stored.markers;
+  const stageReceipts = stored.stageReceipts.filter((receipt) => receipt.criteriaRevision === ticket.criteriaRevision);
+  const changed = staleWorkOrder || stageReceipts.length !== stored.stageReceipts.length;
+  const state: DeliveryState = changed ? { ...stored, markers, stageReceipts } : stored;
+  if (changed) await deps.tracker.stateStore.writeDeliveryState(ticket.identifier, state);
+  states.set(ticket.identifier, state);
+  return state;
+}
+
+async function writeDeliveryState(deps: LoopDeps, ticket: Ticket, state: DeliveryState): Promise<void> {
+  await deps.tracker.stateStore.writeDeliveryState(ticket.identifier, state);
+  deliveryStateCache.get(deps)?.set(ticket.identifier, state);
+}
+
+async function writeMarker(deps: LoopDeps, ticket: Ticket, kind: string, body: string): Promise<void> {
+  const state = await readDeliveryState(deps, ticket);
+  const markers = state.markers.filter((marker) => marker.kind !== kind);
+  markers.push({ kind, body, createdAt: new Date(deps.nowMs ?? Date.now()).toISOString() });
+  await writeDeliveryState(deps, ticket, { ...state, markers });
+}
+
+async function removeMarker(deps: LoopDeps, ticket: Ticket, kind: string): Promise<void> {
+  const state = await readDeliveryState(deps, ticket);
+  const markers = state.markers.filter((marker) => marker.kind !== kind);
+  if (markers.length !== state.markers.length) await writeDeliveryState(deps, ticket, { ...state, markers });
+}
+
+function visibleComments(ticket: Ticket): Ticket["comments"] {
+  return ticket.comments.filter(({ body }) => !/<!--\s*delivery-loop-state:v2:/i.test(body));
+}
+
 /** ground, build, and land are in progress. done is the ticket result. */
 export type TicketProgress =
   | { identifier: string; phase: "ground" | "build" | "land" }
@@ -193,6 +237,26 @@ export type TicketProgress =
       outcome: TicketResult["outcome"];
       detail: string;
     };
+export type EligibilityResult = {
+  outcome: "eligible" | "blocked" | "already-complete";
+  reasonCode: string;
+  reason: string;
+};
+
+type PolicyResult = EligibilityResult | {
+  outcome: "policy-error";
+  reasonCode: "policy-error";
+  reason: string;
+};
+
+type EligibilityAuditResult = { identifier: string } & PolicyResult;
+class EligibilityGateError extends Error {
+  constructor(readonly decision: PolicyResult) {
+    super(`${decision.reasonCode}: ${decision.reason}`);
+  }
+}
+
+
 
 export type TicketResult = {
   identifier: string;
@@ -215,8 +279,12 @@ export type TicketResult = {
     | "journey-missing"
     | "worker-failed"
     | "worker-running"
-    | "heal-exhausted";
+    | "heal-exhausted"
+    | "blocked"
+    | "already-complete"
+    | "policy-error";
   detail: string;
+  reasonCode?: string;
 };
 
 const PROGRESS_DETAIL_MAX = 200;
@@ -276,7 +344,7 @@ async function noteLiveRun(
   const token = leaseRunToken(runId);
   if (token === "pending") return;
   const now = deps.nowMs ?? Date.now();
-  await deps.tracker.comment(ticket.identifier, leaseComment(now, phase, token));
+  await writeMarker(deps, ticket, "delivery-lease", leaseMarkerBody(now, phase, token));
 }
 
 /** 401 and 403 from the forge. Message text is not a signal. */
@@ -286,21 +354,21 @@ export function ownerOnlyLandFailure(error: unknown): boolean {
   return status === 401 || status === 403;
 }
 
-function leaseComment(nowMs: number, phase: string, runId: string): string {
-  const expires = new Date(nowMs + DELIVERY_LEASE_TTL_MS).toISOString();
+function leaseMarkerBody(nowMs: number, phase: string, runId: string): string {
   const gha = process.env.GITHUB_RUN_ID?.trim() ?? "";
-  const ghaAttr = /^\d+$/.test(gha) ? ` gha_run=${gha}` : "";
-  return `<!-- DELIVERY_LEASE expires=${expires}${ghaAttr} cursor_run=${runId} cursor_phase=${phase} -->`;
+  return JSON.stringify({
+    schemaVersion: 2,
+    expiresAt: new Date(nowMs + DELIVERY_LEASE_TTL_MS).toISOString(),
+    ghaRunId: /^\d+$/.test(gha) ? gha : null,
+    cursorAgentId: /^bc-[a-z0-9-]+$/i.test(runId) ? runId : null,
+    cursorRunId: runId,
+    cursorPhase: phase,
+  });
 }
 
-const RELEASE_LEASE = "<!-- DELIVERY_LEASE released=1 -->";
+const RELEASE_LEASE = JSON.stringify({ schemaVersion: 2, released: true });
 
-/**
- * A `cursor_run=pending` stamp is the placeholder written before a child
- * exists. With no Actions run id there is nothing to join, so the parent
- * that wrote it is already gone. A real run id without `gha_run` stays
- * fail-closed until `expires`.
- */
+/** A pending run id is the placeholder written before a child exists. */
 function previousOwnerActive(
   stamp: DeliveryLeaseStamp,
   deps: LoopDeps,
@@ -355,6 +423,15 @@ const GENERIC_GROUND = [
   "GROUNDING_HANDOFF -->",
 ].join("\n");
 
+function criteriaMatrix(criteria: readonly AcceptanceCriterion[]): string {
+  return [
+    "## Acceptance criteria",
+    "| ID | Text | Source |",
+    "| --- | --- | --- |",
+    ...criteria.map(({ id, text, source }) => `| ${id} | ${text.replaceAll("|", "\\|")} | ${source.replaceAll("|", "\\|")} |`),
+  ].join("\n");
+}
+
 function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
   const cwd = deps.cwd ?? process.cwd();
   const docs = listedDocs(cwd, deps.pack.prompts?.ground);
@@ -366,25 +443,27 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     ticket.body,
     "",
     "## Existing comments",
-    formatGroundingCommentSample(ticket.comments),
+    formatGroundingCommentSample(visibleComments(ticket)),
     "",
     "This send is for this issue only. Do not edit files. Do not call the tracker.",
     "Follow the documents above. A verdict is a VERDICT: or **Verdict:** line.",
     "When the verdict is BUILDABLE, put the work order under BUILD_PACKET: inside the handoff.",
     "The invariant id is a heading in the invariants file, or `prefix/slug` from a heading file the install lists.",
     "One **Decision:** sentence that cites that id. **Symbols:** `repo/path#symbol`. **Repos:** in backticks, and only names from the land-repo list.",
+    "Normalize every acceptance criterion into one table with stable unique IDs, exact criterion text, and its source. Preserve every distinct requirement from the ticket and linked evidence.",
+    "The work order's Acceptance criteria table is authoritative. Build and stage verification reuse the same IDs and text.",
     "Every BUILDABLE handoff includes **Prior request:** none | kept | replaced <id> | ask.",
     "none means no written rule asked for the current behavior. kept means one did and this ticket keeps it. replaced names the ticket this one undoes. ask means a rule asked for the current behavior and this ticket does not undo it. The runner records ask as kept.",
     "A missing line, or replaced without a ticket id, stays in intake. ask does not. With no symbols, ask closes the ticket as already done. With symbols, the same land path continues. The verdict stays BUILDABLE.",
     "Look only at the install's invariant and decision documents and at commit subjects that already name a ticket. No sentence means none.",
     "Every BUILDABLE handoff includes **Outside grant:** none | open.",
     "none means the done-state is code this repository can land.",
-    "open means the done-state is a vendor approval, an account only a person can create, or an engine this repository does not own. Build the code this repository owns. The runner will not mark that ticket dev-done, so anything blocked by it stays blocked.",
+    "open means that anything blocked by the external grant remains incomplete. The runner will not mark the ticket complete; build the code this repository owns.",
     "A missing line stays in intake. Reading a vendor's documentation is not the grant.",
     "Every BUILDABLE handoff includes **Journey evidence:** recorded | not-applicable | blocked.",
     "not-applicable means the done-state is not a journey a person walks.",
     `recorded means it is. Web proof is **Journey proof:** an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. Mobile proof is **Journey proof:** a route test on the merged commit, \`repo/path_test.dart\` or \`repo/path.test.ts\`, whose path matches \`${deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC}\`. A sentence that names no token is not proof. A spec outside that pattern stays in intake.`,
-    "blocked means that proof cannot be produced in this run. A missing line or blocked stays in intake and does not mark dev-done.",
+    "blocked means that proof cannot be produced in this run. A missing line or blocked stays in intake and does not mark the ticket complete.",
     `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
     landRepoLine(deps.pack),
     designPromptLines(ticket, deps),
@@ -425,11 +504,12 @@ function buildPrompt(
     programBlock(ticket, deps, "build"),
     `Implement only this work order for ${ticket.identifier}.`,
     orderText,
+    `Acceptance matrix for implementation:\n${criteriaMatrix(parseWorkOrder(orderText)?.criteria ?? [])}`,
     branches.length
       ? `Push these branches from each repo trunk: ${branches.join(", ")}. Include repo and branch in the handoff. Do not merge.`
       : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
     "Stay inside the allowlist. Run the validation commands.",
-    "When the handoff says **Journey evidence:** recorded, the pack journey command prints **Journey proof:**. A web token is an https recording or screenshot URL. A mobile token is the route test on the commit whose path matches the journey-spec pattern. The author does not write that token. The runner does not mark dev-done without it.",
+    "When the handoff says **Journey evidence:** recorded, the pack journey command prints **Journey proof:**. A web token is an https recording or screenshot URL. A mobile token is the route test on the commit whose path matches the journey-spec pattern. The author does not write that token. The runner does not mark the ticket complete without it.",
     retry,
   ].filter((part) => part.length > 0).join("\n\n");
 }
@@ -511,8 +591,9 @@ function conflictPrompt(
   ].filter((part) => part.length > 0).join("\n\n");
 }
 
-function commentBodies(ticket: Ticket): string[] {
-  return ticket.comments.map((comment) => comment.body);
+function commentBodies(ticket: Ticket, deps: LoopDeps): string[] {
+  const persisted = deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers.map(({ body }) => body) ?? [];
+  return [...visibleComments(ticket).map(({ body }) => body), ...persisted];
 }
 
 function programBlock(ticket: Ticket, deps: LoopDeps, phase: "ground" | "build"): string {
@@ -522,7 +603,8 @@ function programBlock(ticket: Ticket, deps: LoopDeps, phase: "ground" | "build")
     unblocking: unblockingStates(deps.pack),
     backlog: deps.pack.status.backlog ?? null,
     hold: holdStatus(deps.pack),
-    dev: deps.pack.status.dev,
+    complete: deps.pack.status.complete,
+    shipped: deps.pack.status.shipped ?? null,
     intake: deps.pack.status.intake,
   };
   const slice = currentProgramSlice(compiled.program, compiled.states, new Set(), board);
@@ -641,12 +723,87 @@ async function finishWorker(worker: WorkerAdapter, runId: string) {
   return joined;
 }
 
+function policyError(reason: string): PolicyResult {
+  return { outcome: "policy-error", reasonCode: "policy-error", reason };
+}
+
+function parseEligibilityResult(stdout: string): EligibilityResult {
+  const value: unknown = JSON.parse(stdout);
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("invalid result");
+  }
+  const result = value as Record<string, unknown>;
+  const keys = Object.keys(result).sort();
+  if (keys.length !== 3 || keys[0] !== "outcome" || keys[1] !== "reason" || keys[2] !== "reasonCode" ||
+    !["eligible", "blocked", "already-complete"].includes(String(result.outcome)) ||
+    typeof result.reasonCode !== "string" || !result.reasonCode.trim() ||
+    typeof result.reason !== "string" || !result.reason.trim()) {
+    throw new Error("invalid result");
+  }
+  return {
+    outcome: result.outcome as EligibilityResult["outcome"],
+    reasonCode: result.reasonCode.trim(),
+    reason: result.reason.trim(),
+  };
+}
+
+function checkEligibility(
+  deps: Pick<LoopDeps, "pack" | "cwd" | "runPackCommand">,
+  ticket: Ticket,
+): PolicyResult {
+  if (deps.pack.eligibility.mode === "none") {
+    return {
+      outcome: "eligible",
+      reasonCode: "explicit-none",
+      reason: "Eligibility policy is explicitly disabled by the project pack.",
+    };
+  }
+  if (ticket.issueType === undefined || ticket.assigneeId === undefined ||
+    !ticket.fieldValues || typeof ticket.fieldValues !== "object" || Array.isArray(ticket.fieldValues) ||
+    !Array.isArray(ticket.attachments) || typeof ticket.criteriaRevision !== "string") {
+    return policyError("Eligibility requires a normalized ticket.");
+  }
+  try {
+    const command = deps.pack.eligibility.command.trim();
+    if (!command) return policyError("Eligibility command is missing.");
+    const run = deps.runPackCommand ?? defaultRunPackCommand;
+    const result = run(command, deps.cwd ?? process.cwd(), `${JSON.stringify(ticket)}\n`, commandEnvironment(deps.pack));
+    if (result.status !== 0) {
+      return policyError(`Eligibility command exited with status ${result.status ?? "unknown"}.`);
+    }
+    return parseEligibilityResult(result.stdout);
+  } catch {
+    return policyError("Eligibility command returned an invalid result or could not be run.");
+  }
+}
+
 export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResult> {
+  const eligibility = checkEligibility(deps, ticket);
+  if (eligibility.outcome !== "eligible") {
+    const result: TicketResult = {
+      identifier: ticket.identifier,
+      outcome: eligibility.outcome,
+      detail: eligibility.reason,
+      reasonCode: eligibility.reasonCode,
+    };
+    noteDone(deps, result);
+    return result;
+  }
   try {
     const result = await executeTicket(deps, ticket);
     noteDone(deps, result);
     return result;
   } catch (error) {
+    if (error instanceof EligibilityGateError) {
+      const result: TicketResult = {
+        identifier: ticket.identifier,
+        outcome: error.decision.outcome,
+        detail: error.decision.reason,
+        reasonCode: error.decision.reasonCode,
+      };
+      noteDone(deps, result);
+      return result;
+    }
     if (error instanceof HealExhaustedError) {
       const result: TicketResult = {
         identifier: ticket.identifier,
@@ -661,11 +818,6 @@ export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketR
 }
 
 async function markHealExhausted(deps: LoopDeps, ticket: Ticket, type: string): Promise<void> {
-  if (!exhaustedFailureType(ticket)) {
-    const body = healExhaustedMarker(type);
-    await deps.tracker.comment(ticket.identifier, body);
-    ticket.comments = [...ticket.comments, { body }];
-  }
   const labels = new Set(ticket.labels.map((label) => label.toLowerCase()));
   if (!labels.has(HEAL_EXHAUSTED_LABEL)) {
     await deps.tracker.addLabel(ticket.identifier, HEAL_EXHAUSTED_LABEL);
@@ -675,10 +827,16 @@ async function markHealExhausted(deps: LoopDeps, ticket: Ticket, type: string): 
     await deps.tracker.addLabel(ticket.identifier, type);
     ticket.labels = [...ticket.labels, type];
   }
+  if (!deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers.some((marker) => marker.kind === "heal-exhausted")) {
+    await writeMarker(deps, ticket, "heal-exhausted", type);
+  }
 }
 
 async function executeTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResult> {
-  const exhausted = exhaustedFailureType(ticket);
+
+  deliveryStateCache.delete(deps);
+  await readDeliveryState(deps, ticket);
+  const exhausted = exhaustedFailureType({ labels: ticket.labels });
   if (exhausted) {
     await markHealExhausted(deps, ticket, exhausted);
     return { identifier: ticket.identifier, outcome: "heal-exhausted", detail: exhausted };
@@ -705,7 +863,8 @@ async function executeTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResu
     };
   }
 
-  const lease = latestDeliveryLeaseStamp(commentBodies(ticket));
+  const leaseMarkers = deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers.filter((marker) => marker.kind === "delivery-lease") ?? [];
+  const lease = latestDeliveryLeaseStamp(leaseMarkers);
   if (leaseIsHeld(lease, now, deps)) {
     return { identifier: ticket.identifier, outcome: "skipped-lease", detail: "lease held" };
   }
@@ -722,11 +881,11 @@ async function executeTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResu
       return { identifier: ticket.identifier, outcome: "worker-running", detail: lease.cursorRunId };
     }
   }
-  await deps.tracker.comment(ticket.identifier, leaseComment(now, "ground", "pending"));
+  await writeMarker(deps, ticket, "delivery-lease", leaseMarkerBody(now, "ground", "pending"));
   try {
     return await runHeldTicket(deps, ticket, home);
   } finally {
-    await deps.tracker.comment(ticket.identifier, RELEASE_LEASE).catch(() => undefined);
+    await writeMarker(deps, ticket, "delivery-lease", RELEASE_LEASE).catch(() => undefined);
   }
 }
 
@@ -737,16 +896,11 @@ async function runHeldTicket(
 ): Promise<TicketResult> {
   const credential = await stopForMissingFigmaToken(deps, ticket);
   if (credential) return credential;
-  const marker = latestLandMarker(ticket.comments);
-  if (marker?.kind === "ship" || marker?.kind === "empty") {
-    const resumed = await resumeMarkedLand(deps, ticket);
-    if (resumed) return resumed;
-  } else {
-    const existing = await resumeExistingPulls(deps, ticket);
-    if (existing) return existing;
-    const resumed = await resumeMarkedLand(deps, ticket);
-    if (resumed) return resumed;
-  }
+  const marker = deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers.find((item) => item.kind === "land-resume")?.body ?? null;
+  const resumed = await resumeMarkedLand(deps, ticket, marker);
+  if (resumed) return resumed;
+  const existing = await resumeExistingPulls(deps, ticket);
+  if (existing) return existing;
   let ground;
   noteTicket(deps, { identifier: ticket.identifier, phase: "ground" });
   try {
@@ -786,9 +940,8 @@ async function runHeldTicket(
       const parked = parkStateForVerdict({
         verdict,
         text: ground.text,
-        priorComments: commentBodies(ticket),
-        devStatus: deps.pack.status.dev,
-        holdStatus: holdStatus(deps.pack),
+        priorComments: commentBodies(ticket, deps),
+        devStatus: deps.pack.status.complete,
         trunkCommit: verdict === "ALREADY SHIPPED" ? trunkCommitFlag(commits) : null,
         journeyProven:
           verdict === "ALREADY SHIPPED"
@@ -801,7 +954,8 @@ async function runHeldTicket(
               )
             : null,
       });
-      if (parked === deps.pack.status.dev && commits && commits.length > 0) {
+      if (parked === deps.pack.status.complete && commits && commits.length > 0) {
+        await writeMarker(deps, ticket, "work-order", JSON.stringify({ ground: ground.text, receipt: ground.text, criteriaRevision: ticket.criteriaRevision }));
         return settleTrunk(
           deps,
           ticket,
@@ -812,7 +966,7 @@ async function runHeldTicket(
           ground.text,
         );
       }
-      if (parked) await deps.tracker.setState(ticket.identifier, parked);
+      if (parked) await deps.tracker.setState(ticket.identifier, parked, ticket.criteriaRevision);
     }
     return {
       identifier: ticket.identifier,
@@ -856,9 +1010,12 @@ async function runHeldTicket(
       "**Prior request:** kept. A written rule already asked for the current behavior.",
     );
     if (!preview || preview.symbols.length === 0) {
-      const onTrunk = trunkCommitFlag(trunkTicketCommits(deps, ticket.identifier, ground.text));
-      const done = onTrunk === true ? deps.pack.status.dev : "Canceled";
-      await deps.tracker.setState(ticket.identifier, done);
+      const commits = trunkTicketCommits(deps, ticket.identifier, ground.text);
+      if (commits && commits.length > 0) {
+        await writeMarker(deps, ticket, "work-order", JSON.stringify({ ground: ground.text, receipt: ground.text, criteriaRevision: ticket.criteriaRevision }));
+        return settleTrunk(deps, ticket, false, commits, "prior request already on trunk", ground.text, ground.text);
+      }
+      await deps.tracker.setState(ticket.identifier, "Canceled", ticket.criteriaRevision);
       return { identifier: ticket.identifier, outcome: "verdict", detail: "prior-request-kept" };
     }
   }
@@ -932,7 +1089,8 @@ async function runHeldTicket(
     };
   }
 
-  await deps.tracker.comment(ticket.identifier, ground.text);
+  await writeMarker(deps, ticket, "work-order", JSON.stringify({ ground: ground.text, receipt: "", criteriaRevision: ticket.criteriaRevision }));
+  if (deps.tracker.kind !== "jira") await deps.tracker.comment(ticket.identifier, ground.text);
   if (deps.until === "ground") {
     return {
       identifier: ticket.identifier,
@@ -956,7 +1114,7 @@ async function runHeldTicket(
     : null;
   let retry = "";
   let builtReceipt = "";
-  if (landings) {
+  if (landings && deps.pack.landingStrategy === "pull-request") {
     const probes = await Promise.all(
       landings.map(async (landing) => ({
         landing,
@@ -999,6 +1157,7 @@ async function runHeldTicket(
         };
       }
       builtReceipt = built.text;
+      await writeMarker(deps, ticket, "work-order", JSON.stringify({ ground: ground.text, receipt: builtReceipt, criteriaRevision: ticket.criteriaRevision }));
     } catch (error) {
       return {
         identifier: ticket.identifier,
@@ -1022,6 +1181,11 @@ async function runHeldTicket(
     if (!landings) {
       return { identifier: ticket.identifier, outcome: "worker-failed", detail: "no branch" };
     }
+  }
+  if (deps.pack.landingStrategy === "fast-forward") {
+    const landed = await landFastForward(deps, ticket, landings, grant === "open", ground.text, builtReceipt);
+    if (!Array.isArray(landed)) return landed;
+    return finishMerged(deps, ticket, grant === "open", landed, ground.text, builtReceipt);
   }
 
   const opened: OpenPull[] = [];
@@ -1061,7 +1225,7 @@ async function runHeldTicket(
     });
   }
   if (opened.length === 0) {
-    await deps.tracker.comment(ticket.identifier, landEmptyMarker(empty));
+    await writeMarker(deps, ticket, "land-resume", JSON.stringify({ kind: "empty", hold: false, rows: empty, declared: ground.text, receipt: builtReceipt } satisfies LandResume));
     return {
       identifier: ticket.identifier,
       outcome: "land-empty",
@@ -1153,32 +1317,10 @@ function deployRefContains(deps: LoopDeps, repo: RepoSpec, ref: string, sha: str
   );
 }
 
-function devCommands(
-  pack: ProjectPack,
-  landed: { name: string; sha: string }[],
-  contains: (name: string, ref: string, sha: string) => boolean,
-): string[] {
-  const promote = pack.dev?.promote;
-  if (promote?.command) {
-    const allowed = new Set(promote.repos ?? []);
-    const seen = new Set<string>();
-    const commands: string[] = [];
-    for (const row of landed) {
-      if (!allowed.has(row.name) || seen.has(row.name)) continue;
-      const refs = promote.refs?.[row.name] ?? [];
-      if (refs.length > 0 && row.sha && refs.every((ref) => contains(row.name, ref, row.sha))) continue;
-      seen.add(row.name);
-      commands.push(promote.command.replaceAll("{repo}", row.name));
-    }
-    return commands;
-  }
-  return pack.dev?.steps ?? [];
-}
 
-const PROOF_RECEIPT_MARKER = "<!-- PROOF_RECEIPT -->";
 
 function proofReceiptBody(receipt: string, rows: { sha: string; url?: string }[]): string {
-  const lines = [PROOF_RECEIPT_MARKER, "Validated proof receipt for the merged commit."];
+  const lines = ["Validated proof receipt for the merged commit."];
   for (const row of rows) {
     const sha = row.sha.trim();
     const url = row.url?.trim() ?? "";
@@ -1190,123 +1332,62 @@ function proofReceiptBody(receipt: string, rows: { sha: string; url?: string }[]
   return lines.join("\n");
 }
 
-function publishedProofReceipt(comments: { body: string }[]): string | null {
-  for (let i = comments.length - 1; i >= 0; i--) {
-    const body = comments[i]?.body ?? "";
-    if (body.includes(PROOF_RECEIPT_MARKER)) return body;
-  }
-  return null;
+function publishedProofReceipt(deps: LoopDeps, ticket: Ticket): string | null {
+  return deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers.find((marker) => marker.kind === "proof-receipt")?.body ?? null;
 }
 
-/**
- * One proof comment before the dev status. A resume that already has the
- * comment keeps it. A tracker write failure throws, like the other writes.
- */
 async function publishProofReceipt(
   deps: LoopDeps,
   ticket: Ticket,
   proof: { receipt: string; rows: { sha: string; url?: string }[] } | null,
 ): Promise<void> {
-  if (publishedProofReceipt(ticket.comments)) return;
-  if (!proof?.receipt.trim()) return;
-  const body = proofReceiptBody(proof.receipt, proof.rows);
-  await deps.tracker.comment(ticket.identifier, body);
-  ticket.comments = [...ticket.comments, { body }];
+  if (publishedProofReceipt(deps, ticket) || !proof?.receipt.trim()) return;
+  await writeMarker(deps, ticket, "proof-receipt", proofReceiptBody(proof.receipt, proof.rows));
 }
 
-function landWaitMarker(
-  hold: boolean,
-  rows: { repo: string; sha: string }[],
-  receipt = "",
-): string {
-  const lines: string[] = [];
-  const saved = receipt.trim();
-  if (saved) lines.push(saved);
-  lines.push("<!-- LAND_WAIT", `hold=${hold ? "1" : "0"}`);
-  for (const row of rows) lines.push(`${row.repo} ${row.sha}`);
-  lines.push("-->");
-  return lines.join("\n");
-}
-
-/** Build receipt saved ahead of the land-wait marker. A resume reads the same text. */
-function savedLandReceipt(body: string): string {
-  const at = body.lastIndexOf("<!-- LAND_WAIT");
-  if (at <= 0) return "";
-  return body.slice(0, at).trim();
-}
-
-/** Ground text and build receipt for a land that is already marked. */
-function resumeProofTexts(comments: { body: string }[]): { declared: string; receipt: string } {
-  const published = publishedProofReceipt(comments) ?? "";
-  let saved = "";
-  let declared = "";
-  for (let i = comments.length - 1; i >= 0; i--) {
-    const body = comments[i]?.body ?? "";
-    if (!saved && body.includes("<!-- LAND_WAIT")) saved = savedLandReceipt(body);
-    if (!declared && !body.includes("<!-- LAND_WAIT") && body !== published && parseJourneyEvidence(body)) {
-      declared = body;
+function resumeProofTexts(deps: LoopDeps, ticket: Ticket): { declared: string; receipt: string } {
+  const body = deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers.find((marker) => marker.kind === "work-order")?.body;
+  let ground = "";
+  let buildReceipt = "";
+  try {
+    const parsed: unknown = body ? JSON.parse(body) : null;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) &&
+      "criteriaRevision" in parsed && parsed.criteriaRevision === ticket.criteriaRevision &&
+      "ground" in parsed && typeof parsed.ground === "string" &&
+      "receipt" in parsed && typeof parsed.receipt === "string") {
+      ground = parsed.ground;
+      buildReceipt = parsed.receipt;
     }
+  } catch {
+    ground = "";
+    buildReceipt = "";
   }
-  const receipt = [saved, published].filter(Boolean).join("\n");
-  return { declared: declared || receipt, receipt };
+  const receipt = [buildReceipt, publishedProofReceipt(deps, ticket) ?? ""].filter(Boolean).join("\n");
+  return { declared: ground, receipt };
 }
 
-function landEmptyMarker(rows: { repo: string; sha: string }[]): string {
-  const lines = ["<!-- LAND_EMPTY"];
-  for (const row of rows) lines.push(`${row.repo} ${row.sha}`);
-  lines.push("-->");
-  return lines.join("\n");
-}
+type LandResume = {
+  kind: "wait" | "empty";
+  hold: boolean;
+  rows: { repo: string; sha: string }[];
+  declared: string;
+  receipt: string;
+};
 
-function shipWaitMarker(hold: boolean, rows: { repo: string; sha: string }[]): string {
-  const lines = ["<!-- SHIP_WAIT", `hold=${hold ? "1" : "0"}`];
-  for (const row of rows) lines.push(`${row.repo} ${row.sha}`);
-  lines.push("-->");
-  return lines.join("\n");
-}
-
-type LandMarker =
-  | { kind: "wait"; hold: boolean; rows: { repo: string; sha: string }[] }
-  | { kind: "empty"; rows: { repo: string; sha: string }[] }
-  | { kind: "ship"; hold: boolean; rows: { repo: string; sha: string }[] };
-
-function markerRows(body: string): { hold: boolean; rows: { repo: string; sha: string }[] } {
-  let hold = false;
-  const rows: { repo: string; sha: string }[] = [];
-  for (const line of body.split("\n").slice(1)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("-->") || trimmed.startsWith("<!--")) break;
-    const holdLine = /^hold=([01])$/.exec(trimmed);
-    if (holdLine) {
-      hold = holdLine[1] === "1";
-      continue;
-    }
-    const [repo, sha] = trimmed.split(/\s+/);
-    if (repo && sha) rows.push({ repo, sha });
+function parseLandResume(body: string | null): LandResume | null {
+  if (!body) return null;
+  try {
+    const value: unknown = JSON.parse(body);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const marker = value as Record<string, unknown>;
+    if ((marker.kind !== "wait" && marker.kind !== "empty") || typeof marker.hold !== "boolean" ||
+      !Array.isArray(marker.rows) || !marker.rows.every((row) => row && typeof row === "object" &&
+        typeof (row as Record<string, unknown>).repo === "string" && typeof (row as Record<string, unknown>).sha === "string") ||
+      typeof marker.declared !== "string" || typeof marker.receipt !== "string") return null;
+    return marker as unknown as LandResume;
+  } catch {
+    return null;
   }
-  return { hold, rows };
-}
-
-/** Latest machine marker wins. Comments are oldest first. */
-export function latestLandMarker(comments: { body: string }[]): LandMarker | null {
-  for (let i = comments.length - 1; i >= 0; i--) {
-    const body = comments[i]?.body ?? "";
-    const shipAt = body.lastIndexOf("SHIP_WAIT");
-    const waitAt = body.lastIndexOf("LAND_WAIT");
-    const emptyAt = body.lastIndexOf("LAND_EMPTY");
-    const latest = Math.max(shipAt, waitAt, emptyAt);
-    if (latest < 0) continue;
-    if (latest === shipAt) {
-      const parsed = markerRows(body.slice(shipAt));
-      return { kind: "ship", hold: parsed.hold, rows: parsed.rows };
-    }
-    if (latest === waitAt) {
-      const parsed = markerRows(body.slice(waitAt));
-      return { kind: "wait", hold: parsed.hold, rows: parsed.rows };
-    }
-    return { kind: "empty", rows: markerRows(body.slice(emptyAt)).rows };
-  }
-  return null;
 }
 
 type CommandOutput = { status: number | null; stdout?: string; stderr?: string; output: string };
@@ -1342,29 +1423,166 @@ async function runWithTransient<T extends { status: number | null; output: strin
   }
 }
 
-export async function runDevCommands(
-  deps: LoopDeps,
-  commands: string[],
-  kind: "promote" | "ship" | "dev",
-): Promise<{ failed: string | null; output: string }> {
-  const cwd = deps.cwd ?? process.cwd();
-  const run = deps.runCommand ?? defaultRunCommand;
-  let output = "";
-  for (const command of commands) {
-    let result: { status: number | null; output: string };
-    try {
-      result = await runWithTransient(deps, async () =>
-        commandOutput(run(command, cwd)),
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return { failed: `${command} ${message}`, output };
-    }
-    output = `${output}\n${result.output}`;
-    if (result.status !== 0) return { failed: command, output };
-    noteEngine(deps, `${kind} ok`);
+
+type StageRun =
+  | { outcome: "complete" }
+  | { outcome: "blocked" | "parked" | "failed"; stage: PromotionStage; reason: string };
+
+function validateStageReceipt(
+  value: unknown,
+  stage: PromotionStage,
+  ticket: Ticket,
+  landed: { repo: string; sha: string }[],
+  criteria: readonly AcceptanceCriterion[],
+): StageVerificationReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid receipt");
+  const receipt = value as Record<string, unknown>;
+  const expectedKeys = ["criteria", "criteriaRevision", "deployed", "outcome", "reason", "stageId", "target"];
+  if (Object.keys(receipt).sort().join("|") !== expectedKeys.join("|")) throw new Error("invalid receipt fields");
+  if (receipt.stageId !== stage.id || receipt.target !== stage.target || receipt.criteriaRevision !== ticket.criteriaRevision) {
+    throw new Error("receipt stage, target, or criteria revision does not match");
   }
-  return { failed: null, output };
+  if (!["passed", "blocked", "parked"].includes(String(receipt.outcome)) || typeof receipt.reason !== "string") {
+    throw new Error("invalid receipt outcome");
+  }
+  if (receipt.outcome !== "passed" && !receipt.reason.trim()) throw new Error("blocked and parked receipts require a reason");
+  if (!Array.isArray(receipt.deployed) || !Array.isArray(receipt.criteria)) throw new Error("invalid receipt arrays");
+  const deployed = receipt.deployed as unknown[];
+  const expectedDeployed = [...landed].sort((a, b) => a.repo.localeCompare(b.repo));
+  if (deployed.length !== expectedDeployed.length) throw new Error("receipt deployed SHA set does not match");
+  const seenRepos = new Set<string>();
+  for (let index = 0; index < deployed.length; index += 1) {
+    const row = deployed[index];
+    const expected = expectedDeployed[index];
+    if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error("invalid deployed row");
+    const item = row as Record<string, unknown>;
+    if (Object.keys(item).sort().join("|") !== "repo|sha" || typeof item.repo !== "string" || typeof item.sha !== "string" ||
+      item.repo !== expected?.repo || item.sha !== expected.sha || seenRepos.has(item.repo)) {
+      throw new Error("receipt deployed SHA set does not match");
+    }
+    seenRepos.add(item.repo);
+  }
+  const rows = receipt.criteria as unknown[];
+  if (rows.length !== criteria.length) throw new Error("receipt criteria IDs do not match");
+  const seenIds = new Set<string>();
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const expected = criteria[index];
+    if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error("invalid criterion row");
+    const item = row as Record<string, unknown>;
+    if (Object.keys(item).sort().join("|") !== "evidence|id|outcome" || item.id !== expected?.id ||
+      !["verified", "blocked"].includes(String(item.outcome)) || !Array.isArray(item.evidence) ||
+      !(item.evidence as unknown[]).every((entry) => typeof entry === "string") || seenIds.has(String(item.id))) {
+      throw new Error("receipt criteria IDs or rows do not match");
+    }
+    if (receipt.outcome === "passed" && (item.outcome !== "verified" || (item.evidence as string[]).length === 0)) {
+      throw new Error("passed receipt requires evidence for every criterion");
+    }
+    seenIds.add(String(item.id));
+  }
+  return receipt as unknown as StageVerificationReceipt;
+}
+
+function stageReceiptPasses(
+  receipt: StageVerificationReceipt,
+  stage: PromotionStage,
+  ticket: Ticket,
+  landed: { repo: string; sha: string }[],
+  criteria: readonly AcceptanceCriterion[],
+): boolean {
+  try {
+    return validateStageReceipt(receipt, stage, ticket, landed, criteria).outcome === "passed";
+  } catch {
+    return false;
+  }
+}
+
+async function runStageCommand(
+  deps: LoopDeps,
+  command: string,
+  repo: RepoSpec,
+  input: object,
+): Promise<{ stdout: string; failed: string | null }> {
+  const run = deps.runPackCommand ?? defaultRunPackCommand;
+  try {
+    const result = await runWithTransient(deps, async () => {
+      const value = run(command, repoCheckoutDir(deps.cwd ?? process.cwd(), repo, deps.pack), `${JSON.stringify(input)}\n`, commandEnvironment(deps.pack, true));
+      return { status: value.status, output: `${value.stdout}\n${value.stderr ?? ""}`, stdout: value.stdout };
+    });
+    return result.status === 0
+      ? { stdout: result.stdout, failed: null }
+      : { stdout: result.stdout, failed: `${command} exited ${result.status ?? "unknown"}` };
+  } catch (error) {
+    return { stdout: "", failed: `${command} ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+async function runPromotionStages(
+  deps: LoopDeps,
+  ticket: Ticket,
+  authorization: "deliver" | "ship",
+  landed: { repo: string; sha: string }[],
+  criteria: readonly AcceptanceCriterion[],
+  options: { continueStageId?: string } = {},
+): Promise<StageRun> {
+  const state = await readDeliveryState(deps, ticket);
+  const stages = deps.pack.promotionStages.filter((stage) => stage.authorization === authorization);
+  const allLanded = [...landed].sort((a, b) => a.repo.localeCompare(b.repo));
+  for (const stage of stages) {
+    const old = state.stageReceipts.find((receipt) => receipt.stageId === stage.id);
+    if (old && stageReceiptPasses(old, stage, ticket, allLanded, criteria)) continue;
+    const repos = stage.repos.map((name) => repoByName(deps.pack, name));
+    const missing = stage.repos.filter((name, index) => !repos[index] || !allLanded.some((row) => row.repo === name && row.sha));
+    if (missing.length) return { outcome: "failed", stage, reason: `stage ${stage.id} has no landed SHA for ${missing.join(", ")}` };
+    const active = { stageId: stage.id, target: stage.target, authorization, criteriaRevision: ticket.criteriaRevision };
+    await writeMarker(deps, ticket, "active-promotion-stage", JSON.stringify(active));
+    const current = await readDeliveryState(deps, ticket);
+    if (old) await writeDeliveryState(deps, ticket, { ...current, stageReceipts: current.stageReceipts.filter((receipt) => receipt.stageId !== stage.id) });
+    const command = options.continueStageId === stage.id ? stage.continueCommand : stage.promoteCommand;
+    if (!command) return { outcome: "failed", stage, reason: `stage ${stage.id} has no continueCommand` };
+    for (let index = 0; index < stage.repos.length; index += 1) {
+      const repoName = stage.repos[index]!;
+      const repo = repos[index]!;
+      const source = allLanded.find((row) => row.repo === repoName)!;
+      const refs = stage.refs?.[repoName] ?? [];
+      if (options.continueStageId !== stage.id && refs.length > 0 && refs.every((ref) => deployRefContains(deps, repo, ref, source.sha))) continue;
+      const promoted = await runStageCommand(deps, command, repo, {
+        ticketId: ticket.identifier,
+        stageId: stage.id,
+        target: stage.target,
+        repo: repoName,
+        sourceSha: source.sha,
+      });
+      if (promoted.failed) return { outcome: "failed", stage, reason: promoted.failed };
+      noteEngine(deps, "promote ok");
+    }
+    const verifyRepo = repos[0]!;
+    const verified = await runStageCommand(deps, stage.verifyCommand, verifyRepo, {
+      ticketId: ticket.identifier,
+      stageId: stage.id,
+      target: stage.target,
+      criteriaRevision: ticket.criteriaRevision,
+      landedShas: allLanded,
+      criteria,
+    });
+    if (verified.failed) return { outcome: "failed", stage, reason: verified.failed };
+    let receipt: StageVerificationReceipt;
+    try {
+      const parsed: unknown = JSON.parse(verified.stdout.trim());
+      receipt = validateStageReceipt(parsed, stage, ticket, allLanded, criteria);
+    } catch (error) {
+      return { outcome: "failed", stage, reason: `invalid stage receipt: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    const after = await readDeliveryState(deps, ticket);
+    await writeDeliveryState(deps, ticket, {
+      ...after,
+      stageReceipts: [...after.stageReceipts.filter((item) => item.stageId !== stage.id), receipt],
+    });
+    if (receipt.outcome !== "passed") return { outcome: receipt.outcome, stage, reason: receipt.reason };
+    await removeMarker(deps, ticket, "active-promotion-stage");
+    noteEngine(deps, "verify ok");
+  }
+  return { outcome: "complete" };
 }
 
 function rememberedVerdict(deps: LoopDeps, key: string): HealVerdict | undefined {
@@ -1377,20 +1595,9 @@ function rememberVerdict(deps: LoopDeps, key: string, verdict: HealVerdict): voi
   deps.pageControl.verdicts[key] = verdict;
 }
 
-async function healShipStep(
-  deps: LoopDeps,
-  ticket: Ticket,
-  step: string,
-  mode: "steps" | "continue",
-  tail = "",
-): Promise<HealVerdict> {
-  const signature = shipNoSignature(tail);
-  const key = signature ? `install:${mode}:${step}:${signature}` : `install:${mode}:${step}`;
-  const reason = signature ? `Ship step returned no: ${step}\n${signature}` : `Ship step returned no: ${step}`;
-  return applyOwnerHeal(deps, ticket, key, reason);
-}
+export type ShipRun = { exitCode: number; lines: string[]; parked: boolean };
 
-function refreshShipGithubToken(env: NodeJS.ProcessEnv): boolean {
+function refreshGithubToken(env: NodeJS.ProcessEnv): boolean {
   const command = env.DELIVERY_LOOP_GITHUB_MINT?.trim();
   if (!command) return false;
   const result = runMintCommand(command);
@@ -1406,86 +1613,15 @@ function refreshShipGithubToken(env: NodeJS.ProcessEnv): boolean {
   return true;
 }
 
-function runShipStep(
-  step: string,
-  cwd: string,
-  env: NodeJS.ProcessEnv,
-): Promise<{ status: number | null; tail: string; output: string }> {
-  return new Promise((resolve) => {
-    const child = spawn(step, { shell: true, cwd, env, stdio: ["inherit", "pipe", "pipe"] });
-    const lines: string[] = [];
-    const chunks: string[] = [];
-    const take = (chunk: Buffer, dest: NodeJS.WriteStream) => {
-      dest.write(chunk);
-      const text = chunk.toString("utf8");
-      chunks.push(text);
-      if (chunks.join("").length > 200_000) chunks.splice(0, chunks.length - 20);
-      for (const piece of text.split(/\n/)) {
-        const trimmed = piece.trim();
-        if (!trimmed) continue;
-        lines.push(trimmed);
-        if (lines.length > 30) lines.shift();
-      }
-    };
-    const finish = (status: number | null) =>
-      resolve({ status, tail: lines.slice(-8).join("\n"), output: chunks.join("") });
-    child.stdout?.on("data", (chunk: Buffer) => take(chunk, process.stdout));
-    child.stderr?.on("data", (chunk: Buffer) => take(chunk, process.stderr));
-    child.on("error", () => finish(1));
-    child.on("close", (code) => finish(code));
-  });
-}
-
-/** `--issue <id>`, then any extra arguments, for `DELIVERY_LOOP_SHIP_ARGS`. */
-function shipStepArgs(identifier: string, extraArgs?: string): string {
-  const extra = (extraArgs ?? "").trim();
-  const issue = `--issue ${identifier}`;
-  return extra ? `${issue} ${extra}` : issue;
-}
-
-export type ShipRun = { exitCode: number; lines: string[] };
-
-function publishShipSummary(outcomes: ReturnType<typeof parseOutcomeLines>): string[] {
-  const lines = shipSummaryLines(outcomes);
-  for (const line of lines) console.log(line);
-  const file = process.env.GITHUB_STEP_SUMMARY;
-  if (file) appendFileSync(file, shipSummaryMarkdown(outcomes));
-  return lines;
-}
-
-/** Pass this ticket to the ship step as `--issue <id>`. */
-async function runShipSteps(deps: LoopDeps, identifier: string): Promise<ShipRun & { failed: string | null }> {
-  const previousIssue = process.env.DELIVERY_LOOP_ISSUE;
-  const previousArgs = process.env.DELIVERY_LOOP_SHIP_ARGS;
-  process.env.DELIVERY_LOOP_ISSUE = identifier;
-  process.env.DELIVERY_LOOP_SHIP_ARGS = shipStepArgs(identifier);
-  try {
-    const run = await runDevCommands(deps, deps.pack.ship?.steps ?? [], "ship");
-    const parsed = parseOutcomeLines(run.output);
-    const outcomes =
-      parsed.length === 0 && !run.failed
-        ? [{ ticket: identifier, outcome: "COMPLETE" as const, reason: "" }]
-        : parsed;
-    const exitCode = run.failed ? 1 : shipExitCode(outcomes, deps.pack.ship?.parkSuccess === true);
-    const lines = publishShipSummary(outcomes);
-    if (run.failed) return { failed: run.failed, exitCode, lines };
-    if (exitCode !== 0) return { failed: null, exitCode, lines };
-    return { failed: null, exitCode: 0, lines };
-  } finally {
-    if (previousIssue === undefined) delete process.env.DELIVERY_LOOP_ISSUE;
-    else process.env.DELIVERY_LOOP_ISSUE = previousIssue;
-    if (previousArgs === undefined) delete process.env.DELIVERY_LOOP_SHIP_ARGS;
-    else process.env.DELIVERY_LOOP_SHIP_ARGS = previousArgs;
-  }
-}
 
 function defaultRunPackCommand(
   command: string,
   cwd: string,
   stdin: string,
-): { status: number | null; stdout: string } {
-  const result = spawnSync(command, { shell: true, cwd, input: stdin, encoding: "utf8" });
-  return { status: result.status, stdout: result.stdout ?? "" };
+  env: NodeJS.ProcessEnv,
+): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync(command, { shell: true, cwd, input: stdin, encoding: "utf8", env });
+  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
 /** A symbol command that is unset accepts every line. A failing command does not. */
@@ -1493,7 +1629,7 @@ async function symbolsResolve(deps: LoopDeps, symbols: string[]): Promise<boolea
   const command = deps.pack.symbolsCommand?.trim();
   if (!command || symbols.length === 0) return true;
   const run = deps.runPackCommand ?? defaultRunPackCommand;
-  const result = run(command, deps.cwd ?? process.cwd(), `${symbols.join("\n")}\n`);
+  const result = run(command, deps.cwd ?? process.cwd(), `${symbols.join("\n")}\n`, commandEnvironment(deps.pack));
   return result.status === 0;
 }
 
@@ -1511,7 +1647,7 @@ function journeyCommandProof(deps: LoopDeps, stdin: string): JourneyCommandPrint
   const command = deps.pack.journeyCommand?.trim();
   if (!command) return { ok: true, stdout: "" };
   const run = deps.runPackCommand ?? defaultRunPackCommand;
-  const result = run(command, deps.cwd ?? process.cwd(), stdin);
+  const result = run(command, deps.cwd ?? process.cwd(), stdin, commandEnvironment(deps.pack));
   if (result.status !== 0) return { ok: false, reason: "failed", status: result.status };
   if (parseJourneyProofs(result.stdout, deps.pack.journeySpec).length === 0) {
     return { ok: false, reason: "empty" };
@@ -1552,6 +1688,23 @@ async function trunkQuality(
     },
     { requestRun: false },
   );
+}
+
+async function waitForExactWorkflow(deps: LoopDeps, repo: RepoSpec, sha: string): Promise<QualityWait> {
+  const polls = deps.maxQualityPolls ?? 60;
+  const sleep = deps.sleep ?? ((ms: number) => {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, ms);
+    return promise;
+  });
+  for (let index = 0; index < polls; index += 1) {
+    const probe = await deps.forge.quality({ repoUrl: repo.url, headSha: sha, workflow: deps.pack.qualityWorkflow });
+    if (probe.state === "success" || probe.state === "failure") return { state: probe.state, detail: probe.detail };
+    const remainingMs = pageBudgetRemainingMs({ nowMs: deps.nowMs ?? Date.now(), startedAtMs: deps.pageStartedAtMs ?? null });
+    if (shouldStopForPageReserve({ remainingMs }) || index === polls - 1) return { state: "pending", detail: probe.detail };
+    await sleep(deps.qualityPollMs ?? QUALITY_POLL_MS);
+  }
+  return { state: "pending", detail: "workflow has no result for exact landed SHA" };
 }
 
 async function trunkTip(
@@ -1617,19 +1770,19 @@ function proofFileOnCommit(
   };
 }
 
-/** Deploy refs when the pack names them. Otherwise the repo trunk. */
-function promotedDevRefs(deps: LoopDeps, repoName: string): string[] {
-  const named = deps.pack.dev?.promote?.refs?.[repoName] ?? [];
+/** Promotion refs when configured. Otherwise the repo trunk. */
+function promotionRefs(deps: LoopDeps, repoName: string): string[] {
+  const named = deps.pack.promotionStages
+    .filter((stage) => stage.authorization === "deliver")
+    .flatMap((stage) => stage.refs?.[repoName] ?? []);
   if (named.length > 0) return named;
   const trunk = repoByName(deps.pack, repoName)?.trunk;
   return trunk ? [trunk] : [];
 }
 
-function proofFileOnPromotedDev(
-  deps: LoopDeps,
-): (repo: string, path: string) => boolean {
+function proofFileOnPromotionTarget(deps: LoopDeps): (repo: string, path: string) => boolean {
   return (repo, path) => {
-    const refs = promotedDevRefs(deps, repo);
+    const refs = promotionRefs(deps, repo);
     return refs.length > 0 && refs.every((ref) => journeyFileInCheckout(deps, repo, ref, path));
   };
 }
@@ -1644,10 +1797,10 @@ function proofSatisfies(
 }
 
 /**
- * Recorded journey proof before the dev status. A fresh land and a resume
- * both use this. A proof comment that already proves the journey is reused.
- * When the merged commit does not contain the route test, the promoted dev
- * ref does: `dev.promote.refs` for that repo, or the repo trunk.
+ * Recorded journey proof before completion. A fresh land and a resume both
+ * use this; the state-store proof marker is reused when it already suffices.
+ * When the merged commit does not contain the route test, configured promotion
+ * target refs are checked; absent refs fall back to the repo trunk.
  * A spec outside the journey-spec pattern is not that proof.
  */
 async function applyRecordedProof(
@@ -1661,18 +1814,18 @@ async function applyRecordedProof(
     parseJourneyEvidence(declared) === "recorded" || parseJourneyEvidence(receipt) === "recorded";
   if (!recorded) return { ok: true, recorded: false, proofReceipt: receipt };
   const onMerge = proofFileOnCommit(deps, rows);
-  const onDev = proofFileOnPromotedDev(deps);
+  const onTarget = proofFileOnPromotionTarget(deps);
   const evidence = `${declared}\n${receipt}`;
-  const existing = publishedProofReceipt(ticket.comments);
+  const existing = publishedProofReceipt(deps, ticket);
   if (
     existing &&
     (proofSatisfies(deps, `${evidence}\n${existing}`, existing, onMerge) ||
-      proofSatisfies(deps, `${evidence}\n${existing}`, existing, onDev))
+      proofSatisfies(deps, `${evidence}\n${existing}`, existing, onTarget))
   ) {
     noteEngine(deps, "proof ok");
     return { ok: true, recorded: true, proofReceipt: existing };
   }
-  if (proofSatisfies(deps, evidence, receipt, onMerge) || proofSatisfies(deps, evidence, receipt, onDev)) {
+  if (proofSatisfies(deps, evidence, receipt, onMerge) || proofSatisfies(deps, evidence, receipt, onTarget)) {
     noteEngine(deps, "proof ok");
     return { ok: true, recorded: true, proofReceipt: receipt.trim() ? receipt : declared };
   }
@@ -1684,7 +1837,7 @@ async function applyRecordedProof(
       result: {
         identifier: ticket.identifier,
         outcome: "journey-missing",
-        detail: "journey command",
+        detail: "recorded proof missing",
       },
     };
   }
@@ -1692,11 +1845,11 @@ async function applyRecordedProof(
   const proofReceipt = combined.trim() ? combined : declared;
   const proven =
     proofSatisfies(deps, `${declared}\n${proofReceipt}`, proofReceipt, onMerge) ||
-    proofSatisfies(deps, `${declared}\n${proofReceipt}`, proofReceipt, onDev);
+    proofSatisfies(deps, `${declared}\n${proofReceipt}`, proofReceipt, onTarget);
   if (!proven) {
     await deps.tracker.comment(
       ticket.identifier,
-      `Journey evidence for ${ticket.identifier} is recorded. The route test is absent from the merged commit and from the promoted dev ref. A web journey needs the recording URL in the build receipt. A mobile journey needs the route test on that ref under \`${journeySpecText(deps)}\`. The ticket stays in intake.`,
+      `Journey evidence for ${ticket.identifier} is recorded. The route test is absent from the merged commit and configured promotion targets. A web journey needs the recording URL in the build receipt. A mobile journey needs the route test on those refs under \`${journeySpecText(deps)}\`. The ticket stays in intake.`,
     );
     return {
       ok: false,
@@ -1711,19 +1864,15 @@ async function applyRecordedProof(
   return { ok: true, recorded: true, proofReceipt };
 }
 
-async function publishDevProof(
+async function publishCompletionProof(
   deps: LoopDeps,
   ticket: Ticket,
   recorded: boolean,
   proofReceipt: string,
   rows: { sha: string; url?: string }[],
 ): Promise<void> {
-  const existing = publishedProofReceipt(ticket.comments);
-  await publishProofReceipt(
-    deps,
-    ticket,
-    recorded ? { receipt: proofReceipt, rows } : existing ? { receipt: existing, rows } : null,
-  );
+  const existing = publishedProofReceipt(deps, ticket);
+  await publishProofReceipt(deps, ticket, recorded ? { receipt: proofReceipt, rows } : existing ? { receipt: existing, rows } : null);
 }
 
 async function settleTrunk(
@@ -1735,90 +1884,225 @@ async function settleTrunk(
   declared = "",
   receipt = "",
 ): Promise<TicketResult> {
+  const candidates = rows.map((row) => ({ repo: row.repo.name, sha: row.sha }));
+  await writeMarker(deps, ticket, "landed-commits", JSON.stringify(candidates));
   const waiting: { repo: string; sha: string }[] = [];
   for (const row of rows) {
-    const tip = await trunkTip(deps, row.repo, row.sha);
-    const quality = await trunkQuality(deps, { repo: row.repo, sha: tip });
-    if (quality.state !== "success") waiting.push({ repo: row.repo.name, sha: tip });
+    const sha = deps.pack.landingStrategy === "fast-forward" ? row.sha : await trunkTip(deps, row.repo, row.sha);
+    const quality = deps.pack.landingStrategy === "fast-forward"
+      ? await waitForExactWorkflow(deps, row.repo, sha)
+      : await trunkQuality(deps, { repo: row.repo, sha });
+    if (quality.state !== "success") waiting.push({ repo: row.repo.name, sha });
   }
   const carried = [declared, receipt].filter((part) => part.trim()).join("\n");
   if (waiting.length > 0) {
-    await deps.tracker.comment(ticket.identifier, landWaitMarker(hold, waiting, carried));
-    return {
-      identifier: ticket.identifier,
-      outcome: "trunk-waiting",
-      detail: waiting.map((row) => `${row.repo} ${row.sha}`).join(" "),
-    };
+    await writeMarker(deps, ticket, "land-resume", JSON.stringify({ kind: "wait", hold, rows: candidates, declared, receipt: carried } satisfies LandResume));
+    return { identifier: ticket.identifier, outcome: "trunk-waiting", detail: waiting.map((row) => `${row.repo} ${row.sha}`).join(" ") };
   }
-  const promoted = await runDevCommands(
-    deps,
-    devCommands(
-      deps.pack,
-      rows.map((row) => ({ name: row.repo.name, sha: row.sha })),
-      (name, ref, sha) => {
-        const repo = rows.find((row) => row.repo.name === name)?.repo;
-        return repo ? deployRefContains(deps, repo, ref, sha) : false;
-      },
-    ),
-    deps.pack.dev?.promote?.command ? "promote" : "dev",
-  );
-  if (promoted.failed) {
-    const failed = promoted.failed;
-    const signature = shipNoSignature(failed) || failed;
-    await applyOwnerHeal(deps, ticket, `heal:dev:${signature}`, `Dev step returned no: ${failed}`);
-    await deps.tracker.comment(
-      ticket.identifier,
-      landWaitMarker(
-        hold,
-        rows.map((row) => ({ repo: row.repo.name, sha: row.sha })),
-        carried,
-      ),
-    );
-    return {
-      identifier: ticket.identifier,
-      outcome: "quality-failed",
-      detail: `dev step failed: ${failed}`,
-    };
+  const order = parseWorkOrder(declared);
+  if (!order) return { identifier: ticket.identifier, outcome: "invalid-packet", detail: "acceptance matrix missing from saved work order" };
+  const stages = await runPromotionStages(deps, ticket, "deliver", candidates, order.criteria);
+  if (stages.outcome !== "complete") {
+    await writeMarker(deps, ticket, "land-resume", JSON.stringify({ kind: "wait", hold, rows: candidates, declared, receipt: carried } satisfies LandResume));
+    if (stages.outcome === "failed") {
+      const signature = shipNoSignature(stages.reason) || stages.reason;
+      await applyOwnerHeal(deps, ticket, `heal:promote:${stages.stage.id}:${signature}`, `Promotion stage ${stages.stage.id} returned no: ${stages.reason}`);
+      return { identifier: ticket.identifier, outcome: "quality-failed", detail: `stage ${stages.stage.id}: ${stages.reason}` };
+    }
+    if (stages.outcome === "blocked") {
+      await deps.tracker.comment(ticket.identifier, `Promotion stage ${stages.stage.id} is blocked: ${stages.reason}`);
+      return { identifier: ticket.identifier, outcome: "blocked", detail: stages.reason };
+    }
+    return { identifier: ticket.identifier, outcome: "blocked", detail: `stage ${stages.stage.id} parked: ${stages.reason}` };
   }
   const gate = await applyRecordedProof(deps, ticket, rows, declared, receipt);
   if (!gate.ok) return gate.result;
-  const devState = hold ? holdStatus(deps.pack) : deps.pack.status.dev;
-  if (!hold) await publishDevProof(deps, ticket, gate.recorded, gate.proofReceipt, rows);
-  if (deps.pack.ship?.afterDev) {
-    await writeState(deps, ticket, devState);
-    const shipped = await runShipSteps(deps, ticket.identifier);
-    if (shipped.failed || shipped.exitCode !== 0) {
-      if (shipped.failed) await healShipStep(deps, ticket, shipped.failed, "steps");
-      await deps.tracker.comment(
-        ticket.identifier,
-        shipWaitMarker(hold, rows.map((row) => ({ repo: row.repo.name, sha: row.sha }))),
-      );
-      return {
-        identifier: ticket.identifier,
-        outcome: "ship-blocked",
-        detail: shipped.failed
-          ? `ship step failed: ${shipped.failed}. Dev status stays. Ship retries from dev.`
-          : shipped.lines.join(" "),
-      };
-    }
-    if (deps.pack.ship.markStatus === false) {
-      return { identifier: ticket.identifier, outcome: "landed", detail: doneDetail };
-    }
-    await deps.tracker.setState(ticket.identifier, deps.pack.status.prod);
-    return { identifier: ticket.identifier, outcome: "landed", detail: doneDetail };
-  }
-  await writeState(deps, ticket, devState);
-  return {
-    identifier: ticket.identifier,
-    outcome: "landed",
-    detail: doneDetail,
-  };
+  if (!hold) await publishCompletionProof(deps, ticket, gate.recorded, gate.proofReceipt, rows);
+  await removeMarker(deps, ticket, "land-resume");
+  await writeTicketStatus(deps, ticket, hold ? holdStatus(deps.pack) : deps.pack.status.complete);
+  return { identifier: ticket.identifier, outcome: "landed", detail: doneDetail };
 }
 
-async function writeState(deps: LoopDeps, ticket: Ticket, state: string): Promise<void> {
+async function writeTicketStatus(deps: LoopDeps, ticket: Ticket, state: string): Promise<void> {
   if (ticket.stateName === state) return;
-  await deps.tracker.setState(ticket.identifier, state);
+  await deps.tracker.setState(ticket.identifier, state, ticket.criteriaRevision);
   ticket.stateName = state;
+}
+
+function commandEnvironment(pack: ProjectPack, allowDeploymentCredentials = false): NodeJS.ProcessEnv {
+  const workerKeys = Object.values(workerKeyNames(pack));
+  const commitActor = pack.commitActorTokenEnv && !(allowDeploymentCredentials && ["GH_TOKEN", "GITHUB_TOKEN"].includes(pack.commitActorTokenEnv))
+    ? pack.commitActorTokenEnv
+    : undefined;
+  const excluded = new Set([
+    "LINEAR_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "WORKER_HTTP_TOKEN",
+    "GOOGLE_APPLICATION_CREDENTIALS", "AZURE_CLIENT_SECRET", "GIT_ASKPASS", "SSH_AUTH_SOCK", "SSH_AGENT_PID",
+    "DOCKER_CONFIG", "DOCKER_AUTH_CONFIG", "NPM_CONFIG_USERCONFIG", "NETRC", "KUBECONFIG",
+    pack.jira?.authHeaderEnv,
+    pack.design?.figmaTokenEnv ?? "FIGMA_ACCESS_TOKEN",
+    commitActor,
+    ...workerKeys,
+  ].filter((name): name is string => Boolean(name)));
+  const credentialName = /(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|ACCESS_KEY|PRIVATE_KEY|AUTHORIZATION|AUTH_HEADER|BEARER)/i;
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    const awsCredential = name.startsWith("AWS_") && name !== "AWS_REGION" && name !== "AWS_DEFAULT_REGION";
+    const deploymentCredential = name === "GH_TOKEN" || name === "GITHUB_TOKEN" || awsCredential;
+    if (value === undefined || excluded.has(name) || name.startsWith("DELIVERY_LOOP_") || name.startsWith("GIT_CONFIG_") ||
+      (deploymentCredential && !allowDeploymentCredentials) || (credentialName.test(name) && !(allowDeploymentCredentials && deploymentCredential))) continue;
+    env[name] = value;
+  }
+  return env;
+}
+
+export function candidateFetchEnvironment(pack: ProjectPack, repoUrl: string): NodeJS.ProcessEnv {
+  const env = commandEnvironment(pack);
+  let url: URL | null = null;
+  try {
+    url = new URL(repoUrl);
+  } catch {
+    url = null;
+  }
+  if (url?.hostname.toLowerCase() === "github.com" && url.protocol === "http:") {
+    throw new Error("GitHub candidate fetch requires HTTPS");
+  }
+  if (url?.hostname.toLowerCase() === "github.com" && url.protocol === "https:") {
+    const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
+    const extraHeader = `http.${url.protocol}//${url.host}/.extraheader`;
+    Object.assign(env, {
+      GIT_CONFIG_COUNT: token ? "4" : "3",
+      GIT_CONFIG_KEY_0: "credential.helper",
+      GIT_CONFIG_VALUE_0: "",
+      GIT_CONFIG_KEY_1: "core.hooksPath",
+      GIT_CONFIG_VALUE_1: process.platform === "win32" ? "NUL" : "/dev/null",
+      GIT_CONFIG_KEY_2: extraHeader,
+      GIT_CONFIG_VALUE_2: "",
+      GIT_TERMINAL_PROMPT: "0",
+      ...(token ? {
+        GIT_CONFIG_KEY_3: extraHeader,
+        GIT_CONFIG_VALUE_3: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`,
+      } : {}),
+    });
+  } else {
+    for (const name of ["SSH_AUTH_SOCK", "SSH_AGENT_PID"]) {
+      const value = process.env[name];
+      if (value) env[name] = value;
+    }
+  }
+  return env;
+}
+
+function runQualityAtCommit(
+  deps: LoopDeps,
+  repo: RepoSpec,
+  branch: string,
+  expectedSha: string,
+): { status: number | null; stdout?: string; stderr?: string } {
+  const sourceDir = repoCheckoutDir(deps.cwd ?? process.cwd(), repo, deps.pack);
+  if (!existsSync(join(sourceDir, ".git"))) return { status: 1, stderr: `${repo.name} has no git checkout for candidate quality` };
+  const hooksPath = process.platform === "win32" ? "NUL" : "/dev/null";
+  const git = (args: string[], env: NodeJS.ProcessEnv = process.env) =>
+    spawnSync("git", ["-C", sourceDir, "-c", `core.hooksPath=${hooksPath}`, ...args], { encoding: "utf8", env });
+  const present = git(["cat-file", "-e", `${expectedSha}^{commit}`]);
+  if (present.status !== 0) {
+    let fetchEnv: NodeJS.ProcessEnv;
+    try {
+      fetchEnv = candidateFetchEnvironment(deps.pack, repo.url);
+    } catch (error) {
+      return { status: 1, stderr: error instanceof Error ? error.message : String(error) };
+    }
+    const fetched = git(["fetch", "--depth=1", "--no-tags", repo.url, branch], fetchEnv);
+    if (fetched.status !== 0) return { status: fetched.status, stderr: fetched.stderr ?? `could not fetch ${branch}` };
+    const fetchedSha = git(["rev-parse", "FETCH_HEAD^{commit}"]);
+    if (fetchedSha.status !== 0 || fetchedSha.stdout?.trim() !== expectedSha) {
+      return { status: 1, stderr: `candidate branch ${branch} changed before quality verification` };
+    }
+  }
+  const tempRoot = mkdtempSync(join(tmpdir(), "delivery-loop-quality-"));
+  const worktree = join(tempRoot, "checkout");
+  let added = false;
+  let result: { status: number | null; stdout?: string; stderr?: string } = { status: 1, stderr: "candidate worktree was not created" };
+  try {
+    const created = git(["worktree", "add", "--detach", worktree, expectedSha]);
+    if (created.status !== 0) return { status: created.status, stderr: created.stderr ?? "git worktree add failed" };
+    added = true;
+    const checked = spawnSync("git", ["-C", worktree, "-c", `core.hooksPath=${hooksPath}`, "rev-parse", "HEAD"], { encoding: "utf8" });
+    if (checked.status !== 0 || checked.stdout?.trim() !== expectedSha) {
+      return { status: 1, stderr: `isolated worktree does not match candidate ${expectedSha}` };
+    }
+    const modules = join(sourceDir, "node_modules");
+    if (existsSync(modules) && !existsSync(join(worktree, "node_modules"))) {
+      symlinkSync(modules, join(worktree, "node_modules"), "dir");
+    }
+    const run = deps.runCommand ?? defaultRunCommand;
+    result = run(deps.pack.qualityCommand, worktree, commandEnvironment(deps.pack));
+  } finally {
+    if (added) {
+      const removed = git(["worktree", "remove", "--force", worktree]);
+      if (removed.status !== 0) {
+        git(["worktree", "prune"]);
+        result = { ...result, status: 1, stderr: `${result.stderr ?? ""}\nfailed to clean candidate worktree: ${removed.stderr ?? "git worktree remove failed"}` };
+      }
+    }
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+  return result;
+}
+
+async function landFastForward(
+  deps: LoopDeps,
+  ticket: Ticket,
+  landings: { repo: RepoSpec; branch: string; sha?: string }[],
+  hold: boolean,
+  declared: string,
+  receipt: string,
+): Promise<MergedHead[] | TicketResult> {
+  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const candidates: { repo: RepoSpec; branch: string; head: string; base: string }[] = [];
+  for (const landing of sortByPack(deps.pack, landings, (row) => row.repo.name)) {
+    const head = lookup(landing.repo.url, landing.branch);
+    const base = lookup(landing.repo.url, landing.repo.trunk);
+    if (!head || !base || (landing.sha && landing.sha !== head)) {
+      return { identifier: ticket.identifier, outcome: "land-blocked", detail: `stale or missing fast-forward head/base for ${landing.repo.name}` };
+    }
+    const check = runQualityAtCommit(deps, landing.repo, landing.branch, head);
+    if (check.status !== 0) {
+      return { identifier: ticket.identifier, outcome: "quality-failed", detail: `${landing.repo.name}: ${deps.pack.qualityCommand} exited ${check.status ?? "unknown"}${check.stderr ? `: ${check.stderr}` : ""}` };
+    }
+    candidates.push({ repo: landing.repo, branch: landing.branch, head, base });
+  }
+  const merged: MergedHead[] = [];
+  for (const candidate of candidates) {
+    let relation: CompareStatus = "unknown";
+    try {
+      relation = await deps.forge.compare({ repoUrl: candidate.repo.url, base: candidate.base, head: candidate.head });
+    } catch {
+      relation = "unknown";
+    }
+    const sha = relation === "identical" || relation === "behind"
+      ? candidate.head
+      : await deps.forge.directLand({
+          repoUrl: candidate.repo.url,
+          branch: candidate.branch,
+          base: candidate.repo.trunk,
+          expectedHeadSha: candidate.head,
+          expectedBaseSha: candidate.base,
+        });
+    merged.push({ repo: candidate.repo, sha, url: candidate.branch });
+  }
+  const landed = merged.map((row) => ({ repo: row.repo.name, sha: row.sha }));
+  await writeMarker(deps, ticket, "landed-commits", JSON.stringify(landed));
+  for (const row of merged) {
+    const quality = await waitForExactWorkflow(deps, row.repo, row.sha);
+    if (quality.state !== "success") {
+      if (quality.state === "pending") {
+        await writeMarker(deps, ticket, "land-resume", JSON.stringify({ kind: "wait", hold, rows: landed, declared, receipt } satisfies LandResume));
+        return { identifier: ticket.identifier, outcome: "quality-pending", detail: `${row.repo.name} ${row.sha}: ${quality.detail}` };
+      }
+      return { identifier: ticket.identifier, outcome: "quality-failed", detail: `${row.repo.name} ${row.sha}: ${quality.detail}` };
+    }
+  }
+  return merged;
 }
 
 async function finishMerged(
@@ -1842,13 +2126,10 @@ async function finishMerged(
 
 type FoundPull = ListedPull & { repo: RepoSpec };
 
-/** Repos named by the latest work order on the ticket. Null when no order was recorded. */
-function recordedLandRepos(ticket: Ticket): string[] | null {
-  for (let i = ticket.comments.length - 1; i >= 0; i--) {
-    const order = parseWorkOrder(ticket.comments[i]?.body ?? "");
-    if (order) return order.repos;
-  }
-  return null;
+/** Repos named by the current v2 work order. */
+function recordedLandRepos(deps: LoopDeps, ticket: Ticket): string[] | null {
+  const texts = resumeProofTexts(deps, ticket);
+  return parseWorkOrder(texts.declared)?.repos ?? null;
 }
 
 /**
@@ -1874,7 +2155,7 @@ async function findTicketPulls(
     if (openRow) open.push({ ...openRow, repo });
   }
   if (merged.length === 0) return null;
-  const named = recordedLandRepos(ticket);
+  const named = recordedLandRepos(deps, ticket);
   if (named) {
     for (const name of named) {
       const repo = repoByName(deps.pack, name);
@@ -1904,31 +2185,25 @@ async function repoAlreadyOnTrunk(deps: LoopDeps, ticket: Ticket, repo: RepoSpec
   }
 }
 
-function promoteSatisfied(deps: LoopDeps, merged: FoundPull[]): boolean {
-  const promote = deps.pack.dev?.promote;
-  if (!promote) return true;
-  for (const row of merged) {
-    if (!promote.repos.includes(row.repo.name)) continue;
-    const refs = promote.refs?.[row.repo.name] ?? [];
-    const sha = row.mergedSha ?? "";
-    if (refs.length === 0 || !sha) continue;
-    if (!refs.every((ref) => deployRefContains(deps, row.repo, ref, sha))) return false;
-  }
-  return true;
-}
-
-/**
- * Dev or prod, every pull request merged, and every named deploy ref contains
- * that commit. Intake tickets are never finished here.
- */
 async function alreadyFinished(deps: LoopDeps, ticket: Ticket): Promise<boolean> {
-  const dev = deps.pack.status.dev;
-  const prod = deps.pack.status.prod;
-  if (ticket.stateName !== dev && ticket.stateName !== prod) return false;
-  const found = await findTicketPulls(deps, ticket);
-  if (!found || found.open.length > 0) return false;
-  if (ticket.stateName === prod) return true;
-  return promoteSatisfied(deps, found.merged);
+  if (ticket.stateName !== deps.pack.status.complete && ticket.stateName !== deps.pack.status.shipped) return false;
+  const stages = deps.pack.promotionStages.filter((stage) => stage.authorization === "deliver");
+  if (stages.length === 0) return true;
+  const state = await readDeliveryState(deps, ticket);
+  const rawRows = state.markers.find((marker) => marker.kind === "landed-commits")?.body;
+  const texts = resumeProofTexts(deps, ticket);
+  const order = parseWorkOrder(texts.declared);
+  if (!rawRows || !order) return false;
+  let landed: { repo: string; sha: string }[];
+  try {
+    landed = JSON.parse(rawRows) as { repo: string; sha: string }[];
+  } catch {
+    return false;
+  }
+  return stages.every((stage) => {
+    const receipt = state.stageReceipts.find((item) => item.stageId === stage.id);
+    return Boolean(receipt && stageReceiptPasses(receipt, stage, ticket, landed, order.criteria));
+  });
 }
 
 /**
@@ -1939,7 +2214,7 @@ async function alreadyFinished(deps: LoopDeps, ticket: Ticket): Promise<boolean>
 async function resumeExistingPulls(deps: LoopDeps, ticket: Ticket): Promise<TicketResult | null> {
   const found = await findTicketPulls(deps, ticket);
   if (!found) return null;
-  const texts = resumeProofTexts(ticket.comments);
+  const texts = resumeProofTexts(deps, ticket);
   const journey = parseJourneyEvidence(texts.declared) ?? parseJourneyEvidence(texts.receipt);
   const grant = parseOutsideGrant(texts.declared);
   if ((journey !== "recorded" && journey !== "not-applicable") || !grant) return null;
@@ -1975,65 +2250,24 @@ async function resumeExistingPulls(deps: LoopDeps, ticket: Ticket): Promise<Tick
  * A previous land already merged, or already saw there was nothing to merge.
  * Re-check that fact. Do not start a worker while the recorded commit is unchanged.
  */
-async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket): Promise<TicketResult | null> {
-  const marker = latestLandMarker(ticket.comments);
+async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket, body: string | null): Promise<TicketResult | null> {
+  const marker = parseLandResume(body);
   if (!marker) return null;
   if (marker.kind === "empty") {
     const template = deps.pack.branchTemplate;
     if (!template || marker.rows.length === 0) return null;
     const lookup = deps.lookupHead ?? lookupRemoteHead;
     for (const row of marker.rows) {
-      const spec = repoByName(deps.pack, row.repo);
-      if (!spec) return null;
-      const sha = lookup(spec.url, renderBranch(template, ticket.identifier, row.repo));
-      if (!sha || sha !== row.sha) return null;
+      const repo = repoByName(deps.pack, row.repo);
+      if (!repo || lookup(repo.url, renderBranch(template, ticket.identifier, row.repo)) !== row.sha) return null;
     }
     return { identifier: ticket.identifier, outcome: "land-empty", detail: "branch unchanged" };
   }
-  if (marker.kind === "ship") {
-    noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
-    const texts = resumeProofTexts(ticket.comments);
-    const shipRows = reposForMarker(deps, marker.rows);
-    const gate = await applyRecordedProof(deps, ticket, shipRows, texts.declared, texts.receipt);
-    if (!gate.ok) return gate.result;
-    const devState = marker.hold ? holdStatus(deps.pack) : deps.pack.status.dev;
-    if (!marker.hold) await publishDevProof(deps, ticket, gate.recorded, gate.proofReceipt, shipRows);
-    await deps.tracker.setState(ticket.identifier, devState);
-    if (!deps.pack.ship?.afterDev) {
-      return {
-        identifier: ticket.identifier,
-        outcome: "landed",
-        detail: "dev only",
-      };
-    }
-    const shipped = await runShipSteps(deps, ticket.identifier);
-    if (shipped.failed || shipped.exitCode !== 0) {
-      if (shipped.failed) await healShipStep(deps, ticket, shipped.failed, "steps");
-      return {
-        identifier: ticket.identifier,
-        outcome: "ship-blocked",
-        detail: shipped.failed
-          ? `ship step failed: ${shipped.failed}. Dev status stays. Ship retries from dev.`
-          : shipped.lines.join(" "),
-      };
-    }
-    if (deps.pack.ship?.markStatus !== false) {
-      await deps.tracker.setState(ticket.identifier, deps.pack.status.prod);
-    } else {
-      await deps.tracker.setState(ticket.identifier, devState);
-    }
-    return { identifier: ticket.identifier, outcome: "landed", detail: "ship resumed" };
-  }
-  if (marker.rows.length === 0) return null;
-  const rows: { repo: RepoSpec; sha: string }[] = [];
-  for (const row of marker.rows) {
-    const spec = repoByName(deps.pack, row.repo);
-    if (!spec) return null;
-    rows.push({ repo: spec, sha: row.sha });
-  }
+  const rows = reposForMarker(deps, marker.rows);
+  if (rows.length !== marker.rows.length || rows.length === 0) return null;
   noteTicket(deps, { identifier: ticket.identifier, phase: "land" });
-  const texts = resumeProofTexts(ticket.comments);
-  return settleTrunk(deps, ticket, marker.hold, rows, "trunk green", texts.declared, texts.receipt);
+  const texts = resumeProofTexts(deps, ticket);
+  return settleTrunk(deps, ticket, marker.hold, rows, "landed commits unchanged", marker.declared || texts.declared, marker.receipt || texts.receipt);
 }
 
 let releaseTagCache: string[] | undefined | null = null;
@@ -2075,7 +2309,16 @@ async function applyOwnerHeal(
 ): Promise<HealVerdict> {
   if (healAlready(deps, ticket, key)) return "wait";
   const type = failureTypeForHealKey(key);
-  if (countOwnerHeals(ticket.comments, type) >= healCapFor(deps.pack.heal, type)) {
+  const markerBodies = deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers.filter((marker) => marker.kind === "owner-heal").map((marker) => marker.body) ?? [];
+  const ownerHealCount = markerBodies.filter((body) => {
+    try {
+      const parsed: unknown = JSON.parse(body);
+      return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && "type" in parsed && parsed.type === type;
+    } catch {
+      return false;
+    }
+  }).length;
+  if (ownerHealCount >= healCapFor(deps.pack.heal, type)) {
     await markHealExhausted(deps, ticket, type);
     throw new HealExhaustedError(type);
   }
@@ -2086,6 +2329,8 @@ async function applyOwnerHeal(
     issue: ticket.identifier,
     releaseTags: releaseTagsForHeal(),
   });
+  const eligibility = checkEligibility(deps, ticket);
+  if (eligibility.outcome !== "eligible") throw new EligibilityGateError(eligibility);
   let text = "";
   if (deps.ownerHeal) {
     text = (await deps.ownerHeal({ prompt, repoUrl: home.url, baseRef: home.trunk })) ?? "";
@@ -2099,9 +2344,11 @@ async function applyOwnerHeal(
     rememberVerdict(deps, key, verdict);
     return verdict;
   }
-  const body = `${ownerHealMarker(key)}\n${reason}`;
-  await deps.tracker.comment(ticket.identifier, body);
-  ticket.comments = [...ticket.comments, { body }];
+  const state = await readDeliveryState(deps, ticket);
+  await writeDeliveryState(deps, ticket, {
+    ...state,
+    markers: [...state.markers, { kind: "owner-heal", body: JSON.stringify({ key, type, reason }), createdAt: new Date(deps.nowMs ?? Date.now()).toISOString() }],
+  });
   rememberVerdict(deps, key, verdict);
   if (!deps.pageControl) deps.pageControl = { stop: false, healed: [] };
   deps.pageControl.healed.push(key);
@@ -2536,8 +2783,9 @@ type QualityWait = {
 function defaultRunCommand(
   command: string,
   cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
 ): { status: number | null; stdout: string; stderr: string } {
-  const result = spawnSync(command, { shell: true, cwd, encoding: "utf8" });
+  const result = spawnSync(command, { shell: true, cwd, encoding: "utf8", env });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
@@ -2551,7 +2799,7 @@ async function waitForQuality(
   if (deps.pack.check === "command") {
     const cwd = repoCheckoutDir(deps.cwd ?? process.cwd(), pr.repo, deps.pack);
     const run = deps.runCommand ?? defaultRunCommand;
-    const result = run(deps.pack.qualityCommand, cwd);
+    const result = run(deps.pack.qualityCommand, cwd, commandEnvironment(deps.pack));
     return result.status === 0
       ? { state: "success", detail: deps.pack.qualityCommand }
       : { state: "failure", detail: `${deps.pack.qualityCommand} exited ${result.status ?? "null"}` };
@@ -2634,6 +2882,7 @@ async function loadProgram(deps: LoopDeps, projectName?: string | null): Promise
   if (deps.program) return deps.program;
   const name = (projectName ?? deps.project)?.trim();
   if (!name) return null;
+  if (deps.tracker.kind !== "linear" || !deps.tracker.projectSnapshot) return null;
   const snapshot = await deps.tracker.projectSnapshot(name);
   if (!snapshot) return null;
   return compileDeliveryProgramFromLinear(snapshot, deps.pack.program?.parkMilestones ?? []);
@@ -2705,7 +2954,7 @@ export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
       }
       results.push(result);
       if (deps.pageControl?.stop) return results;
-      if (result.outcome === "skipped-graph") {
+      if (result.outcome === "skipped-graph" || result.outcome === "blocked") {
         blocked.add(ticket.identifier);
         continue;
       }
@@ -2717,6 +2966,21 @@ export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
       }
     }
     if (!moved) break;
+  }
+  return results;
+}
+
+export async function auditEligibility(
+  deps: Pick<LoopDeps, "pack" | "project" | "cwd" | "runPackCommand"> & {
+    tracker: Pick<TrackerAdapter, "listIntake">;
+  },
+): Promise<EligibilityAuditResult[]> {
+  const tickets = await deps.tracker.listIntake(
+    deps.project ? { project: deps.project } : undefined,
+  );
+  const results: EligibilityAuditResult[] = [];
+  for (const ticket of tickets) {
+    results.push({ identifier: ticket.identifier, ...checkEligibility(deps, ticket) });
   }
   return results;
 }
@@ -2736,95 +3000,95 @@ export async function deliver(
 export async function ship(
   deps: LoopDeps,
   identifier?: string,
-  extraArgs?: string,
   mode: "ship" | "continue" = "ship",
 ): Promise<ShipRun> {
   const id = identifier?.trim() ?? "";
   if (!id) throw new Error("ship needs a ticket id");
   await probeConfiguredCredentials(deps);
-  const steps = mode === "continue" ? (deps.pack.ship?.continue ?? []) : (deps.pack.ship?.steps ?? []);
-  if (mode === "continue" && steps.length === 0) throw new Error("ship continue has no steps");
-  const env = {
-    ...process.env,
-    DELIVERY_LOOP_ISSUE: id,
-    DELIVERY_LOOP_SHIP_ARGS: shipStepArgs(id, extraArgs),
-  };
-  async function loadTicket(): Promise<Ticket | null> {
-    try {
-      return await deps.tracker.get(id);
-    } catch {
-      return null;
-    }
-  }
-  let current = await loadTicket();
-  const stopped = current ? exhaustedFailureType(current) : null;
+  deliveryStateCache.delete(deps);
+  const ticket = await deps.tracker.get(id);
+  const state = await readDeliveryState(deps, ticket);
+  const stopped = exhaustedFailureType({ labels: ticket.labels });
   if (stopped) throw new HealExhaustedError(stopped);
-  const cwd = deps.cwd ?? process.cwd();
-  const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
-  let output = "";
-  for (const step of steps) {
-    let result = await runWithTransient(deps, async () => runShipStep(step, cwd, env));
-    output = `${output}\n${result.output}`;
-    let waits = 0;
-    let refreshedLogin = false;
-    while (result.status !== 0) {
-      if (!current && deps.tracker.kind === "ship-idle" && deps.openTracker) {
-        deps.tracker = deps.openTracker();
-        current = await loadTicket();
-      }
-      const standIn: Ticket = current ?? {
-        id,
-        identifier: id,
-        title: "",
-        body: "",
-        stateName: "",
-        labels: [],
-        blockedBy: [],
-        comments: [],
-      };
-      current = standIn;
-      const signature = shipNoSignature(result.tail);
-      const modeName = mode === "continue" ? "continue" : "steps";
-      const key = signature
-        ? `install:${modeName}:${step}:${signature}`
-        : `install:${modeName}:${step}`;
-      let verdict = rememberedVerdict(deps, key);
-      if (verdict === "edit" && healAlready(deps, standIn, key)) {
-        throw new Error(`ship step failed: ${step}`);
-      }
-      if (!verdict) {
-        if (healAlready(deps, standIn, key)) throw new Error(`ship step failed: ${step}`);
-        verdict = await healShipStep(deps, standIn, step, modeName, result.tail);
-      }
-      if (verdict === "wait") {
-        if (waits >= 40) throw new Error(`ship step failed: ${step}`);
-        waits += 1;
-        await sleep(30_000);
-        result = await runWithTransient(deps, async () => runShipStep(step, cwd, env));
-        output = `${output}\n${result.output}`;
-        continue;
-      }
-      if (verdict === "login") {
-        if (refreshedLogin || !refreshShipGithubToken(env)) throw new Error(`ship step failed: ${step}`);
-        refreshedLogin = true;
-        result = await runWithTransient(deps, async () => runShipStep(step, cwd, env));
-        output = `${output}\n${result.output}`;
-        continue;
-      }
-      waits = 0;
-      result = await runWithTransient(deps, async () => runShipStep(step, cwd, env));
-      output = `${output}\n${result.output}`;
+  const alreadyShipped = Boolean(deps.pack.status.shipped && ticket.stateName === deps.pack.status.shipped);
+  if (!alreadyShipped && ticket.stateName !== deps.pack.status.complete) throw new Error(`ship requires ${deps.pack.status.complete}`);
+  const deliveryStages = deps.pack.promotionStages.filter((stage) => stage.authorization === "deliver");
+  const shipStages = deps.pack.promotionStages.filter((stage) => stage.authorization === "ship");
+  const texts = resumeProofTexts(deps, ticket);
+  const order = parseWorkOrder(texts.declared);
+  const rawLanded = state.markers.find((marker) => marker.kind === "landed-commits")?.body;
+  let landed: { repo: string; sha: string }[] = [];
+  try {
+    if (rawLanded) landed = JSON.parse(rawLanded) as { repo: string; sha: string }[];
+  } catch {
+    throw new Error("landed commit state is invalid");
+  }
+  if ((deliveryStages.length > 0 || shipStages.length > 0) && !order) throw new Error("ship requires the saved acceptance matrix");
+  if (deliveryStages.some((stage) => {
+    const saved = state.stageReceipts.find((receipt) => receipt.stageId === stage.id);
+    return !saved || !stageReceiptPasses(saved, stage, ticket, landed, order!.criteria);
+  })) throw new Error("ship requires every delivery stage to have a current passed receipt");
+  if (shipStages.length === 0) return { exitCode: 0, lines: [`${id} ${alreadyShipped ? "already shipped" : "has no ship stages"}`], parked: false };
+  if (alreadyShipped) {
+    const passed = shipStages.every((stage) => {
+      const saved = state.stageReceipts.find((receipt) => receipt.stageId === stage.id);
+      return Boolean(saved && stageReceiptPasses(saved, stage, ticket, landed, order!.criteria));
+    });
+    if (!passed) throw new Error("shipped ticket lacks current passed ship receipts");
+    return { exitCode: 0, lines: [`${id} already shipped`], parked: false };
+  }
+  let continueStageId: string | undefined;
+  if (mode === "continue") {
+    const body = state.markers.find((marker) => marker.kind === "active-promotion-stage")?.body;
+    let active: Record<string, unknown> = {};
+    try {
+      active = body ? JSON.parse(body) as Record<string, unknown> : {};
+    } catch {
+      active = {};
     }
+    const stageId = typeof active.stageId === "string" ? active.stageId : "";
+    const stage = shipStages.find((candidate) => candidate.id === stageId);
+    if (active.authorization !== "ship" || active.criteriaRevision !== ticket.criteriaRevision || !stage) {
+      throw new Error("ship continue requires an active ship stage for the current criteria revision");
+    }
+    if (!stage.continueCommand) throw new Error(`stage ${stage.id} has no continueCommand`);
+    continueStageId = stage.id;
   }
-  const parsed = parseOutcomeLines(output);
-  const outcomes =
-    parsed.length === 0
-      ? [{ ticket: id, outcome: "COMPLETE" as const, reason: "" }]
-      : parsed;
-  const exitCode = shipExitCode(outcomes, deps.pack.ship?.parkSuccess === true);
-  const lines = publishShipSummary(outcomes);
-  if (exitCode === 0 && deps.pack.ship?.markStatus !== false) {
-    await deps.tracker.setState(id, deps.pack.status.prod);
+  let result = await runPromotionStages(deps, ticket, "ship", landed, order?.criteria ?? [], { continueStageId });
+  let waits = 0;
+  let refreshedLogin = false;
+  const sleep = deps.sleep ?? ((ms: number) => {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, ms);
+    return promise;
+  });
+  while (result.outcome === "failed") {
+    const signature = shipNoSignature(result.reason) || result.reason;
+    const action = mode === "continue" ? "continue" : "promote";
+    const key = `install:${action}:${result.stage.id}:${signature}`;
+    let verdict = rememberedVerdict(deps, key);
+    if (verdict === "edit" && healAlready(deps, ticket, key)) throw new Error(`stage ${result.stage.id} failed: ${result.reason}`);
+    if (!verdict) {
+      if (healAlready(deps, ticket, key)) throw new Error(`stage ${result.stage.id} failed: ${result.reason}`);
+      verdict = await applyOwnerHeal(deps, ticket, key, `Promotion stage ${result.stage.id} returned no: ${result.reason}`);
+    }
+    if (verdict === "wait") {
+      if (waits >= 40) throw new Error(`stage ${result.stage.id} failed: ${result.reason}`);
+      waits += 1;
+      await sleep(30_000);
+    } else if (verdict === "login") {
+      if (refreshedLogin || !refreshGithubToken(process.env)) throw new Error(`stage ${result.stage.id} failed: ${result.reason}`);
+      refreshedLogin = true;
+    }
+    result = await runPromotionStages(deps, ticket, "ship", landed, order?.criteria ?? [], { continueStageId });
   }
-  return { exitCode, lines };
+  if (result.outcome === "blocked") return { exitCode: 1, lines: [`${id} BLOCKED ${result.reason}`], parked: false };
+  if (result.outcome === "parked") {
+    return { exitCode: result.stage.parkSuccess ? 0 : 2, lines: [`${id} PARKED ${result.reason}`], parked: true };
+  }
+  if (shipStages.some((stage) => stage.writeStatus)) {
+    if (!deps.pack.status.shipped) throw new Error("status.shipped is required by ship stages");
+    await writeTicketStatus(deps, ticket, deps.pack.status.shipped);
+  }
+  return { exitCode: 0, lines: [`${id} COMPLETE`], parked: false };
 }

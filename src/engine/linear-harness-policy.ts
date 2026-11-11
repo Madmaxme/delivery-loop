@@ -14,28 +14,22 @@ export function isSweepIntakeState(stateName: string | null | undefined): boolea
   return SWEEP_INTAKE_STATES.some((s) => s.toLowerCase() === n);
 }
 
-export const TERMINAL_DEV_STATE = "Dev";
-export const TERMINAL_PROD_STATE = "Prod";
 
 /**
  * `blockedBy` is satisfied when the blocker is a delivery/closed terminal.
  * Linear stores the edge as inverse `blocks` (this issue is relatedIssue).
  * Resolved blockers often move to `related` — missing edge also means unblocked.
  */
-export const GRAPH_UNBLOCKING_STATES = [
-  TERMINAL_DEV_STATE,
-  TERMINAL_PROD_STATE,
-  "Canceled",
-  "Duplicate",
-] as const;
+export const GRAPH_UNBLOCKING_STATES = ["Canceled", "Duplicate"] as const;
 
 export type GraphUnblockingState = (typeof GRAPH_UNBLOCKING_STATES)[number];
 
 export function isGraphUnblockingState(
   stateName: string | null | undefined,
+  unblockingStates: readonly string[] = GRAPH_UNBLOCKING_STATES,
 ): boolean {
   const n = (stateName ?? "").trim().toLowerCase();
-  return GRAPH_UNBLOCKING_STATES.some((s) => s.toLowerCase() === n);
+  return unblockingStates.some((s) => s.trim().toLowerCase() === n);
 }
 
 export type IssueBlocker = {
@@ -254,19 +248,18 @@ function normState(stateName: string | null | undefined): string {
 /**
  * Machine labels that must not linger after a terminal status write.
  * Does not touch `surface:*`, `source:*`, or `needs-product`.
- * Does not clear `store-gated` / `ship-lease` on Dev (live `/ship` park).
- */
+ * Does not clear `store-gated` or `ship-lease` unless the configured status permits it.
 export function machineLabelsToClearOnTerminal(
   stateName: string | null | undefined,
   labels: string[],
+  statuses: { complete?: string | null; shipped?: string | null } = {},
 ): string[] {
   const state = normState(stateName);
-  const names =
-    state === TERMINAL_PROD_STATE.toLowerCase()
-      ? PROD_CLEAR
-      : state === TERMINAL_DEV_STATE.toLowerCase()
-        ? DEV_CLEAR
-        : [];
+  const names = state === (statuses.shipped ?? "").trim().toLowerCase()
+    ? PROD_CLEAR
+    : state === (statuses.complete ?? "").trim().toLowerCase()
+      ? DEV_CLEAR
+      : [];
   return names.filter((n) => hasLabel(labels, n));
 }
 
@@ -502,16 +495,6 @@ export function marketingBeatsReleasedFloor(
   };
 }
 
-/** States that still belong to an open delivery, including dev-landed work. */
-export const DELIVERY_TRAIN_STATES = [
-  TERMINAL_DEV_STATE,
-  "In Review",
-  "Todo",
-] as const;
-
-/** Matches Linear `<!-- DELIVERY_LEASE expires=… [gha_run=…] [cursor_*] -->`. */
-export const DELIVERY_LEASE_COMMENT_RE =
-  /<!--\s*DELIVERY_LEASE\b([^>]*)-->/i;
 
 export type CursorLeasePhase = "ground" | "build" | "cifix";
 
@@ -523,46 +506,33 @@ export type DeliveryLeaseStamp = {
   cursorPhase: CursorLeasePhase | null;
 };
 
-const CURSOR_LEASE_PHASES = new Set<CursorLeasePhase>([
-  "ground",
-  "build",
-  "cifix",
-]);
+const CURSOR_LEASE_PHASES: Record<CursorLeasePhase, true> = { ground: true, build: true, cifix: true };
 
-function attrValue(attrs: string, name: string): string {
-  const m = attrs.match(new RegExp(`\\b${name}=([^\\s>]+)`, "i"));
-  return (m?.[1] ?? "").trim();
+function parseCursorLeasePhase(raw: unknown): CursorLeasePhase | null {
+  if (typeof raw !== "string") return null;
+  const phase = raw.trim().toLowerCase();
+  return Object.hasOwn(CURSOR_LEASE_PHASES, phase) ? phase as CursorLeasePhase : null;
 }
 
-function parseCursorLeasePhase(raw: string): CursorLeasePhase | null {
-  const p = raw.trim().toLowerCase();
-  if (CURSOR_LEASE_PHASES.has(p as CursorLeasePhase)) {
-    return p as CursorLeasePhase;
+export function parseDeliveryLeaseStamp(body: string): DeliveryLeaseStamp | null {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed) || !("schemaVersion" in parsed) || parsed.schemaVersion !== 2) return null;
+    if ("released" in parsed && parsed.released === true) return emptyDeliveryLeaseStamp();
+    if (!("expiresAt" in parsed) || typeof parsed.expiresAt !== "string") return null;
+    const expiresAt = Date.parse(parsed.expiresAt);
+    if (!Number.isFinite(expiresAt)) return null;
+    const gha = "ghaRunId" in parsed && typeof parsed.ghaRunId === "string" && /^\d+$/.test(parsed.ghaRunId)
+      ? parsed.ghaRunId
+      : null;
+    const cursorAgent = "cursorAgentId" in parsed && typeof parsed.cursorAgentId === "string" && /^bc-[a-z0-9-]+$/i.test(parsed.cursorAgentId)
+      ? parsed.cursorAgentId
+      : null;
+    const cursorRun = "cursorRunId" in parsed && typeof parsed.cursorRunId === "string" ? parsed.cursorRunId : null;
+    return { expiresAt, ghaRunId: gha, cursorAgentId: cursorAgent, cursorRunId: cursorRun, cursorPhase: "cursorPhase" in parsed ? parseCursorLeasePhase(parsed.cursorPhase) : null };
+  } catch {
+    return null;
   }
-  return null;
-}
-
-export function parseDeliveryLeaseStamp(
-  body: string,
-): DeliveryLeaseStamp | null {
-  if (/^\s*\[HISTORICAL\]/i.test(body)) return null;
-  const m = body.match(DELIVERY_LEASE_COMMENT_RE);
-  if (!m) return null;
-  const attrs = m[1] ?? "";
-  const released = attrValue(attrs, "released") === "1";
-  const expiresAt = Date.parse(attrValue(attrs, "expires"));
-  const ghaRaw = attrValue(attrs, "gha_run");
-  const cursorAgentRaw = attrValue(attrs, "cursor_agent");
-  const cursorRunRaw = attrValue(attrs, "cursor_run");
-  return {
-    expiresAt: released || !Number.isFinite(expiresAt) ? null : expiresAt,
-    ghaRunId: /^\d+$/.test(ghaRaw) ? ghaRaw : null,
-    cursorAgentId: /^bc-[a-z0-9-]+$/i.test(cursorAgentRaw)
-      ? cursorAgentRaw
-      : null,
-    cursorRunId: cursorRunRaw.length > 0 ? cursorRunRaw : null,
-    cursorPhase: parseCursorLeasePhase(attrValue(attrs, "cursor_phase")),
-  };
 }
 
 export function emptyDeliveryLeaseStamp(): DeliveryLeaseStamp {
@@ -575,7 +545,7 @@ export function emptyDeliveryLeaseStamp(): DeliveryLeaseStamp {
   };
 }
 
-/** Live lease TTL — must stay in lockstep with the comment `expires=` write. */
+/** Live lease TTL shared by v2 delivery-state markers and agent-run timeouts. */
 export const DELIVERY_LEASE_TTL_MS = 2 * 60 * 60 * 1000;
 
 /**
@@ -590,18 +560,9 @@ export const AGENT_RUN_HARD_TIMEOUT_MS = DELIVERY_LEASE_TTL_MS;
 export const PIPELINE_LEASE_POLL_MS = 15_000;
 
 /**
- * Steal (clear + re-acquire) a labelled lease when the previous owner is
- * gone. A dead/cancelled GHA parent (6h cap, human cancel, or a leftover
- * from the old cancel-in-progress group) leaves Linear TTL (~2h); GitHub
- * run status is the lock SSOT, not the comment clock.
- *
- * - Live previous GHA run: steal only after `expires=` (same as today).
- * - Dead/cancelled previous GHA run: steal immediately.
- * - Unknown run (legacy stamp with no `gha_run=`): steal on expiry, or
- *   when land is waiting on origin heads (`LAND_PREFLIGHT_BLOCKED` / partial).
- * - Label with no expiry and no steal signal: fail closed.
- * A live `cursor_run=` is not a steal blocker: the successor GHA page
- * restamps `gha_run=` and **joins** that run (does not `send` a second child).
+ * Steal a v2 state-store lease when its owning run is gone. A live Actions
+ * parent remains the lock authority; its timestamp limits the maximum hold.
+ * A partial land resume may be claimed immediately by the landing owner.
  */
 export function shouldStealDeliveryLease(input: {
   hasLeaseLabel: boolean;
@@ -619,62 +580,6 @@ export function shouldStealDeliveryLease(input: {
   return expired;
 }
 
-export type ShipLeaseStamp = {
-  expiresAt: number | null;
-  ghaRunId: string | null;
-};
-
-export const SHIP_LEASE_COMMENT_RE =
-  /<!--\s*SHIP_LEASE\s+expires=([^\s>]+)(?:\s+gha_run=(\d+))?\s*-->/i;
-
-export function parseShipLeaseStamp(body: string): ShipLeaseStamp | null {
-  const m = body.match(SHIP_LEASE_COMMENT_RE);
-  if (!m) return null;
-  const t = Date.parse(m[1]);
-  return {
-    expiresAt: Number.isFinite(t) ? t : null,
-    ghaRunId: m[2] && /^\d+$/.test(m[2]) ? m[2] : null,
-  };
-}
-
-export function latestShipLeaseStamp(
-  commentBodies: readonly string[],
-): ShipLeaseStamp {
-  let best: ShipLeaseStamp = { expiresAt: null, ghaRunId: null };
-  for (const body of commentBodies) {
-    const s = parseShipLeaseStamp(body);
-    if (!s) continue;
-    if (
-      s.expiresAt !== null &&
-      (best.expiresAt === null || s.expiresAt > best.expiresAt)
-    ) {
-      best = s;
-    }
-  }
-  return best;
-}
-
-/**
- * Steal a leftover `ship-lease` when the previous holder is dead or this is
- * `/ship continue` on the same ticket (parked tickets must not skip continue
- * for 4h because park/crash left the label). Never steal while a live GHA
- * ship parent still holds the lease.
- */
-export function shouldStealShipLease(input: {
-  hasLeaseLabel: boolean;
-  expiresAt: number | null;
-  nowMs: number;
-  previousGhaRunActive?: boolean | null;
-  sameTicketContinue?: boolean;
-}): boolean {
-  if (!input.hasLeaseLabel) return false;
-  const expired =
-    input.expiresAt !== null && input.nowMs >= input.expiresAt;
-  if (input.previousGhaRunActive === true) return expired;
-  if (input.previousGhaRunActive === false) return true;
-  if (input.sameTicketContinue) return true;
-  return expired;
-}
 
 export type TimedComment = {
   body: string;
@@ -722,22 +627,23 @@ export function formatGroundingCommentSample(
   ].join("\n");
 }
 
-/** Last stamp in chronological comment order. A later release supersedes a longer TTL. */
+/** Last v2 lease marker wins; release markers supersede an earlier live lease. */
 export function latestDeliveryLeaseStamp(
-  commentBodies: readonly string[],
+  markers: readonly { kind: string; body: string }[],
 ): DeliveryLeaseStamp {
-  let best: DeliveryLeaseStamp = emptyDeliveryLeaseStamp();
-  for (const body of commentBodies) {
-    const s = parseDeliveryLeaseStamp(body);
-    if (s) best = s;
+  let best = emptyDeliveryLeaseStamp();
+  for (const marker of markers) {
+    if (marker.kind !== "delivery-lease") continue;
+    const stamp = parseDeliveryLeaseStamp(marker.body);
+    if (stamp) best = stamp;
   }
   return best;
 }
 
 export function latestDeliveryLeaseExpiryMs(
-  commentBodies: readonly string[],
+  markers: readonly { kind: string; body: string }[],
 ): number | null {
-  return latestDeliveryLeaseStamp(commentBodies).expiresAt;
+  return latestDeliveryLeaseStamp(markers).expiresAt;
 }
 
 export type PipelineLeaseDecision =
@@ -749,7 +655,7 @@ export type PipelineLeaseDecision =
 /**
  * `/deliver` (pipeline) waits on a live lease instead of SKIPPED.
  * Sweep/ground/build stay fail-fast so one leased ticket cannot stall a wave.
- * Terminal Dev/Prod while waiting = the other run finished the loop.
+ * A configured completion status while waiting means the other run finished.
  */
 export function decidePipelineLeaseAction(input: {
   stateName?: string | null;
@@ -760,12 +666,10 @@ export function decidePipelineLeaseAction(input: {
   maxWaitMs?: number;
   previousGhaRunActive?: boolean | null;
   resumeLandFromPartial?: boolean;
+  completeStatuses?: readonly string[];
 }): PipelineLeaseDecision {
   const state = (input.stateName ?? "").trim();
-  if (
-    state.toLowerCase() === TERMINAL_DEV_STATE.toLowerCase() ||
-    state.toLowerCase() === TERMINAL_PROD_STATE.toLowerCase()
-  ) {
+  if (input.completeStatuses?.some((name) => name.trim().toLowerCase() === state.toLowerCase())) {
     return { action: "already_complete", stateName: state };
   }
   if (
@@ -853,7 +757,7 @@ export type ProgramSlice = {
   id: string;
   title: string;
   /** How far the factory may go unattended for this slice. */
-  afkTo: "dev" | "none";
+  afkTo: "complete" | "none";
   intake: "auto" | "park";
   park: ProgramPark[];
   issues: ProgramIssue[];
@@ -1084,7 +988,7 @@ export function compileDeliveryProgramFromLinear(
     return {
       id: sliceIdFromMilestone(m.name, m.id, usedIds),
       title: m.name,
-      afkTo: intakePark ? "none" : "dev",
+      afkTo: intakePark ? "none" : "complete",
       intake: intakePark ? "park" : "auto",
       park,
       issues,
@@ -1121,10 +1025,10 @@ export function compileDeliveryProgramFromLinear(
 /** Do not Todo tickets that are already intake or delivery-terminal. */
 export function shouldProgramSyncSkipState(
   stateName: string | null | undefined,
+  board?: ProgramBoard,
 ): boolean {
-  const n = (stateName ?? "").trim().toLowerCase();
-  if (n === "todo") return true;
-  return isGraphUnblockingState(stateName);
+  if ((stateName ?? "").trim().toLowerCase() === "todo") return true;
+  return isIssueTerminalForProgram(stateName, board);
 }
 
 export function isIssueTerminalForProgram(
@@ -1150,7 +1054,8 @@ export type ProgramBoard = {
   unblocking?: readonly string[];
   backlog?: string | null;
   hold?: string | null;
-  dev?: string | null;
+  complete?: string | null;
+  shipped?: string | null;
   intake?: string | null;
 };
 
@@ -1232,7 +1137,7 @@ export function describeProgramCursor(
   const s = normalizeProgramStates(states);
   for (const sl of program.slices) {
     for (const issue of sl.issues) {
-      if (!isIssueTerminalForProgram(s[issue.id.toUpperCase()])) {
+      if (!isIssueTerminalForProgram(s[issue.id.toUpperCase()], board)) {
         return { kind: "empty-bag" };
       }
     }
@@ -1359,9 +1264,10 @@ export function formatDeliveryProgramContext(opts: {
 }): string {
   const board = opts.board;
   const hold = board?.hold?.trim() || "Hold";
-  const dev = board?.dev?.trim() || "Dev";
+  const complete = board?.complete?.trim() || "Complete";
+  const shipped = board?.shipped?.trim() || "";
   const backlog = board?.backlog?.trim() || "";
-  const named = [backlog, hold, dev].filter(Boolean).join(" / ");
+  const named = [backlog, hold, complete, shipped].filter(Boolean).join(" / ");
   const s = normalizeProgramStates(opts.states);
   const held = new Set(
     [...(opts.heldOff ?? [])].map((id) => id.trim().toUpperCase()).filter(Boolean),
@@ -1375,7 +1281,7 @@ export function formatDeliveryProgramContext(opts: {
     "If a later-stage ticket is already delivered, extend those primitives — do not fork a parallel path for the same behavior.",
     "Re-ground when the latest audit lacks **Program graph:** — unchanged description is not a skip.",
     "Linear ticket text is **product intent**, not a closed spec. Engineering owns closed defaults: BUILDABLE the smallest safe change from current code and documented invariants. Write `**Harness packet:**` (one sentence) on the audit. Do not wait for a PM rewrite.",
-    `Smallest safe change does not leave other callers of the same primitive on the old behavior. Inventory remaining same-behavior callers (or name a category exclusion with a path). Sweep completes engineering e2e; the only human gate is product using ${dev} and filing a new ticket. Do not park leftover callers in Recommendations. Do not rely on a second ground after land.`,
+    `Smallest safe change does not leave other callers of the same primitive on the old behavior. Inventory remaining same-behavior callers (or name a category exclusion with a path). Sweep completes engineering e2e; product uses ${complete} and files a new ticket. Do not park leftover callers in Recommendations. Do not rely on a second ground after land.`,
     `NEEDS RESCOPE without that line is a retry, not a park. NEEDS RESCOPE after a cited harness packet means no safe default — ${hold}. WRONG DIAGNOSIS parks to Canceled. Phase parks and real \`blockedBy\` still bind.`,
     "",
   ];

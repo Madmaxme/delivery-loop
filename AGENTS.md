@@ -6,7 +6,7 @@ An engineering bot or cloud agent reads this repo's harness rules before each ta
 
 ## This package
 
-This repository is the delivery-loop engine. The master methodology is [conduct/methodology/SKILL.md](conduct/methodology/SKILL.md). The Cursor rule is [.cursor/rules/delivery-loop.mdc](.cursor/rules/delivery-loop.mdc). Code conduct is [conduct/conduct/SKILL.md](conduct/conduct/SKILL.md). Clients pin a tag and add overlays. Conduct stays in that skill.
+This repository is the Delivery Loop v2 engine. The versioned master procedure is [conduct/methodology/SKILL.md](conduct/methodology/SKILL.md); its companion code-conduct source is [conduct/conduct/SKILL.md](conduct/conduct/SKILL.md). Installs expose them as `.agents/skills/delivery-loop` and `.agents/skills/delivery-loop-conduct`, with Cursor and Claude links to those canonical targets. Clients pin a tag and keep policy/deploy instructions in overlays. See the [v1-to-v2 migration guide](conduct/methodology/MIGRATION-V1-TO-V2.md) before upgrading.
 
 The orchestrator talks to the owner. The engineering bot owns the code and runs the loop: it dispatches sweeps, launches cloud agents, and merges, or leaves the merge to the lander or the engine-heal workflow. Any actor may squash-merge once quality is green on the head. Updating the branch with trunk is part of that path. GitHub is the record.
 

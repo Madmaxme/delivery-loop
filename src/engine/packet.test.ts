@@ -27,6 +27,10 @@ const PACKET = `
 **Symbols:** \`api/src/pay.ts#charge\`
 **Validation:** \`npm test\`
 **Stop:** The same handler is the only charge path.
+## Acceptance criteria
+| ID | Text | Source |
+| --- | --- | --- |
+| one-charge | Repeating a request creates only one charge. | Issue description |
 BUILD_PACKET -->
 `;
 
@@ -132,6 +136,14 @@ describe("work order", () => {
     assert.deepEqual(order?.repos, ["api"]);
     assert.equal(order?.invariant, "charges-are-idempotent");
     assert.equal(order?.symbols[0], "api/src/pay.ts#charge");
+    assert.deepEqual(order?.criteria, [
+      { id: "one-charge", text: "Repeating a request creates only one charge.", source: "Issue description" },
+    ]);
+  });
+  it("rejects missing or duplicate acceptance criteria", () => {
+    const criterion = "| one-charge | Repeating a request creates only one charge. | Issue description |\n";
+    assert.equal(parseWorkOrder(PACKET.replace(criterion, "")), null);
+    assert.equal(parseWorkOrder(PACKET.replace("BUILD_PACKET -->", `${criterion}BUILD_PACKET -->`)), null);
   });
 
   it("rejects a packet that does not cite an invariant", () => {
@@ -158,6 +170,10 @@ npm test
 \`\`\`
 ## Stop
 One commission path remains.
+## Acceptance criteria
+| ID | Text | Source |
+| --- | --- | --- |
+| commission | Keep the single commission snapshot. | Grounding decision |
 GROUNDING_HANDOFF -->
 The prompt says BUILDABLE, NEEDS DIAGNOSIS.
 `;
@@ -167,6 +183,9 @@ The prompt says BUILDABLE, NEEDS DIAGNOSIS.
     const separate = handoff.replace("**Repos:** `api, customer-web`", "**Repos:** `api` `customer-web`");
     assert.deepEqual(parseWorkOrder(separate)?.repos, ["api", "customer-web"]);
     assert.equal(order?.invariant, "billing/commission-resolution");
+    assert.deepEqual(order?.criteria, [
+      { id: "commission", text: "Keep the single commission snapshot.", source: "Grounding decision" },
+    ]);
     assert.equal(order?.validation[0], "npm test");
     assert.equal(parseVerdict("The prompt lists BUILDABLE as a choice."), null);
   });

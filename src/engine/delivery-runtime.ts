@@ -6,12 +6,13 @@
  * the sweep/pipeline join loop there.
  */
 
-export type DeliveryMode = "ground" | "build" | "land" | "pipeline" | "sweep";
-export type DeliveryRuntime = "gha" | "local";
+export type ShipAction = "ship" | "continue";
+export type DeliveryMode = "ground" | "build" | "land" | "pipeline" | "sweep" | "audit" | "ship";
 
 export type DeliveryPlan = {
   runtime: DeliveryRuntime;
   mode: DeliveryMode;
+  shipAction?: ShipAction;
   issue: string | null;
   project: string | null;
   surface: string | null;
@@ -29,6 +30,8 @@ const MODES = new Set<DeliveryMode>([
   "land",
   "pipeline",
   "sweep",
+  "audit",
+  "ship",
 ]);
 
 function takeValue(
@@ -45,6 +48,7 @@ export function planDeliveryInvocation(input: {
   envRuntime?: string;
   mode: string;
   argv: string[];
+  shipAction?: ShipAction;
 }): DeliveryPlan {
   if (!MODES.has(input.mode as DeliveryMode)) {
     throw new Error(`Unknown mode: ${input.mode}`);
@@ -118,7 +122,7 @@ export function planDeliveryInvocation(input: {
       noPruneStaleGraph = true;
       continue;
     }
-    if (mode !== "sweep" && /^[A-Z][A-Z0-9]*-\d+$/i.test(a) && !issue) {
+    if (mode !== "sweep" && mode !== "audit" && /^[A-Z][A-Z0-9]*-\d+$/i.test(a) && !issue) {
       issue = a.toUpperCase();
       continue;
     }
@@ -127,7 +131,7 @@ export function planDeliveryInvocation(input: {
 
   const project = projectParts.length ? projectParts.join(" ") : null;
   const localArgs: string[] = [];
-  if (mode === "sweep") {
+  if (mode === "sweep" || mode === "audit") {
     if (project) localArgs.push("--project", project);
     if (surface) localArgs.push("--surface", surface);
     if (noFillGraph) localArgs.push("--no-fill-graph");
@@ -139,7 +143,7 @@ export function planDeliveryInvocation(input: {
   }
   localArgs.push(...extras);
 
-  const lever = mode === "sweep" || mode === "pipeline";
+  const lever = mode === "sweep" || mode === "pipeline" || mode === "audit" || mode === "ship";
   let runtime: DeliveryRuntime = lever ? "gha" : "local";
   let reason = lever
     ? "default: GitHub Actions is the durable parent (chat VMs hibernate between turns)"
@@ -169,6 +173,7 @@ export function planDeliveryInvocation(input: {
     noPruneStaleGraph,
     localArgs,
     reason,
+    shipAction: mode === "ship" ? input.shipAction ?? "ship" : undefined,
   };
 }
 
@@ -179,9 +184,10 @@ export function ghaDispatchFields(plan: DeliveryPlan): Record<string, string> {
   if (plan.surface) fields.surface = plan.surface;
   if (plan.noFillGraph) fields.no_fill_graph = "true";
   if (plan.fillGraph && !plan.noFillGraph) fields.fill_graph = "true";
-  if (plan.noPruneStaleGraph) fields.no_prune_stale_graph = "true";
+  if (plan.shipAction) fields.ship_action = plan.shipAction;
   return fields;
 }
+
 
 function isMainModule(): boolean {
   const entry = process.argv[1] ?? "";

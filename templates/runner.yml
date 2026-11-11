@@ -4,18 +4,32 @@ on:
   workflow_dispatch:
     inputs:
       issue:
-        description: Ticket id. Required except for sweep.
+        description: Ticket id. Required except for audit or sweep.
+        required: false
+        type: string
+        default: ""
+      project:
+        description: Optional project scope for audit or sweep.
         required: false
         type: string
         default: ""
       mode:
-        description: sweep, deliver, or ship
+        description: audit, sweep, deliver, or ship
         required: true
         type: choice
         options:
+          - audit
           - sweep
           - deliver
           - ship
+      ship_action:
+        description: ship or continue the active ship stage
+        required: false
+        type: choice
+        options:
+          - ship
+          - continue
+        default: ship
 
 permissions:
   contents: write
@@ -29,9 +43,11 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Pack prepare
         run: |
-          if [ -x scripts/delivery-loop-prepare.sh ]; then
+          if [ "${{ inputs.mode }}" != "audit" ] && [ -x scripts/delivery-loop-prepare.sh ]; then
             bash scripts/delivery-loop-prepare.sh
           fi
       - uses: actions/setup-node@v4
@@ -40,16 +56,18 @@ jobs:
       - name: Run the loop
         env:
           GITHUB_ACTIONS: "true"
+          DELIVERY_LOOP_PROJECT: ${{ inputs.project }}
+          DELIVERY_LOOP_ISSUE: ${{ inputs.issue }}
           DELIVERY_LOOP_RUNTIME: local
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           # Prints an installation token for check-runs. Empty keeps GH_TOKEN.
-          DELIVERY_LOOP_GITHUB_MINT: ${{ vars.DELIVERY_LOOP_GITHUB_MINT }}
+          DELIVERY_LOOP_GITHUB_MINT: ${{ inputs.mode != 'audit' && vars.DELIVERY_LOOP_GITHUB_MINT || '' }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          CURSOR_API_KEY: ${{ inputs.mode != 'audit' && secrets.CURSOR_API_KEY || '' }}
           # Second cursor key slot. An empty secret leaves the launch on the primary slot.
-          CURSOR_API_KEY_FALLBACK: ${{ secrets.CURSOR_API_KEY_FALLBACK }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CURSOR_API_KEY_FALLBACK: ${{ inputs.mode != 'audit' && secrets.CURSOR_API_KEY_FALLBACK || '' }}
+          ANTHROPIC_API_KEY: ${{ inputs.mode != 'audit' && secrets.ANTHROPIC_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ inputs.mode != 'audit' && secrets.OPENAI_API_KEY || '' }}
           # Empty URL writes the event file and does not post.
           # The header is one line from the client's own store.
           # REQUIRED true or 1 fails the run when the post fails.
@@ -61,7 +79,9 @@ jobs:
           dir="$(mktemp -d)/delivery-loop"
           git clone --depth 1 --branch __DELIVERY_LOOP_REF__ https://github.com/Madmaxme/delivery-loop.git "$dir"
           event_failed=0
-          bash "$dir/scripts/run-event.sh" started || event_failed=1
+          if [ "${{ inputs.mode }}" != "audit" ]; then
+            bash "$dir/scripts/run-event.sh" started || event_failed=1
+          fi
           code=0
           if [ "$event_failed" -eq 0 ]; then
             set +e
@@ -72,10 +92,24 @@ jobs:
               code=$?
             fi
             if [ "$code" -eq 0 ]; then
-              if [ "${{ inputs.mode }}" = "sweep" ]; then
-                delivery-loop sweep
+              if [ "${{ inputs.mode }}" = "audit" ]; then
+                if [ -n "$DELIVERY_LOOP_PROJECT" ]; then
+                  delivery-loop audit --project "$DELIVERY_LOOP_PROJECT"
+                else
+                  delivery-loop audit
+                fi
+              elif [ "${{ inputs.mode }}" = "sweep" ]; then
+                if [ -n "$DELIVERY_LOOP_PROJECT" ]; then
+                  delivery-loop sweep --project "$DELIVERY_LOOP_PROJECT"
+                else
+                  delivery-loop sweep
+                fi
               elif [ "${{ inputs.mode }}" = "ship" ]; then
-                delivery-loop ship ${{ inputs.issue }}
+                if [ "${{ inputs.ship_action }}" = "continue" ]; then
+                  delivery-loop ship continue "$DELIVERY_LOOP_ISSUE"
+                else
+                  delivery-loop ship "$DELIVERY_LOOP_ISSUE"
+                fi
               else
                 delivery-loop deliver ${{ inputs.issue }}
               fi
@@ -88,13 +122,15 @@ jobs:
           else
             event_status=success
           fi
-          bash "$dir/scripts/run-event.sh" finished "$event_status" || event_failed=1
+          if [ "${{ inputs.mode }}" != "audit" ]; then
+            bash "$dir/scripts/run-event.sh" finished "$event_status" || event_failed=1
+          fi
           if [ "$event_failed" -ne 0 ]; then
             exit 1
           fi
           exit "$code"
       - name: Upload run events
-        if: always()
+        if: ${{ always() && inputs.mode != 'audit' }}
         uses: actions/upload-artifact@v4
         with:
           name: delivery-loop-run-events

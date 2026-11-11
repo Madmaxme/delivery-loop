@@ -1,73 +1,7 @@
 # Methodology
 
-[conduct/methodology/SKILL.md](conduct/methodology/SKILL.md) is the master copy of the harness. [.cursor/rules/delivery-loop.mdc](.cursor/rules/delivery-loop.mdc) is the Cursor rule. [AGENTS.md](AGENTS.md) points agents at both. [conduct/conduct/SKILL.md](conduct/conduct/SKILL.md) is the code conduct those files reference. Clients pin a tag, for example `github:<owner>/<repo>#vX.Y.Z`, and add overlays: `delivery-loop.yaml`, the invariants file, and prompt files. Product names stay in the client repo.
+The versioned master procedure is [the Delivery Loop v2 skill](conduct/methodology/SKILL.md). Its companion code-conduct source is [conduct/conduct/SKILL.md](conduct/conduct/SKILL.md). [AGENTS.md](AGENTS.md) and [.cursor/rules](.cursor/rules) point agents to these canonical sources. Clients pin a package tag and keep eligibility, Jira policy, acceptance meaning, deployment commands, and environment instructions in their own overlays.
 
-`delivery-loop init` and `delivery-loop update` copy the skills, the Cursor rule, and the runner workflow from the pinned package. The runner clones that same tag.
+`delivery-loop init` writes a complete v2 pack and installs the canonical skills under `.agents/skills`; Cursor and Claude skill entries link to those targets. `delivery-loop update` refreshes generated skills, the Cursor rule, and runner workflow without changing the pack or invariants.
 
-## Roles
-
-The orchestrator talks to the owner. The engineering bot owns the code and runs the loop. It dispatches sweeps, launches cloud agents, and merges, or leaves the merge to the lander or the engine-heal workflow. The lander opens one pull request per land repo and squash-merges it. A later sweep resumes pull requests the ticket already has. A merged pull request counts as landed. An open one uses the same quality and merge path, and a branch that is only behind is updated from trunk. Every open pull request is ready before the first squash. One that is not ready leaves the others unmerged. Before `status.dev`, the engine promotes each landed repo listed for dev whose deploy ref does not already contain that commit, including when the pull request merged earlier and when the verdict is already shipped, then posts one comment with the validated proof receipt, the merged SHA, and the pull request URL. A resume reuses that comment. A ticket already in the dev or prod status, with those refs containing the commits, is left as it is. A resume applies the same recorded-proof check, and when the merged commit does not contain the route test it checks the promoted dev ref. A route-test proof matches `journeySpec`. A spec outside that pattern is not proof. GitHub is the record of the pull request, the checks, and the merge.
-
-## Merge
-
-Any actor may squash-merge once quality is green on the head. A branch that is only behind is updated from trunk, then quality runs again on the new head. Two updates are the limit. When the install lists `commitActors` for that repo, the token's login is that actor.
-
-Check-runs use the token printed by `DELIVERY_LOOP_GITHUB_MINT` when that command is set. Other forge calls keep the forge token. A bare token expires 60 minutes after the mint. JSON with `token` and `expires_at` uses that expiry. The forge mints again when five minutes or less remain. A 401 or 403 from check-runs is a credential error. The forge does not read that check from another endpoint.
-
-When `DELIVERY_LOOP_GITHUB_MINT` is set, each run mints once at startup and reads `/rate_limit` with that token. Later check-runs reuse it. A failed mint or rate-limit read is logged and the run continues. That read is not a check.
-
-A Figma frame URL is the `figma.com` address. Surrounding markdown and a trailing `)` `]` `>` `.` `,` `;` or quote are not part of it. `node-id=1-2` is read as `1:2`. A 400 includes Figma's `err` or `message` and stops as a rejected request. A 403 or 404 stops as access and names `design.figmaTokenEnv`. The token, the headers, and a URL that contains a token are not written.
-
-## Credential log
-
-Each credential call writes one line. The line names the slot, the endpoint class, and the status. A success is included. A mint writes `slot=mint` and `endpoint=mint`. A re-mint near expiry adds `refresh=1`. Check-runs write `endpoint=check-runs`, with `slot=mint` when the mint command is set and `slot=gh-token` when it is not. Other GitHub calls write `slot=gh-token` and a class such as `pulls`, `contents`, `commits`, `compare`, `actions`, `issues`, `git`, or `user`. Linear writes `slot=linear` and `endpoint=linear-graphql`. A cursor launch writes `slot=primary` or `slot=fallback` and `endpoint=cursor-launch`. A Figma read writes `slot=figma` and `endpoint=figma`.
-
-The run line is `[delivery-loop] credential slot=<slot> endpoint=<endpoint> status=<status>`. The run ends with one summary line per slot, endpoint class, and status: `[delivery-loop] credential summary slot=<slot> endpoint=<endpoint> status=<status> count=<n>`. A grep for `credential summary` that finds no status other than 200 means every recorded call returned 200.
-
-```text
-[delivery-loop] credential slot=mint endpoint=mint status=200
-[delivery-loop] credential slot=mint endpoint=mint status=200 refresh=1
-[delivery-loop] credential slot=mint endpoint=check-runs status=200
-[delivery-loop] credential slot=gh-token endpoint=pulls status=200
-[delivery-loop] credential summary slot=mint endpoint=check-runs status=200 count=1
-[delivery-loop] credential summary slot=mint endpoint=mint status=200 count=2
-[delivery-loop] credential summary slot=gh-token endpoint=pulls status=200 count=1
-```
-
-The token, the headers, and the request URL are not written. A slot or endpoint class outside the known set is logged as `unknown`. A usable mint is logged as `status=200`. A mint that exits 0 without a usable token logs `status=0`. A worker launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. A GraphQL error carried on HTTP 200 stays `status=200`. A promote that does not run, because the deploy ref already contains the commit, does not add a promote line. The promote and ship lines do not include the command.
-
-A recorded proof that passes writes `[delivery-loop] proof ok`. A promote or ship command that exits 0 writes `[delivery-loop] promote ok` or `[delivery-loop] ship ok`. A dev step that is not a promote writes `[delivery-loop] dev ok`. A squash that returns a commit writes `[delivery-loop] land ok`.
-
-## Engine heal
-
-An engine heal of this package opens a pull request on `engine-heal/<ticket>` with the label `engine-heal`. The opener commits the next patch of `package.json` and `package-lock.json`, computed from the highest `v*` tag, and pushes with the commit-actor token. The first heal after `v1.0.0` is `1.0.1`. If that tag already exists, the opener stops. The `pull_request` `quality` check gates that head. The workflow squash-merges, reads the version from the merged `package.json`, tags that commit, and publishes the GitHub release. A pull request without the bump gets a comment and stops. A head from another repository is left unmerged. A client pins the tag when it needs the change.
-
-## Run events
-
-A worker run may write `delivery-loop.run.started` and `delivery-loop.run.finished`. The writer is `scripts/run-event.sh`. The schema is [schemas/run-event-1.0.schema.json](schemas/run-event-1.0.schema.json). The script writes `.delivery-loop/events/<type>.json` and the workflow uploads the artifact `delivery-loop-run-events`. This package does not post the file. A client sets `DELIVERY_LOOP_EVENT_URL` to an http(s) endpoint and may set `DELIVERY_LOOP_EVENT_HEADER`. An empty URL only writes the file. A failed post leaves the run's own exit code. `DELIVERY_LOOP_EVENT_REQUIRED` set to `true` or `1` makes a failed post fail the run. The URL and the header are never printed.
-
-## Lease
-
-One runner holds the ticket with a `DELIVERY_LEASE` comment. The lease records the live agent id as soon as the worker starts.
-
-## Bot definitions
-
-A leftover `bots` key is ignored with a warning.
-
-## Ship outcomes
-
-A zero ship exit with no outcome lines is success, including a store wait. The pack reports `delivery-loop outcome <ticket> COMPLETE`, `PARKED`, or `BLOCKED`, plus an optional reason. The engine prints `ship outcome <ticket> <state> [reason]` and `ship outcomes complete=<n> parked=<n> blocked=<n>`. Exit 0 means every ticket is COMPLETE. Exit 2 means a PARKED ticket and no BLOCKED ticket, unless `ship.parkSuccess` is true. Any BLOCKED line exits 1. `ship.parkSuccess` defaults to false. Exit 75, or a non-zero exit with `delivery-loop transient <reason>`, retries that ship or promote step. `transient.maxAttempts` defaults to 3. Waits start at one second and double. `transient.maxWaitMs` defaults to 60000 and caps the sum. A spent budget reports the reason and does not edit an owner. A non-transient failure still edits the owner. `$GITHUB_STEP_SUMMARY`, when set, receives the same rows as Markdown.
-
-## Worker keys
-
-The cursor worker launches with the env var named by `workerKeys.primary`, then the env var named by `workerKeys.fallback`. The defaults are `CURSOR_API_KEY` and `CURSOR_API_KEY_FALLBACK`. The log records the slot in use, `primary` or `fallback`, and the launch status. A launch that succeeds logs `status=200`. A launch that fails without an HTTP status logs `status=0`. The value stays in the environment.
-
-A capacity or balance refusal on the primary slot retries that launch once on the fallback slot.
-An authentication failure stops on the slot that returned it.
-A rate limit stops on the slot that returned it.
-A network failure stops on the slot that returned it.
-A refusal from both slots fails the launch and reports that both slots are out of capacity.
-An empty fallback variable leaves that launch on the primary slot.
-
-`workerModel` is the cursor model id. The launch passes `{ id }` and the credential line names that id. An absent `workerModel` omits the model and logs that the account default is in use.
-A 5xx on a cursor launch waits one second and retries that slot once. A second 5xx uses the fallback slot. Each attempt logs its slot, `endpoint=cursor-launch`, and status.
+Before upgrading a v1 client, follow the [v1-to-v2 migration guide](conduct/methodology/MIGRATION-V1-TO-V2.md). V2 has no v1 pack or run-state compatibility path.
