@@ -2292,6 +2292,39 @@ describe("loop", () => {
     assert.match(note, /\{e2e,integration_test,journey\}\/\*\*/);
   });
 
+  it("asks the owner to heal when a saved receipt still does not parse", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "abc";
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => ({ status: 0, stdout: "" });
+    await seedLandResume(env, false, [{ repo: "api", sha: "abc" }], audit("api", "**Journey evidence:** recorded"));
+    const state = await env.deps.tracker.stateStore.readDeliveryState("API-1");
+    await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+      ...state,
+      markers: [
+        ...state.markers.filter((marker) => marker.kind !== "proof-receipt" && marker.kind !== "landed-commits"),
+        { kind: "landed-commits", body: JSON.stringify([{ repo: "api", sha: "abc" }]), createdAt: new Date(0).toISOString() },
+        {
+          kind: "proof-receipt",
+          body: JSON.stringify({
+            schemaVersion: 2,
+            criteriaRevision: ticket().criteriaRevision,
+            landed: [{ repo: "api", sha: "abc" }],
+            pullRequests: [],
+            attempted: true,
+            validated: false,
+            receipt: "```text\n`https://example.test/dl/walk.webm`\n```",
+          }),
+          createdAt: new Date(0).toISOString(),
+        },
+      ],
+    });
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "land-blocked");
+    assert.match(result.detail, /Recorded journey proof did not parse/);
+    assert.equal(env.deliveryState().markers.some((marker) => marker.kind === "owner-heal"), true);
+  });
+
   it("advances a v2 resume after recording journey proof once", async () => {
     const env = harness(BUILDABLE);
     env.deps.lookupHead = () => "trunk";

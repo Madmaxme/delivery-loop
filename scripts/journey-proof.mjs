@@ -78,15 +78,44 @@ const RECORDING = /^https:\/\/\S+$/i;
 const RECORDING_SHAPE = /\.(?:png|jpe?g|webp|gif|mp4|webm|mov)(?:[?#]\S*)?$|\/artifacts\//i;
 
 /**
- * Proof lines for tokens named in `text`.
- * A route token counts when its path matches the journey-spec pattern.
- * A spec outside that pattern is left out. A recording URL is kept.
+ * Spans inside one backtick. A fence of three or more backticks is a
+ * delimiter, including its info string, and is not a token. A URL written
+ * in backticks inside that fence stays a token.
  */
+export function backtickTokens(text) {
+  const tokens = [];
+  const src = String(text ?? "");
+  let i = 0;
+  while (i < src.length) {
+    if (src[i] !== "`") {
+      i += 1;
+      continue;
+    }
+    let j = i;
+    while (j < src.length && src[j] === "`") j += 1;
+    const run = j - i;
+    if (run >= 3) {
+      const lineEnd = src.indexOf("\n", j);
+      i = lineEnd === -1 ? src.length : lineEnd + 1;
+      continue;
+    }
+    const closer = "`".repeat(run);
+    const close = src.indexOf(closer, j);
+    if (close === -1) {
+      i = j;
+      continue;
+    }
+    tokens.push(src.slice(j, close));
+    i = close + run;
+  }
+  return tokens;
+}
+
 export function proofLinesFor(text, pattern = DEFAULT_JOURNEY_SPEC) {
   const lines = [];
   const seen = new Set();
-  for (const match of String(text ?? "").matchAll(/`([^`]+)`/g)) {
-    const token = match[1].trim();
+  for (const raw of backtickTokens(text)) {
+    const token = raw.trim();
     if (!token || seen.has(token)) continue;
     if (RECORDING.test(token) && RECORDING_SHAPE.test(token)) {
       seen.add(token);

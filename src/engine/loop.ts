@@ -2017,6 +2017,21 @@ function journeyMissComment(
   return `Journey evidence for ${identifier} is recorded. The route test is absent from the landed commit and configured delivery-stage refs. A web journey needs the recording URL in the build receipt. A mobile journey needs the route test on those refs under \`${journeySpecText(deps)}\`. The ticket stays in intake.`;
 }
 
+/** A saved receipt that still does not parse asks the owner to heal. */
+async function healUnparsedJourneyProof(
+  deps: LoopDeps,
+  ticket: Ticket,
+  result: TicketResult,
+): Promise<TicketResult> {
+  const reason = `Recorded journey proof did not parse. ${result.detail}`;
+  await applyOwnerHeal(deps, ticket, "heal:journey:unparsed", reason);
+  return {
+    identifier: ticket.identifier,
+    outcome: "land-blocked",
+    detail: reason,
+  };
+}
+
 async function applyRecordedProof(
   deps: LoopDeps,
   ticket: Ticket,
@@ -2045,14 +2060,16 @@ async function applyRecordedProof(
   const printed = journeyCommandProof(deps, evidence);
   if (!printed.ok) {
     await deps.tracker.comment(ticket.identifier, journeyTokenMissing(deps, ticket.identifier, printed));
-    return {
-      ok: false,
-      result: {
-        identifier: ticket.identifier,
-        outcome: "journey-missing",
-        detail: "recorded proof missing",
-      },
+    const missing: TicketResult = {
+      identifier: ticket.identifier,
+      outcome: "journey-missing",
+      detail: "recorded proof missing",
     };
+    const saved = journeyProofReceiptState(deps, ticket);
+    if (saved?.receipt.trim()) {
+      return { ok: false, result: await healUnparsedJourneyProof(deps, ticket, missing) };
+    }
+    return { ok: false, result: missing };
   }
   const combined = [receipt, printed.stdout].filter((part) => part.trim()).join("\n");
   const proofReceipt = combined.trim() ? combined : declared;
