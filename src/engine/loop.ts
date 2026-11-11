@@ -425,11 +425,21 @@ const GENERIC_GROUND = [
 ].join("\n");
 
 function criteriaMatrix(criteria: readonly AcceptanceCriterion[]): string {
+  const stages = criteria.some((row) => row.stages && row.stages.length > 0);
+  const repos = criteria.some((row) => row.repos && row.repos.length > 0);
+  const head = ["ID", "Text", "Source", ...(stages ? ["Stages"] : []), ...(repos ? ["Repos"] : [])];
+  const line = (cells: string[]) => `| ${cells.join(" | ")} |`;
   return [
     "## Acceptance criteria",
-    "| ID | Text | Source |",
-    "| --- | --- | --- |",
-    ...criteria.map(({ id, text, source }) => `| ${id} | ${text.replaceAll("|", "\\|")} | ${source.replaceAll("|", "\\|")} |`),
+    line(head),
+    line(head.map(() => "---")),
+    ...criteria.map((row) => line([
+      row.id,
+      row.text.replaceAll("|", "\\|"),
+      row.source.replaceAll("|", "\\|"),
+      ...(stages ? [row.stages?.join(", ") ?? ""] : []),
+      ...(repos ? [row.repos?.join(", ") ?? ""] : []),
+    ])),
   ].join("\n");
 }
 
@@ -453,6 +463,7 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "One **Decision:** sentence that cites that id. **Symbols:** `repo/path#symbol`. **Repos:** in backticks, and only names from the land-repo list.",
     "Normalize every acceptance criterion into one table with stable unique IDs, exact criterion text, and its source. Preserve every distinct requirement from the ticket and linked evidence.",
     "The work order's Acceptance criteria table is authoritative. Build and stage verification reuse the same IDs and text.",
+    "Optional columns are Stages and Repos. An empty cell applies the criterion to every stage, or to every repo that stage landed. A stage receipt covers exactly the criteria that apply to it. Evidence from another stage is not reused.",
     "Every BUILDABLE handoff includes **Prior request:** none | kept | replaced <id> | ask.",
     "none means no written rule asked for the current behavior. kept means one did and this ticket keeps it. replaced names the ticket this one undoes. ask means a rule asked for the current behavior and this ticket does not undo it. The runner records ask as kept.",
     "A missing line, or replaced without a ticket id, stays in intake. ask does not. With no symbols, ask closes the ticket as already done. With symbols, the same land path continues. The verdict stays BUILDABLE.",
@@ -1527,6 +1538,57 @@ function stageLandedRows(
   return rows;
 }
 
+function criterionApplies(
+  criterion: AcceptanceCriterion,
+  stage: PromotionStage,
+  scoped: readonly { repo: string; sha: string }[],
+): boolean {
+  if (scoped.length === 0) return false;
+  if (criterion.stages && !criterion.stages.includes(stage.id)) return false;
+  if (criterion.repos && !criterion.repos.some((repo) => scoped.some((row) => row.repo === repo))) return false;
+  return true;
+}
+
+/** Criteria this stage must prove. Undeclared stages and repos apply to every stage and every landed repo. */
+function criteriaForStage(
+  criteria: readonly AcceptanceCriterion[],
+  stage: PromotionStage,
+  scoped: readonly { repo: string; sha: string }[],
+): AcceptanceCriterion[] {
+  return criteria.filter((criterion) => criterionApplies(criterion, stage, scoped));
+}
+
+function uncoveredCriteria(
+  criteria: readonly AcceptanceCriterion[],
+  authorizationStages: readonly PromotionStage[],
+  allStages: readonly PromotionStage[],
+  landed: readonly { repo: string; sha: string }[],
+): AcceptanceCriterion[] {
+  return criteria.filter((criterion) => {
+    if (criterion.stages?.some((id) => !allStages.some((stage) => stage.id === id))) return true;
+    const inThis = !criterion.stages || criterion.stages.some((id) => authorizationStages.some((stage) => stage.id === id));
+    if (!inThis) return false;
+    return !authorizationStages.some((stage) => criterionApplies(criterion, stage, stageLandedRows(stage, landed)));
+  });
+}
+
+function authorizationSatisfied(
+  stages: readonly PromotionStage[],
+  allStages: readonly PromotionStage[],
+  receipts: readonly StageVerificationReceipt[],
+  ticket: { criteriaRevision: string },
+  landed: readonly { repo: string; sha: string }[],
+  criteria: readonly AcceptanceCriterion[],
+): boolean {
+  if (stages.length === 0) return true;
+  if (stages.every((stage) => stageLandedRows(stage, landed).length === 0)) return false;
+  if (!stages.every((stage) => {
+    const receipt = receipts.find((item) => item.stageId === stage.id);
+    return currentStageReceipt(receipt, stage, ticket, landed, criteria);
+  })) return false;
+  return uncoveredCriteria(criteria, stages, allStages, landed).length === 0;
+}
+
 function notApplicableReceipt(stage: PromotionStage, ticket: { criteriaRevision: string }): StageVerificationReceipt {
   return {
     stageId: stage.id,
@@ -1559,7 +1621,7 @@ function currentStageReceipt(
       receipt.reason.trim(),
     );
   }
-  return Boolean(receipt && stageReceiptPasses(receipt, stage, ticket, sortedLanded(scoped), criteria));
+  return Boolean(receipt && stageReceiptPasses(receipt, stage, ticket, sortedLanded(scoped), criteriaForStage(criteria, stage, scoped)));
 }
 
 async function writeStageReceipt(deps: LoopDeps, ticket: Ticket, receipt: StageVerificationReceipt): Promise<void> {
@@ -1707,7 +1769,8 @@ async function runPromotionStages(
     }
     applicable += 1;
     const landedHere = sortedLanded(scoped);
-    if (old && stageReceiptPasses(old, stage, ticket, landedHere, criteria)) continue;
+    const expected = criteriaForStage(criteria, stage, scoped);
+    if (old && stageReceiptPasses(old, stage, ticket, landedHere, expected)) continue;
     const repos = scoped.map((row) => ({ name: row.repo, spec: repoByName(deps.pack, row.repo) }));
     const missingSpec = repos.find((row) => !row.spec);
     if (missingSpec) return { outcome: "failed", stage, reason: `stage ${stage.id} has no checkout for ${missingSpec.name}` };
@@ -1732,7 +1795,7 @@ async function runPromotionStages(
         repo: row.name,
         sourceSha: source.sha,
       }, commandTimeout);
-      if (promoted.timedOut) return blockTimedOutStage(deps, ticket, stage, commandKind, commandTimeout!, landedHere, criteria);
+      if (promoted.timedOut) return blockTimedOutStage(deps, ticket, stage, commandKind, commandTimeout!, landedHere, expected);
       if (promoted.failed) return { outcome: "failed", stage, reason: promoted.failed };
       noteEngine(deps, "promote ok");
     }
@@ -1743,15 +1806,15 @@ async function runPromotionStages(
       target: stage.target,
       criteriaRevision: ticket.criteriaRevision,
       landedShas: landedHere,
-      criteria: [...criteria],
+      criteria: expected,
     };
     const verified = await runStageCommand(deps, stage.verifyCommand, verifyRepo, verifyInput, stage.verify?.timeoutMs);
-    if (verified.timedOut) return blockTimedOutStage(deps, ticket, stage, "verify", stage.verify!.timeoutMs, landedHere, criteria);
+    if (verified.timedOut) return blockTimedOutStage(deps, ticket, stage, "verify", stage.verify!.timeoutMs, landedHere, expected);
     if (verified.failed) return { outcome: "failed", stage, reason: verified.failed };
     let receipt: StageVerificationReceipt;
     try {
       const parsed: unknown = JSON.parse(verified.stdout.trim());
-      receipt = validateStageReceipt(parsed, stage, ticket, landedHere, criteria);
+      receipt = validateStageReceipt(parsed, stage, ticket, landedHere, expected);
     } catch (error) {
       return { outcome: "failed", stage, reason: `invalid stage receipt: ${error instanceof Error ? error.message : String(error)}` };
     }
@@ -1760,8 +1823,13 @@ async function runPromotionStages(
     await removeMarker(deps, ticket, "active-promotion-stage");
     noteEngine(deps, "verify ok");
   }
-  if (stages.length > 0 && applicable === 0) {
-    return { outcome: "failed", stage: stages[0]!, reason: "no promotion stage applies to the landed repos" };
+  const recorded = await readDeliveryState(deps, ticket);
+  if (stages.length > 0 && !authorizationSatisfied(stages, deps.pack.promotionStages, recorded.stageReceipts, ticket, allLanded, criteria)) {
+    const uncovered = uncoveredCriteria(criteria, stages, deps.pack.promotionStages, allLanded);
+    const reason = applicable === 0
+      ? "no promotion stage applies to the landed repos"
+      : `acceptance criteria not covered: ${uncovered.map((item) => item.id).join(", ")}`;
+    return { outcome: "failed", stage: stages[0]!, reason };
   }
   return { outcome: "complete" };
 }
@@ -2539,10 +2607,7 @@ async function alreadyFinished(deps: LoopDeps, ticket: Ticket): Promise<boolean>
   } catch {
     return false;
   }
-  return stages.every((stage) => {
-    const receipt = state.stageReceipts.find((item) => item.stageId === stage.id);
-    return currentStageReceipt(receipt, stage, ticket, landed, order.criteria);
-  });
+  return authorizationSatisfied(stages, deps.pack.promotionStages, state.stageReceipts, ticket, landed, order.criteria);
 }
 
 /**
@@ -3372,16 +3437,12 @@ export async function ship(
     throw new Error("landed commit state is invalid");
   }
   if ((deliveryStages.length > 0 || shipStages.length > 0) && !order) throw new Error("ship requires the saved acceptance matrix");
-  if (deliveryStages.some((stage) => {
-    const saved = state.stageReceipts.find((receipt) => receipt.stageId === stage.id);
-    return !currentStageReceipt(saved, stage, ticket, landed, order!.criteria);
-  })) throw new Error("ship requires every applicable delivery stage to have a current passed receipt");
+  if (!authorizationSatisfied(deliveryStages, deps.pack.promotionStages, state.stageReceipts, ticket, landed, order!.criteria)) {
+    throw new Error("ship requires every applicable delivery stage to have a current passed receipt");
+  }
   if (shipStages.length === 0) return { exitCode: 0, lines: [`${id} ${alreadyShipped ? "already shipped" : "has no ship stages"}`], parked: false };
   if (alreadyShipped) {
-    const passed = shipStages.every((stage) => {
-      const saved = state.stageReceipts.find((receipt) => receipt.stageId === stage.id);
-      return currentStageReceipt(saved, stage, ticket, landed, order!.criteria);
-    });
+    const passed = authorizationSatisfied(shipStages, deps.pack.promotionStages, state.stageReceipts, ticket, landed, order!.criteria);
     if (!passed) throw new Error("shipped ticket lacks current passed ship receipts");
     return { exitCode: 0, lines: [`${id} already shipped`], parked: false };
   }

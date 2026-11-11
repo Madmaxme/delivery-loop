@@ -260,8 +260,10 @@ function receiptFor(input: {
   deployed: { repo: string; sha: string }[];
   outcome?: "passed" | "blocked" | "parked";
   reason?: string;
+  criteria?: { id: string }[];
 }): string {
   const outcome = input.outcome ?? "passed";
+  const rows = input.criteria ?? [{ id: "single-charge" }];
   return JSON.stringify({
     stageId: input.stageId,
     target: input.target,
@@ -269,11 +271,11 @@ function receiptFor(input: {
     reason: input.reason ?? "",
     criteriaRevision: input.criteriaRevision,
     deployed: input.deployed,
-    criteria: [{
-      id: "single-charge",
+    criteria: rows.map((row) => ({
+      id: row.id,
       outcome: outcome === "passed" ? "verified" : "blocked",
-      evidence: outcome === "passed" ? ["verified on the deployed build"] : [],
-    }],
+      evidence: outcome === "passed" ? [`verified ${row.id}`] : [],
+    })),
   });
 }
 
@@ -1832,6 +1834,125 @@ describe("loop", () => {
     assert.deepEqual(receipts.find((item) => item.stageId === "handset")?.deployed, []);
     assert.deepEqual(receipts.find((item) => item.stageId === "handset")?.criteria, []);
     assert.equal(env.state(), pack.status.complete);
+  });
+
+  it("covers exactly the criteria scoped to each stage", async () => {
+    const ground = BUILDABLE.replace(
+      `| ID | Text | Source |
+| --- | --- | --- |
+| single-charge | Preserve one charge path. | Issue description`,
+      `| ID | Text | Source | Stages | Repos |
+| --- | --- | --- | --- | --- |
+| api-path | Preserve one charge path. | Issue description | shared | api |
+| handset-path | Keep the handset path. | Issue description | handset | mobile`,
+    );
+    const env = harness(ground);
+    env.deps.ownerHeal = async () => "**Heal:** wait";
+    const mobile = { name: "mobile", url: "https://github.com/acme/mobile", trunk: "main" };
+    env.deps.pack = {
+      ...pack,
+      repos: [...pack.repos, mobile],
+      promotionStages: [
+        { id: "shared", target: "shared-ring", authorization: "deliver", promoteCommand: "promote-shared", repos: ["api", "mobile"], verifyCommand: "verify-shared" },
+        { id: "handset", target: "handset-ring", authorization: "deliver", promoteCommand: "promote-handset", repos: ["mobile"], verifyCommand: "verify-handset" },
+      ],
+    };
+    const seen: { command: string; criteria: string[] }[] = [];
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (!command.startsWith("verify")) return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as StageVerifyInput;
+      seen.push({ command, criteria: input.criteria.map((item) => item.id) });
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision,
+          deployed: input.landedShas,
+          criteria: input.criteria,
+        }),
+      };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "quality-failed");
+    assert.match(result.detail, /handset-path/);
+    assert.deepEqual(seen, [{ command: "verify-shared", criteria: ["api-path"] }]);
+    assert.equal(env.deliveryState().stageReceipts.find((item) => item.stageId === "handset")?.outcome, "not-applicable");
+    assert.equal(env.state(), "Todo");
+
+    const both = BUILDABLE.replace(
+      `| ID | Text | Source |
+| --- | --- | --- |
+| single-charge | Preserve one charge path. | Issue description`,
+      `| ID | Text | Source | Stages |
+| --- | --- | --- | --- |
+| first-path | Preserve one charge path. | Issue description | stage-one |
+| second-path | Keep the second path. | Issue description | stage-two`,
+    );
+    const split = harness(both);
+    split.deps.pack = {
+      ...pack,
+      promotionStages: [
+        { id: "stage-one", target: "green-ring", authorization: "deliver", promoteCommand: "promote-one", repos: ["api"], verifyCommand: "verify-one" },
+        { id: "stage-two", target: "west-cluster", authorization: "deliver", promoteCommand: "promote-two", repos: ["api"], verifyCommand: "verify-two" },
+      ],
+    };
+    const criteriaSeen: string[][] = [];
+    split.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (!command.startsWith("verify")) return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as StageVerifyInput;
+      criteriaSeen.push(input.criteria.map((item) => item.id));
+      if (command === "verify-two") {
+        return {
+          status: 0,
+          stdout: receiptFor({
+            stageId: input.stageId,
+            target: input.target,
+            criteriaRevision: input.criteriaRevision,
+            deployed: input.landedShas,
+            criteria: [{ id: "first-path" }, { id: "second-path" }],
+          }),
+        };
+      }
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision,
+          deployed: input.landedShas,
+          criteria: input.criteria,
+        }),
+      };
+    };
+    const extra = await runTicket(split.deps, ticket());
+    assert.equal(extra.outcome, "quality-failed");
+    assert.deepEqual(criteriaSeen, [["first-path"], ["second-path"]]);
+    assert.equal(split.deliveryState().stageReceipts.some((item) => item.stageId === "stage-two"), false);
+
+    split.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (!command.startsWith("verify")) return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as StageVerifyInput;
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision,
+          deployed: input.landedShas,
+          criteria: input.criteria,
+          ...(command === "verify-two" ? {} : {}),
+        }),
+      };
+    };
+    const covered = await runTicket(split.deps, ticket());
+    assert.equal(covered.outcome, "landed");
+    assert.deepEqual(
+      split.deliveryState().stageReceipts.map((item) => item.criteria.map((row) => row.id)),
+      [["first-path"], ["second-path"]],
+    );
+    assert.equal(split.deliveryState().stageReceipts[1]?.criteria[0]?.evidence.includes("verified first-path"), false);
+    assert.equal(split.state(), pack.status.complete);
   });
 
   it("records a stage with no landed repos as not applicable", async () => {
