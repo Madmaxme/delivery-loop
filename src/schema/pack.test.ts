@@ -72,7 +72,10 @@ describe("pack requirements", () => {
     verifyCommand: ./scripts/verify.sh
 `;
     assert.throws(() => loadPack(write(base.replace("promotionStages: []", stage))), /parkSuccess and writeStatus/);
-    const writesStatus = stage.replace("verifyCommand: ./scripts/verify.sh", "verifyCommand: ./scripts/verify.sh\n    parkSuccess: false\n    writeStatus: true");
+    const writesStatus = stage.replace(
+      "verifyCommand: ./scripts/verify.sh",
+      "verifyCommand: ./scripts/verify.sh\n    parkSuccess: false\n    writeStatus: true\n    approval:\n      source: label\n      label: approved",
+    );
     assert.throws(() => loadPack(write(base.replace("promotionStages: []", writesStatus))), /status.shipped/);
     const shipped = base.replace("  complete: Dev Complete", "  complete: Dev Complete\n  shipped: Shipped");
     assert.equal(loadPack(write(shipped.replace("promotionStages: []", writesStatus))).status.shipped, "Shipped");
@@ -85,7 +88,7 @@ describe("pack requirements", () => {
     promoteCommand: ./scripts/promote.sh
     repos:
       - api
-    verifyCommand: ./scripts/verify.sh${authorization === "ship" ? "\n    parkSuccess: false\n    writeStatus: false" : ""}`;
+    verifyCommand: ./scripts/verify.sh${authorization === "ship" ? "\n    parkSuccess: false\n    writeStatus: false\n    approval:\n      source: label\n      label: approved" : ""}`;
     const duplicateId = base.replace("promotionStages: []", `promotionStages:\n${stage("dev", "dev", "deliver")}\n${stage("dev", "qa", "deliver")}`);
     assert.throws(() => loadPack(write(duplicateId)), /unique/);
     const duplicateTarget = base.replace("promotionStages: []", `promotionStages:\n${stage("dev", "dev", "deliver")}\n${stage("qa", "dev", "deliver")}`);
@@ -383,10 +386,61 @@ journeyCommand: node scripts/journey-proof.mjs
     verifyCommand: ./scripts/verify.sh
     parkSuccess: false
     writeStatus: false
+    approval:
+      source: label
+      label: approved
     dependsOn:
       - first`;
     const shipped = base.replace("  complete: Dev Complete", "  complete: Dev Complete\n  shipped: Shipped");
     assert.throws(() => loadPack(write(shipped.replace("promotionStages: []", `promotionStages:\n${stage("first")}\n${ship}`))), /another authorization/);
+  });
+
+  it("rejects a ship stage without approval and rejects a bad approval shape", () => {
+    const shipped = base.replace("  complete: Dev Complete", "  complete: Dev Complete\n  shipped: Shipped");
+    const stage = (approval: string) => `promotionStages:
+  - id: release
+    target: production
+    authorization: ship
+    promoteCommand: ./scripts/promote.sh
+    repos:
+      - api
+    verifyCommand: ./scripts/verify.sh
+    parkSuccess: false
+    writeStatus: false
+${approval}`;
+    const missing = stage("");
+    assert.throws(() => loadPack(write(shipped.replace("promotionStages: []", missing))), /approval/);
+    const shapes = [
+      "    approval: {}",
+      "    approval:\n      source: list",
+      "    approval:\n      source: list\n      issues: []",
+      "    approval:\n      source: list\n      issues:\n        - \"\"",
+      "    approval:\n      source: list\n      issues:\n        - API-1\n        - API-1",
+      "    approval:\n      source: label",
+      "    approval:\n      source: label\n      label: \"\"",
+      "    approval:\n      source: other\n      label: approved",
+      "    approval:\n      source: list\n      issues:\n        - API-1\n      label: approved",
+      "    approval:\n      source: label\n      label: approved\n      issues:\n        - API-1",
+    ];
+    for (const shape of shapes) {
+      assert.throws(() => loadPack(write(shipped.replace("promotionStages: []", stage(shape)))), /approval/);
+    }
+    const listed = loadPack(write(shipped.replace("promotionStages: []", stage("    approval:\n      source: list\n      issues:\n        - API-1\n        - API-2"))));
+    assert.deepEqual(listed.promotionStages[0]?.approval, { source: "list", issues: ["API-1", "API-2"] });
+    const labeled = loadPack(write(shipped.replace("promotionStages: []", stage("    approval:\n      source: label\n      label: approved"))));
+    assert.deepEqual(labeled.promotionStages[0]?.approval, { source: "label", label: "approved" });
+    const deliver = `promotionStages:
+  - id: dev
+    target: dev
+    authorization: deliver
+    promoteCommand: ./scripts/promote.sh
+    repos:
+      - api
+    verifyCommand: ./scripts/verify.sh
+    approval:
+      source: label
+      label: approved`;
+    assert.throws(() => loadPack(write(base.replace("promotionStages: []", deliver))), /approval is only valid on a ship stage/);
   });
 
   it("keeps heal caps and leaves an absent cap at the runner default", () => {

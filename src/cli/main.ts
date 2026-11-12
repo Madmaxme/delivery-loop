@@ -36,7 +36,7 @@ import { githubRepoFromUrl } from "../adapters/types.js";
 import type { ForgeAdapter, LinearProgramTracker, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { findConnector } from "../connectors/catalog.js";
 import { writeCredentialSummary } from "../engine/credential-log.js";
-import { auditEligibility, deliver, repoCheckoutDir, ship, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
+import { auditEligibility, deliver, repoCheckoutDir, ship, shipSweep, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
 export { validateStageReceipt, type StageVerifyInput } from "../engine/loop.js";
 export type { StageVerificationReceipt } from "../adapters/types.js";
 import { shipInvocationDeps } from "./ship-deps.js";
@@ -472,14 +472,16 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     const packRunner = existsSync(packPath(process.cwd()))
       ? loadPack(packPath(process.cwd())).runner
       : undefined;
+    const sweepMode = argv.includes("sweep");
     const continueMode = argv.includes("continue");
-    const rest = argv.filter((item) => item !== "continue");
+    const rest = argv.filter((item) => item !== "continue" && item !== "sweep");
+    const shipAction = sweepMode ? "sweep" : continueMode ? "continue" : "ship";
     const plan = planDeliveryInvocation({
       githubActions: process.env.GITHUB_ACTIONS === "true",
       envRuntime: packRunner === "local" ? "local" : process.env.DELIVERY_LOOP_RUNTIME,
       mode: "ship",
       argv: rest,
-      shipAction: continueMode ? "continue" : "ship",
+      shipAction,
     });
     if (plan.runtime === "gha") {
       const repo = process.env.GITHUB_REPOSITORY;
@@ -495,7 +497,8 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     }
     const pack = loadPack(packPath(process.cwd()));
     const issue = plan.issue;
-    if (!issue) throw new Error("ship needs a ticket id");
+    const action = plan.shipAction ?? "ship";
+    if (action === "ship" && !issue) throw new Error("ship needs a ticket id");
     const deps = shipInvocationDeps(pack, process.cwd());
     deps.ownerHeal = async (input) => {
       const side = pack.workerHttp?.statusStore ? openForge(pack, false) : undefined;
@@ -505,11 +508,13 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       if (joined.status === "failed") throw new Error(joined.text || "owner edit failed");
       return joined.text;
     };
-    ship(deps, issue, plan.shipAction ?? "ship").then(
+    const run = action === "sweep" ? shipSweep(deps) : ship(deps, issue ?? undefined, action === "continue" ? "continue" : "ship");
+    run.then(
       (result) => {
         for (const line of result.lines) console.log(line);
         if (result.exitCode !== 0) process.exitCode = result.exitCode;
-        else console.log(result.parked ? "ship parked" : "shipped");
+        else if (result.parked) console.log("ship parked");
+        else if (result.shipped !== false) console.log("shipped");
       },
       (err) => {
         console.error(err instanceof Error ? err.message : String(err));
@@ -738,7 +743,7 @@ if (isCli) {
     dispatchOrRun(command === "deliver" ? "pipeline" : command, argv.slice(1));
   } else {
     console.error(
-      "Usage: delivery-loop init|update|connector add <name>|audit|sweep|deliver <id>|ground <id>|ship [continue] <id>",
+      "Usage: delivery-loop init|update|connector add <name>|audit|sweep|deliver <id>|ground <id>|ship [continue] <id>|ship sweep",
     );
     process.exit(command ? 1 : 0);
   }

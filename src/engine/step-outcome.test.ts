@@ -54,6 +54,11 @@ describe("ship outcomes", () => {
       "registry download",
     );
     assert.equal(transientReason(1, "missing required attribute"), null);
+    assert.equal(
+      transientReason(0, JSON.stringify({ outcome: "transient", reason: "rate limit" })),
+      "rate limit",
+    );
+    assert.equal(transientReason(0, JSON.stringify({ outcome: "waiting", reason: "later" })), null);
   });
 
   it("waits one second, then doubles, and stops at the attempt count or the total wait", () => {

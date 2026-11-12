@@ -24,6 +24,51 @@ const OUTCOME_LINE =
 
 const TRANSIENT_LINE = /^delivery-loop transient(?:\s+(.*))?$/;
 
+export const STAGE_COMMAND_OUTCOMES = ["passed", "parked", "transient", "waiting", "needs-step", "broken"] as const;
+
+export type StageCommandOutcome = (typeof STAGE_COMMAND_OUTCOMES)[number];
+
+export type StageCommandResult = {
+  outcome: StageCommandOutcome;
+  reason: string;
+  step?: string;
+};
+
+function parseStageCommandObject(value: unknown): StageCommandResult | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (!keys.every((key) => key === "outcome" || key === "reason" || key === "step")) return null;
+  if (typeof record.outcome !== "string" || !STAGE_COMMAND_OUTCOMES.includes(record.outcome as StageCommandOutcome)) {
+    return null;
+  }
+  if (typeof record.reason !== "string") return null;
+  if (record.step !== undefined && typeof record.step !== "string") return null;
+  const step = typeof record.step === "string" ? record.step : undefined;
+  return {
+    outcome: record.outcome as StageCommandOutcome,
+    reason: record.reason,
+    ...(step !== undefined ? { step } : {}),
+  };
+}
+
+/** A stage command's stdout object. A receipt, or any other shape, is not one. */
+export function parseTypedStageOutcome(text: string): StageCommandResult | null {
+  const lines = text.trim().split(/\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) return null;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (!line?.startsWith("{")) continue;
+    try {
+      const parsed = parseStageCommandObject(JSON.parse(line) as unknown);
+      if (parsed) return parsed;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
 /** Last line for each ticket wins. Tickets stay in first-seen order. */
 export function parseOutcomeLines(text: string): ParsedOutcome[] {
   const order: string[] = [];
@@ -40,8 +85,13 @@ export function parseOutcomeLines(text: string): ParsedOutcome[] {
   return order.map((ticket) => byTicket.get(ticket)!);
 }
 
-/** A non-zero exit is transient when it is exit 75 or the output says so. A zero exit is not. */
+/**
+ * A non-zero exit is transient when it is exit 75 or the output says so.
+ * A zero exit is not, unless the stage command's JSON outcome is `transient`.
+ */
 export function transientReason(status: number | null, output: string): string | null {
+  const typed = parseTypedStageOutcome(output);
+  if (typed?.outcome === "transient") return typed.reason.trim() || "transient";
   if (status === 0) return null;
   let named = "";
   for (const line of output.split(/\n/)) {

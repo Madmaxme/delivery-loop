@@ -6,7 +6,7 @@
  * the sweep/pipeline join loop there.
  */
 
-export type ShipAction = "ship" | "continue";
+export type ShipAction = "ship" | "continue" | "sweep";
 export type DeliveryMode = "ground" | "build" | "land" | "pipeline" | "sweep" | "audit" | "ship";
 
 export type DeliveryPlan = {
