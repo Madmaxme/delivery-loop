@@ -9,7 +9,7 @@ import type { DeliveryState, ForgeAdapter, LinearProgramTracker, Ticket, Tracker
 import type { ProjectPack, PromotionStage } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
 import { proofLinesFor } from "../../scripts/journey-proof.mjs";
-import { auditEligibility, candidateFetchEnvironment, ciFixLimit, formatTicketProgress, repoCheckoutDir, runTicket, ship, shipSweep, sortByPack, sweep, sweepNeedsAnotherPage, type LoopDeps, type StageVerifyInput } from "./loop.ts";
+import { auditEligibility, candidateFetchEnvironment, ciFixLimit, deliveryExitCode, formatTicketProgress, repoCheckoutDir, runTicket, ship, shipSweep, sortByPack, sweep, sweepNeedsAnotherPage, type LoopDeps, type StageVerifyInput } from "./loop.ts";
 import { classifyQualityCause } from "./quality-cause.ts";
 
 const pack: ProjectPack = {
@@ -252,6 +252,16 @@ const BUILDABLE = `
 | single-charge | Preserve one charge path. | Issue description |
 BUILD_PACKET -->
 `;
+
+function shipPlan(stdin: string, carries = ["API-1"], untracked: string[] = []): { status: 0; stdout: string } | null {
+  try {
+    const input = JSON.parse(stdin) as { phase?: string };
+    if (input.phase !== "plan") return null;
+  } catch {
+    return null;
+  }
+  return { status: 0, stdout: JSON.stringify({ carries, untracked }) };
+}
 
 function receiptFor(input: {
   stageId: string;
@@ -2492,6 +2502,75 @@ describe("loop", () => {
     assert.equal(env.state(), "Dev Complete");
   });
 
+  it("rejects journey proof whose repo is not in the pack", async () => {
+    const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded"));
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => ({
+      status: 0,
+      stdout: JSON.stringify([{ repo: "nope", path: "e2e/signup.spec.ts", sha: "trunk" }]),
+    });
+    let heals = 0;
+    env.deps.ownerHeal = async () => {
+      heals += 1;
+      return "**Heal:** wait";
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "journey-missing");
+    assert.match(result.detail, /unknown repo nope/);
+    assert.equal(heals, 1);
+    assert.notEqual(env.state(), pack.status.complete);
+    assert.equal(deliveryExitCode(result), 1);
+  });
+
+  it("opens one heal and exits non-zero when proof is missing after land", async () => {
+    const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded"));
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = () => ({ status: 0, stdout: "[]" });
+    let heals = 0;
+    env.deps.ownerHeal = async () => {
+      heals += 1;
+      return "**Heal:** wait";
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(heals, 1);
+    assert.equal(deliveryExitCode(result), 1);
+    assert.notEqual(env.state(), pack.status.complete);
+    const again = await runTicket(env.deps, ticket());
+    assert.equal(again.outcome, "journey-missing");
+    assert.equal(heals, 1);
+    assert.equal(env.merged(), true);
+  });
+
+  it("does not treat a test/e2e path from task text as a missing proof", async () => {
+    const ground = [
+      BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded"),
+      "See api/test/e2e/absent.spec.ts in the notes.",
+      "**Journey proof:** `api/test/e2e/absent.spec.ts`",
+    ].join("\n");
+    const env = harness(ground);
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs", journeySpec: "test/e2e" };
+    const checked: string[] = [];
+    env.deps.journeyFileAt = ({ path, ref }) => {
+      checked.push(`${ref}:${path}`);
+      return path === "test/e2e/signup.spec.ts" && ref === "trunk";
+    };
+    env.deps.runPackCommand = () => ({
+      status: 0,
+      stdout: JSON.stringify([{ repo: "api", path: "test/e2e/signup.spec.ts", sha: "trunk" }]),
+    });
+    let heals = 0;
+    env.deps.ownerHeal = async () => {
+      heals += 1;
+      return "**Heal:** wait";
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), pack.status.complete);
+    assert.equal(heals, 0);
+    assert.equal(checked.includes("trunk:test/e2e/signup.spec.ts"), true);
+  });
+
   it("persists the validated proof receipt before the completion status", async () => {
     const url = "https://example.test/artifacts/signup.mp4";
     const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded"));
@@ -2964,21 +3043,50 @@ describe("loop", () => {
     assert.equal(env.state(), "Todo");
   });
 
-  it("requires completed delivery before invoking a ship stage", async () => {
+  it("requires current delivery receipts before invoking a ship stage", async () => {
     const env = harness(BUILDABLE);
+    const deliverStage: PromotionStage = {
+      id: "delivery-stage",
+      target: "dev",
+      authorization: "deliver",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+    };
     env.deps.pack = {
       ...pack,
       status: { ...pack.status, complete: "Delivery Complete", shipped: "Shipped" },
-      promotionStages: [
-        { id: "publish", target: "artifact-zone", authorization: "ship", promoteCommand: "promote", repos: ["api"], verifyCommand: "verify", continueCommand: "continue", parkSuccess: true, writeStatus: true, approval: { source: "list", issues: ["API-1"] } },
-      ],
+      promotionStages: [deliverStage],
     };
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (command !== "verify") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target, criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }) };
+    };
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    const shipStage: PromotionStage = {
+      id: "publish",
+      target: "artifact-zone",
+      authorization: "ship",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: false,
+      writeStatus: true,
+      approval: { source: "list", issues: ["API-1"] },
+    };
+    env.deps.pack = { ...env.deps.pack, promotionStages: [deliverStage, shipStage] };
+    const state = env.deliveryState();
+    await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+      ...state,
+      stageReceipts: state.stageReceipts.map((receipt) => ({ ...receipt, criteriaRevision: "stale" })),
+    });
     let commands = 0;
     env.deps.runPackCommand = () => {
       commands += 1;
       return { status: 0, stdout: "" };
     };
-    await assert.rejects(() => ship(env.deps, "API-1"), /ship requires Delivery Complete/);
+    await assert.rejects(() => ship(env.deps, "API-1"), /current passed receipt/);
     assert.equal(commands, 0);
   });
 
@@ -3013,6 +3121,8 @@ describe("loop", () => {
     });
     const events: string[] = [];
     env.deps.runPackCommand = (command, _cwd, stdin) => {
+      const planned = shipPlan(stdin);
+      if (planned) return planned;
       const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
       events.push(command);
       return command === "verify"
@@ -3052,6 +3162,8 @@ describe("loop", () => {
       return "**Heal:** wait";
     };
     env.deps.runPackCommand = (command, _cwd, stdin) => {
+      const planned = shipPlan(stdin);
+      if (planned) return planned;
       if (command !== "verify") return { status: 0, stdout: "" };
       const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
       return {
@@ -3113,9 +3225,11 @@ describe("loop", () => {
       }],
     });
     env.deps.tracker.get = async (id) => ticket({ identifier: id, stateName: "Delivery Complete", labels: [] });
-    let commands = 0;
-    env.deps.runPackCommand = () => {
-      commands += 1;
+    let promoted = 0;
+    env.deps.runPackCommand = (_command, _cwd, stdin) => {
+      const planned = shipPlan(stdin);
+      if (planned) return planned;
+      promoted += 1;
       return { status: 0, stdout: "" };
     };
     for (const run of [() => ship(env.deps, "API-1"), () => ship(env.deps, "API-1", "continue"), () => shipSweep(env.deps)]) {
@@ -3123,7 +3237,7 @@ describe("loop", () => {
       assert.equal(result.exitCode, 1);
       assert.match(result.lines.join("\n"), /approval-missing/);
     }
-    assert.equal(commands, 0);
+    assert.equal(promoted, 0);
   });
 
   it("blocks the release when a carried ticket is unapproved", async () => {
@@ -3147,15 +3261,22 @@ describe("loop", () => {
     };
     assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
     const states = new Map<string, DeliveryState>();
-    states.set("API-1", env.deliveryState());
+    const landed = env.deliveryState();
+    states.set("API-1", {
+      ...landed,
+      markers: [...landed.markers, {
+        kind: "active-promotion-stage",
+        body: JSON.stringify({ stages: [{ stageId: "publish", target: "artifact-zone", authorization: "ship", criteriaRevision: ticket().criteriaRevision }] }),
+        createdAt: new Date(0).toISOString(),
+      }],
+    });
     states.set("API-2", {
-      schemaVersion: 2,
-      markers: [{
+      ...landed,
+      markers: [...landed.markers, {
         kind: "ship-retry",
         body: JSON.stringify({ ticket: "API-2", stage: "publish", reason: "later", notBefore: new Date(0).toISOString(), outcome: "waiting" }),
         createdAt: new Date(0).toISOString(),
       }],
-      stageReceipts: [],
     });
     env.deps.tracker.stateStore.readDeliveryState = async (id) => states.get(id) ?? { schemaVersion: 2, markers: [], stageReceipts: [] };
     env.deps.tracker.stateStore.writeDeliveryState = async (id, next) => { states.set(id, next); };
@@ -3164,9 +3285,11 @@ describe("loop", () => {
       ticket({ identifier: "API-2", stateName: "Delivery Complete" }),
     ];
     env.deps.tracker.get = async (id) => ticket({ identifier: id, stateName: "Delivery Complete" });
-    let commands = 0;
-    env.deps.runPackCommand = () => {
-      commands += 1;
+    let promoted = 0;
+    env.deps.runPackCommand = (_command, _cwd, stdin) => {
+      const planned = shipPlan(stdin, ["API-1", "API-2"]);
+      if (planned) return planned;
+      promoted += 1;
       return { status: 0, stdout: "" };
     };
     for (const run of [() => ship(env.deps, "API-1"), () => ship(env.deps, "API-1", "continue"), () => shipSweep(env.deps)]) {
@@ -3174,7 +3297,7 @@ describe("loop", () => {
       assert.equal(result.exitCode, 1);
       assert.match(result.lines.join("\n"), /API-2 BLOCKED approval-missing/);
     }
-    assert.equal(commands, 0);
+    assert.equal(promoted, 0);
   });
 
   it("records a waiting marker and lets the next ship sweep run a fresh ship", async () => {
@@ -3200,6 +3323,8 @@ describe("loop", () => {
     let promotes = 0;
     env.deps.sleep = async () => { sleeps += 1; };
     env.deps.runPackCommand = (command, _cwd, stdin) => {
+      const planned = shipPlan(stdin);
+      if (planned) return planned;
       if (command === "promote") {
         promotes += 1;
         if (promotes === 1) return { status: 0, stdout: JSON.stringify({ outcome: "waiting", reason: "registry" }) };
@@ -3266,6 +3391,8 @@ describe("loop", () => {
         return "**Heal:** wait";
       };
       env.deps.runPackCommand = (command, _cwd, stdin) => {
+        const planned = shipPlan(stdin);
+        if (planned) return planned;
         if (command === "promote") {
           promotes += 1;
           if (outcome === "transient" && promotes === 1) {
@@ -3330,6 +3457,11 @@ describe("loop", () => {
       let sleeps = 0;
       env.deps.sleep = async () => { sleeps += 1; };
       env.deps.runPackCommand = (command, _cwd, stdin) => {
+        const planned = shipPlan(stdin);
+        if (planned) {
+          commands += 1;
+          return planned;
+        }
         commands += 1;
         if (command !== "verify") return { status: 0, stdout: "" };
         const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
@@ -3423,6 +3555,8 @@ describe("loop", () => {
     };
     assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
     env.deps.runPackCommand = (command, _cwd, stdin) => {
+      const planned = shipPlan(stdin);
+      if (planned) return planned;
       if (command !== "verify") return { status: 0, stdout: "" };
       const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
       return { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target, criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }) };
@@ -3432,6 +3566,216 @@ describe("loop", () => {
     assert.equal(result.parked, false);
     assert.equal(env.state(), "Delivery Complete");
     assert.deepEqual(env.statusRevisions, [ticket().criteriaRevision]);
+  });
+
+  it("requires a plan call and blocks an unapproved carried ticket", async () => {
+    const env = harness(BUILDABLE);
+    const stage: PromotionStage = {
+      id: "publish",
+      target: "artifact-zone",
+      authorization: "ship",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: false,
+      writeStatus: true,
+      approval: { source: "list", issues: ["API-1"] },
+    };
+    env.deps.pack = {
+      ...pack,
+      status: { ...pack.status, complete: "Delivery Complete", shipped: "Shipped" },
+      promotionStages: [stage],
+    };
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    let promoted = 0;
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      const planned = shipPlan(stdin, []);
+      if (planned) return { status: 0, stdout: "" };
+      promoted += 1;
+      return { status: 0, stdout: "" };
+    };
+    const missing = await ship(env.deps, "API-1");
+    assert.equal(missing.exitCode, 1);
+    assert.match(missing.lines.join("\n"), /ship plan is required/);
+    assert.equal(promoted, 0);
+    env.deps.runPackCommand = (_command, _cwd, stdin) => {
+      const planned = shipPlan(stdin, ["API-9"]);
+      if (planned) return planned;
+      promoted += 1;
+      return { status: 0, stdout: "" };
+    };
+    const blocked = await ship(env.deps, "API-1");
+    assert.equal(blocked.exitCode, 1);
+    assert.match(blocked.lines.join("\n"), /API-9 BLOCKED approval-missing/);
+    assert.equal(promoted, 0);
+    assert.equal(env.state(), "Delivery Complete");
+  });
+
+  it("lists untracked commits in the summary and does not block on them", async () => {
+    const env = harness(BUILDABLE);
+    const stage: PromotionStage = {
+      id: "publish",
+      target: "artifact-zone",
+      authorization: "ship",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: false,
+      writeStatus: true,
+      approval: { source: "list", issues: ["API-1"] },
+    };
+    env.deps.pack = {
+      ...pack,
+      status: { ...pack.status, complete: "Delivery Complete", shipped: "Shipped" },
+      promotionStages: [stage],
+    };
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      const planned = shipPlan(stdin, ["API-1"], ["abc123"]);
+      if (planned) return planned;
+      if (command !== "verify") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target, criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }) };
+    };
+    const result = await ship(env.deps, "API-1");
+    assert.equal(result.exitCode, 0);
+    assert.match(result.lines.join("\n"), /untracked abc123/);
+    assert.equal(env.comments.some((body) => body.includes("abc123")), true);
+    assert.equal(env.state(), "Shipped");
+  });
+
+  it("sends releaseSet on plan, promote, verify, and continue", async () => {
+    const env = harness(BUILDABLE);
+    const stage: PromotionStage = {
+      id: "publish",
+      target: "artifact-zone",
+      authorization: "ship",
+      promoteCommand: "promote",
+      continueCommand: "continue",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: false,
+      writeStatus: true,
+      approval: { source: "list", issues: ["API-1"] },
+    };
+    env.deps.pack = {
+      ...pack,
+      status: { ...pack.status, complete: "Delivery Complete", shipped: "Shipped" },
+      promotionStages: [stage],
+    };
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    const seen: { phase?: string; command: string; target?: string; releaseSet?: Record<string, string> }[] = [];
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      const input = JSON.parse(stdin) as { phase?: string; target?: string; releaseSet?: Record<string, string>; stageId: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      seen.push({ phase: input.phase, command, target: input.target, releaseSet: input.releaseSet });
+      const planned = shipPlan(stdin);
+      if (planned) return planned;
+      if (command === "verify") {
+        return { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target ?? "", criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }) };
+      }
+      return { status: 0, stdout: "" };
+    };
+    assert.equal((await ship(env.deps, "API-1")).exitCode, 0);
+    const state = env.deliveryState();
+    await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+      ...state,
+      stageReceipts: [],
+      markers: [...state.markers, {
+        kind: "active-promotion-stage",
+        body: JSON.stringify({ stages: [{ stageId: "publish", target: "artifact-zone", authorization: "ship", criteriaRevision: ticket().criteriaRevision }] }),
+        createdAt: new Date(0).toISOString(),
+      }],
+    });
+    assert.equal((await ship(env.deps, "API-1", "continue")).exitCode, 0);
+    const phases = seen.map((item) => item.phase ?? item.command);
+    assert.deepEqual(phases, ["plan", "promote", "verify", "plan", "continue", "verify"]);
+    for (const item of seen) {
+      assert.equal(item.target, "artifact-zone");
+      assert.deepEqual(item.releaseSet, { api: "trunk" });
+    }
+  });
+
+  it("writes status only after passed receipts and blocks a stale receipt", async () => {
+    const env = harness(BUILDABLE);
+    const deliverStage: PromotionStage = {
+      id: "delivery-stage",
+      target: "dev",
+      authorization: "deliver",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+    };
+    env.deps.pack = {
+      ...pack,
+      status: { ...pack.status, complete: "Delivery Complete", shipped: "Shipped" },
+      promotionStages: [deliverStage],
+    };
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (command !== "verify") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target, criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }) };
+    };
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    const shipStage: PromotionStage = {
+      id: "publish",
+      target: "artifact-zone",
+      authorization: "ship",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: false,
+      writeStatus: true,
+      approval: { source: "list", issues: ["API-1"] },
+    };
+    env.deps.pack = { ...env.deps.pack, promotionStages: [deliverStage, shipStage] };
+    const saved = structuredClone(env.deliveryState());
+    const stale = saved;
+    await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+      ...stale,
+      stageReceipts: stale.stageReceipts.map((receipt) => ({
+        ...receipt,
+        deployed: receipt.deployed.map((row) => ({ ...row, sha: "other" })),
+      })),
+    });
+    let commands = 0;
+    env.deps.runPackCommand = () => {
+      commands += 1;
+      return { status: 0, stdout: "" };
+    };
+    await assert.rejects(() => ship(env.deps, "API-1"), /current passed receipt/);
+    assert.equal(commands, 0);
+    assert.equal(env.state(), "Delivery Complete");
+    const current = env.deliveryState();
+    await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+      ...current,
+      stageReceipts: current.stageReceipts.map((receipt) => ({
+        ...receipt,
+        criteriaRevision: "stale-revision",
+        deployed: [{ repo: "api", sha: "trunk" }],
+      })),
+    });
+    await assert.rejects(() => ship(env.deps, "API-1"), /current passed receipt/);
+    assert.equal(commands, 0);
+    await env.deps.tracker.stateStore.writeDeliveryState("API-1", saved);
+    const order: string[] = [];
+    const setState = env.deps.tracker.setState.bind(env.deps.tracker);
+    env.deps.tracker.setState = async (id, next, revision) => {
+      order.push(`state:${next}`);
+      await setState(id, next, revision);
+    };
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      const planned = shipPlan(stdin);
+      if (planned) return planned;
+      order.push(command);
+      if (command !== "verify") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target, criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }) };
+    };
+    const shipped = await ship(env.deps, "API-1");
+    assert.equal(shipped.exitCode, 0);
+    assert.equal(env.state(), "Shipped");
+    assert.ok(order.indexOf("verify") >= 0);
+    assert.ok(order.indexOf("verify") < order.indexOf("state:Shipped"));
   });
 });
 

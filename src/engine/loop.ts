@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { DEFAULT_JOURNEY_SPEC } from "../../scripts/journey-proof.mjs";
+import { DEFAULT_JOURNEY_SPEC, matchesJourneySpec } from "../../scripts/journey-proof.mjs";
 import { interpretMintOutput, runMintCommand } from "../adapters/github-mint.ts";
 import { noteMint } from "./credential-log.ts";
 import { parseTypedStageOutcome, transientReason, transientWaitMs, type StageCommandResult } from "./step-outcome.ts";
@@ -46,6 +46,7 @@ import {
   parkStateForVerdict,
   parseJourneyEvidence,
   parseJourneyProofs,
+  parseStructuredJourneyProof,
   parseOutsideGrant,
   parsePriorRequest,
   parseVerdict,
@@ -287,6 +288,12 @@ export type TicketResult = {
   detail: string;
   reasonCode?: string;
 };
+
+/** A landed ticket that is still missing proof does not exit 0. */
+export function deliveryExitCode(result: { outcome: string }): number {
+  if (result.outcome === "journey-missing" || result.outcome === "land-blocked") return 1;
+  return 0;
+}
 
 const PROGRESS_DETAIL_MAX = 200;
 
@@ -1557,7 +1564,46 @@ export type StageVerifyInput = {
   criteriaRevision: string;
   landedShas: { repo: string; sha: string }[];
   criteria: AcceptanceCriterion[];
+  releaseSet: Record<string, string>;
 };
+
+function releaseSetFrom(rows: readonly { repo: string; sha: string }[]): Record<string, string> {
+  const set: Record<string, string> = {};
+  for (const row of sortedLanded(rows)) set[row.repo] = row.sha;
+  return set;
+}
+
+type ShipPlan = { carries: string[]; untracked: string[] };
+
+/** The promote or continue command's plan. Anything else is not a plan. */
+function parseShipPlan(stdout: string): ShipPlan | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(stdout.trim());
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).sort().join(",") !== "carries,untracked") return null;
+  if (!Array.isArray(record.carries) || !Array.isArray(record.untracked)) return null;
+  if (record.carries.some((item) => typeof item !== "string" || !item.trim())) return null;
+  if (record.untracked.some((item) => typeof item !== "string" || !item.trim())) return null;
+  return {
+    carries: [...new Set(record.carries.map((item) => (item as string).trim()))],
+    untracked: [...new Set(record.untracked.map((item) => (item as string).trim()))],
+  };
+}
+
+const shipReleaseNotes = new WeakMap<LoopDeps, ShipPlan>();
+
+function noteShipRelease(deps: LoopDeps, plan: ShipPlan): void {
+  const prev = shipReleaseNotes.get(deps) ?? { carries: [], untracked: [] };
+  shipReleaseNotes.set(deps, {
+    carries: [...new Set([...prev.carries, ...plan.carries])],
+    untracked: [...new Set([...prev.untracked, ...plan.untracked])],
+  });
+}
 
 function sortedLanded(rows: readonly { repo: string; sha: string }[]): { repo: string; sha: string }[] {
   return [...rows].sort((a, b) => a.repo.localeCompare(b.repo));
@@ -1878,7 +1924,7 @@ async function runOneStage(
   authorization: "deliver" | "ship",
   scoped: { repo: string; sha: string }[],
   criteria: readonly AcceptanceCriterion[],
-  options: { continueStageId?: string; step?: string },
+  options: { continueStageId?: string; step?: string; releaseSet?: Record<string, string> },
 ): Promise<{ outcome: "passed"; stage: PromotionStage } | StageProblem> {
   const landedHere = sortedLanded(scoped);
   const expected = criteriaForStage(criteria, stage, scoped);
@@ -1900,6 +1946,30 @@ async function runOneStage(
   const commandKind = continuing ? "continue" : "promote";
   const commandTimeout = continuing ? stage.continue?.timeoutMs : stage.promote?.timeoutMs;
   if (!command) return { outcome: "failed", stage, reason: `stage ${stage.id} has no continueCommand`, evidence: [] };
+  const releaseSet = options.releaseSet ?? releaseSetFrom(landedHere);
+  if (authorization === "ship") {
+    const planRepo = repos[0]!;
+    const planSha = scoped.find((item) => item.repo === planRepo.name)!.sha;
+    const planned = await runStageCommand(deps, command, planRepo.spec!, {
+      phase: "plan",
+      ticketId: ticket.identifier,
+      stageId: stage.id,
+      target: stage.target,
+      repo: planRepo.name,
+      sourceSha: planSha,
+      releaseSet,
+    }, commandTimeout);
+    if (planned.timedOut) return blockTimedOutStage(deps, ticket, stage, commandKind, commandTimeout!, landedHere, expected);
+    const plan = parseShipPlan(planned.stdout ?? "");
+    if (planned.failed || !plan) return { outcome: "failed", stage, reason: "ship plan is required", evidence: [] };
+    noteShipRelease(deps, plan);
+    const missing: string[] = [];
+    for (const carriedId of plan.carries) {
+      const carried = carriedId === ticket.identifier ? ticket : await deps.tracker.get(carriedId);
+      if (!ticketApproved(carried, [stage])) missing.push(carried.identifier);
+    }
+    if (missing.length > 0) return { outcome: "failed", stage, reason: "approval-missing", evidence: missing };
+  }
   for (const row of repos) {
     const repo = row.spec!;
     const source = scoped.find((item) => item.repo === row.name)!;
@@ -1911,6 +1981,7 @@ async function runOneStage(
       target: stage.target,
       repo: row.name,
       sourceSha: source.sha,
+      releaseSet,
       ...(options.step ? { step: options.step } : {}),
     }, commandTimeout);
     if (promoted.timedOut) return blockTimedOutStage(deps, ticket, stage, commandKind, commandTimeout!, landedHere, expected);
@@ -1928,6 +1999,7 @@ async function runOneStage(
     criteriaRevision: ticket.criteriaRevision,
     landedShas: landedHere,
     criteria: expected,
+    releaseSet,
   };
   const verified = await runStageCommand(deps, stage.verifyCommand, verifyRepo, verifyInput, stage.verify?.timeoutMs);
   if (verified.timedOut) return blockTimedOutStage(deps, ticket, stage, "verify", stage.verify!.timeoutMs, landedHere, expected);
@@ -2000,6 +2072,7 @@ async function runPromotionStages(
   while (pending.size > 0) {
     const ready = stages.filter((stage) => pending.has(stage.id) && (stage.dependsOn ?? []).every((id) => done.has(id)));
     if (ready.length === 0) break;
+    const releaseSet = releaseSetFrom(allLanded);
     const results = await Promise.all(ready.map((stage) => runOneStage(
       deps,
       ticket,
@@ -2007,7 +2080,7 @@ async function runPromotionStages(
       authorization,
       stageLandedRows(stage, allLanded),
       criteria,
-      options,
+      { ...options, releaseSet },
     )));
     for (const result of results) {
       pending.delete(result.stage.id);
@@ -2145,6 +2218,7 @@ async function journeyCommandProof(deps: LoopDeps, stdin: string): Promise<Journ
   const result = await Promise.resolve(run(command, deps.cwd ?? process.cwd(), stdin, commandEnvironment(deps.pack)));
   const stdout = result.stdout ?? "";
   if (result.status !== 0) return { ok: false, reason: "failed", status: result.status, stdout };
+  if (parseStructuredJourneyProof(stdout)) return { ok: true, stdout };
   if (parseJourneyProofs(stdout, deps.pack.journeySpec).length === 0) {
     return { ok: false, reason: "empty", stdout };
   }
@@ -2468,6 +2542,62 @@ async function healUnparsedJourneyProof(
   };
 }
 
+async function judgeStructuredJourney(
+  deps: LoopDeps,
+  ticket: Ticket,
+  proofs: { repo: string; path: string; sha: string }[],
+  rows: { repo: RepoSpec; sha: string }[],
+): Promise<{ ok: true } | { ok: false; detail: string; evidence: string }> {
+  if (proofs.length === 0) {
+    return { ok: false, detail: "recorded proof missing", evidence: `Journey command returned no proof for ${ticket.identifier}.` };
+  }
+  const names = new Set(deps.pack.repos.map((repo) => repo.name));
+  for (const proof of proofs) {
+    if (!names.has(proof.repo)) {
+      return {
+        ok: false,
+        detail: `unknown repo ${proof.repo}`,
+        evidence: `Journey proof repo ${proof.repo} is not in the pack repos for ${ticket.identifier}.`,
+      };
+    }
+    if (!matchesJourneySpec(proof.path, deps.pack.journeySpec)) {
+      return {
+        ok: false,
+        detail: "recorded proof missing",
+        evidence: `Journey proof path ${proof.path} is outside the journey spec for ${ticket.identifier}.`,
+      };
+    }
+    const landed = rows.find((row) => row.repo.name === proof.repo);
+    if (!landed || landed.sha !== proof.sha) {
+      return {
+        ok: false,
+        detail: "recorded proof missing",
+        evidence: `Journey proof sha for ${proof.repo} does not match the landed commit for ${ticket.identifier}.`,
+      };
+    }
+  }
+  const unavailable: string[] = [];
+  for (const proof of proofs) {
+    const found = await journeyFileState(deps, proof.repo, proof.sha, proof.path);
+    if (found.state === "unavailable") unavailable.push(`${proof.repo} ${proof.path} @ ${proof.sha}: ${found.reason}`);
+    if (found.state === "absent") {
+      return {
+        ok: false,
+        detail: "recorded proof missing",
+        evidence: `Journey proof ${proof.repo}/${proof.path} is absent at ${proof.sha} for ${ticket.identifier}.`,
+      };
+    }
+  }
+  if (unavailable.length > 0) {
+    return {
+      ok: false,
+      detail: "journey file unavailable",
+      evidence: `Journey proof file check could not run for ${ticket.identifier}: ${unavailable.join("; ")}.`,
+    };
+  }
+  return { ok: true };
+}
+
 async function applyRecordedProof(
   deps: LoopDeps,
   ticket: Ticket,
@@ -2494,6 +2624,17 @@ async function applyRecordedProof(
     return { ok: true, recorded: true, proofReceipt: receipt.trim() ? receipt : declared };
   }
   const printed = await journeyCommandProof(deps, evidence);
+  const structured = printed.ok ? parseStructuredJourneyProof(printed.stdout) : null;
+  if (structured) {
+    const judged = await judgeStructuredJourney(deps, ticket, structured, rows);
+    if (!judged.ok) {
+      await deps.tracker.comment(ticket.identifier, judged.detail);
+      await healMissingJourney(deps, ticket, judged.evidence);
+      return { ok: false, result: { identifier: ticket.identifier, outcome: "journey-missing", detail: judged.detail } };
+    }
+    noteEngine(deps, "proof ok");
+    return { ok: true, recorded: true, proofReceipt: printed.stdout.trim() };
+  }
   if (!printed.ok) {
     await deps.tracker.comment(ticket.identifier, journeyTokenMissing(deps, ticket.identifier, printed));
     const missing: TicketResult = {
@@ -2535,6 +2676,12 @@ function journeyCommandOutput(printed: Extract<JourneyCommandPrint, { ok: false 
   const body = printed.stdout.trim();
   if (printed.reason === "failed") return [`exit ${printed.status ?? "null"}`, body].filter(Boolean).join("\n");
   return body;
+}
+
+/** Missing or unavailable proof after land opens one heal. The landed work stays off status.complete. */
+async function healMissingJourney(deps: LoopDeps, ticket: Ticket, evidence: string): Promise<void> {
+  const reason = evidence.trim() || "Journey proof is missing.";
+  await applyOwnerHeal(deps, ticket, "heal:journey:missing", reason);
 }
 
 /** A recorded attempt at these landed SHAs, with no proof from the journey command, goes to heal. */
@@ -2993,7 +3140,7 @@ function releaseTagsForHeal(): string[] | undefined {
 
 function healAlready(deps: LoopDeps, ticket: Ticket, key: string): boolean {
   void ticket;
-  return deps.pageControl?.healed.includes(key) ?? false;
+  return deps.pageControl?.healed.includes(key) === true || rememberedVerdict(deps, key) !== undefined;
 }
 
 /**
@@ -3757,48 +3904,6 @@ function ticketApproved(ticket: Ticket, stages: readonly PromotionStage[]): bool
   });
 }
 
-function ticketHasShipWork(deps: LoopDeps, ticket: Ticket, state: DeliveryState): boolean {
-  if (parseShipRetry(state)) return true;
-  const shipIds = new Set(shipStageList(deps).map((stage) => stage.id));
-  return state.stageReceipts.some((receipt) =>
-    receipt.outcome === "parked" &&
-    shipIds.has(receipt.stageId) &&
-    receipt.criteriaRevision === ticket.criteriaRevision);
-}
-
-async function carriedShipTickets(deps: LoopDeps, entryId: string | null): Promise<Ticket[]> {
-  const ids = new Set<string>();
-  if (entryId) ids.add(entryId);
-  for (const stage of shipStageList(deps)) {
-    if (stage.approval?.source === "list") {
-      for (const id of stage.approval.issues) ids.add(id);
-    }
-  }
-  const intake = await deps.tracker.listIntake(deps.project ? { project: deps.project } : undefined);
-  for (const candidate of intake) {
-    const loaded = await deps.tracker.get(candidate.identifier);
-    const state = await readDeliveryState(deps, loaded);
-    if (ticketHasShipWork(deps, loaded, state)) ids.add(loaded.identifier);
-  }
-  const tickets: Ticket[] = [];
-  for (const id of ids) tickets.push(await deps.tracker.get(id));
-  return tickets;
-}
-
-/** Every carried ticket must be approved. The trigger is not an input. */
-async function approvalBlock(deps: LoopDeps, entryId: string | null): Promise<ShipRun | null> {
-  const stages = shipStageList(deps);
-  if (stages.length === 0) return null;
-  const missing = (await carriedShipTickets(deps, entryId)).filter((ticket) => !ticketApproved(ticket, stages));
-  if (missing.length === 0) return null;
-  return {
-    exitCode: 1,
-    lines: missing.map((ticket) => `${ticket.identifier} BLOCKED approval-missing`),
-    parked: false,
-    shipped: false,
-  };
-}
-
 async function writeShipRetry(
   deps: LoopDeps,
   ticket: Ticket,
@@ -3858,13 +3963,36 @@ function sweepAction(
   return "ship";
 }
 
+async function withReleaseSummary(deps: LoopDeps, ticket: Ticket, id: string, run: ShipRun): Promise<ShipRun> {
+  const note = shipReleaseNotes.get(deps);
+  shipReleaseNotes.delete(deps);
+  if (!note) return run;
+  await deps.tracker.comment(ticket.identifier, [
+    "Release summary",
+    `carried: ${note.carries.join(" ") || "(none)"}`,
+    `untracked: ${note.untracked.join(" ") || "(none)"}`,
+  ].join("\n"));
+  return { ...run, lines: [...run.lines, ...note.untracked.map((sha) => `${id} untracked ${sha}`)] };
+}
+
 async function finishShipRun(deps: LoopDeps, ticket: Ticket, id: string, result: StageRun): Promise<ShipRun> {
+  return withReleaseSummary(deps, ticket, id, await finishShipBody(deps, ticket, id, result));
+}
+
+async function finishShipBody(deps: LoopDeps, ticket: Ticket, id: string, result: StageRun): Promise<ShipRun> {
+  const denied = result.outcome !== "complete" && result.problems.some((problem) => problem.reason === "approval-missing");
+  if (!denied) await removeMarker(deps, ticket, "ship-retry");
   if (result.outcome === "complete") {
     if (shipStageList(deps).some((stage) => stage.writeStatus)) {
       if (!deps.pack.status.shipped) throw new Error("status.shipped is required by ship stages");
       await writeTicketStatus(deps, ticket, deps.pack.status.shipped);
     }
     return { exitCode: 0, lines: [`${id} COMPLETE`], parked: false };
+  }
+  const deniedProblems = result.problems.filter((problem) => problem.reason === "approval-missing");
+  if (deniedProblems.length > 0) {
+    const ids = [...new Set(deniedProblems.flatMap((problem) => problem.evidence))];
+    return { exitCode: 1, lines: ids.map((item) => `${item} BLOCKED approval-missing`), parked: false, shipped: false };
   }
   const broken = result.problems.filter((problem) => problem.outcome === "broken");
   if (broken.length > 0) {
@@ -3906,14 +4034,11 @@ async function finishShipRun(deps: LoopDeps, ticket: Ticket, id: string, result:
 async function shipOne(deps: LoopDeps, id: string, mode: "ship" | "continue"): Promise<ShipRun> {
   await probeConfiguredCredentials(deps);
   deliveryStateCache.delete(deps);
-  const blocked = await approvalBlock(deps, id);
-  if (blocked) return blocked;
+  shipReleaseNotes.delete(deps);
   const ticket = await deps.tracker.get(id);
   const state = await readDeliveryState(deps, ticket);
   const stopped = exhaustedFailureType({ labels: ticket.labels });
   if (stopped) throw new HealExhaustedError(stopped);
-  const alreadyShipped = Boolean(deps.pack.status.shipped && ticket.stateName === deps.pack.status.shipped);
-  if (!alreadyShipped && ticket.stateName !== deps.pack.status.complete) throw new Error(`ship requires ${deps.pack.status.complete}`);
   const deliveryStages = deps.pack.promotionStages.filter((stage) => stage.authorization === "deliver");
   const shipStages = shipStageList(deps);
   const texts = resumeProofTexts(deps, ticket);
@@ -3929,10 +4054,8 @@ async function shipOne(deps: LoopDeps, id: string, mode: "ship" | "continue"): P
   if (!authorizationSatisfied(deliveryStages, deps.pack.promotionStages, state.stageReceipts, ticket, landed, order!.criteria)) {
     throw new Error("ship requires every applicable delivery stage to have a current passed receipt");
   }
-  if (shipStages.length === 0) return { exitCode: 0, lines: [`${id} ${alreadyShipped ? "already shipped" : "has no ship stages"}`], parked: false };
-  if (alreadyShipped) {
-    const passed = authorizationSatisfied(shipStages, deps.pack.promotionStages, state.stageReceipts, ticket, landed, order!.criteria);
-    if (!passed) throw new Error("shipped ticket lacks current passed ship receipts");
+  if (shipStages.length === 0) return { exitCode: 0, lines: [`${id} has no ship stages`], parked: false };
+  if (order && authorizationSatisfied(shipStages, deps.pack.promotionStages, state.stageReceipts, ticket, landed, order.criteria)) {
     return { exitCode: 0, lines: [`${id} already shipped`], parked: false };
   }
   let continueStageId: string | undefined;
@@ -3951,7 +4074,6 @@ async function shipOne(deps: LoopDeps, id: string, mode: "ship" | "continue"): P
   }
   const retry = parseShipRetry(await readDeliveryState(deps, ticket));
   const step = mode === "continue" && retry?.outcome === "needs-step" ? retry.step : undefined;
-  await removeMarker(deps, ticket, "ship-retry");
   const result = await runPromotionStages(deps, ticket, "ship", landed, order?.criteria ?? [], { continueStageId, step });
   return finishShipRun(deps, ticket, id, result);
 }
@@ -3986,8 +4108,6 @@ async function releaseIds(deps: LoopDeps): Promise<Set<string>> {
 export async function shipSweep(deps: LoopDeps): Promise<ShipRun> {
   await probeConfiguredCredentials(deps);
   deliveryStateCache.delete(deps);
-  const blocked = await approvalBlock(deps, null);
-  if (blocked) return blocked;
   const now = deps.nowMs ?? Date.now();
   const items: { id: string; action: "ship" | "continue" }[] = [];
   for (const id of await releaseIds(deps)) {
@@ -4006,8 +4126,6 @@ export async function shipSweep(deps: LoopDeps): Promise<ShipRun> {
 async function shipContinueAll(deps: LoopDeps): Promise<ShipRun> {
   await probeConfiguredCredentials(deps);
   deliveryStateCache.delete(deps);
-  const blocked = await approvalBlock(deps, null);
-  if (blocked) return blocked;
   const items: { id: string; action: "continue" }[] = [];
   for (const id of await releaseIds(deps)) {
     const ticket = await deps.tracker.get(id);

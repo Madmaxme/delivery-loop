@@ -36,7 +36,7 @@ import { githubRepoFromUrl } from "../adapters/types.js";
 import type { ForgeAdapter, LinearProgramTracker, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { findConnector } from "../connectors/catalog.js";
 import { writeCredentialSummary } from "../engine/credential-log.js";
-import { auditEligibility, deliver, repoCheckoutDir, ship, shipSweep, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
+import { auditEligibility, deliver, deliveryExitCode, repoCheckoutDir, ship, shipSweep, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
 export { validateStageReceipt, type StageVerifyInput } from "../engine/loop.js";
 export type { StageVerificationReceipt } from "../adapters/types.js";
 import { shipInvocationDeps } from "./ship-deps.js";
@@ -198,7 +198,7 @@ export function runnerWorkflowText(): string {
 }
 
 export function failForPolicyErrors(results: readonly { outcome: string }[]): void {
-  if (results.some((result) => result.outcome === "policy-error")) process.exitCode = 1;
+  if (results.some((result) => result.outcome === "policy-error" || deliveryExitCode(result) !== 0)) process.exitCode = 1;
 }
 
 function installHarnessFiles(dir: string): void {

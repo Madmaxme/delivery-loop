@@ -265,6 +265,37 @@ export type JourneyProof =
  * A route test counts when its path matches `journeySpec`.
  * A spec outside that pattern is not proof.
  */
+export type StructuredJourneyProof = { repo: string; path: string; sha: string };
+
+/**
+ * Journey command stdout. A JSON list of `{ repo, path, sha }` is the proof.
+ * Any other text is not a structured list. Task prose is not read here.
+ */
+export function parseStructuredJourneyProof(text: string): StructuredJourneyProof[] | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("[")) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(value)) return null;
+  const proofs: StructuredJourneyProof[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+    const record = item as Record<string, unknown>;
+    if (Object.keys(record).sort().join(",") !== "path,repo,sha") return null;
+    if (typeof record.repo !== "string" || typeof record.path !== "string" || typeof record.sha !== "string") return null;
+    const repo = record.repo.trim();
+    const path = record.path.trim().replaceAll("\\", "/").replace(/^\/+/, "");
+    const sha = record.sha.trim();
+    if (!repo || !path || !sha || path.split("/").includes("..")) return null;
+    proofs.push({ repo, path, sha });
+  }
+  return proofs;
+}
+
 export function parseJourneyProofs(text: string, journeySpec?: string): JourneyProof[] {
   const proofs: JourneyProof[] = [];
   for (const match of text.matchAll(/\*\*Journey proof:\*\*\s*(.+)/gi)) {

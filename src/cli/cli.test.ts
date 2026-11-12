@@ -256,6 +256,7 @@ describe("stage receipt export", () => {
       criteriaRevision: "a".repeat(64),
       landedShas: [{ repo: "api", sha: "abc" }],
       criteria: [{ id: "single-charge", text: "Preserve one charge path.", source: "Issue description" }],
+      releaseSet: { api: "abc" },
     };
     const receipt: StageVerificationReceipt = {
       stageId: input.stageId,
