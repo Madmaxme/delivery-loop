@@ -1333,6 +1333,119 @@ async function launch(input: {
   }
 }
 
+describe("runner identity mint", () => {
+  it("uses no gh-token slot for forge calls", async () => {
+    const rec = createCredentialRecorder();
+    let fetches = 0;
+    const forge = githubForge({
+      token: "forge-token",
+      identity: "mint",
+      step: "deliver",
+      mintCommand: "mint-installation-token",
+      runMint: () => ({ status: 0, stdout: "mint-token\n" }),
+      credentialNote: rec.note,
+      fetch: async (_url, init) => {
+        fetches += 1;
+        const headers = init?.headers as Record<string, string>;
+        assert.equal(headers.Authorization, "Bearer mint-token");
+        return jsonResponse({ status: "identical" });
+      },
+    });
+    assert.equal(
+      await forge.compare!({ repoUrl: "https://github.com/acme/api", base: "main", head: "abc" }),
+      "identical",
+    );
+    const summary = rec.summaryLines().join("\n");
+    assert.equal(summary.includes("gh-token"), false);
+    assert.match(summary, /slot=mint/);
+    assert.equal(summary.includes("mint-token"), false);
+    assert.equal(summary.includes("forge-token"), false);
+    assert.ok(fetches > 0);
+  });
+
+  it("stops a failed mint and uses no other token", async () => {
+    let fetches = 0;
+    const forge = githubForge({
+      token: "forge-token",
+      identity: "mint",
+      step: "ship",
+      mintCommand: "mint-installation-token",
+      runMint: () => ({ status: 1, stdout: "forge-token\n" }),
+      fetch: async () => {
+        fetches += 1;
+        return jsonResponse({});
+      },
+    });
+    await assert.rejects(
+      () => forge.compare!({ repoUrl: "https://github.com/acme/api", base: "main", head: "abc" }),
+      /ship: DELIVERY_LOOP_GITHUB_MINT did not return an installation token that is still valid/,
+    );
+    assert.equal(fetches, 0);
+  });
+
+  it("writes trustedRequesters and requestedBy from the mint login", async () => {
+    const forge = githubForge({
+      token: "forge-token",
+      identity: "mint",
+      step: "deliver",
+      mintCommand: "mint-installation-token",
+      runMint: () => ({ status: 0, stdout: "mint-token\n" }),
+      fetch: async (url, init) => {
+        const method = init?.method ?? "GET";
+        const href = String(url);
+        const headers = init?.headers as Record<string, string>;
+        assert.equal(headers.Authorization, "Bearer mint-token");
+        if (href.includes("/git/matching-refs/")) {
+          return jsonResponse([{ ref: "refs/heads/results", object: { sha: "abc123" } }]);
+        }
+        if (method === "PUT" && href.includes("/contents/")) {
+          return jsonResponse(
+            { commit: { author: { email: "1+mint-login@users.noreply.github.com" } } },
+            201,
+          );
+        }
+        if (method === "POST" && href.endsWith("/issues")) {
+          const body = JSON.parse(String(init?.body)) as { body: string };
+          const fenced = body.body.replace(/^```json\n/, "").replace(/\n```$/, "");
+          const record = JSON.parse(fenced) as { requestedBy?: string; trustedRequesters?: string[] };
+          assert.equal(record.requestedBy, "mint-login");
+          assert.deepEqual(record.trustedRequesters, ["relay-login"]);
+          return jsonResponse({ number: 7 }, 201);
+        }
+        if (method === "POST" && href.endsWith("/assignees")) return jsonResponse({}, 201);
+        return jsonResponse({}, 500);
+      },
+    });
+    const worker = httpWorker({
+      model: "model-4.7",
+      newId: () => "req-mint",
+      statusStore: { kind: "forge", repo: "acme/store", branch: "results", path: "worker-results/{id}.json" },
+      request: {
+        kind: "forge-issue",
+        repo: "acme/signals",
+        assignee: "relay-login",
+        trustedRequesters: ["relay-login"],
+      },
+      files: {
+        write: (input) => forge.writeTextFile!({ ...input, message: input.message ?? "seed" }),
+        read: (input) => forge.readTextFile!(input),
+      },
+      issues: {
+        open: (input) => forge.createIssue!(input),
+        assign: (input) => forge.assignIssue!(input),
+        actor: () => forge.actorLogin!(),
+      },
+      fetch: async () => jsonResponse({}, 202),
+    });
+    const started = await worker.start({
+      prompt: "ground the ticket",
+      repoUrl: "https://github.com/acme/api",
+      baseRef: "main",
+    });
+    assert.equal(started.runId, "req-mint");
+  });
+});
+
 function httpStatus(status: number): Error {
   const error = new Error(`HTTP ${status}`);
   (error as Error & { status: number }).status = status;

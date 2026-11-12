@@ -69,12 +69,18 @@ export function createInstallationToken(opts: {
   nowMs?: () => number;
   runMint?: (command: string) => MintRun;
   note?: CredentialNoteFn;
+  /** When set, an empty or failed mint throws and names this step. There is no other token. */
+  requireMint?: boolean;
+  step?: string;
 }): { get(): Promise<InstallationToken> } {
   let cached: MintedCredential | null = null;
   return {
     async get() {
       const command = opts.command().trim();
-      if (!command) return { token: opts.fallbackToken, slot: "gh-token" };
+      if (!command) {
+        if (opts.requireMint) throw new Error(`${opts.step ?? "mint"}: DELIVERY_LOOP_GITHUB_MINT is required`);
+        return { token: opts.fallbackToken, slot: "gh-token" };
+      }
       const now = (opts.nowMs ?? Date.now)();
       if (cached && !credentialDue(cached.expiresAtMs, now)) {
         return { token: cached.token, slot: "mint" };
@@ -85,9 +91,8 @@ export function createInstallationToken(opts: {
       const ok = Boolean(minted && minted.expiresAtMs > now);
       noteMint({ exitStatus: result.status, ok, refresh, note: opts.note });
       if (!minted || minted.expiresAtMs <= now) {
-        throw new Error(
-          "credential error: DELIVERY_LOOP_GITHUB_MINT did not return an installation token that is still valid.",
-        );
+        const detail = "DELIVERY_LOOP_GITHUB_MINT did not return an installation token that is still valid.";
+        throw new Error(opts.requireMint ? `${opts.step ?? "mint"}: ${detail}` : `credential error: ${detail}`);
       }
       cached = minted;
       return { token: minted.token, slot: "mint" };

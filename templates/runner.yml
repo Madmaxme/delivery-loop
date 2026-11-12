@@ -66,8 +66,9 @@ jobs:
           DELIVERY_LOOP_ISSUE: ${{ inputs.issue }}
           DELIVERY_LOOP_RUNTIME: local
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          # Prints an installation token for check-runs. Empty keeps GH_TOKEN.
+          # Prints an installation token. runner.identity mint requires it for every forge call.
           DELIVERY_LOOP_GITHUB_MINT: ${{ inputs.mode != 'audit' && vars.DELIVERY_LOOP_GITHUB_MINT || '' }}
+          DELIVERY_LOOP_ENGINE_REPOSITORY: ${{ vars.DELIVERY_LOOP_ENGINE_REPOSITORY }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           CURSOR_API_KEY: ${{ inputs.mode != 'audit' && secrets.CURSOR_API_KEY || '' }}
           # Second cursor key slot. An empty secret leaves the launch on the primary slot.
@@ -83,7 +84,7 @@ jobs:
         run: |
           set -euo pipefail
           dir="$(mktemp -d)/delivery-loop"
-          git clone --depth 1 --branch __DELIVERY_LOOP_REF__ https://github.com/Madmaxme/delivery-loop.git "$dir"
+          git clone --depth 1 --branch __DELIVERY_LOOP_REF__ "https://github.com/${DELIVERY_LOOP_ENGINE_REPOSITORY}.git" "$dir"
           event_failed=0
           if [ "${{ inputs.mode }}" != "audit" ]; then
             bash "$dir/scripts/run-event.sh" started || event_failed=1

@@ -33,8 +33,8 @@ const HTTP_PENDING = new Set(["pending", "running"]);
 export type WorkerHttpToken = {
   /** Minted installation token when that command is set, otherwise the forge token. */
   mint(): Promise<InstallationToken>;
-  /** Forge token. The value is not written. */
-  forge(): InstallationToken;
+  /** Forge token, or the minted token when the runner identity is mint. The value is not written. */
+  forge(): InstallationToken | Promise<InstallationToken>;
 };
 
 function headerToken(name: string, value: string): string {
@@ -65,9 +65,9 @@ async function resolveHeaderMap(
       value = minted?.token ?? "";
       slot = minted?.slot ?? "mint";
     } else if (source === "gh-token") {
-      const forge = tokens?.forge();
+      const forge = await Promise.resolve(tokens?.forge());
       value = forge?.token ?? "";
-      slot = "gh-token";
+      slot = forge?.slot ?? "gh-token";
     } else {
       value = env[source] ?? "";
     }
@@ -282,6 +282,7 @@ export function httpWorker(opts: {
           path: storePath,
         };
         payload.requestedBy = actor;
+        if (opts.request.trustedRequesters?.length) payload.trustedRequesters = opts.request.trustedRequesters;
         let issueBody = fencedJson(payload);
         if (issueBody.length > WORKER_REQUEST_BODY_MAX) {
           const requestPath = workerHttpRequestPath(storePath);

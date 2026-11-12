@@ -513,6 +513,8 @@ export function githubIssuesTracker(opts: {
   intakeLabel: string;
   fetch?: FetchLike;
   credentialNote?: CredentialNoteFn;
+  /** `mint` when the runner identity is mint. The token value is not written. */
+  slot?: "mint" | "gh-token";
 }): TrackerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const headers = {
@@ -524,7 +526,7 @@ export function githubIssuesTracker(opts: {
 
   async function api(path: string, init?: RequestInit): Promise<unknown> {
     const response = await credentialFetch(
-      "gh-token",
+      opts.slot ?? "gh-token",
       githubEndpointClass(path),
       () =>
         fetchImpl(`https://api.github.com${path}`, {

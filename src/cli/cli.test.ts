@@ -62,7 +62,8 @@ describe("installer", () => {
     assert.match(workflow, /persist-credentials: false/);
     assert.doesNotMatch(workflow, /DELIVERY_LOOP_DEPLOY_KEY/);
     assert.match(workflow, new RegExp(`--branch v${version.replaceAll(".", "\\.")}`));
-    assert.match(workflow, /https:\/\/github.com\/Madmaxme\/delivery-loop.git/);
+    assert.match(workflow, /DELIVERY_LOOP_ENGINE_REPOSITORY/);
+    assert.doesNotMatch(workflow, /Madmaxme/);
     assert.doesNotMatch(workflow, /__DELIVERY_LOOP_REF__/);
     assert.match(workflow, /npm install --omit=dev/);
     assert.match(workflow, /CURSOR_API_KEY_FALLBACK/);

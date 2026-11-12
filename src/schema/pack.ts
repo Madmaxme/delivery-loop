@@ -96,6 +96,11 @@ export type WorkerHttpRequest = {
   repo: string;
   assignee: string;
   labels?: string[];
+  /**
+   * Logins a relay may accept as the requester.
+   * The engine copies this list onto the request record next to `requestedBy`.
+   */
+  trustedRequesters?: string[];
 };
 
 export type WorkerHttp = {
@@ -208,6 +213,11 @@ export type ProjectPack = {
   check?: CheckKind;
   /** What executes the loop. `gha` dispatches GitHub Actions. `local` runs here. */
   runner?: RunnerKind;
+  /**
+   * `mint` uses `DELIVERY_LOOP_GITHUB_MINT` for every forge call and worker request.
+   * Absent keeps the forge token for calls other than check-runs.
+   */
+  identity?: "mint";
   /** owner/repo used when the tracker is GitHub Issues. */
   githubRepo?: string;
   /** Jira REST settings. Secrets remain in `authHeaderEnv`'s environment value. */
@@ -381,10 +391,11 @@ export function loadPack(path: string): ProjectPack {
   }
   raw.forge = raw.forge ?? "github";
   raw.check = raw.check ?? "workflow";
-  raw.runner = raw.runner ?? "gha";
+  const runner = loadRunner(legacy.runner, path);
+  raw.runner = runner.runner;
+  raw.identity = runner.identity;
   if (!FORGES.includes(raw.forge)) throw new Error(`${path} forge must be github or git`);
   if (!CHECKS.includes(raw.check)) throw new Error(`${path} check must be workflow or command`);
-  if (!RUNNERS.includes(raw.runner)) throw new Error(`${path} runner must be gha or local`);
   if (raw.check === "workflow" && raw.forge !== "github") {
     throw new Error(`${path} check workflow needs forge github`);
   }
@@ -406,6 +417,29 @@ export function loadPack(path: string): ProjectPack {
   raw.workerHttp = loadWorkerHttp(raw.workerHttp, raw.worker, path);
   raw.transient = loadTransient(raw.transient, path);
   return raw;
+}
+
+function loadRunner(value: unknown, path: string): { runner: RunnerKind; identity?: "mint" } {
+  if (value === undefined || value === null) return { runner: "gha" };
+  if (typeof value === "string") {
+    if (!RUNNERS.includes(value as RunnerKind)) throw new Error(`${path} runner must be gha or local`);
+    return { runner: value as RunnerKind };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${path} runner must be gha or local`);
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort().join(",");
+  if (keys !== "identity,kind" && keys !== "kind" && keys !== "identity") {
+    throw new Error(`${path} runner.identity must be mint`);
+  }
+  const kind = record.kind === undefined ? "gha" : record.kind;
+  if (typeof kind !== "string" || !RUNNERS.includes(kind as RunnerKind)) {
+    throw new Error(`${path} runner must be gha or local`);
+  }
+  if (record.identity === undefined) return { runner: kind as RunnerKind };
+  if (record.identity !== "mint") throw new Error(`${path} runner.identity must be mint`);
+  return { runner: kind as RunnerKind, identity: "mint" };
 }
 
 function loadEligibility(value: unknown, path: string): Eligibility {
@@ -713,7 +747,26 @@ function loadWorkerRequest(
   if (labels.some((label) => !label || /[\r\n]/.test(label))) {
     throw new Error(`${path} workerHttp.request labels are names`);
   }
-  return { kind: "forge-issue", repo, assignee, ...(labels.length ? { labels } : {}) };
+  const trusted = loadTrustedRequesters(value.trustedRequesters, path);
+  return {
+    kind: "forge-issue",
+    repo,
+    assignee,
+    ...(labels.length ? { labels } : {}),
+    ...(trusted ? { trustedRequesters: trusted } : {}),
+  };
+}
+
+function loadTrustedRequesters(value: unknown, path: string): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`${path} workerHttp.request.trustedRequesters is a list of logins`);
+  }
+  const logins = value.map((item) => (typeof item === "string" ? item.trim() : ""));
+  if (logins.some((login) => !FORGE_LOGIN.test(login)) || new Set(logins).size !== logins.length) {
+    throw new Error(`${path} workerHttp.request.trustedRequesters is a list of logins`);
+  }
+  return logins;
 }
 
 const STORE_REPO = /^[^/\s]+\/[^/\s]+$/;

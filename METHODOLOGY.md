@@ -14,15 +14,21 @@ The orchestrator talks to the owner; the engineering bot runs explicit audit, de
 
 Any actor may squash-merge an ordinary pull request once quality is green on the head. Engine-heal pull requests are merged by their workflow. A branch that is only behind is updated from trunk, then quality runs again on the new head. Two updates are the limit. When the install lists `commitActors` for that repo, the token's login is that actor.
 
-Check-runs use the token printed by `DELIVERY_LOOP_GITHUB_MINT` when that command is set. Other forge calls keep the forge token. A bare token expires 60 minutes after the mint. JSON with `token` and `expires_at` uses that expiry. The forge mints again when five minutes or less remain. A 401 or 403 from check-runs is a credential error. The forge does not read that check from another endpoint.
+`runner.identity: mint` requires `DELIVERY_LOOP_GITHUB_MINT`. Deliver, sweep, ship, and ship sweep use that minted token for every forge call and every worker request. There is no switch to `GH_TOKEN` or any other token. A failed mint stops the run and names the step. When `identity` is absent, check-runs use the minted token when the command is set and other forge calls keep the forge token. A failed mint in that mode is logged and the run continues.
 
-When `DELIVERY_LOOP_GITHUB_MINT` is set, each run mints once at startup and reads `/rate_limit` with that token. Later check-runs reuse it. A failed mint or rate-limit read is logged and the run continues. That read is not a check.
+A bare token expires 60 minutes after the mint. JSON with `token` and `expires_at` uses that expiry. The forge mints again when five minutes or less remain. A 401 or 403 from check-runs is a credential error. The forge does not read that check from another endpoint.
+
+Before any step, every env name the pack references must be set and non-empty. That covers `commitActorTokenEnv`, `design.figmaTokenEnv`, header-map sources other than `mint` and `gh-token`, and `DELIVERY_LOOP_GITHUB_MINT` when `identity` is mint. A missing name stops the run. The message names the env and not the value. The heal prompt names `commitActorTokenEnv` from the pack.
+
+`delivery-loop audit` reports expiry or validity for each credential it can inspect without printing the value. The mint response supplies the installation-token expiry. A configured provider that returns an expiry, or a 401 on a cheap identity call, supplies the rest. A credential that expires inside `DELIVERY_LOOP_CREDENTIAL_EXPIRY_DAYS` (14 when unset) is a warning. An expired or invalid credential fails the audit. A provider with no expiry is `expiry unknown`.
+
+Stage promote, verify, and continue git calls set `GIT_ASKPASS` and `DELIVERY_LOOP_GIT_ASKPASS` to `scripts/git-askpass.sh`. The password is the minted token when `identity` is mint, and the forge token otherwise. The helper does not choose another token.
 
 A Figma frame URL is the `figma.com` address. Surrounding markdown and a trailing `)` `]` `>` `.` `,` `;` or quote are not part of it. `node-id=1-2` is read as `1:2`. A 400 includes Figma's `err` or `message` and stops as a rejected request. A 403 or 404 stops as access and names `design.figmaTokenEnv`. The token, the headers, and a URL that contains a token are not written.
 
 ## Credential log
 
-Each credential call writes one line. The line names the slot, the endpoint class, and the status. A success is included. A mint writes `slot=mint` and `endpoint=mint`. A re-mint near expiry adds `refresh=1`. Check-runs write `endpoint=check-runs`, with `slot=mint` when the mint command is set and `slot=gh-token` when it is not. Other GitHub calls write `slot=gh-token` and a class such as `pulls`, `contents`, `commits`, `compare`, `actions`, `issues`, `git`, or `user`. Linear writes `slot=linear` and `endpoint=linear-graphql`. A cursor launch writes `slot=primary` or `slot=fallback` and `endpoint=cursor-launch`. An http worker start writes `endpoint=worker-http-start`. An http worker status read writes `endpoint=worker-http-status`. A status-store seed writes `endpoint=worker-http-seed`. The slot is `worker-http`, or `mint` or `gh-token` when a header or the forge credential uses that source. A Figma read writes `slot=figma` and `endpoint=figma`.
+Each credential call writes one line. The line names the slot, the endpoint class, and the status. A success is included. A mint writes `slot=mint` and `endpoint=mint`. A re-mint near expiry adds `refresh=1`. Check-runs write `endpoint=check-runs`, with `slot=mint` when the mint command is set and `slot=gh-token` when it is not. Other GitHub calls write `slot=gh-token` when `identity` is absent, and `slot=mint` when `identity` is mint. The class is `pulls`, `contents`, `commits`, `compare`, `actions`, `issues`, `git`, or `user`. Linear writes `slot=linear` and `endpoint=linear-graphql`. A cursor launch writes `slot=primary` or `slot=fallback` and `endpoint=cursor-launch`. An http worker start writes `endpoint=worker-http-start`. An http worker status read writes `endpoint=worker-http-status`. A status-store seed writes `endpoint=worker-http-seed`. The slot is `worker-http`, or `mint` or `gh-token` when a header or the forge credential uses that source. A Figma read writes `slot=figma` and `endpoint=figma`.
 
 The run line is `[delivery-loop] credential slot=<slot> endpoint=<endpoint> status=<status>`. The run ends with one summary line per slot, endpoint class, and status: `[delivery-loop] credential summary slot=<slot> endpoint=<endpoint> status=<status> count=<n>`. A grep for `credential summary` that finds no status other than 200 means every recorded call returned 200.
 
@@ -121,13 +127,13 @@ Start request:
 }
 ```
 
-`statusStore` is present only when `statusUrl` mode is used and that key is set, or when the same record is placed on a forge issue. `path` is the template with `{id}` replaced. `requestedBy` is added on the issue record. Any 2xx `startUrl` response is success. The body is ignored.
+`statusStore` is present only when `statusUrl` mode is used and that key is set, or when the same record is placed on a forge issue. `path` is the template with `{id}` replaced. `requestedBy` and, when `workerHttp.request.trustedRequesters` is set, `trustedRequesters` are added on the issue record. A relay accepts a requester only when that login is in `trustedRequesters`. Any 2xx `startUrl` response is success. The body is ignored.
 
 Forge issue body, when it fits:
 
 ````markdown
 ```json
-{"id":"<request-id>","prompt":"<prompt>","repoUrl":"<repo-url>","baseRef":"<base-ref>","model":{"id":"<workerModel>"},"statusStore":{"repo":"<owner/name>","branch":"<branch>","path":"worker-results/<request-id>.json"},"requestedBy":"<login>"}
+{"id":"<request-id>","prompt":"<prompt>","repoUrl":"<repo-url>","baseRef":"<base-ref>","model":{"id":"<workerModel>"},"statusStore":{"repo":"<owner/name>","branch":"<branch>","path":"worker-results/<request-id>.json"},"requestedBy":"<login>","trustedRequesters":["<login>"]}
 ```
 ````
 

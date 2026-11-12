@@ -296,6 +296,34 @@ workerHttp:
     assert.equal(pack.forge, "git");
     assert.equal(pack.check, "command");
     assert.equal(pack.runner, "local");
+    assert.equal(pack.identity, undefined);
+  });
+
+  it("reads runner.identity mint and trusted requesters", () => {
+    const pack = loadPack(write(`${base.replace("worker: cursor", "worker: http")}
+runner:
+  kind: gha
+  identity: mint
+workerHttp:
+  statusStore:
+    kind: forge
+    repo: acme/store
+    branch: results
+    path: worker-results/{id}.json
+  request:
+    kind: forge-issue
+    repo: acme/signals
+    assignee: relay-login
+    trustedRequesters:
+      - relay-login
+`));
+    assert.equal(pack.runner, "gha");
+    assert.equal(pack.identity, "mint");
+    assert.deepEqual(pack.workerHttp?.request?.trustedRequesters, ["relay-login"]);
+    assert.throws(
+      () => loadPack(write(`${base}runner:\n  identity: other\n`)),
+      /runner.identity must be mint/,
+    );
   });
 
   it("refuses a workflow check on a plain git forge", () => {
