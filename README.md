@@ -16,7 +16,7 @@ delivery-loop update
 
 `init` writes the v2 project pack and installs the canonical `.agents/skills/delivery-loop` and `.agents/skills/delivery-loop-conduct` skills. Cursor and Claude skill entries are symlinks to those canonical directories. `update` refreshes generated skills, the Cursor rule, and runner workflow without changing `delivery-loop.yaml` or the invariants file.
 
-Use `delivery-loop audit` for a read-only eligibility review, `delivery-loop deliver <id>` for one ticket, and `delivery-loop sweep` for an explicitly dispatched intake run. `delivery-loop ship <id>` runs ship-authorized stages; `delivery-loop ship continue <id>` resumes the active ship stage. See the [v1-to-v2 migration guide](conduct/methodology/MIGRATION-V1-TO-V2.md) before upgrading a v1 client; v2 has no v1 pack or run-state compatibility path.
+Use `delivery-loop audit` for a read-only eligibility review, `delivery-loop deliver <id>` for one ticket, and `delivery-loop sweep` for an explicitly dispatched intake run. `delivery-loop ship <id>` runs ship-authorized stages; `delivery-loop ship continue` resumes the active ship stage; `delivery-loop ship sweep` runs due ship retries. See the [v1-to-v2 migration guide](conduct/methodology/MIGRATION-V1-TO-V2.md) before upgrading a v1 client; v2 has no v1 pack or run-state compatibility path.
 
 Optional run events are written by `scripts/run-event.sh` and posted only when `DELIVERY_LOOP_EVENT_URL` is set. Credential logs record the slot, endpoint class, and status, never tokens, headers, or request URLs.
 

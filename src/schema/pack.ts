@@ -151,6 +151,14 @@ export type StageCommandTimeout = {
   timeoutMs: number;
 };
 
+/** Tickets named here are the approved set for the release. */
+export type ShipApprovalList = { source: "list"; issues: string[] };
+
+/** A ticket is approved when it carries this label. */
+export type ShipApprovalLabel = { source: "label"; label: string };
+
+export type ShipApproval = ShipApprovalList | ShipApprovalLabel;
+
 export type PromotionStage = {
   id: string;
   target: string;
@@ -170,6 +178,11 @@ export type PromotionStage = {
   dependsOn?: string[];
   parkSuccess?: boolean;
   writeStatus?: boolean;
+  /**
+   * Required on a ship stage. `list` names the approved ticket ids.
+   * `label` approves a ticket that carries that label.
+   */
+  approval?: ShipApproval;
 };
 
 export type JiraConfig = {
@@ -462,6 +475,10 @@ function loadPromotionStages(value: unknown, path: string): PromotionStage[] {
     } else if (shipStageSeen) {
       throw new Error(`${path} deliver stages must precede ship stages`);
     }
+    if (stage.authorization === "deliver" && stage.approval !== undefined) {
+      throw new Error(`${path} promotionStages[${index}].approval is only valid on a ship stage`);
+    }
+    const approval = stage.authorization === "ship" ? loadShipApproval(stage.approval, path, index) : undefined;
     if (stage.continueCommand !== undefined &&
       (typeof stage.continueCommand !== "string" || !stage.continueCommand.trim())) {
       throw new Error(`${path} promotionStages[${index}].continueCommand must be non-empty`);
@@ -485,10 +502,33 @@ function loadPromotionStages(value: unknown, path: string): PromotionStage[] {
       ...(verify ? { verify } : { verify: undefined }),
       ...(continued ? { continue: continued } : { continue: undefined }),
       ...(dependsOn ? { dependsOn } : { dependsOn: undefined }),
+      ...(approval ? { approval } : { approval: undefined }),
     } as PromotionStage;
   });
   assertStageDependencies(stages, path);
   return stages;
+}
+
+function loadShipApproval(value: unknown, path: string, index: number): ShipApproval {
+  const where = `${path} promotionStages[${index}].approval`;
+  const expected = `${where} must be { source: list, issues } or { source: label, label }`;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(expected);
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort().join(",");
+  if (record.source === "list" && keys === "issues,source") {
+    if (!Array.isArray(record.issues) || record.issues.length === 0 ||
+      record.issues.some((item) => typeof item !== "string" || !item.trim())) {
+      throw new Error(`${where} list issues must be non-empty ids`);
+    }
+    const issues = record.issues.map((item) => (item as string).trim());
+    if (new Set(issues).size !== issues.length) throw new Error(`${where} list issues must be unique`);
+    return { source: "list", issues };
+  }
+  if (record.source === "label" && keys === "label,source" &&
+    typeof record.label === "string" && record.label.trim()) {
+    return { source: "label", label: record.label.trim() };
+  }
+  throw new Error(expected);
 }
 
 function loadDependsOn(value: unknown, path: string, index: number): string[] | undefined {

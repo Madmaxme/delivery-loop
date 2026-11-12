@@ -7,6 +7,6 @@ alwaysApply: true
 
 The versioned master source is `conduct/methodology/SKILL.md`; installs expose it as `.agents/skills/delivery-loop/SKILL.md`. Code conduct is sourced from `conduct/conduct/SKILL.md` and installed as `.agents/skills/delivery-loop-conduct/SKILL.md`. Cursor and Claude skill entries link to those canonical directories.
 
-Follow the pinned v2 methodology and the client's own overlay. The client owns eligibility, product acceptance meaning, Jira settings, and deployment/environment instructions. The engine is the only status writer. `audit` is read-only; `deliver`, `sweep`, `ship`, and `ship continue` are explicit commands, not scheduled triggers.
+Follow the pinned v2 methodology and the client's own overlay. The client owns eligibility, product acceptance meaning, Jira settings, and deployment/environment instructions. The engine is the only status writer. `audit` is read-only. `deliver` and intake `sweep` are explicit commands, not scheduled triggers. `ship`, `ship continue`, and `ship sweep` check approval before promote or continue. `ship sweep` is the hourly schedule and the `ship-continue` repository dispatch.
 
 For v1 pack or run-state migration, follow `.agents/skills/delivery-loop/MIGRATION-V1-TO-V2.md`. Never add a v1 parser or skill alias.

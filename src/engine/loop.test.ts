@@ -9,7 +9,7 @@ import type { DeliveryState, ForgeAdapter, LinearProgramTracker, Ticket, Tracker
 import type { ProjectPack, PromotionStage } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
 import { proofLinesFor } from "../../scripts/journey-proof.mjs";
-import { auditEligibility, candidateFetchEnvironment, ciFixLimit, formatTicketProgress, repoCheckoutDir, runTicket, ship, sortByPack, sweep, sweepNeedsAnotherPage, type LoopDeps, type StageVerifyInput } from "./loop.ts";
+import { auditEligibility, candidateFetchEnvironment, ciFixLimit, formatTicketProgress, repoCheckoutDir, runTicket, ship, shipSweep, sortByPack, sweep, sweepNeedsAnotherPage, type LoopDeps, type StageVerifyInput } from "./loop.ts";
 import { classifyQualityCause } from "./quality-cause.ts";
 
 const pack: ProjectPack = {
@@ -2970,7 +2970,7 @@ describe("loop", () => {
       ...pack,
       status: { ...pack.status, complete: "Delivery Complete", shipped: "Shipped" },
       promotionStages: [
-        { id: "publish", target: "artifact-zone", authorization: "ship", promoteCommand: "promote", repos: ["api"], verifyCommand: "verify", continueCommand: "continue", parkSuccess: true, writeStatus: true },
+        { id: "publish", target: "artifact-zone", authorization: "ship", promoteCommand: "promote", repos: ["api"], verifyCommand: "verify", continueCommand: "continue", parkSuccess: true, writeStatus: true, approval: { source: "list", issues: ["API-1"] } },
       ],
     };
     let commands = 0;
@@ -2994,6 +2994,7 @@ describe("loop", () => {
       verifyCommand: "verify",
       parkSuccess: false,
       writeStatus: true,
+      approval: { source: "list", issues: ["API-1"] },
     };
     env.deps.pack = {
       ...pack,
@@ -3037,6 +3038,7 @@ describe("loop", () => {
       verifyCommand: "verify",
       parkSuccess: true,
       writeStatus: true,
+      approval: { source: "list", issues: ["API-1"] },
     };
     env.deps.pack = {
       ...pack,
@@ -3077,7 +3079,105 @@ describe("loop", () => {
     assert.equal(notSuccessful.parked, true);
     assert.equal(env.state(), "Delivery Complete");
   });
-  it("runs the ship path again when the heal says the fix is already on trunk", async () => {
+  it("does not promote or continue an unapproved ticket from ship, continue, or sweep", async () => {
+    const env = harness(BUILDABLE);
+    const stage: PromotionStage = {
+      id: "publish",
+      target: "artifact-zone",
+      authorization: "ship",
+      promoteCommand: "promote",
+      continueCommand: "continue",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: false,
+      writeStatus: false,
+      approval: { source: "label", label: "approved" },
+    };
+    env.deps.pack = {
+      ...pack,
+      status: { ...pack.status, complete: "Delivery Complete" },
+      promotionStages: [stage],
+    };
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    const landed = env.deliveryState();
+    await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+      ...landed,
+      markers: [...landed.markers, {
+        kind: "ship-retry",
+        body: JSON.stringify({ ticket: "API-1", stage: "publish", reason: "later", notBefore: new Date(0).toISOString(), outcome: "waiting" }),
+        createdAt: new Date(0).toISOString(),
+      }, {
+        kind: "active-promotion-stage",
+        body: JSON.stringify({ stages: [{ stageId: "publish", target: "artifact-zone", authorization: "ship", criteriaRevision: ticket().criteriaRevision }] }),
+        createdAt: new Date(0).toISOString(),
+      }],
+    });
+    env.deps.tracker.get = async (id) => ticket({ identifier: id, stateName: "Delivery Complete", labels: [] });
+    let commands = 0;
+    env.deps.runPackCommand = () => {
+      commands += 1;
+      return { status: 0, stdout: "" };
+    };
+    for (const run of [() => ship(env.deps, "API-1"), () => ship(env.deps, "API-1", "continue"), () => shipSweep(env.deps)]) {
+      const result = await run();
+      assert.equal(result.exitCode, 1);
+      assert.match(result.lines.join("\n"), /approval-missing/);
+    }
+    assert.equal(commands, 0);
+  });
+
+  it("blocks the release when a carried ticket is unapproved", async () => {
+    const env = harness(BUILDABLE);
+    const stage: PromotionStage = {
+      id: "publish",
+      target: "artifact-zone",
+      authorization: "ship",
+      promoteCommand: "promote",
+      continueCommand: "continue",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: false,
+      writeStatus: false,
+      approval: { source: "list", issues: ["API-1"] },
+    };
+    env.deps.pack = {
+      ...pack,
+      status: { ...pack.status, complete: "Delivery Complete" },
+      promotionStages: [stage],
+    };
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    const states = new Map<string, DeliveryState>();
+    states.set("API-1", env.deliveryState());
+    states.set("API-2", {
+      schemaVersion: 2,
+      markers: [{
+        kind: "ship-retry",
+        body: JSON.stringify({ ticket: "API-2", stage: "publish", reason: "later", notBefore: new Date(0).toISOString(), outcome: "waiting" }),
+        createdAt: new Date(0).toISOString(),
+      }],
+      stageReceipts: [],
+    });
+    env.deps.tracker.stateStore.readDeliveryState = async (id) => states.get(id) ?? { schemaVersion: 2, markers: [], stageReceipts: [] };
+    env.deps.tracker.stateStore.writeDeliveryState = async (id, next) => { states.set(id, next); };
+    env.deps.tracker.listIntake = async () => [
+      ticket({ identifier: "API-1", stateName: "Delivery Complete" }),
+      ticket({ identifier: "API-2", stateName: "Delivery Complete" }),
+    ];
+    env.deps.tracker.get = async (id) => ticket({ identifier: id, stateName: "Delivery Complete" });
+    let commands = 0;
+    env.deps.runPackCommand = () => {
+      commands += 1;
+      return { status: 0, stdout: "" };
+    };
+    for (const run of [() => ship(env.deps, "API-1"), () => ship(env.deps, "API-1", "continue"), () => shipSweep(env.deps)]) {
+      const result = await run();
+      assert.equal(result.exitCode, 1);
+      assert.match(result.lines.join("\n"), /API-2 BLOCKED approval-missing/);
+    }
+    assert.equal(commands, 0);
+  });
+
+  it("records a waiting marker and lets the next ship sweep run a fresh ship", async () => {
     const env = harness(BUILDABLE);
     const stage: PromotionStage = {
       id: "publish",
@@ -3088,6 +3188,7 @@ describe("loop", () => {
       verifyCommand: "verify",
       parkSuccess: false,
       writeStatus: true,
+      approval: { source: "list", issues: ["API-1"] },
     };
     env.deps.pack = {
       ...pack,
@@ -3095,13 +3196,15 @@ describe("loop", () => {
       promotionStages: [stage],
     };
     assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
-    let verifies = 0;
     let sleeps = 0;
+    let promotes = 0;
     env.deps.sleep = async () => { sleeps += 1; };
-    env.deps.ownerHeal = async () => "**Heal:** wait";
     env.deps.runPackCommand = (command, _cwd, stdin) => {
-      if (command !== "verify") return { status: 0, stdout: "" };
-      verifies += 1;
+      if (command === "promote") {
+        promotes += 1;
+        if (promotes === 1) return { status: 0, stdout: JSON.stringify({ outcome: "waiting", reason: "registry" }) };
+        return { status: 0, stdout: "" };
+      }
       const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
       return {
         status: 0,
@@ -3110,62 +3213,194 @@ describe("loop", () => {
           target: input.target,
           criteriaRevision: input.criteriaRevision ?? "",
           deployed: input.landedShas ?? [],
-          ...(verifies === 1 ? { outcome: "blocked" as const, reason: "back-merge conflict" } : {}),
         }),
       };
     };
-    const result = await ship(env.deps, "API-1");
-    assert.equal(result.exitCode, 0);
-    assert.equal(result.parked, false);
-    assert.equal(verifies, 2);
-    assert.equal(sleeps, 1);
+    const first = await ship(env.deps, "API-1");
+    assert.equal(first.exitCode, 0);
+    assert.equal(first.shipped, false);
+    assert.equal(sleeps, 0);
+    assert.equal(promotes, 1);
+    const marker = JSON.parse(env.deliveryState().markers.find((item) => item.kind === "ship-retry")?.body ?? "{}") as {
+      ticket: string;
+      stage: string;
+      reason: string;
+      notBefore: string;
+    };
+    assert.equal(marker.ticket, "API-1");
+    assert.equal(marker.stage, "publish");
+    assert.equal(marker.reason, "registry");
+    assert.equal(Number.isFinite(Date.parse(marker.notBefore)), true);
+    const second = await shipSweep(env.deps);
+    assert.equal(second.exitCode, 0);
+    assert.equal(promotes, 2);
+    assert.equal(sleeps, 0);
     assert.equal(env.state(), "Shipped");
   });
 
-  it("stops a waiting ship after the heal budget", async () => {
-    const env = harness(BUILDABLE);
-    const stage: PromotionStage = {
-      id: "publish",
-      target: "artifact-zone",
-      authorization: "ship",
-      promoteCommand: "promote",
-      repos: ["api"],
-      verifyCommand: "verify",
-      parkSuccess: false,
-      writeStatus: false,
-    };
-    env.deps.pack = {
-      ...pack,
-      status: { ...pack.status, complete: "Delivery Complete" },
-      promotionStages: [stage],
-    };
-    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
-    let sleeps = 0;
-    let heals = 0;
-    env.deps.sleep = async () => { sleeps += 1; };
-    env.deps.ownerHeal = async () => {
-      heals += 1;
-      return "**Heal:** wait";
-    };
-    env.deps.runPackCommand = (command, _cwd, stdin) => {
-      if (command !== "verify") return { status: 0, stdout: "" };
-      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
-      return {
-        status: 0,
-        stdout: receiptFor({
-          stageId: input.stageId,
-          target: input.target,
-          criteriaRevision: input.criteriaRevision ?? "",
-          deployed: input.landedShas ?? [],
-          outcome: "blocked",
-          reason: "back-merge conflict",
-        }),
+  it("opens one heal for broken and none for parked, waiting, needs-step, or transient", async () => {
+    async function ready(outcome: string) {
+      const env = harness(BUILDABLE);
+      const stage: PromotionStage = {
+        id: "publish",
+        target: "artifact-zone",
+        authorization: "ship",
+        promoteCommand: "promote",
+        repos: ["api"],
+        verifyCommand: "verify",
+        parkSuccess: true,
+        writeStatus: false,
+        approval: { source: "list", issues: ["API-1"] },
       };
-    };
-    await assert.rejects(() => ship(env.deps, "API-1"), /stage publish failed: back-merge conflict/);
-    assert.equal(sleeps, 40);
-    assert.equal(heals, 1);
-    assert.equal(env.state(), "Delivery Complete");
+      env.deps.pack = {
+        ...pack,
+        status: { ...pack.status, complete: "Delivery Complete" },
+        promotionStages: [stage],
+      };
+      assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+      let heals = 0;
+      let promotes = 0;
+      env.deps.sleep = async () => {};
+      env.deps.ownerHeal = async () => {
+        heals += 1;
+        return "**Heal:** wait";
+      };
+      env.deps.runPackCommand = (command, _cwd, stdin) => {
+        if (command === "promote") {
+          promotes += 1;
+          if (outcome === "transient" && promotes === 1) {
+            return { status: 0, stdout: JSON.stringify({ outcome: "transient", reason: "rate limit" }) };
+          }
+          if (outcome !== "transient") return { status: 0, stdout: JSON.stringify({ outcome, reason: `${outcome} reason`, step: "publish" }) };
+          return { status: 0, stdout: "" };
+        }
+        const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+        return {
+          status: 0,
+          stdout: receiptFor({
+            stageId: input.stageId,
+            target: input.target,
+            criteriaRevision: input.criteriaRevision ?? "",
+            deployed: input.landedShas ?? [],
+          }),
+        };
+      };
+      return { env, heals: () => heals, promotes: () => promotes };
+    }
+    const broken = await ready("broken");
+    const brokenResult = await ship(broken.env.deps, "API-1");
+    assert.equal(broken.heals(), 1);
+    assert.equal(broken.promotes(), 1);
+    assert.equal(brokenResult.exitCode, 0);
+    const brokenMarker = JSON.parse(broken.env.deliveryState().markers.find((item) => item.kind === "ship-retry")?.body ?? "{}") as { outcome: string };
+    assert.equal(brokenMarker.outcome, "broken");
+    for (const outcome of ["parked", "waiting", "needs-step", "transient"]) {
+      const run = await ready(outcome);
+      await ship(run.env.deps, "API-1");
+      assert.equal(run.heals(), 0, outcome);
+    }
+  });
+
+  it("retakes a ship lock for the same run, waits when another run holds it, and takes an expired lock", async () => {
+    const previousRun = process.env.DELIVERY_LOOP_RUN_ID;
+    const previousGithub = process.env.GITHUB_RUN_ID;
+    const now = Date.parse("2026-06-01T00:00:00.000Z");
+    async function ready() {
+      const env = harness(BUILDABLE);
+      const stage: PromotionStage = {
+        id: "publish",
+        target: "artifact-zone",
+        authorization: "ship",
+        promoteCommand: "promote",
+        repos: ["api"],
+        verifyCommand: "verify",
+        parkSuccess: false,
+        writeStatus: false,
+        approval: { source: "list", issues: ["API-1"] },
+      };
+      env.deps.pack = {
+        ...pack,
+        runner: "gha",
+        status: { ...pack.status, complete: "Delivery Complete" },
+        promotionStages: [stage],
+      };
+      env.deps.nowMs = now;
+      assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+      let commands = 0;
+      let sleeps = 0;
+      env.deps.sleep = async () => { sleeps += 1; };
+      env.deps.runPackCommand = (command, _cwd, stdin) => {
+        commands += 1;
+        if (command !== "verify") return { status: 0, stdout: "" };
+        const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+        return {
+          status: 0,
+          stdout: receiptFor({
+            stageId: input.stageId,
+            target: input.target,
+            criteriaRevision: input.criteriaRevision ?? "",
+            deployed: input.landedShas ?? [],
+          }),
+        };
+      };
+      return { env, commands: () => commands, sleeps: () => sleeps };
+    }
+    async function hold(env: ReturnType<typeof harness>, runId: string, expiresAt: string) {
+      const state = await env.deps.tracker.stateStore.readDeliveryState("API-1");
+      await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+        ...state,
+        markers: [
+          ...state.markers.filter((marker) => marker.kind !== "ship-lock"),
+          { kind: "ship-lock", body: JSON.stringify({ runId, expiresAt }), createdAt: new Date(now).toISOString() },
+        ],
+      });
+    }
+    try {
+      process.env.DELIVERY_LOOP_RUN_ID = "run-a";
+      const same = await ready();
+      await hold(same.env, "run-a", new Date(now + 60_000).toISOString());
+      const retaken = await ship(same.env.deps, "API-1");
+      assert.equal(retaken.exitCode, 0);
+      assert.ok(same.commands() > 0);
+      const sameLock = JSON.parse(same.env.deliveryState().markers.find((item) => item.kind === "ship-lock")?.body ?? "{}") as { runId: string; expiresAt: string };
+      assert.equal(sameLock.runId, "run-a");
+      assert.ok(Date.parse(sameLock.expiresAt) > now + 60_000);
+
+      process.env.DELIVERY_LOOP_RUN_ID = "run-b";
+      const other = await ready();
+      await hold(other.env, "run-a", new Date(now + 60 * 60 * 1000).toISOString());
+      const held = await ship(other.env.deps, "API-1");
+      assert.equal(held.exitCode, 0);
+      assert.match(held.lines.join("\n"), /waiting/);
+      assert.equal(other.commands(), 0);
+      assert.equal(other.sleeps(), 0);
+
+      const expired = await ready();
+      await hold(expired.env, "run-a", new Date(now - 1).toISOString());
+      const taken = await ship(expired.env.deps, "API-1");
+      assert.equal(taken.exitCode, 0);
+      assert.ok(expired.commands() > 0);
+      const takenLock = JSON.parse(expired.env.deliveryState().markers.find((item) => item.kind === "ship-lock")?.body ?? "{}") as { runId: string };
+      assert.equal(takenLock.runId, "run-b");
+
+      delete process.env.DELIVERY_LOOP_RUN_ID;
+      process.env.GITHUB_RUN_ID = "4242";
+      const gha = await ready();
+      const fromGithub = await ship(gha.env.deps, "API-1");
+      assert.equal(fromGithub.exitCode, 0);
+      const ghaLock = JSON.parse(gha.env.deliveryState().markers.find((item) => item.kind === "ship-lock")?.body ?? "{}") as { runId: string };
+      assert.equal(ghaLock.runId, "4242");
+    } finally {
+      if (previousRun === undefined) delete process.env.DELIVERY_LOOP_RUN_ID;
+      else process.env.DELIVERY_LOOP_RUN_ID = previousRun;
+      if (previousGithub === undefined) delete process.env.GITHUB_RUN_ID;
+      else process.env.GITHUB_RUN_ID = previousGithub;
+    }
+  });
+
+  it("does not sleep for 30 seconds in the ship path", () => {
+    const source = readFileSync(new URL("./loop.ts", import.meta.url), "utf8");
+    assert.equal(source.includes("sleep(30_000)"), false);
   });
 
   it("does not write shipped when every ship stage disables writeStatus", async () => {
@@ -3179,6 +3414,7 @@ describe("loop", () => {
       verifyCommand: "verify",
       parkSuccess: false,
       writeStatus: false,
+      approval: { source: "list", issues: ["API-1"] },
     };
     env.deps.pack = {
       ...pack,

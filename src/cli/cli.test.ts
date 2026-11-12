@@ -54,6 +54,9 @@ describe("installer", () => {
     assert.match(workflow, /ship_action/);
     assert.match(workflow, /inputs\.ship_action/);
     assert.match(workflow, /delivery-loop ship continue/);
+    assert.match(workflow, /delivery-loop ship sweep/);
+    assert.match(workflow, /ship-continue/);
+    assert.match(workflow, /cron: "0 \* \* \* \*"/);
     assert.match(workflow, /delivery-loop audit/);
     assert.match(workflow, /inputs\.mode != 'audit'/);
     assert.match(workflow, /persist-credentials: false/);

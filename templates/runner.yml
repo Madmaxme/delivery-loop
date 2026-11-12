@@ -1,6 +1,10 @@
 name: Delivery loop
 
 on:
+  schedule:
+    - cron: "0 * * * *"
+  repository_dispatch:
+    types: [ship-continue]
   workflow_dispatch:
     inputs:
       issue:
@@ -23,12 +27,13 @@ on:
           - deliver
           - ship
       ship_action:
-        description: ship or continue the active ship stage
+        description: ship, continue the active ship stage, or sweep
         required: false
         type: choice
         options:
           - ship
           - continue
+          - sweep
         default: ship
 
 permissions:
@@ -56,6 +61,7 @@ jobs:
       - name: Run the loop
         env:
           GITHUB_ACTIONS: "true"
+          DELIVERY_LOOP_RUN_ID: ${{ github.run_id }}
           DELIVERY_LOOP_PROJECT: ${{ inputs.project }}
           DELIVERY_LOOP_ISSUE: ${{ inputs.issue }}
           DELIVERY_LOOP_RUNTIME: local
@@ -92,7 +98,9 @@ jobs:
               code=$?
             fi
             if [ "$code" -eq 0 ]; then
-              if [ "${{ inputs.mode }}" = "audit" ]; then
+              if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+                delivery-loop ship sweep
+              elif [ "${{ inputs.mode }}" = "audit" ]; then
                 if [ -n "$DELIVERY_LOOP_PROJECT" ]; then
                   delivery-loop audit --project "$DELIVERY_LOOP_PROJECT"
                 else
@@ -107,6 +115,8 @@ jobs:
               elif [ "${{ inputs.mode }}" = "ship" ]; then
                 if [ "${{ inputs.ship_action }}" = "continue" ]; then
                   delivery-loop ship continue "$DELIVERY_LOOP_ISSUE"
+                elif [ "${{ inputs.ship_action }}" = "sweep" ]; then
+                  delivery-loop ship sweep
                 else
                   delivery-loop ship "$DELIVERY_LOOP_ISSUE"
                 fi

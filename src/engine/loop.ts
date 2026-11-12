@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { DEFAULT_JOURNEY_SPEC } from "../../scripts/journey-proof.mjs";
 import { interpretMintOutput, runMintCommand } from "../adapters/github-mint.ts";
 import { noteMint } from "./credential-log.ts";
-import { transientReason, transientWaitMs } from "./step-outcome.ts";
+import { parseTypedStageOutcome, transientReason, transientWaitMs, type StageCommandResult } from "./step-outcome.ts";
 import { githubRepoFromUrl, type CompareStatus, type DeliveryState, type DesignCheckProbe, type FetchLike, type ForgeAdapter, type ListedPull, type LinearProgramTracker, type StageVerificationReceipt, type Ticket, type TrackerAdapter, type WorkerAdapter } from "../adapters/types.js";
 import { agentHome, holdStatus, repoByName, unblockingStates, workerKeyNames, type ProjectPack, type PromotionStage, type RepoSpec } from "../schema/pack.js";
 import {
@@ -1291,6 +1291,12 @@ async function settleLand(
 }
 
 const QUALITY_POLL_MS = 30_000;
+
+/** Land heal wait. Ship does not use this loop. */
+const HEAL_WAIT_MS = 30_000;
+
+/** A ship lock expires after one hour. The same run may retake it before then. */
+const SHIP_LOCK_TTL_MS = 60 * 60 * 1000;
 const MERGE_SETTLE_MS = 2_000;
 const MAX_BRANCH_UPDATES = 2;
 
@@ -1505,10 +1511,11 @@ async function runWithTransient<T extends { status: number | null; output: strin
 
 
 type StageProblem = {
-  outcome: "blocked" | "parked" | "failed";
+  outcome: "blocked" | "parked" | "failed" | "broken" | "waiting" | "needs-step";
   stage: PromotionStage;
   reason: string;
   evidence: string[];
+  step?: string;
 };
 
 type StageRun =
@@ -1708,7 +1715,14 @@ function stageProblemText(problem: StageProblem): string {
 
 function stageRunFrom(problems: StageProblem[]): StageRun {
   if (problems.length === 0) return { outcome: "complete" };
-  const rank = { failed: 0, blocked: 1, parked: 2 };
+  const rank: Record<StageProblem["outcome"], number> = {
+    broken: 0,
+    failed: 1,
+    blocked: 2,
+    waiting: 3,
+    "needs-step": 4,
+    parked: 5,
+  };
   const primary = [...problems].sort((a, b) => rank[a.outcome] - rank[b.outcome] || a.stage.id.localeCompare(b.stage.id))[0]!;
   return { ...primary, problems };
 }
@@ -1788,19 +1802,20 @@ async function runStageCommand(
   repo: RepoSpec,
   input: object,
   timeoutMs?: number,
-): Promise<{ stdout: string; failed: string | null; timedOut: boolean }> {
+): Promise<{ stdout: string; failed: string | null; timedOut: boolean; outcome: StageCommandResult | null }> {
   const run = deps.runPackCommand ?? spawnPackCommand;
   try {
     const result = await runWithTransient(deps, async () => {
       const value = await Promise.resolve(run(command, repoCheckoutDir(deps.cwd ?? process.cwd(), repo, deps.pack), `${JSON.stringify(input)}\n`, commandEnvironment(deps.pack, true), timeoutMs));
       return { status: value.status, output: `${value.stdout}\n${value.stderr ?? ""}`, stdout: value.stdout, timedOut: value.timedOut === true };
     });
-    if (result.timedOut) return { stdout: result.stdout, failed: null, timedOut: true };
+    const outcome = parseTypedStageOutcome(result.stdout ?? "");
+    if (result.timedOut) return { stdout: result.stdout, failed: null, timedOut: true, outcome };
     return result.status === 0
-      ? { stdout: result.stdout, failed: null, timedOut: false }
-      : { stdout: result.stdout, failed: `${command} exited ${result.status ?? "unknown"}`, timedOut: false };
+      ? { stdout: result.stdout, failed: null, timedOut: false, outcome }
+      : { stdout: result.stdout, failed: `${command} exited ${result.status ?? "unknown"}`, timedOut: false, outcome };
   } catch (error) {
-    return { stdout: "", failed: `${command} ${error instanceof Error ? error.message : String(error)}`, timedOut: false };
+    return { stdout: "", failed: `${command} ${error instanceof Error ? error.message : String(error)}`, timedOut: false, outcome: null };
   }
 }
 
@@ -1827,6 +1842,35 @@ async function blockTimedOutStage(
   return { outcome: "blocked", stage, reason, evidence: [] };
 }
 
+async function finishTypedShipOutcome(
+  deps: LoopDeps,
+  ticket: Ticket,
+  stage: PromotionStage,
+  outcome: StageCommandResult,
+  landedHere: { repo: string; sha: string }[],
+  criteria: readonly AcceptanceCriterion[],
+): Promise<StageProblem> {
+  const reason = outcome.reason.trim() || outcome.outcome;
+  const step = outcome.step?.trim() ? outcome.step : undefined;
+  if (outcome.outcome === "parked") {
+    const receipt = validateStageReceipt({
+      stageId: stage.id,
+      target: stage.target,
+      outcome: "parked",
+      reason,
+      criteriaRevision: ticket.criteriaRevision,
+      deployed: landedHere,
+      criteria: criteria.map((item) => ({ id: item.id, outcome: "blocked", evidence: [] })),
+    }, stage, ticket, landedHere, criteria);
+    await writeStageReceipt(deps, ticket, receipt);
+    return { outcome: "parked", stage, reason, evidence: [], ...(step ? { step } : {}) };
+  }
+  if (outcome.outcome === "broken" || outcome.outcome === "waiting" || outcome.outcome === "needs-step") {
+    return { outcome: outcome.outcome, stage, reason, evidence: [], ...(step ? { step } : {}) };
+  }
+  return { outcome: "failed", stage, reason, evidence: [], ...(step ? { step } : {}) };
+}
+
 async function runOneStage(
   deps: LoopDeps,
   ticket: Ticket,
@@ -1834,7 +1878,7 @@ async function runOneStage(
   authorization: "deliver" | "ship",
   scoped: { repo: string; sha: string }[],
   criteria: readonly AcceptanceCriterion[],
-  options: { continueStageId?: string },
+  options: { continueStageId?: string; step?: string },
 ): Promise<{ outcome: "passed"; stage: PromotionStage } | StageProblem> {
   const landedHere = sortedLanded(scoped);
   const expected = criteriaForStage(criteria, stage, scoped);
@@ -1867,8 +1911,12 @@ async function runOneStage(
       target: stage.target,
       repo: row.name,
       sourceSha: source.sha,
+      ...(options.step ? { step: options.step } : {}),
     }, commandTimeout);
     if (promoted.timedOut) return blockTimedOutStage(deps, ticket, stage, commandKind, commandTimeout!, landedHere, expected);
+    if (authorization === "ship" && promoted.outcome && promoted.outcome.outcome !== "passed" && promoted.outcome.outcome !== "transient") {
+      return finishTypedShipOutcome(deps, ticket, stage, promoted.outcome, landedHere, expected);
+    }
     if (promoted.failed) return { outcome: "failed", stage, reason: promoted.failed, evidence: [] };
     noteEngine(deps, "promote ok");
   }
@@ -1883,6 +1931,9 @@ async function runOneStage(
   };
   const verified = await runStageCommand(deps, stage.verifyCommand, verifyRepo, verifyInput, stage.verify?.timeoutMs);
   if (verified.timedOut) return blockTimedOutStage(deps, ticket, stage, "verify", stage.verify!.timeoutMs, landedHere, expected);
+  if (authorization === "ship" && verified.outcome && verified.outcome.outcome !== "passed" && verified.outcome.outcome !== "transient") {
+    return finishTypedShipOutcome(deps, ticket, stage, verified.outcome, landedHere, expected);
+  }
   if (verified.failed) return { outcome: "failed", stage, reason: verified.failed, evidence: [] };
   let receipt: StageVerificationReceipt;
   try {
@@ -1919,7 +1970,7 @@ async function runPromotionStages(
   authorization: "deliver" | "ship",
   landed: { repo: string; sha: string }[],
   criteria: readonly AcceptanceCriterion[],
-  options: { continueStageId?: string } = {},
+  options: { continueStageId?: string; step?: string } = {},
 ): Promise<StageRun> {
   const stages = deps.pack.promotionStages.filter((stage) => stage.authorization === authorization);
   const allLanded = sortedLanded(landed);
@@ -1985,7 +2036,16 @@ function rememberVerdict(deps: LoopDeps, key: string, verdict: HealVerdict): voi
   deps.pageControl.verdicts[key] = verdict;
 }
 
-export type ShipRun = { exitCode: number; lines: string[]; parked: boolean };
+export type ShipRun = { exitCode: number; lines: string[]; parked: boolean; shipped?: boolean };
+
+export type ShipRetryMarker = {
+  ticket: string;
+  stage: string;
+  reason: string;
+  notBefore: string;
+  outcome: string;
+  step?: string;
+};
 
 function refreshGithubToken(env: NodeJS.ProcessEnv): boolean {
   const command = env.DELIVERY_LOOP_GITHUB_MINT?.trim();
@@ -3176,7 +3236,7 @@ async function healNo(
     return paused;
   }
   tries.waits += 1;
-  await sleep(30_000);
+  await sleep(HEAL_WAIT_MS);
   return null;
 }
 
@@ -3637,15 +3697,217 @@ export async function deliver(
   return runTicket(program ? { ...next, program } : next, ticket);
 }
 
-export async function ship(
+function shipStageList(deps: LoopDeps): PromotionStage[] {
+  return deps.pack.promotionStages.filter((stage) => stage.authorization === "ship");
+}
+
+/** `DELIVERY_LOOP_RUN_ID` wins. `GITHUB_RUN_ID` is the id when the runner is gha. */
+export function shipRunId(pack: ProjectPack, env: NodeJS.ProcessEnv = process.env): string {
+  const named = env.DELIVERY_LOOP_RUN_ID?.trim() ?? "";
+  if (named) return named;
+  if ((pack.runner ?? "gha") === "gha") return env.GITHUB_RUN_ID?.trim() ?? "";
+  return "";
+}
+
+function parseShipRetry(state: DeliveryState): ShipRetryMarker | null {
+  const body = state.markers.find((marker) => marker.kind === "ship-retry")?.body;
+  if (!body) return null;
+  try {
+    const value: unknown = JSON.parse(body);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if (typeof record.ticket !== "string" || typeof record.stage !== "string" ||
+      typeof record.reason !== "string" || typeof record.notBefore !== "string") return null;
+    return {
+      ticket: record.ticket,
+      stage: record.stage,
+      reason: record.reason,
+      notBefore: record.notBefore,
+      outcome: typeof record.outcome === "string" ? record.outcome : "",
+      ...(typeof record.step === "string" && record.step ? { step: record.step } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseShipLock(state: DeliveryState): { runId: string; expiresAt: string; expiresAtMs: number } | null {
+  const body = state.markers.find((marker) => marker.kind === "ship-lock")?.body;
+  if (!body) return null;
+  try {
+    const value: unknown = JSON.parse(body);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if (typeof record.runId !== "string" || typeof record.expiresAt !== "string") return null;
+    const expiresAtMs = Date.parse(record.expiresAt);
+    if (!Number.isFinite(expiresAtMs)) return null;
+    return { runId: record.runId, expiresAt: record.expiresAt, expiresAtMs };
+  } catch {
+    return null;
+  }
+}
+
+function ticketApproved(ticket: Ticket, stages: readonly PromotionStage[]): boolean {
+  if (stages.length === 0) return true;
+  return stages.every((stage) => {
+    const approval = stage.approval;
+    if (!approval) return false;
+    if (approval.source === "list") return approval.issues.includes(ticket.identifier);
+    return ticket.labels.includes(approval.label);
+  });
+}
+
+function ticketHasShipWork(deps: LoopDeps, ticket: Ticket, state: DeliveryState): boolean {
+  if (parseShipRetry(state)) return true;
+  const shipIds = new Set(shipStageList(deps).map((stage) => stage.id));
+  return state.stageReceipts.some((receipt) =>
+    receipt.outcome === "parked" &&
+    shipIds.has(receipt.stageId) &&
+    receipt.criteriaRevision === ticket.criteriaRevision);
+}
+
+async function carriedShipTickets(deps: LoopDeps, entryId: string | null): Promise<Ticket[]> {
+  const ids = new Set<string>();
+  if (entryId) ids.add(entryId);
+  for (const stage of shipStageList(deps)) {
+    if (stage.approval?.source === "list") {
+      for (const id of stage.approval.issues) ids.add(id);
+    }
+  }
+  const intake = await deps.tracker.listIntake(deps.project ? { project: deps.project } : undefined);
+  for (const candidate of intake) {
+    const loaded = await deps.tracker.get(candidate.identifier);
+    const state = await readDeliveryState(deps, loaded);
+    if (ticketHasShipWork(deps, loaded, state)) ids.add(loaded.identifier);
+  }
+  const tickets: Ticket[] = [];
+  for (const id of ids) tickets.push(await deps.tracker.get(id));
+  return tickets;
+}
+
+/** Every carried ticket must be approved. The trigger is not an input. */
+async function approvalBlock(deps: LoopDeps, entryId: string | null): Promise<ShipRun | null> {
+  const stages = shipStageList(deps);
+  if (stages.length === 0) return null;
+  const missing = (await carriedShipTickets(deps, entryId)).filter((ticket) => !ticketApproved(ticket, stages));
+  if (missing.length === 0) return null;
+  return {
+    exitCode: 1,
+    lines: missing.map((ticket) => `${ticket.identifier} BLOCKED approval-missing`),
+    parked: false,
+    shipped: false,
+  };
+}
+
+async function writeShipRetry(
   deps: LoopDeps,
-  identifier?: string,
-  mode: "ship" | "continue" = "ship",
-): Promise<ShipRun> {
-  const id = identifier?.trim() ?? "";
-  if (!id) throw new Error("ship needs a ticket id");
+  ticket: Ticket,
+  stage: string,
+  reason: string,
+  outcome: string,
+  notBeforeMs?: number,
+  step?: string,
+): Promise<void> {
+  const notBefore = new Date(notBeforeMs ?? deps.nowMs ?? Date.now()).toISOString();
+  const body: ShipRetryMarker = {
+    ticket: ticket.identifier,
+    stage,
+    reason,
+    notBefore,
+    outcome,
+    ...(step ? { step } : {}),
+  };
+  await writeMarker(deps, ticket, "ship-retry", JSON.stringify(body));
+}
+
+async function takeShipLock(
+  deps: LoopDeps,
+  ticket: Ticket,
+): Promise<{ ok: true } | { ok: false; expiresAt: string }> {
+  const runId = shipRunId(deps.pack);
+  const now = deps.nowMs ?? Date.now();
+  const existing = parseShipLock(await readDeliveryState(deps, ticket));
+  if (existing && existing.expiresAtMs > now && existing.runId !== runId) {
+    return { ok: false, expiresAt: existing.expiresAt };
+  }
+  const expiresAt = new Date(now + SHIP_LOCK_TTL_MS).toISOString();
+  await writeMarker(deps, ticket, "ship-lock", JSON.stringify({ runId, expiresAt }));
+  return { ok: true };
+}
+
+function parkedShipStage(deps: LoopDeps, ticket: Ticket, state: DeliveryState): PromotionStage | undefined {
+  for (const stage of shipStageList(deps)) {
+    const receipt = state.stageReceipts.find((item) => item.stageId === stage.id);
+    if (receipt?.outcome === "parked" && receipt.criteriaRevision === ticket.criteriaRevision) return stage;
+  }
+  return undefined;
+}
+
+function sweepAction(
+  deps: LoopDeps,
+  retry: ShipRetryMarker | null,
+  due: boolean,
+  parked: PromotionStage | undefined,
+): "ship" | "continue" {
+  if (due && retry?.outcome === "needs-step") {
+    const stage = shipStageList(deps).find((item) => item.id === retry.stage);
+    if (stage?.continueCommand) return "continue";
+  }
+  if (due && retry) return "ship";
+  if (parked?.continueCommand) return "continue";
+  return "ship";
+}
+
+async function finishShipRun(deps: LoopDeps, ticket: Ticket, id: string, result: StageRun): Promise<ShipRun> {
+  if (result.outcome === "complete") {
+    if (shipStageList(deps).some((stage) => stage.writeStatus)) {
+      if (!deps.pack.status.shipped) throw new Error("status.shipped is required by ship stages");
+      await writeTicketStatus(deps, ticket, deps.pack.status.shipped);
+    }
+    return { exitCode: 0, lines: [`${id} COMPLETE`], parked: false };
+  }
+  const broken = result.problems.filter((problem) => problem.outcome === "broken");
+  if (broken.length > 0) {
+    const problem = broken[0]!;
+    const signature = shipNoSignature(problem.reason) || problem.reason;
+    const verdict = await applyOwnerHeal(
+      deps,
+      ticket,
+      `install:ship:${problem.stage.id}:${signature}`,
+      stageProblemText(problem),
+    );
+    if (verdict === "login") refreshGithubToken(process.env);
+    await writeShipRetry(deps, ticket, problem.stage.id, problem.reason, "broken", undefined, problem.step);
+    return { exitCode: 0, lines: [`${id} RETRY ${problem.reason}`], parked: false, shipped: false };
+  }
+  const deferred = result.problems.filter((problem) => problem.outcome === "waiting" || problem.outcome === "needs-step");
+  if (deferred.length > 0) {
+    for (const problem of deferred) {
+      await writeShipRetry(deps, ticket, problem.stage.id, problem.reason, problem.outcome, undefined, problem.step);
+    }
+    return {
+      exitCode: 0,
+      lines: deferred.map((problem) => `${id} ${problem.outcome} ${problem.reason}`),
+      parked: false,
+      shipped: false,
+    };
+  }
+  if (result.outcome === "parked") {
+    return {
+      exitCode: result.stage.parkSuccess ? 0 : 2,
+      lines: [`${id} PARKED ${result.reason}`],
+      parked: true,
+      shipped: false,
+    };
+  }
+  return { exitCode: 1, lines: [`${id} BLOCKED ${result.reason}`], parked: false, shipped: false };
+}
+
+async function shipOne(deps: LoopDeps, id: string, mode: "ship" | "continue"): Promise<ShipRun> {
   await probeConfiguredCredentials(deps);
   deliveryStateCache.delete(deps);
+  const blocked = await approvalBlock(deps, id);
+  if (blocked) return blocked;
   const ticket = await deps.tracker.get(id);
   const state = await readDeliveryState(deps, ticket);
   const stopped = exhaustedFailureType({ labels: ticket.labels });
@@ -3653,7 +3915,7 @@ export async function ship(
   const alreadyShipped = Boolean(deps.pack.status.shipped && ticket.stateName === deps.pack.status.shipped);
   if (!alreadyShipped && ticket.stateName !== deps.pack.status.complete) throw new Error(`ship requires ${deps.pack.status.complete}`);
   const deliveryStages = deps.pack.promotionStages.filter((stage) => stage.authorization === "deliver");
-  const shipStages = deps.pack.promotionStages.filter((stage) => stage.authorization === "ship");
+  const shipStages = shipStageList(deps);
   const texts = resumeProofTexts(deps, ticket);
   const order = parseWorkOrder(texts.declared);
   const rawLanded = state.markers.find((marker) => marker.kind === "landed-commits")?.body;
@@ -3675,60 +3937,97 @@ export async function ship(
   }
   let continueStageId: string | undefined;
   if (mode === "continue") {
-    const body = state.markers.find((marker) => marker.kind === "active-promotion-stage")?.body;
-    const active = readActivePromotions({ schemaVersion: 2, markers: body ? [{ kind: "active-promotion-stage", body, createdAt: "" }] : [], stageReceipts: [] })
+    const active = readActivePromotions(state)
       .filter((item) => item.authorization === "ship" && item.criteriaRevision === ticket.criteriaRevision);
     const stage = active.length === 1 ? shipStages.find((candidate) => candidate.id === active[0]?.stageId && candidate.target === active[0]?.target) : undefined;
     if (!stage) throw new Error("ship continue requires one active ship stage for the current criteria revision");
     if (!stage.continueCommand) throw new Error(`stage ${stage.id} has no continueCommand`);
     continueStageId = stage.id;
   }
-  let result = await runPromotionStages(deps, ticket, "ship", landed, order?.criteria ?? [], { continueStageId });
-  let waits = 0;
-  let refreshedLogin = false;
-  const sleep = deps.sleep ?? ((ms: number) => {
-    const { promise, resolve } = Promise.withResolvers<void>();
-    setTimeout(resolve, ms);
-    return promise;
-  });
-  const action = mode === "continue" ? "continue" : "promote";
-  while (result.outcome === "failed" || result.outcome === "blocked") {
-    let waiting = false;
-    let login = false;
-    for (const problem of result.problems) {
-      if (problem.outcome === "parked") continue;
-      const signature = shipNoSignature(problem.reason) || problem.reason;
-      const key = `install:${action}:${problem.stage.id}:${signature}`;
-      let verdict = rememberedVerdict(deps, key);
-      if (verdict === "edit" && healAlready(deps, ticket, key)) throw new Error(`stage ${problem.stage.id} failed: ${problem.reason}`);
-      if (!verdict) {
-        if (healAlready(deps, ticket, key)) throw new Error(`stage ${problem.stage.id} failed: ${problem.reason}`);
-        verdict = await applyOwnerHeal(deps, ticket, key, stageProblemText(problem));
-      }
-      if (verdict === "wait") waiting = true;
-      if (verdict === "login") login = true;
+  const lock = await takeShipLock(deps, ticket);
+  if (!lock.ok) {
+    await writeShipRetry(deps, ticket, continueStageId ?? shipStages[0]!.id, "ship-lock", "waiting", Date.parse(lock.expiresAt));
+    return { exitCode: 0, lines: [`${id} waiting ship-lock`], parked: false, shipped: false };
+  }
+  const retry = parseShipRetry(await readDeliveryState(deps, ticket));
+  const step = mode === "continue" && retry?.outcome === "needs-step" ? retry.step : undefined;
+  await removeMarker(deps, ticket, "ship-retry");
+  const result = await runPromotionStages(deps, ticket, "ship", landed, order?.criteria ?? [], { continueStageId, step });
+  return finishShipRun(deps, ticket, id, result);
+}
+
+async function eachShip(deps: LoopDeps, items: { id: string; action: "ship" | "continue" }[]): Promise<ShipRun> {
+  const lines: string[] = [];
+  let exitCode = 0;
+  let parked = false;
+  let shipped = true;
+  for (const item of items) {
+    const result = await ship(deps, item.id, item.action);
+    lines.push(...result.lines);
+    if (result.exitCode !== 0) exitCode = result.exitCode;
+    if (result.parked) parked = true;
+    if (result.shipped === false) shipped = false;
+  }
+  return { exitCode, lines, parked, shipped: shipped && exitCode === 0 };
+}
+
+async function releaseIds(deps: LoopDeps): Promise<Set<string>> {
+  const ids = new Set<string>();
+  for (const stage of shipStageList(deps)) {
+    if (stage.approval?.source === "list") {
+      for (const id of stage.approval.issues) ids.add(id);
     }
-    if (login) {
-      if (refreshedLogin || !refreshGithubToken(process.env)) throw new Error(`stage ${result.stage.id} failed: ${result.reason}`);
-      refreshedLogin = true;
-    } else if (waiting) {
-      if (waits >= 40) throw new Error(`stage ${result.stage.id} failed: ${result.reason}`);
-      waits += 1;
-      await sleep(30_000);
-    } else if (result.outcome === "blocked") {
-      break;
-    }
-    result = await runPromotionStages(deps, ticket, "ship", landed, order?.criteria ?? [], { continueStageId });
   }
-  if (result.outcome === "blocked") {
-    return { exitCode: 1, lines: [`${id} BLOCKED ${result.reason}`], parked: false };
+  const intake = await deps.tracker.listIntake(deps.project ? { project: deps.project } : undefined);
+  for (const candidate of intake) ids.add(candidate.identifier);
+  return ids;
+}
+
+export async function shipSweep(deps: LoopDeps): Promise<ShipRun> {
+  await probeConfiguredCredentials(deps);
+  deliveryStateCache.delete(deps);
+  const blocked = await approvalBlock(deps, null);
+  if (blocked) return blocked;
+  const now = deps.nowMs ?? Date.now();
+  const items: { id: string; action: "ship" | "continue" }[] = [];
+  for (const id of await releaseIds(deps)) {
+    const ticket = await deps.tracker.get(id);
+    const state = await readDeliveryState(deps, ticket);
+    const retry = parseShipRetry(state);
+    const due = Boolean(retry && Number.isFinite(Date.parse(retry.notBefore)) && Date.parse(retry.notBefore) <= now);
+    const parked = parkedShipStage(deps, ticket, state);
+    if (!due && !parked) continue;
+    items.push({ id, action: sweepAction(deps, due ? retry : null, due, parked) });
   }
-  if (result.outcome === "parked") {
-    return { exitCode: result.stage.parkSuccess ? 0 : 2, lines: [`${id} PARKED ${result.reason}`], parked: true };
+  if (items.length === 0) return { exitCode: 0, lines: ["ship sweep idle"], parked: false, shipped: false };
+  return eachShip(deps, items);
+}
+
+async function shipContinueAll(deps: LoopDeps): Promise<ShipRun> {
+  await probeConfiguredCredentials(deps);
+  deliveryStateCache.delete(deps);
+  const blocked = await approvalBlock(deps, null);
+  if (blocked) return blocked;
+  const items: { id: string; action: "continue" }[] = [];
+  for (const id of await releaseIds(deps)) {
+    const ticket = await deps.tracker.get(id);
+    const active = readActivePromotions(await readDeliveryState(deps, ticket))
+      .filter((item) => item.authorization === "ship" && item.criteriaRevision === ticket.criteriaRevision);
+    if (active.length === 1) items.push({ id, action: "continue" });
   }
-  if (shipStages.some((stage) => stage.writeStatus)) {
-    if (!deps.pack.status.shipped) throw new Error("status.shipped is required by ship stages");
-    await writeTicketStatus(deps, ticket, deps.pack.status.shipped);
+  if (items.length === 0) return { exitCode: 0, lines: ["ship continue idle"], parked: false, shipped: false };
+  return eachShip(deps, items);
+}
+
+export async function ship(
+  deps: LoopDeps,
+  identifier?: string,
+  mode: "ship" | "continue" = "ship",
+): Promise<ShipRun> {
+  const id = identifier?.trim() ?? "";
+  if (!id) {
+    if (mode === "continue") return shipContinueAll(deps);
+    throw new Error("ship needs a ticket id");
   }
-  return { exitCode: 0, lines: [`${id} COMPLETE`], parked: false };
+  return shipOne(deps, id, mode);
 }
