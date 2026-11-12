@@ -127,7 +127,7 @@ Start request:
 }
 ```
 
-`statusStore` is present only when `statusUrl` mode is used and that key is set, or when the same record is placed on a forge issue. `path` is the template with `{id}` replaced. `requestedBy` and, when `workerHttp.request.trustedRequesters` is set, `trustedRequesters` are added on the issue record. A relay accepts a requester only when that login is in `trustedRequesters`. Any 2xx `startUrl` response is success. The body is ignored.
+`statusStore` is present only when `statusUrl` mode is used and that key is set, or when the same record is placed on a forge issue. `path` is the template with `{id}` replaced. `requestedBy` and, when `workerHttp.request.trustedRequesters` is set, `trustedRequesters` are added on the issue record. Each entry is a GitHub user login or an app bot login `<slug>[bot]`. A relay accepts `requestedBy` only when it equals one entry. The comparison is the whole login. Any 2xx `startUrl` response is success. The body is ignored.
 
 Forge issue body, when it fits:
 

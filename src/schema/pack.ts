@@ -98,7 +98,9 @@ export type WorkerHttpRequest = {
   labels?: string[];
   /**
    * Logins a relay may accept as the requester.
+   * Each entry is a GitHub user login or an app bot login `<slug>[bot]`.
    * The engine copies this list onto the request record next to `requestedBy`.
+   * A relay compares `requestedBy` to an entry as the whole string.
    */
   trustedRequesters?: string[];
 };
@@ -726,6 +728,18 @@ function loadWorkerHttp(
 }
 
 const FORGE_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+/** A GitHub user login: 1–39 letters, digits, or single hyphens, not at either end. */
+const GITHUB_USER_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+/**
+ * A GitHub App slug: the app name in lowercase, at most 34 characters,
+ * letters, digits, or single hyphens, not at either end.
+ * The bot login is that slug plus `[bot]`, and nothing else.
+ */
+const GITHUB_APP_BOT_LOGIN = /^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,33}\[bot\]$/;
+
+function isTrustedRequesterLogin(value: string): boolean {
+  return GITHUB_USER_LOGIN.test(value) || GITHUB_APP_BOT_LOGIN.test(value);
+}
 
 function loadWorkerRequest(
   value: WorkerHttpRequest | undefined,
@@ -762,8 +776,8 @@ function loadTrustedRequesters(value: unknown, path: string): string[] | undefin
   if (!Array.isArray(value) || value.length === 0) {
     throw new Error(`${path} workerHttp.request.trustedRequesters is a list of logins`);
   }
-  const logins = value.map((item) => (typeof item === "string" ? item.trim() : ""));
-  if (logins.some((login) => !FORGE_LOGIN.test(login)) || new Set(logins).size !== logins.length) {
+  const logins = value.map((item) => (typeof item === "string" ? item : ""));
+  if (logins.some((login) => !isTrustedRequesterLogin(login)) || new Set(logins).size !== logins.length) {
     throw new Error(`${path} workerHttp.request.trustedRequesters is a list of logins`);
   }
   return logins;

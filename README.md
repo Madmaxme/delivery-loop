@@ -61,7 +61,7 @@ workerHttp:
       - <login>
 ```
 
-`request` replaces `startUrl` and requires `statusStore`. The issue title is `worker-request <id>`. The body is a fenced JSON block of the start record plus `requestedBy`. When `trustedRequesters` is set, that list is written next to `requestedBy`. A relay accepts a requester only when the login is in that list. When that block is longer than 65536 characters, the full JSON is written at `worker-results/<id>.request.json` and the issue body is only that path.
+`request` replaces `startUrl` and requires `statusStore`. The issue title is `worker-request <id>`. The body is a fenced JSON block of the start record plus `requestedBy`. When `trustedRequesters` is set, that list is written next to `requestedBy`. Each entry is a GitHub user login or an app bot login `<slug>[bot]`. A relay accepts `requestedBy` only when it equals one entry. The comparison is the whole login. When that block is longer than 65536 characters, the full JSON is written at `worker-results/<id>.request.json` and the issue body is only that path.
 
 `statusUrl` stays the read path when `statusStore` is absent. `path` must contain `{id}`. The start body sends `statusStore` with that path filled in. The file written before the POST is `{"status":"pending","id","repoUrl","baseRef","requestedAt"}`. The relay updates that file. `pending` and `running` stay open. `finished` and `failed` stop the wait.
 

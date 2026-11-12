@@ -326,6 +326,32 @@ workerHttp:
     );
   });
 
+  it("accepts a user login or an app bot login and rejects anything else", () => {
+    const http = base.replace("worker: cursor", "worker: http");
+    const request = (logins: string[]) => `${http}
+workerHttp:
+  statusStore:
+    kind: forge
+    repo: acme/store
+    branch: results
+    path: worker-results/{id}.json
+  request:
+    kind: forge-issue
+    repo: acme/signals
+    assignee: relay-login
+    trustedRequesters:
+${logins.map((login) => `      - ${JSON.stringify(login)}`).join("\n")}
+`;
+    const pack = loadPack(write(request(["qws-delivery[bot]", "Madmaxme"])));
+    assert.deepEqual(pack.workerHttp?.request?.trustedRequesters, ["qws-delivery[bot]", "Madmaxme"]);
+    for (const login of ["foo[bot]x", "[bot]", "", "qws delivery", "a/b"]) {
+      assert.throws(
+        () => loadPack(write(request([login]))),
+        /workerHttp.request.trustedRequesters is a list of logins/,
+      );
+    }
+  });
+
   it("refuses a workflow check on a plain git forge", () => {
     assert.throws(() => loadPack(write(`${base}\nforge: git\ncheck: workflow\n`)), /forge github/);
   });
