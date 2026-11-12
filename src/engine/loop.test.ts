@@ -9,7 +9,8 @@ import type { DeliveryState, ForgeAdapter, LinearProgramTracker, Ticket, Tracker
 import type { ProjectPack, PromotionStage } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
 import { proofLinesFor } from "../../scripts/journey-proof.mjs";
-import { auditEligibility, candidateFetchEnvironment, ciFixLimit, deliveryExitCode, formatTicketProgress, repoCheckoutDir, runTicket, ship, shipSweep, sortByPack, sweep, sweepNeedsAnotherPage, type LoopDeps, type StageVerifyInput } from "./loop.ts";
+import { gitAskpassPath } from "./credentials.ts";
+import { auditEligibility, candidateFetchEnvironment, ciFixLimit, deliver, deliveryExitCode, formatTicketProgress, repoCheckoutDir, runTicket, ship, shipSweep, sortByPack, sweep, sweepNeedsAnotherPage, type LoopDeps, type StageVerifyInput } from "./loop.ts";
 import { classifyQualityCause } from "./quality-cause.ts";
 
 const pack: ProjectPack = {
@@ -3808,6 +3809,70 @@ describe("ci fix limit", () => {
       withFixMax(raw, () => {
         assert.equal(ciFixLimit({ ...env.deps, ciFixMax: undefined }), 5);
       });
+    }
+  });
+
+  it("a missing referenced env stops before any step and logs the env name without its value", async () => {
+    const env = harness(BUILDABLE);
+    const secret = "secret-token-value";
+    env.deps.pack = { ...pack, commitActorTokenEnv: "COMMIT_ACTOR_TOKEN" };
+    let steps = 0;
+    env.deps.tracker.get = async () => {
+      steps += 1;
+      return ticket();
+    };
+    const previous = process.env.COMMIT_ACTOR_TOKEN;
+    process.env.COMMIT_ACTOR_TOKEN = `  ${secret}  `;
+    delete process.env.COMMIT_ACTOR_TOKEN;
+    try {
+      await assert.rejects(() => deliver(env.deps, "API-1"), /missing env COMMIT_ACTOR_TOKEN/);
+      assert.equal(steps, 0);
+      try {
+        await deliver(env.deps, "API-1");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.equal(message.includes(secret), false);
+        assert.equal(message, "missing env COMMIT_ACTOR_TOKEN");
+      }
+    } finally {
+      if (previous === undefined) delete process.env.COMMIT_ACTOR_TOKEN;
+      else process.env.COMMIT_ACTOR_TOKEN = previous;
+    }
+  });
+
+  it("sets git askpass for stage git calls", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = {
+      ...pack,
+      promotionStages: [
+        { id: "stage-one", target: "green-ring", authorization: "deliver", promoteCommand: "promote-one", repos: ["api"], verifyCommand: "verify-one" },
+      ],
+    };
+    const previous = process.env.GH_TOKEN;
+    process.env.GH_TOKEN = "stage-git-token";
+    const askpass = gitAskpassPath();
+    env.deps.runPackCommand = (command, _cwd, stdin, childEnv) => {
+      assert.equal(childEnv?.GIT_ASKPASS, askpass);
+      assert.equal(childEnv?.DELIVERY_LOOP_GIT_ASKPASS, askpass);
+      assert.equal(childEnv?.GIT_TERMINAL_PROMPT, "0");
+      assert.equal(childEnv?.DELIVERY_LOOP_GIT_PASSWORD, "stage-git-token");
+      if (command.startsWith("promote-")) return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision ?? "",
+          deployed: input.landedShas ?? [],
+        }),
+      };
+    };
+    try {
+      await runTicket(env.deps, ticket());
+    } finally {
+      if (previous === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = previous;
     }
   });
 

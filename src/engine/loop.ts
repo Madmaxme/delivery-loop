@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { DEFAULT_JOURNEY_SPEC, matchesJourneySpec } from "../../scripts/journey-proof.mjs";
 import { interpretMintOutput, runMintCommand } from "../adapters/github-mint.ts";
+import { assertReferencedCredentials, stageAskpassEnv, stageGitPassword } from "./credentials.ts";
 import { noteMint } from "./credential-log.ts";
 import { parseTypedStageOutcome, transientReason, transientWaitMs, type StageCommandResult } from "./step-outcome.ts";
 import { githubRepoFromUrl, type CompareStatus, type DeliveryState, type DesignCheckProbe, type FetchLike, type ForgeAdapter, type ListedPull, type LinearProgramTracker, type StageVerificationReceipt, type Ticket, type TrackerAdapter, type WorkerAdapter } from "../adapters/types.js";
@@ -1852,7 +1853,13 @@ async function runStageCommand(
   const run = deps.runPackCommand ?? spawnPackCommand;
   try {
     const result = await runWithTransient(deps, async () => {
-      const value = await Promise.resolve(run(command, repoCheckoutDir(deps.cwd ?? process.cwd(), repo, deps.pack), `${JSON.stringify(input)}\n`, commandEnvironment(deps.pack, true), timeoutMs));
+      const value = await Promise.resolve(run(
+        command,
+        repoCheckoutDir(deps.cwd ?? process.cwd(), repo, deps.pack),
+        `${JSON.stringify(input)}\n`,
+        { ...commandEnvironment(deps.pack, true), ...stageAskpassEnv(stageGitPassword(deps.pack)) },
+        timeoutMs,
+      ));
       return { status: value.status, output: `${value.stdout}\n${value.stderr ?? ""}`, stdout: value.stdout, timedOut: value.timedOut === true };
     });
     const outcome = parseTypedStageOutcome(result.stdout ?? "");
@@ -1861,7 +1868,9 @@ async function runStageCommand(
       ? { stdout: result.stdout, failed: null, timedOut: false, outcome }
       : { stdout: result.stdout, failed: `${command} exited ${result.status ?? "unknown"}`, timedOut: false, outcome };
   } catch (error) {
-    return { stdout: "", failed: `${command} ${error instanceof Error ? error.message : String(error)}`, timedOut: false, outcome: null };
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("DELIVERY_LOOP_GITHUB_MINT")) throw error;
+    return { stdout: "", failed: `${command} ${message}`, timedOut: false, outcome: null };
   }
 }
 
@@ -2120,15 +2129,24 @@ export type ShipRetryMarker = {
   step?: string;
 };
 
-function refreshGithubToken(env: NodeJS.ProcessEnv): boolean {
+function refreshGithubToken(env: NodeJS.ProcessEnv, pack: ProjectPack): boolean {
   const command = env.DELIVERY_LOOP_GITHUB_MINT?.trim();
-  if (!command) return false;
+  if (!command) {
+    if (pack.identity === "mint") throw new Error("ship: DELIVERY_LOOP_GITHUB_MINT is required");
+    return false;
+  }
   const result = runMintCommand(command);
   const now = Date.now();
   const minted = result.status === 0 ? interpretMintOutput(result.stdout, now) : null;
   const ok = Boolean(minted && minted.expiresAtMs > now);
   noteMint({ exitStatus: result.status, ok });
-  if (!minted || !ok) return false;
+  if (!minted || !ok) {
+    if (pack.identity === "mint") {
+      throw new Error("ship: DELIVERY_LOOP_GITHUB_MINT did not return an installation token that is still valid.");
+    }
+    return false;
+  }
+  if (pack.identity === "mint") return true;
   env.GH_TOKEN = minted.token;
   env.GITHUB_TOKEN = minted.token;
   process.env.GH_TOKEN = minted.token;
@@ -3743,10 +3761,12 @@ const MAX_SWEEP_PASSES = 50;
  * this same page. A pass that only skips blocked tickets stops.
  */
 async function probeConfiguredCredentials(deps: LoopDeps): Promise<void> {
+  assertReferencedCredentials(deps.pack);
   if (!deps.forge.probeCredentials) return;
   try {
     await deps.forge.probeCredentials();
-  } catch {
+  } catch (error) {
+    if (deps.pack.identity === "mint") throw error;
     noteEngine(deps, "credential probe failed");
   }
 }
@@ -3822,6 +3842,7 @@ export async function auditEligibility(
     tracker: Pick<TrackerAdapter, "listIntake">;
   },
 ): Promise<EligibilityAuditResult[]> {
+  assertReferencedCredentials(deps.pack);
   const tickets = await deps.tracker.listIntake(
     deps.project ? { project: deps.project } : undefined,
   );
@@ -4004,7 +4025,7 @@ async function finishShipBody(deps: LoopDeps, ticket: Ticket, id: string, result
       `install:ship:${problem.stage.id}:${signature}`,
       stageProblemText(problem),
     );
-    if (verdict === "login") refreshGithubToken(process.env);
+    if (verdict === "login") refreshGithubToken(process.env, deps.pack);
     await writeShipRetry(deps, ticket, problem.stage.id, problem.reason, "broken", undefined, problem.step);
     return { exitCode: 0, lines: [`${id} RETRY ${problem.reason}`], parked: false, shipped: false };
   }

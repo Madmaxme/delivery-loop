@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Push this package to the product repository.
-# Default remote: https://github.com/Madmaxme/delivery-loop
+# DELIVERY_LOOP_REMOTE is owner/name. DELIVERY_LOOP_COMMIT_TOKEN is the push token.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-REMOTE="${DELIVERY_LOOP_REMOTE:-Madmaxme/delivery-loop}"
+REMOTE="${DELIVERY_LOOP_REMOTE:-}"
+if [[ -z "$REMOTE" ]]; then
+  echo "DELIVERY_LOOP_REMOTE is required" >&2
+  exit 1
+fi
 owner="${REMOTE%%/*}"
-if [[ -n "${MADMAXME_GH_TOKEN:-}" ]]; then
-  export GH_TOKEN="${MADMAXME_GH_TOKEN}"
+if [[ -n "${DELIVERY_LOOP_COMMIT_TOKEN:-}" ]]; then
+  export GH_TOKEN="${DELIVERY_LOOP_COMMIT_TOKEN}"
 fi
 login="$(gh api user --jq .login 2>/dev/null || true)"
 if [[ "$login" != "$owner" ]]; then

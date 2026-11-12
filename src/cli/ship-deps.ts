@@ -52,7 +52,10 @@ function idleForge(): ForgeAdapter {
   };
 }
 
-function trackerFor(pack: ProjectPack): TrackerAdapter & Partial<LinearProgramTracker> {
+function trackerFor(
+  pack: ProjectPack,
+  github?: { token: string; slot: "mint" | "gh-token" },
+): TrackerAdapter & Partial<LinearProgramTracker> {
   if (pack.tracker === "jira") {
     if (!pack.jira) throw new Error("Jira tracker configuration is missing");
     return jiraTracker(pack.jira);
@@ -64,20 +67,29 @@ function trackerFor(pack: ProjectPack): TrackerAdapter & Partial<LinearProgramTr
       intakeState: pack.status.intake,
     });
   }
+  const auth = github ?? (pack.identity === "mint"
+    ? undefined
+    : { token: requireEnv("GH_TOKEN"), slot: "gh-token" as const });
+  if (!auth) throw new Error("ship: DELIVERY_LOOP_GITHUB_MINT is required");
   return githubIssuesTracker({
-    token: requireEnv("GH_TOKEN"),
+    token: auth.token,
+    slot: auth.slot,
     repo: pack.githubRepo ?? "",
     intakeLabel: pack.status.intake,
   });
 }
 
 /** Ship uses the tracker for stage receipts and the ticket's current revision. */
-export function shipInvocationDeps(pack: ProjectPack, cwd: string): LoopDeps {
+export function shipInvocationDeps(
+  pack: ProjectPack,
+  cwd: string,
+  github?: { token: string; slot: "mint" | "gh-token" },
+): LoopDeps {
   return {
     pack,
     cwd,
     worker: idleWorker(),
     forge: idleForge(),
-    tracker: trackerFor(pack),
+    tracker: trackerFor(pack, github),
   };
 }

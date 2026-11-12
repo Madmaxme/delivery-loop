@@ -36,6 +36,7 @@ import { githubRepoFromUrl } from "../adapters/types.js";
 import type { ForgeAdapter, LinearProgramTracker, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { findConnector } from "../connectors/catalog.js";
 import { writeCredentialSummary } from "../engine/credential-log.js";
+import { assertReferencedCredentials, credentialAuditFailed, formatCredentialAudit, inspectCredentials } from "../engine/credentials.js";
 import { auditEligibility, deliver, deliveryExitCode, repoCheckoutDir, ship, shipSweep, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
 export { validateStageReceipt, type StageVerifyInput } from "../engine/loop.js";
 export type { StageVerificationReceipt } from "../adapters/types.js";
@@ -315,7 +316,10 @@ export function commitActorsFromTrustedRef(pack: ProjectPack): ProjectPack["comm
   return parsed.commitActors ?? [];
 }
 
-function trackerFor(pack: ProjectPack): TrackerAdapter & Partial<LinearProgramTracker> {
+function trackerFor(
+  pack: ProjectPack,
+  github?: { token: string; slot: "mint" | "gh-token" },
+): TrackerAdapter & Partial<LinearProgramTracker> {
   if (pack.tracker === "linear") {
     return linearTracker({
       apiKey: requireEnv("LINEAR_API_KEY"),
@@ -324,8 +328,10 @@ function trackerFor(pack: ProjectPack): TrackerAdapter & Partial<LinearProgramTr
     });
   }
   if (pack.tracker === "github") {
+    const auth = github ?? { token: requireEnv("GH_TOKEN"), slot: "gh-token" as const };
     return githubIssuesTracker({
-      token: requireEnv("GH_TOKEN"),
+      token: auth.token,
+      slot: auth.slot,
       repo: pack.githubRepo ?? "",
       intakeLabel: pack.status.intake,
     });
@@ -334,7 +340,7 @@ function trackerFor(pack: ProjectPack): TrackerAdapter & Partial<LinearProgramTr
   return jiraTracker(pack.jira);
 }
 
-function openForge(pack: ProjectPack, withActors: boolean): {
+function openForge(pack: ProjectPack, withActors: boolean, step: string): {
   forge: ForgeAdapter;
   tokens: WorkerHttpToken;
 } {
@@ -344,10 +350,12 @@ function openForge(pack: ProjectPack, withActors: boolean): {
     return repoCheckoutDir(process.cwd(), spec, pack);
   };
   // The generic Git forge relies on caller-configured remote auth; Actions credentials are not persisted in the checkout.
-  const forgeToken = pack.forge === "git" ? "" : requireEnv("GH_TOKEN");
+  const forgeToken = pack.forge === "git" || pack.identity === "mint" ? "" : requireEnv("GH_TOKEN");
   const installation = createInstallationToken({
     command: () => process.env.DELIVERY_LOOP_GITHUB_MINT?.trim() ?? "",
     fallbackToken: forgeToken,
+    requireMint: pack.identity === "mint",
+    step,
   });
   const forge =
     pack.forge === "git"
@@ -355,6 +363,8 @@ function openForge(pack: ProjectPack, withActors: boolean): {
       : githubForge({
           token: forgeToken,
           installation,
+          identity: pack.identity,
+          step,
           repo: pack.githubRepo ?? `${githubRepoFromUrl(pack.repos[0].url).owner}/${githubRepoFromUrl(pack.repos[0].url).repo}`,
           ...(withActors ? { commitActors: commitActorsFromTrustedRef(pack) } : {}),
         });
@@ -362,18 +372,20 @@ function openForge(pack: ProjectPack, withActors: boolean): {
     forge,
     tokens: {
       mint: () => installation.get(),
-      forge: () => ({ token: forgeToken, slot: "gh-token" }),
+      forge: () => pack.identity === "mint" ? installation.get() : { token: forgeToken, slot: "gh-token" },
     },
   };
 }
 
-export function adaptersFor(pack: ProjectPack): {
+export async function adaptersFor(pack: ProjectPack, step: string): Promise<{
   tracker: TrackerAdapter & Partial<LinearProgramTracker>;
   worker: WorkerAdapter;
   forge: ForgeAdapter;
-} {
-  const { forge, tokens } = openForge(pack, true);
-  const tracker = trackerFor(pack);
+}> {
+  assertReferencedCredentials(pack);
+  const { forge, tokens } = openForge(pack, true, step);
+  const github = pack.identity === "mint" ? await tokens.mint() : undefined;
+  const tracker = trackerFor(pack, github);
   const worker = workerFor(pack, tokens, forge);
   return { tracker, worker, forge };
 }
@@ -499,9 +511,14 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     const issue = plan.issue;
     const action = plan.shipAction ?? "ship";
     if (action === "ship" && !issue) throw new Error("ship needs a ticket id");
-    const deps = shipInvocationDeps(pack, process.cwd());
+    const step = action === "sweep" ? "ship sweep" : "ship";
+    const runShip = async () => {
+    assertReferencedCredentials(pack);
+    const opened = openForge(pack, false, step);
+    const github = pack.identity === "mint" ? await opened.tokens.mint() : undefined;
+    const deps = shipInvocationDeps(pack, process.cwd(), github);
     deps.ownerHeal = async (input) => {
-      const side = pack.workerHttp?.statusStore ? openForge(pack, false) : undefined;
+      const side = pack.workerHttp?.statusStore ? openForge(pack, false, "ship") : undefined;
       const worker = workerFor(pack, side?.tokens, side?.forge);
       const started = await worker.start(input);
       const joined = await worker.join(started.runId);
@@ -509,7 +526,7 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       return joined.text;
     };
     const run = action === "sweep" ? shipSweep(deps) : ship(deps, issue ?? undefined, action === "continue" ? "continue" : "ship");
-    run.then(
+    return run.then(
       (result) => {
         for (const line of result.lines) console.log(line);
         if (result.exitCode !== 0) process.exitCode = result.exitCode;
@@ -522,6 +539,11 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       },
     ).finally(() => {
       writeCredentialSummary();
+    });
+    };
+    runShip().catch((error: unknown) => {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
     });
     return;
   }
@@ -558,16 +580,25 @@ function dispatchOrRun(mode: string, argv: string[]): void {
   }
   const pack = loadPack(packPath(process.cwd()));
   if (mode === "audit") {
-    auditEligibility({
-      pack,
-      tracker: trackerFor(pack),
-      cwd: process.cwd(),
-      project: plan.project,
-    })
-      .then((results) => {
-        console.log(JSON.stringify(results, null, 2));
-        failForPolicyErrors(results);
-      })
+    const runAudit = async () => {
+      assertReferencedCredentials(pack);
+      const credentials = await inspectCredentials({ pack });
+      const credentialText = formatCredentialAudit(credentials);
+      if (credentialText) console.log(credentialText);
+      if (credentialAuditFailed(credentials)) process.exitCode = 1;
+      const github = pack.identity === "mint"
+        ? await openForge(pack, false, "audit").tokens.mint()
+        : undefined;
+      const results = await auditEligibility({
+        pack,
+        tracker: trackerFor(pack, github),
+        cwd: process.cwd(),
+        project: plan.project,
+      });
+      console.log(JSON.stringify(results, null, 2));
+      failForPolicyErrors(results);
+    };
+    runAudit()
       .catch((error: unknown) => {
         console.error(error instanceof Error ? error.message : String(error));
         process.exitCode = 1;
@@ -577,15 +608,16 @@ function dispatchOrRun(mode: string, argv: string[]): void {
   const started = Number(
     process.env.DELIVERY_LOOP_PAGE_STARTED_MS || "",
   );
+  const runLocal = async () => {
   const deps = {
     pack,
-    ...adaptersFor(pack),
+    ...(await adaptersFor(pack, mode === "sweep" ? "sweep" : "deliver")),
     cwd: process.cwd(),
     project: plan.project,
     pageStartedAtMs: Number.isFinite(started) && started > 0 ? started : null,
   };
   if (mode === "sweep") {
-    sweep(deps)
+    return sweep(deps)
       .then((results) => {
         console.log(JSON.stringify(results, null, 2));
         failForPolicyErrors(results);
@@ -601,12 +633,11 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       .finally(() => {
         writeCredentialSummary();
       });
-    return;
   }
   const issue = plan.issue;
   if (!issue) throw new Error("deliver needs a ticket id");
   const until = mode === "ground" ? "ground" : undefined;
-  deliver(deps, issue, until ? { until } : undefined)
+  return deliver(deps, issue, until ? { until } : undefined)
     .then((result) => {
       console.log(JSON.stringify(result, null, 2));
       failForPolicyErrors([result]);
@@ -618,6 +649,11 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     .finally(() => {
       writeCredentialSummary();
     });
+  };
+  runLocal().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
 }
 
 function requiredArg(name: string, argv: string[]): string {

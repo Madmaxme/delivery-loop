@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/Madmaxme/delivery-loop/schemas/run-event-1.0.schema.json",
+  "$id": "https://delivery-loop.dev/schemas/run-event-1.0.schema.json",
   "title": "delivery-loop run event",
   "description": "One run phase. specversion 1.0. The file is the record. An endpoint is not part of the record.",
   "type": "object",

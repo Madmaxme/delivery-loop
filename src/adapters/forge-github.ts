@@ -203,22 +203,30 @@ export function githubForge(opts: {
    * The token is not written.
    */
   installation?: ReturnType<typeof createInstallationToken>;
+  /**
+   * `mint` uses the minted token for every forge call.
+   * A failed mint throws and names `step`. No other token is used.
+   */
+  identity?: "mint";
+  step?: string;
 }): ForgeAdapter {
   const fetchImpl = opts.fetch ?? fetch;
   const note = opts.credentialNote;
   const gitRun = opts.runGit ?? runGitCommand;
-  const headers = {
-    Authorization: `Bearer ${opts.token}`,
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-    "Content-Type": "application/json",
-  };
   let loginPromise: Promise<string | null> | null = null;
+
+  async function bearer(): Promise<{ token: string; slot: "mint" | "gh-token" }> {
+    if (opts.identity === "mint") {
+      const minted = await installation.get();
+      return { token: minted.token, slot: "mint" };
+    }
+    return { token: opts.token, slot: "gh-token" };
+  }
 
   async function requireActor(repoUrl: string): Promise<void> {
     const expected = commitActorLogin(opts.commitActors, repoUrl);
     if (!expected) return;
-    loginPromise ??= githubUserLogin(fetchImpl, opts.token, note);
+    loginPromise ??= bearer().then((auth) => githubUserLogin(fetchImpl, auth.token, note, auth.slot));
     assertCommitActor(repoUrl, await loginPromise, expected);
   }
 
@@ -231,29 +239,40 @@ export function githubForge(opts: {
     opts.installation ??
     createInstallationToken({
       command: mintCommand,
-      fallbackToken: opts.token,
+      fallbackToken: opts.identity === "mint" ? "" : opts.token,
       nowMs: opts.nowMs,
       runMint: opts.runMint ?? runMintCommand,
       note,
+      requireMint: opts.identity === "mint",
+      step: opts.step,
     });
 
   function tokenForCheckRuns() {
     return installation.get();
   }
 
-  function callGithub(
+  async function callGithub(
     path: string,
     init?: RequestInit,
     slot = "gh-token",
     endpoint?: string,
   ): Promise<Response> {
+    const auth = opts.identity === "mint" ? await bearer() : { token: opts.token, slot };
+    const headers = {
+      Authorization: `Bearer ${auth.token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "Content-Type": "application/json",
+      ...(init?.headers ?? {}),
+      ...(opts.identity === "mint" ? { Authorization: `Bearer ${auth.token}` } : {}),
+    };
     return credentialFetch(
-      slot,
+      auth.slot,
       endpoint ?? githubEndpointClass(path),
       () =>
         fetchImpl(`https://api.github.com${path}`, {
           ...init,
-          headers: { ...headers, ...(init?.headers ?? {}) },
+          headers,
         }),
       note,
     );
@@ -402,6 +421,20 @@ export function githubForge(opts: {
       };
     },
     async probeCredentials() {
+      if (opts.identity === "mint") {
+        const minted = await tokenForCheckRuns();
+        try {
+          const response = await callGithub(
+            "/rate_limit",
+            { headers: { Authorization: `Bearer ${minted.token}` } },
+            "mint",
+          );
+          await response.text().catch(() => undefined);
+        } catch {
+          /* The status is already recorded. A failed mint already threw. */
+        }
+        return;
+      }
       if (!mintCommand()) return;
       let token = "";
       try {
@@ -549,6 +582,7 @@ export function githubForge(opts: {
             throw new Error("GitHub direct land could not configure its isolated repository");
           }
         }
+        const gitAuth = await bearer();
         const localGit = gitForge({
           cwd: bareRepo,
           run: (args, cwd) => {
@@ -560,18 +594,18 @@ export function githubForge(opts: {
                   ...isolatedEnv,
                   GIT_CONFIG_COUNT: "2",
                   GIT_CONFIG_KEY_1: "http.https://github.com/.extraheader",
-                  GIT_CONFIG_VALUE_1: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${opts.token}`).toString("base64")}`,
+                  GIT_CONFIG_VALUE_1: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${gitAuth.token}`).toString("base64")}`,
                 }
               : isolatedEnv;
             const record = note ?? noteCredential;
             try {
               const result = gitRun(gitArgs, cwd, env);
               if (network) {
-                record({ slot: "gh-token", endpoint: "git", status: result.status === 0 ? 200 : result.status ?? 0 });
+                record({ slot: gitAuth.slot, endpoint: "git", status: result.status === 0 ? 200 : result.status ?? 0 });
               }
               return result;
             } catch (error) {
-              if (network) record({ slot: "gh-token", endpoint: "git", status: 0 });
+              if (network) record({ slot: gitAuth.slot, endpoint: "git", status: 0 });
               throw error;
             }
           },
