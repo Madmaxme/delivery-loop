@@ -354,7 +354,7 @@ export function linearTracker(opts: {
       const teamId = teamData.teams.nodes[0]?.id;
       if (!teamId) throw new Error(`Linear team not found: ${opts.team}`);
       const existing = await gql<{ issueLabels: { nodes: { id: string; name: string }[] } }>(
-        `query($name: String!, $teamId: String!) {
+        `query($name: String!, $teamId: ID!) {
           issueLabels(filter: { name: { eqIgnoreCase: $name }, team: { id: { eq: $teamId } } }) {
             nodes { id name }
           }
