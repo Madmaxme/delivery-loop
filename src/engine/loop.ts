@@ -42,6 +42,7 @@ import {
 import { confirmLandBranches, lookupRemoteHead, renderBranch } from "./land-branches.js";
 import {
   invariantExists,
+  investigationBlocksBuild,
   journeyEvidenceBlocksBuild,
   journeyEvidenceProven,
   parkStateForVerdict,
@@ -480,6 +481,9 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "none means the done-state is code this repository can land.",
     "open means that anything blocked by the external grant remains incomplete. The runner will not mark the ticket complete; build the code this repository owns.",
     "A missing line stays in intake. Reading a vendor's documentation is not the grant.",
+    "Every BUILDABLE handoff that read a live system includes **Evidence:** queried and **Killed alternatives:** with a probe: for each explanation that probe killed, including one where this repository's code is innocent.",
+    "A cited query is the start of the investigation. While two records disagree, the verdict stays NEEDS DIAGNOSIS. A code change waits until a probe shows the outside system did what we asked and this repository's code did something else.",
+    "**Evidence:** not-applicable means nothing is already wrong. not-applicable is unfinished when a live system was read. A cited query without a killed alternative stays in intake.",
     "Every BUILDABLE handoff includes **Journey evidence:** recorded | not-applicable | blocked.",
     "not-applicable means the done-state is not a journey a person walks.",
     `recorded means the done-state includes journey proof. Web proof is an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. The build handoff includes that raw URL in backticks and omits the **Journey proof:** prefix; the configured journey command prints the prefix. Mobile proof is **Journey proof:** a route test on the exact landed commit, \`repo/path_test.dart\` or \`repo/path.test.ts\`, whose path matches \`${deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC}\`. A sentence that names no token is not proof. A spec outside that pattern stays in intake. If the route test is not on the landed commit, the engine checks configured delivery-stage refs (or the repo trunk when refs are not configured); promotion receipts remain bound to the exact landed SHAs and criteria revision.`,
@@ -1016,6 +1020,15 @@ async function runHeldTicket(
         : "BUILDABLE requires **Journey evidence:** recorded | not-applicable | blocked. The ticket stays in intake.";
     await deps.tracker.comment(ticket.identifier, reason);
     return { identifier: ticket.identifier, outcome: "invalid-packet", detail: `journey-${journey}` };
+  }
+
+  const investigation = investigationBlocksBuild(ground.text);
+  if (investigation) {
+    await deps.tracker.comment(
+      ticket.identifier,
+      "BUILDABLE cited a query and did not name a killed alternative with a probe. The ticket stays in intake.",
+    );
+    return { identifier: ticket.identifier, outcome: "invalid-packet", detail: "investigation-unkilled" };
   }
 
   const prior = priorRequestBlocksBuild(ground.text);
