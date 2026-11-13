@@ -13,6 +13,8 @@ import {
   parsePriorRequest,
   parseVerdict,
   parseWorkOrder,
+  citesQuery,
+  investigationBlocksBuild,
   priorRequestBlocksBuild,
   parkStateForVerdict,
 } from "./packet.ts";
@@ -51,6 +53,37 @@ describe("prior request", () => {
     assert.equal(priorRequestBlocksBuild("**Prior request:** kept"), null);
     assert.equal(priorRequestBlocksBuild("**Prior request:** replaced — no id"), "replaced");
     assert.equal(priorRequestBlocksBuild("**Verdict:** BUILDABLE"), "missing");
+  });
+});
+
+describe("investigation", () => {
+  it("lets a handoff build when it did not cite a query", () => {
+    assert.equal(citesQuery("**Evidence:** not-applicable"), false);
+    assert.equal(citesQuery("**Runtime evidence:** blocked"), false);
+    assert.equal(investigationBlocksBuild("**Verdict:** BUILDABLE"), null);
+  });
+
+  it("blocks a cited query that names no killed alternative", () => {
+    assert.equal(citesQuery("**Evidence:** queried"), true);
+    assert.equal(citesQuery("**Runtime evidence:** queried — outbox"), true);
+    assert.equal(investigationBlocksBuild("**Evidence:** queried"), "unkilled");
+    assert.equal(investigationBlocksBuild("**Runtime evidence:** queried\n**Killed alternatives:** none"), "unkilled");
+    assert.equal(
+      investigationBlocksBuild("**Evidence:** queried\n**Killed alternatives:** not-applicable"),
+      "unkilled",
+    );
+    assert.equal(
+      investigationBlocksBuild("**Evidence:** queried\n**Killed alternatives:** the table said sent"),
+      "unkilled",
+    );
+  });
+
+  it("allows a cited query once a probe killed an alternative", () => {
+    const text = [
+      "**Evidence:** queried",
+      "**Killed alternatives:** the outside system already failed — probe: replayed the request and the outside system accepted it",
+    ].join("\n");
+    assert.equal(investigationBlocksBuild(text), null);
   });
 });
 

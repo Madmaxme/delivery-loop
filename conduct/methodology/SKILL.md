@@ -7,7 +7,7 @@ description: Delivery Loop v2 orchestration policy. Defines explicit eligibility
 
 This is the versioned, client-neutral orchestration procedure. A client pins one package tag and keeps its product policy, Jira configuration, acceptance meaning, deployment commands, and environment-specific instructions in its own repository. Never infer those values from another client or from a target name.
 
-The companion `delivery-loop-conduct` skill supplies code-conduct rules. The engine owns tracker state transitions and delivery state; workers do not call tracker, forge, deployment, or status APIs directly.
+The companion `delivery-loop-conduct` skill supplies code-conduct rules. A cited query does not make a ticket buildable. Conduct owns the investigation rule, and the runner rejects a buildable handoff that cites a query without a killed alternative and its `probe:`. The engine owns tracker state transitions and delivery state; workers do not call tracker, forge, deployment, or status APIs directly.
 
 ## Required client choices
 
