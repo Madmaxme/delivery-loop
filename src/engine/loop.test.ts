@@ -1152,6 +1152,15 @@ describe("loop", () => {
     assert.equal(absentLogs.some((line) => line.includes("result=unavailable")), false);
   });
 
+  it("stays in intake when a buildable handoff cites a query and kills no alternative", async () => {
+    const env = harness(`${BUILDABLE}\n**Evidence:** queried\n**Killed alternatives:** not-applicable\n`);
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "invalid-packet");
+    assert.equal(result.detail, "investigation-unkilled");
+    assert.equal(env.merged(), false);
+    assert.equal(env.state(), "Todo");
+  });
+
   it("stays in intake when a buildable handoff omits the outside grant line", async () => {
     const env = harness(BUILDABLE.replace("**Outside grant:** none\n", ""));
     const result = await runTicket(env.deps, ticket());

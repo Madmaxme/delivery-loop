@@ -168,6 +168,34 @@ export function priorRequestBlocksBuild(text: string): "missing" | "replaced" | 
   return null;
 }
 
+const EVIDENCE_RE = /\*\*Evidence:\*\*\s*(queried|not-applicable)\b/i;
+const RUNTIME_EVIDENCE_RE = /\*\*Runtime evidence:\*\*\s*(queried|blocked|not-applicable)\b/i;
+const KILLED_ALTERNATIVES_RE = /\*\*Killed alternatives:\*\*\s*(.*)/i;
+
+/**
+ * A handoff cites a query when it says a live system was read.
+ * `**Evidence:** queried` is the line. `**Runtime evidence:** queried` is the older spelling.
+ * `not-applicable` and `blocked` are not a cited query.
+ */
+export function citesQuery(text: string): boolean {
+  if (text.match(EVIDENCE_RE)?.[1]?.toLowerCase() === "queried") return true;
+  return text.match(RUNTIME_EVIDENCE_RE)?.[1]?.toLowerCase() === "queried";
+}
+
+/**
+ * Why a BUILDABLE handoff that cites a query must not build.
+ * A cited query with no killed alternative, or with `none` / `not-applicable`, stays in intake.
+ * Each killed explanation names a `probe:` that could have failed it.
+ * A handoff that does not cite a query is not this gate. Null means the line allows a build.
+ */
+export function investigationBlocksBuild(text: string): "unkilled" | null {
+  if (!citesQuery(text)) return null;
+  const line = text.match(KILLED_ALTERNATIVES_RE)?.[1]?.trim() ?? "";
+  if (!line || /^(?:none|not-applicable)\b/i.test(line)) return "unkilled";
+  if (!/probe:/i.test(line)) return "unkilled";
+  return null;
+}
+
 export type JourneyEvidence = "recorded" | "not-applicable" | "blocked";
 
 const JOURNEY_EVIDENCE_RE =
