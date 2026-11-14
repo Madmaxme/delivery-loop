@@ -37,7 +37,7 @@ import type { ForgeAdapter, LinearProgramTracker, TrackerAdapter, WorkerAdapter 
 import { findConnector } from "../connectors/catalog.js";
 import { writeCredentialSummary } from "../engine/credential-log.js";
 import { assertReferencedCredentials, credentialAuditFailed, formatCredentialAudit, inspectCredentials } from "../engine/credentials.js";
-import { auditEligibility, deliver, deliveryExitCode, repoCheckoutDir, ship, shipSweep, sweep, sweepNeedsAnotherPage } from "../engine/loop.js";
+import { auditEligibility, deliver, deliveryExitCode, needsNextPage, repoCheckoutDir, ship, shipSweep, sweep, type TicketResult } from "../engine/loop.js";
 export { validateStageReceipt, type StageVerifyInput } from "../engine/loop.js";
 export type { StageVerificationReceipt } from "../adapters/types.js";
 import { shipInvocationDeps } from "./ship-deps.js";
@@ -200,6 +200,12 @@ export function runnerWorkflowText(): string {
 
 export function failForPolicyErrors(results: readonly { outcome: string }[]): void {
   if (results.some((result) => result.outcome === "policy-error" || deliveryExitCode(result) !== 0)) process.exitCode = 1;
+}
+
+/** The runner reads `chain=true` and starts the page that loads this trunk. */
+export function recordPageChain(results: readonly TicketResult[], output = process.env.GITHUB_OUTPUT): void {
+  if (!output || !needsNextPage([...results])) return;
+  appendFileSync(output, "chain=true\n");
 }
 
 function installHarnessFiles(dir: string): void {
@@ -620,11 +626,8 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     return sweep(deps)
       .then((results) => {
         console.log(JSON.stringify(results, null, 2));
+        recordPageChain(results);
         failForPolicyErrors(results);
-        const output = process.env.GITHUB_OUTPUT;
-        if (output && sweepNeedsAnotherPage(results)) {
-          appendFileSync(output, "chain=true\n");
-        }
       })
       .catch((error: unknown) => {
         console.error(error instanceof Error ? error.message : String(error));
@@ -640,6 +643,7 @@ function dispatchOrRun(mode: string, argv: string[]): void {
   return deliver(deps, issue, until ? { until } : undefined)
     .then((result) => {
       console.log(JSON.stringify(result, null, 2));
+      recordPageChain([result]);
       failForPolicyErrors([result]);
     })
     .catch((error: unknown) => {

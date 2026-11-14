@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
-import { failForPolicyErrors, init, installConnector, update, validateStageReceipt, writeProject, type StageVerificationReceipt, type StageVerifyInput } from "./main.ts";
+import { failForPolicyErrors, init, installConnector, recordPageChain, update, validateStageReceipt, writeProject, type StageVerificationReceipt, type StageVerifyInput } from "./main.ts";
 import { loadPack } from "../schema/pack.ts";
 
 describe("installer", () => {
@@ -297,5 +297,20 @@ describe("dispatch result exit codes", () => {
     } finally {
       process.exitCode = previous;
     }
+  });
+});
+
+describe("page chain", () => {
+  it("sets the chain flag for a deliver pause and leaves a finished ticket alone", () => {
+    const dir = mkdtempSync(join(tmpdir(), "delivery-loop-chain-"));
+    const paused = join(dir, "paused");
+    const finished = join(dir, "finished");
+    const exhausted = join(dir, "exhausted");
+    recordPageChain([{ identifier: "QUI-1", outcome: "land-blocked", detail: "next page" }], paused);
+    recordPageChain([{ identifier: "QUI-1", outcome: "landed", detail: "done" }], finished);
+    recordPageChain([{ identifier: "QUI-1", outcome: "heal-exhausted", detail: "quality-red" }], exhausted);
+    assert.equal(readFileSync(paused, "utf8"), "chain=true\n");
+    assert.equal(existsSync(finished), false);
+    assert.equal(existsSync(exhausted), false);
   });
 });
