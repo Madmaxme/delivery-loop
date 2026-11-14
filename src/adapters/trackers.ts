@@ -81,6 +81,106 @@ function stateComment(body: string): DeliveryState | null {
   }
 }
 
+/** Stable attachment URL. Creating it again on the same issue updates that attachment. */
+export const LINEAR_DELIVERY_STATE_URL = "https://github.com/Madmaxme/delivery-loop#delivery-state";
+
+function deliveryStateSubtitle(state: DeliveryState): string {
+  const lease = [...state.markers].reverse().find((marker) => marker.kind === "delivery-lease");
+  if (!lease) return "state";
+  try {
+    const parsed: unknown = JSON.parse(lease.body);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as { released?: unknown; cursorPhase?: unknown };
+      if (record.released === true) return "released";
+      if (typeof record.cursorPhase === "string" && record.cursorPhase.trim()) return record.cursorPhase.trim();
+    }
+  } catch {
+    return "state";
+  }
+  return "state";
+}
+
+function stateFromMetadata(metadata: unknown): DeliveryState | null {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return null;
+  if (!Object.prototype.hasOwnProperty.call(metadata, "deliveryState")) return null;
+  const raw = (metadata as { deliveryState?: unknown }).deliveryState;
+  if (typeof raw !== "string" || !raw.trim()) {
+    throw new Error("Delivery state attachment is invalid");
+  }
+  try {
+    return validateDeliveryState(JSON.parse(raw));
+  } catch {
+    throw new Error("Delivery state attachment is invalid");
+  }
+}
+
+type LinearStateRecord = {
+  id: string;
+  comments?: { nodes: { id: string; body: string; createdAt?: string }[] };
+  attachments?: { nodes: { id: string; url?: string | null; metadata?: unknown }[] };
+};
+
+function linearAttachmentStateStore(
+  gql: <T>(query: string, variables: Record<string, unknown>) => Promise<T>,
+  issueFor: (identifier: string) => Promise<LinearStateRecord>,
+): TrackerStateStore {
+  return {
+    async readDeliveryState(identifier) {
+      const issue = await issueFor(identifier);
+      const attachment = (issue.attachments?.nodes ?? []).find((item) => item.url === LINEAR_DELIVERY_STATE_URL);
+      if (attachment) {
+        const stored = stateFromMetadata(attachment.metadata);
+        if (stored) return stored;
+      }
+      const comments = [...(issue.comments?.nodes ?? [])].sort(
+        (a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? ""),
+      );
+      for (let index = comments.length - 1; index >= 0; index -= 1) {
+        const state = stateComment(comments[index]!.body);
+        if (state) return state;
+      }
+      return emptyDeliveryState();
+    },
+    async writeDeliveryState(identifier, value) {
+      const state = validateDeliveryState(value);
+      const issue = await issueFor(identifier);
+      const metadata = { deliveryState: JSON.stringify(state) };
+      const subtitle = deliveryStateSubtitle(state);
+      const existing = (issue.attachments?.nodes ?? []).find((item) => item.url === LINEAR_DELIVERY_STATE_URL);
+      if (existing) {
+        await gql(
+          `mutation($id: String!, $input: AttachmentUpdateInput!) {
+            attachmentUpdate(id: $id, input: $input) { success }
+          }`,
+          { id: existing.id, input: { title: "Delivery", subtitle, metadata } },
+        );
+      } else {
+        await gql(
+          `mutation($input: AttachmentCreateInput!) {
+            attachmentCreate(input: $input) { success }
+          }`,
+          {
+            input: {
+              issueId: issue.id,
+              title: "Delivery",
+              subtitle,
+              url: LINEAR_DELIVERY_STATE_URL,
+              metadata,
+            },
+          },
+        );
+      }
+      for (const comment of issue.comments?.nodes ?? []) {
+        if (!comment.body.startsWith("<!-- delivery-loop-state:v2:")) continue;
+        await gql(
+          `mutation($id: String!) { commentDelete(id: $id) { success } }`,
+          { id: comment.id },
+        );
+      }
+    },
+  };
+}
+
 function commentStateStore(
   commentsFor: (identifier: string) => Promise<TicketComment[]>,
   addComment: (identifier: string, body: string) => Promise<void>,
@@ -306,10 +406,26 @@ export function linearTracker(opts: {
     );
   }
 
-  const stateStore = commentStateStore(
-    async (identifier) => (await fetchTicket(identifier)).comments,
-    createComment,
-  );
+  async function fetchStateIssue(identifier: string): Promise<LinearStateRecord> {
+    const number = Number(identifier.split("-").pop());
+    const data = await gql<{ issues: { nodes: LinearStateRecord[] } }>(
+      `query($team: String!, $number: Float!) {
+        issues(filter: { team: { key: { eq: $team } }, number: { eq: $number } }, first: 1) {
+          nodes {
+            id
+            comments(first: 100) { nodes { id body createdAt } }
+            attachments { nodes { id url metadata } }
+          }
+        }
+      }`,
+      { team: opts.team, number },
+    );
+    const issue = data.issues.nodes[0];
+    if (!issue) throw new Error(`Linear issue not found: ${identifier}`);
+    return issue;
+  }
+
+  const stateStore = linearAttachmentStateStore(gql, fetchStateIssue);
 
   return {
     kind: "linear",
