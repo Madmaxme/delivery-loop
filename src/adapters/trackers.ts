@@ -386,7 +386,34 @@ export function linearTracker(opts: {
       );
     },
     async removeLabel(identifier, label) {
-      await this.comment(identifier, `unlabel:${label}`);
+      const ticket = await this.get(identifier);
+      const teamData = await gql<{ teams: { nodes: { id: string }[] } }>(
+        `query($team: String!) { teams(filter: { key: { eq: $team } }) { nodes { id } } }`,
+        { team: opts.team },
+      );
+      const teamId = teamData.teams.nodes[0]?.id;
+      if (!teamId) throw new Error(`Linear team not found: ${opts.team}`);
+      const existing = await gql<{ issueLabels: { nodes: { id: string; name: string }[] } }>(
+        `query($name: String!, $teamId: ID!) {
+          issueLabels(filter: { name: { eqIgnoreCase: $name }, team: { id: { eq: $teamId } } }) {
+            nodes { id name }
+          }
+        }`,
+        { name: label, teamId },
+      );
+      const labelId = existing.issueLabels.nodes[0]?.id;
+      if (!labelId) return;
+      const current = await gql<{ issue: { labels: { nodes: { id: string }[] } } }>(
+        `query($id: String!) { issue(id: $id) { labels { nodes { id } } } }`,
+        { id: ticket.id },
+      );
+      const labelIds = current.issue.labels.nodes.map((item) => item.id).filter((id) => id !== labelId);
+      await gql(
+        `mutation($id: String!, $labelIds: [String!]!) {
+          issueUpdate(id: $id, input: { labelIds: $labelIds }) { success }
+        }`,
+        { id: ticket.id, labelIds },
+      );
     },
     projectSnapshot(name) {
       return linearProjectSnapshot(gql, name);

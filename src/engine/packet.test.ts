@@ -13,6 +13,7 @@ import {
   parsePriorRequest,
   parseVerdict,
   parseWorkOrder,
+  publishedHandoff,
   citesQuery,
   investigationBlocksBuild,
   priorRequestBlocksBuild,
@@ -215,6 +216,11 @@ The prompt says BUILDABLE, NEEDS DIAGNOSIS.
     assert.deepEqual(order?.repos, ["api", "customer-web"]);
     const separate = handoff.replace("**Repos:** `api, customer-web`", "**Repos:** `api` `customer-web`");
     assert.deepEqual(parseWorkOrder(separate)?.repos, ["api", "customer-web"]);
+    const published = publishedHandoff(handoff);
+    assert.match(published, /^\*\*Codebase audit:\*\* \*\*BUILDABLE\*\*/);
+    assert.match(published, /<!-- GROUNDING_HANDOFF/);
+    assert.equal(parseWorkOrder(published)?.invariant, "billing/commission-resolution");
+    assert.equal(publishedHandoff(published), published);
     assert.equal(order?.invariant, "billing/commission-resolution");
     assert.deepEqual(order?.criteria, [
       { id: "commission", text: "Keep the single commission snapshot.", source: "Grounding decision" },

@@ -29,6 +29,7 @@ import {
   formatGroundingCommentSample,
   latestDeliveryLeaseStamp,
   landingShaNeedsRebuild,
+  machineLabelsToClearOnTerminal,
   pageBudgetRemainingMs,
   qualityRunUnscheduled,
   QUALITY_NO_RUN_MS,
@@ -48,6 +49,7 @@ import {
   parkStateForVerdict,
   parseJourneyEvidence,
   parseJourneyProofs,
+  publishedHandoff,
   parseStructuredJourneyProof,
   parseOutsideGrant,
   parsePriorRequest,
@@ -960,7 +962,7 @@ async function runHeldTicket(
   if (verdict !== "BUILDABLE") {
     await deps.tracker.comment(
       ticket.identifier,
-      `**Verdict:** ${verdict ?? "MISSING"}\n\n${ground.text}`,
+      `**Verdict:** ${verdict ?? "MISSING"}\n\n${publishedHandoff(ground.text)}`,
     );
     if (verdict) {
       const commits =
@@ -1061,7 +1063,7 @@ async function runHeldTicket(
   if (!order) {
     await deps.tracker.comment(
       ticket.identifier,
-      `BUILDABLE without a complete work order.\n\n${ground.text.slice(0, 4000)}`,
+      `BUILDABLE without a complete work order.\n\n${publishedHandoff(ground.text).slice(0, 4000)}`,
     );
     return { identifier: ticket.identifier, outcome: "invalid-packet", detail: "packet" };
   }
@@ -1127,7 +1129,7 @@ async function runHeldTicket(
   }
 
   await writeMarker(deps, ticket, "work-order", JSON.stringify({ ground: ground.text, receipt: "", criteriaRevision: ticket.criteriaRevision }));
-  if (deps.tracker.kind !== "jira") await deps.tracker.comment(ticket.identifier, ground.text);
+  if (deps.tracker.kind !== "jira") await deps.tracker.comment(ticket.identifier, publishedHandoff(ground.text));
   if (deps.until === "ground") {
     return {
       identifier: ticket.identifier,
@@ -2795,10 +2797,29 @@ async function settleTrunk(
   return { identifier: ticket.identifier, outcome: "landed", detail: doneDetail };
 }
 
+const SHIPPED_COMMENT =
+  "**SHIP_COMPLETE** → Linear **Deployed to Prod**.\n\n<!-- SHIP_HANDOFF status=complete -->";
+
 async function writeTicketStatus(deps: LoopDeps, ticket: Ticket, state: string): Promise<void> {
-  if (ticket.stateName === state) return;
-  await deps.tracker.setState(ticket.identifier, state, ticket.criteriaRevision);
-  ticket.stateName = state;
+  const changed = ticket.stateName !== state;
+  if (changed) {
+    await deps.tracker.setState(ticket.identifier, state, ticket.criteriaRevision);
+    ticket.stateName = state;
+  }
+  const clear = machineLabelsToClearOnTerminal(state, ticket.labels, {
+    complete: deps.pack.status.complete,
+    shipped: deps.pack.status.shipped,
+  });
+  for (const name of clear) {
+    await deps.tracker.removeLabel(ticket.identifier, name);
+  }
+  if (clear.length > 0) {
+    const gone = new Set(clear.map((name) => name.toLowerCase()));
+    ticket.labels = ticket.labels.filter((label) => !gone.has(label.toLowerCase()));
+  }
+  if (changed && deps.pack.status.shipped && state === deps.pack.status.shipped) {
+    await deps.tracker.comment(ticket.identifier, SHIPPED_COMMENT);
+  }
 }
 
 function commandEnvironment(pack: ProjectPack, allowDeploymentCredentials = false): NodeJS.ProcessEnv {

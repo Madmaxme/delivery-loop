@@ -54,6 +54,33 @@ function words(value: string): string[] {
 const HANDOFF_RE =
   /<!--\s*GROUNDING_HANDOFF\s*([\s\S]*?)\s*GROUNDING_HANDOFF\s*-->/i;
 
+function firstLine(text: string): string {
+  return text.split("\n").map((line) => line.trim()).find((line) => line.length > 0) ?? "";
+}
+
+/**
+ * The handoff block stays for the runner. The audit and the packet are
+ * visible text in front of it. A preamble that already contains them is unchanged.
+ */
+export function publishedHandoff(text: string): string {
+  const match = text.match(HANDOFF_RE);
+  if (!match || match.index === undefined) return text;
+  const inner = match[1] ?? "";
+  const packetSplit = inner.split(/^BUILD_PACKET:\s*\n?/m);
+  const commentSplit = (packetSplit[0] ?? "").split(/^COMMENT:\s*\n?/m);
+  const comment = (commentSplit[1] ?? "").trim();
+  const packet = packetSplit.slice(1).join("\n").replace(/\s*GROUNDING_HANDOFF\s*$/i, "").trim();
+  const visible = [comment, packet].filter((part) => part.length > 0).join("\n\n");
+  if (!visible) return text;
+  const preamble = text.slice(0, match.index).trim();
+  const commentLine = firstLine(comment);
+  const packetLine = firstLine(packet);
+  const commentShown = !commentLine || preamble.includes(commentLine);
+  const packetShown = !packetLine || preamble.includes(packetLine);
+  if (commentShown && packetShown && (commentLine || packetLine)) return text;
+  return [preamble, visible, match[0]].filter((part) => part.length > 0).join("\n\n");
+}
+
 /** Verdict only from a labeled line. A mention of the word is not a verdict. */
 export function parseVerdict(text: string): Verdict | null {
   const handoff = text.match(HANDOFF_RE)?.[1] ?? text;

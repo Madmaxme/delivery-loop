@@ -249,6 +249,7 @@ function normState(stateName: string | null | undefined): string {
  * Machine labels that must not linger after a terminal status write.
  * Does not touch `surface:*`, `source:*`, or `needs-product`.
  * Does not clear `store-gated` or `ship-lease` unless the configured status permits it.
+ */
 export function machineLabelsToClearOnTerminal(
   stateName: string | null | undefined,
   labels: string[],
