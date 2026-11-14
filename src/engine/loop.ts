@@ -2772,12 +2772,21 @@ async function settleTrunk(
   const stages = await runPromotionStages(deps, ticket, "deliver", candidates, order.criteria);
   if (stages.outcome !== "complete") {
     await writeMarker(deps, ticket, "land-resume", JSON.stringify({ kind: "wait", hold, rows: candidates, declared, receipt: carried } satisfies LandResume));
+    let resumed = false;
     for (const problem of stages.problems) {
       const signature = shipNoSignature(problem.reason) || problem.reason;
-      await applyOwnerHeal(deps, ticket, `heal:promote:${problem.stage.id}:${signature}`, stageProblemText(problem));
+      const verdict = await applyOwnerHeal(deps, ticket, `heal:promote:${problem.stage.id}:${signature}`, stageProblemText(problem));
+      if (verdict === "edit") resumed = true;
       if (problem.outcome === "blocked" || problem.outcome === "parked") {
         await deps.tracker.comment(ticket.identifier, `Promotion stage ${problem.stage.id} is blocked: ${problem.reason}`);
       }
+    }
+    if (resumed) {
+      return {
+        identifier: ticket.identifier,
+        outcome: "land-blocked",
+        detail: "The procedure owner was edited. The next page resumes this branch.",
+      };
     }
     if (stages.outcome === "failed") {
       return { identifier: ticket.identifier, outcome: "quality-failed", detail: `stage ${stages.stage.id}: ${stages.reason}` };
