@@ -82,7 +82,7 @@ function stateComment(body: string): DeliveryState | null {
 }
 
 /** Stable attachment URL. Creating it again on the same issue updates that attachment. */
-export const LINEAR_DELIVERY_STATE_URL = "https://github.com/Madmaxme/delivery-loop#delivery-state";
+export const LINEAR_DELIVERY_STATE_URL = "https://github.com/delivery-loop/delivery-loop#delivery-state";
 
 function deliveryStateSubtitle(state: DeliveryState): string {
   const lease = [...state.markers].reverse().find((marker) => marker.kind === "delivery-lease");

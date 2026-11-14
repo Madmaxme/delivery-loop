@@ -1072,7 +1072,7 @@ describe("adapters", () => {
           const input = body.variables.input as { url: string; metadata: { deliveryState: string }; title: string; subtitle: string };
           assert.equal(input.title, "Delivery");
           assert.equal(input.subtitle, "build");
-          assert.equal(input.url, "https://github.com/Madmaxme/delivery-loop#delivery-state");
+          assert.equal(input.url, "https://github.com/delivery-loop/delivery-loop#delivery-state");
           attachment = { id: "att-1", url: input.url, metadata: input.metadata };
           return jsonResponse({ data: { attachmentCreate: { success: true } } });
         }
