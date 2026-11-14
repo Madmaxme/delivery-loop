@@ -1910,6 +1910,7 @@ describe("loop", () => {
 | second-path | Keep the second path. | Issue description | stage-two`,
     );
     const split = harness(both);
+    split.deps.ownerHeal = async () => "**Heal:** wait";
     split.deps.pack = {
       ...pack,
       promotionStages: [
@@ -1999,6 +2000,7 @@ describe("loop", () => {
 
   it("blocks the stage that exceeds its own command timeout", async () => {
     const env = harness(BUILDABLE);
+    env.deps.ownerHeal = async () => "**Heal:** wait";
     env.deps.pack = {
       ...pack,
       promotionStages: [{
@@ -2026,6 +2028,7 @@ describe("loop", () => {
     assert.equal(env.state(), "Todo");
 
     const verifyEnv = harness(BUILDABLE);
+    verifyEnv.deps.ownerHeal = async () => "**Heal:** wait";
     verifyEnv.deps.pack = {
       ...pack,
       promotionStages: [{
@@ -2124,6 +2127,7 @@ describe("loop", () => {
 
   it("does not run a later delivery stage after a blocked receipt", async () => {
     const env = harness(BUILDABLE);
+    env.deps.ownerHeal = async () => "**Heal:** wait";
     env.deps.pack = {
       ...pack,
       promotionStages: [
@@ -2153,6 +2157,37 @@ describe("loop", () => {
     assert.deepEqual(commands, ["promote-first", "verify-first"]);
     assert.equal(env.state(), "Todo");
     assert.deepEqual(env.deliveryState().stageReceipts.map((receipt) => receipt.stageId), ["first"]);
+  });
+
+  it("resumes the next page when a blocked promotion edits its owner", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = {
+      ...pack,
+      promotionStages: [
+        { id: "first", target: "alpha", authorization: "deliver", promoteCommand: "promote-first", repos: ["api"], verifyCommand: "verify-first" },
+      ],
+    };
+    env.deps.ownerHeal = async () => "**Heal:** edit";
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (command !== "verify-first") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision ?? "",
+          deployed: input.landedShas ?? [],
+          outcome: "blocked",
+          reason: "live evidence is unavailable",
+        }),
+      };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "land-blocked");
+    assert.match(result.detail, /next page resumes/);
+    assert.equal(needsNextPage([result]), true);
+    assert.equal(env.state(), "Todo");
   });
 
   it("verifies independent stages together and heals every blocked receipt", async () => {
