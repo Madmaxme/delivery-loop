@@ -3764,7 +3764,12 @@ async function waitForQuality(
   return { state: "pending", detail: "" };
 }
 
-export function sweepNeedsAnotherPage(results: TicketResult[]): boolean {
+/**
+ * One predicate for sweep and for a single-ticket deliver.
+ * A resume, a pending check, or an owner edit ends this page and the runner
+ * starts the next one. A heal that has reached its cap does not.
+ */
+export function needsNextPage(results: TicketResult[]): boolean {
   return results.some(
     (result) =>
       result.outcome === "quality-pending" ||

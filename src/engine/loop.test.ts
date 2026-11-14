@@ -10,7 +10,7 @@ import type { ProjectPack, PromotionStage } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
 import { proofLinesFor } from "../../scripts/journey-proof.mjs";
 import { gitAskpassPath } from "./credentials.ts";
-import { auditEligibility, candidateFetchEnvironment, ciFixLimit, deliver, deliveryExitCode, formatTicketProgress, repoCheckoutDir, runTicket, ship, shipSweep, sortByPack, sweep, sweepNeedsAnotherPage, type LoopDeps, type StageVerifyInput } from "./loop.ts";
+import { auditEligibility, candidateFetchEnvironment, ciFixLimit, deliver, deliveryExitCode, formatTicketProgress, repoCheckoutDir, runTicket, ship, shipSweep, sortByPack, sweep, needsNextPage, type LoopDeps, type StageVerifyInput } from "./loop.ts";
 import { classifyQualityCause } from "./quality-cause.ts";
 
 const pack: ProjectPack = {
@@ -552,7 +552,7 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
     assert.match(result.detail, /next page resumes/);
-    assert.equal(sweepNeedsAnotherPage([result]), true);
+    assert.equal(needsNextPage([result]), true);
     assert.equal(env.merged(), false);
   });
 
@@ -591,7 +591,7 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
     assert.match(result.detail, /next page resumes/);
-    assert.equal(sweepNeedsAnotherPage([result]), true);
+    assert.equal(needsNextPage([result]), true);
     assert.equal(env.merged(), false);
     assert.equal(env.state(), "Todo");
   });
@@ -632,7 +632,7 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
     assert.match(result.detail, /next page resumes/);
-    assert.equal(sweepNeedsAnotherPage([result]), true);
+    assert.equal(needsNextPage([result]), true);
     assert.equal(env.merged(), false);
     assert.equal(env.state(), "Todo");
   });
@@ -667,7 +667,7 @@ describe("loop", () => {
     );
     assert.equal(env.deps.pageControl?.stop, true);
     assert.equal(merged, 0);
-    assert.equal(sweepNeedsAnotherPage(results), true);
+    assert.equal(needsNextPage(results), true);
   });
 
   it("probes configured credentials once at the start of a sweep", async () => {
@@ -809,7 +809,7 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "landed");
     assert.equal(n, 3);
-    assert.equal(sweepNeedsAnotherPage([result]), false);
+    assert.equal(needsNextPage([result]), false);
   });
 
   it("hands a still-pending quality check to the next page", async () => {
@@ -830,7 +830,7 @@ describe("loop", () => {
     assert.equal(result.outcome, "quality-pending");
     assert.equal(env.comments.some((body) => /still running/.test(body)), true);
     assert.equal(env.merged(), false);
-    assert.equal(sweepNeedsAnotherPage([result]), true);
+    assert.equal(needsNextPage([result]), true);
   });
 
   it("fixes a red landing on the same branch and does not rebuild from trunk", async () => {
@@ -952,7 +952,7 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
     assert.equal(env.deps.pageControl?.stop, true);
-    assert.equal(sweepNeedsAnotherPage([result]), true);
+    assert.equal(needsNextPage([result]), true);
     assert.equal(env.merged(), false);
   });
 
@@ -1528,7 +1528,7 @@ describe("loop", () => {
     assert.equal(opened, 0);
     assert.equal(starts, 1);
     assert.equal(env.state(), "Todo");
-    assert.equal(sweepNeedsAnotherPage([first]), false);
+    assert.equal(needsNextPage([first]), false);
     const marker = JSON.parse(env.deliveryState().markers.find((item) => item.kind === "land-resume")!.body) as { kind: string; rows: { repo: string; sha: string }[] };
     assert.equal(marker.kind, "empty");
     assert.deepEqual(marker.rows, [{ repo: "api", sha: "abc1234" }]);
@@ -1557,7 +1557,7 @@ describe("loop", () => {
     const marker = JSON.parse(env.deliveryState().markers.find((item) => item.kind === "land-resume")!.body) as { hold: boolean; rows: { repo: string; sha: string }[] };
     assert.equal(marker.hold, false);
     assert.deepEqual(marker.rows, [{ repo: "api", sha: "trunk" }]);
-    assert.equal(sweepNeedsAnotherPage([result]), true);
+    assert.equal(needsNextPage([result]), true);
   });
 
   it("accepts a green trunk tip that contains the merge", async () => {
@@ -1611,7 +1611,7 @@ describe("loop", () => {
     assert.deepEqual(lines, ["API-1 land", "API-1 trunk-waiting api trunk"]);
     assert.equal(env.state(), "Todo");
     assert.equal(env.deliveryState().markers.some((marker) => marker.kind === "land-resume"), true);
-    assert.equal(sweepNeedsAnotherPage([result]), true);
+    assert.equal(needsNextPage([result]), true);
   });
 
   it("refuses an HTTP GitHub candidate URL before creating auth config", () => {
@@ -2919,7 +2919,7 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "heal-exhausted");
     assert.equal(result.detail, "quality-red");
-    assert.equal(sweepNeedsAnotherPage([result]), false);
+    assert.equal(needsNextPage([result]), false);
     assert.equal(prompts.some((prompt) => prompt.includes("Fix that owner")), false);
     assert.deepEqual(env.labels, ["heal-exhausted", "quality-red"]);
     let starts = 0;
