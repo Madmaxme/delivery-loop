@@ -1052,22 +1052,46 @@ describe("adapters", () => {
       assert.deepEqual(await jira.stateStore.readDeliveryState("APP-1"), skipped);
     });
   });
-  it("stores v2 snapshots in Linear and GitHub comments", async () => {
+  it("stores v2 snapshots in a Linear attachment and GitHub comments", async () => {
     const state = {
       schemaVersion: 2 as const,
-      markers: [{ kind: "LEASE", body: "active", createdAt: "2026-10-01T12:00:00.000Z" }],
+      markers: [{ kind: "delivery-lease", body: JSON.stringify({ cursorPhase: "build" }), createdAt: "2026-10-01T12:00:00.000Z" }],
       stageReceipts: [],
     };
-    let linearComment = "";
+    const legacyState = { schemaVersion: 2, markers: [], stageReceipts: [] };
+    const legacy = `<!-- delivery-loop-state:v2:${Buffer.from(JSON.stringify(legacyState)).toString("base64url")} -->`;
+    let attachment: { id: string; url: string; metadata: { deliveryState: string } } | null = null;
+    const deleted: string[] = [];
     const linear = linearTracker({
       apiKey: "k",
       team: "APP",
       intakeState: "Todo",
       fetch: async (_url, init) => {
         const body = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
-        if (body.query.includes("commentCreate")) {
-          linearComment = String(body.variables.body);
-          return jsonResponse({ data: { commentCreate: { success: true } } });
+        if (body.query.includes("attachmentCreate")) {
+          const input = body.variables.input as { url: string; metadata: { deliveryState: string }; title: string; subtitle: string };
+          assert.equal(input.title, "Delivery");
+          assert.equal(input.subtitle, "build");
+          assert.equal(input.url, "https://github.com/delivery-loop/delivery-loop#delivery-state");
+          attachment = { id: "att-1", url: input.url, metadata: input.metadata };
+          return jsonResponse({ data: { attachmentCreate: { success: true } } });
+        }
+        if (body.query.includes("attachmentUpdate")) {
+          const input = body.variables.input as { metadata: { deliveryState: string } };
+          if (!attachment) throw new Error("missing attachment");
+          attachment = { ...attachment, metadata: input.metadata };
+          return jsonResponse({ data: { attachmentUpdate: { success: true } } });
+        }
+        if (body.query.includes("commentDelete")) {
+          deleted.push(String(body.variables.id));
+          return jsonResponse({ data: { commentDelete: { success: true } } });
+        }
+        if (body.query.includes("comments(first: 100)")) {
+          return jsonResponse({ data: { issues: { nodes: [{
+            id: "linear-1",
+            comments: { nodes: attachment ? [] : [{ id: "c-legacy", body: legacy, createdAt: "2026-10-01T11:00:00.000Z" }] },
+            attachments: { nodes: attachment ? [attachment] : [] },
+          }] } } });
         }
         return jsonResponse({ data: { issues: { nodes: [{
           id: "linear-1",
@@ -1076,21 +1100,27 @@ describe("adapters", () => {
           description: "",
           state: { name: "Todo" },
           labels: { nodes: [] },
-          comments: { nodes: linearComment ? [{ body: linearComment, createdAt: "2026-10-01T12:00:00.000Z" }] : [] },
+          comments: { nodes: [] },
           attachments: { nodes: [] },
           inverseRelations: { nodes: [] },
         }] } } });
       },
     });
-    linearComment = "<!-- delivery-loop-state:v1:old-snapshot -->";
     assert.deepEqual(await linear.stateStore.readDeliveryState("APP-1"), {
       schemaVersion: 2,
       markers: [],
       stageReceipts: [],
     });
     await linear.stateStore.writeDeliveryState("APP-1", state);
-    assert.match(linearComment, /^<!-- delivery-loop-state:v2:[A-Za-z0-9_-]+ -->$/);
+    assert.deepEqual(deleted, ["c-legacy"]);
+    assert.equal(attachment?.metadata.deliveryState, JSON.stringify(state));
     assert.deepEqual(await linear.stateStore.readDeliveryState("APP-1"), state);
+    const released = {
+      ...state,
+      markers: [{ kind: "delivery-lease", body: JSON.stringify({ released: true }), createdAt: "2026-10-01T12:00:00.000Z" }],
+    };
+    await linear.stateStore.writeDeliveryState("APP-1", released);
+    assert.deepEqual(await linear.stateStore.readDeliveryState("APP-1"), released);
 
     const githubComments: { id: string; body: string; created_at: string }[] = [];
     const github = githubIssuesTracker({
