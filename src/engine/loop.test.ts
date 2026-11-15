@@ -1189,7 +1189,8 @@ describe("loop", () => {
 
     const waiting = await runTicket(env.deps, ticket());
 
-    assert.equal(waiting.outcome, "journey-missing");
+    assert.equal(waiting.outcome, "land-blocked");
+    assert.equal(needsNextPage([waiting]), true);
     assert.equal(env.state(), "Todo");
     assert.equal(starts, 2);
     const proof = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}") as { attempted: boolean };
@@ -2936,8 +2937,8 @@ describe("loop", () => {
     env.deps.runPackCommand = () => ({ status: 0, stdout: "no token\n" });
     await seedLandResume(env, false, [{ repo: "api", sha: "abc" }], audit("api", "**Journey evidence:** recorded"));
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "journey-missing");
-    assert.equal(result.detail, "recorded proof missing");
+    assert.equal(result.outcome, "land-blocked");
+    assert.equal(needsNextPage([result]), true);
     assert.equal(env.state(), "Todo");
     const note = env.comments.find((body) => body.includes("Journey command"));
     assert.ok(note);
