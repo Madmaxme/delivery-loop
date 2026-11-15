@@ -2941,7 +2941,7 @@ describe("loop", () => {
     assert.equal(env.merged(), false);
   });
 
-  it("stops a red quality check at the heal cap and does not chain another page", async () => {
+  it("keeps editing a red quality check after earlier attempts", async () => {
     const env = harness(BUILDABLE);
     const prompts: string[] = [];
     const start = env.deps.worker.start.bind(env.deps.worker);
@@ -2951,45 +2951,11 @@ describe("loop", () => {
     };
     env.deps.pack = { ...pack, heal: { caps: { "quality-red": 0 } } };
     env.deps.forge.quality = async () => ({ state: "failure", detail: "quality failure" });
-    const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "heal-exhausted");
-    assert.equal(result.detail, "quality-red");
-    assert.equal(needsNextPage([result]), false);
-    assert.equal(prompts.some((prompt) => prompt.includes("Fix that owner")), false);
-    assert.deepEqual(env.labels, ["heal-exhausted", "quality-red"]);
-    let starts = 0;
-    env.deps.worker.start = async () => {
-      starts += 1;
-      return { runId: "later" };
-    };
-    const again = await runTicket(
-      env.deps,
-      ticket({ comments: env.comments.map((body) => ({ body })), labels: ["heal-exhausted", "quality-red"] }),
-    );
-    assert.equal(again.outcome, "heal-exhausted");
-  });
-
-  it("records the heal cap when the tracker cannot create a label", async () => {
-    const env = harness(BUILDABLE);
-    env.deps.pack = { ...pack, heal: { caps: { "quality-red": 0 } } };
-    env.deps.forge.quality = async () => ({ state: "failure", detail: "quality failure" });
-    env.deps.tracker.addLabel = async () => {
-      throw new Error("not allowed to take action");
-    };
-    const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "heal-exhausted");
-    assert.equal(result.detail, "quality-red");
-    assert.equal(
-      env.deliveryState().markers.some((marker) => marker.kind === "heal-exhausted" && marker.body === "quality-red"),
-      true,
-    );
-    const again = await runTicket(env.deps, ticket());
-    assert.equal(again.outcome, "heal-exhausted");
-    assert.equal(env.labels.length, 0);
-    const notices = env.comments.filter((body) => body.startsWith("**Stopped.**"));
-    assert.equal(notices.length, 1);
-    assert.match(notices[0], /quality-red reached its heal cap/);
-    assert.match(notices[0], /Another page will not start/);
+    const result = await runTicket(env.deps, ticket({ labels: ["heal-exhausted", "quality-red"] }));
+    assert.equal(result.outcome, "land-blocked");
+    assert.match(result.detail, /procedure owner was edited/);
+    assert.equal(needsNextPage([result]), true);
+    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 1);
   });
 
   it("keeps the stage command error in the failure", () => {
