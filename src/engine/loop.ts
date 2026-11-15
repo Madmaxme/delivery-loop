@@ -68,6 +68,7 @@ import {
 import {
   exhaustedFailureType,
   failureTypeForHealKey,
+  labelWriteRefused,
   healCapFor,
   HealExhaustedError,
   HEAL_EXHAUSTED_LABEL,
@@ -844,25 +845,29 @@ export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketR
 }
 
 async function markHealExhausted(deps: LoopDeps, ticket: Ticket, type: string): Promise<void> {
-  const labels = new Set(ticket.labels.map((label) => label.toLowerCase()));
-  if (!labels.has(HEAL_EXHAUSTED_LABEL)) {
-    await deps.tracker.addLabel(ticket.identifier, HEAL_EXHAUSTED_LABEL);
-    ticket.labels = [...ticket.labels, HEAL_EXHAUSTED_LABEL];
-  }
-  if (!labels.has(type.toLowerCase())) {
-    await deps.tracker.addLabel(ticket.identifier, type);
-    ticket.labels = [...ticket.labels, type];
-  }
   if (!deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers.some((marker) => marker.kind === "heal-exhausted")) {
     await writeMarker(deps, ticket, "heal-exhausted", type);
+  }
+  const labels = new Set(ticket.labels.map((label) => label.toLowerCase()));
+  try {
+    if (!labels.has(HEAL_EXHAUSTED_LABEL)) {
+      await deps.tracker.addLabel(ticket.identifier, HEAL_EXHAUSTED_LABEL);
+      ticket.labels = [...ticket.labels, HEAL_EXHAUSTED_LABEL];
+    }
+    if (!labels.has(type.toLowerCase())) {
+      await deps.tracker.addLabel(ticket.identifier, type);
+      ticket.labels = [...ticket.labels, type];
+    }
+  } catch (error) {
+    if (!labelWriteRefused(error)) throw error;
   }
 }
 
 async function executeTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResult> {
 
   deliveryStateCache.delete(deps);
-  await readDeliveryState(deps, ticket);
-  const exhausted = exhaustedFailureType({ labels: ticket.labels });
+  const opened = await readDeliveryState(deps, ticket);
+  const exhausted = exhaustedFailureType({ labels: ticket.labels, markers: opened.markers });
   if (exhausted) {
     await markHealExhausted(deps, ticket, exhausted);
     return { identifier: ticket.identifier, outcome: "heal-exhausted", detail: exhausted };
@@ -4106,7 +4111,7 @@ async function shipOne(deps: LoopDeps, id: string, mode: "ship" | "continue"): P
   shipReleaseNotes.delete(deps);
   const ticket = await deps.tracker.get(id);
   const state = await readDeliveryState(deps, ticket);
-  const stopped = exhaustedFailureType({ labels: ticket.labels });
+  const stopped = exhaustedFailureType({ labels: ticket.labels, markers: state.markers });
   if (stopped) throw new HealExhaustedError(stopped);
   const deliveryStages = deps.pack.promotionStages.filter((stage) => stage.authorization === "deliver");
   const shipStages = shipStageList(deps);
