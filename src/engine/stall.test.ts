@@ -48,6 +48,9 @@ describe("stall", () => {
     assert.equal(exhaustedFailureType({ labels: ["heal-exhausted", "merge-conflict"] }), "merge-conflict");
     assert.equal(exhaustedFailureType({ labels: ["heal-exhausted"] }), "heal-exhausted");
     assert.equal(exhaustedFailureType({ labels: [] }), null);
+    assert.equal(exhaustedFailureType({
+      markers: [{ kind: "heal-exhausted", body: "promote-failed" }],
+    }), "promote-failed");
   });
 
 

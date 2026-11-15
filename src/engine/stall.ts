@@ -95,13 +95,24 @@ export function healCapFor(
   return DEFAULT_HEAL_CAP;
 }
 
-/** The failure type already stopped on this ticket. Null when the cap label is absent. */
+/** The failure type already stopped on this ticket. A label or the delivery-state marker is enough. */
 export function exhaustedFailureType(input: {
   labels?: readonly string[];
+  markers?: readonly { kind: string; body: string }[];
 }): HealFailureType | "heal-exhausted" | null {
   const labels = (input.labels ?? []).map((label) => label.toLowerCase());
-  if (!labels.includes(HEAL_EXHAUSTED_LABEL)) return null;
-  return HEAL_FAILURE_TYPES.find((type) => labels.includes(type)) ?? "heal-exhausted";
+  if (labels.includes(HEAL_EXHAUSTED_LABEL)) {
+    return HEAL_FAILURE_TYPES.find((type) => labels.includes(type)) ?? "heal-exhausted";
+  }
+  const body = input.markers?.find((marker) => marker.kind === "heal-exhausted")?.body.trim().toLowerCase();
+  if (!body) return null;
+  return HEAL_FAILURE_TYPES.find((type) => type === body) ?? "heal-exhausted";
+}
+
+/** Linear forbids this app from creating labels. The delivery-state marker still records the cap. */
+export function labelWriteRefused(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error);
+  return /not allowed to take action/i.test(text);
 }
 
 export class HealExhaustedError extends Error {

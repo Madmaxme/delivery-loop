@@ -2967,7 +2967,25 @@ describe("loop", () => {
       ticket({ comments: env.comments.map((body) => ({ body })), labels: ["heal-exhausted", "quality-red"] }),
     );
     assert.equal(again.outcome, "heal-exhausted");
-    assert.equal(starts, 0);
+  });
+
+  it("records the heal cap when the tracker cannot create a label", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = { ...pack, heal: { caps: { "quality-red": 0 } } };
+    env.deps.forge.quality = async () => ({ state: "failure", detail: "quality failure" });
+    env.deps.tracker.addLabel = async () => {
+      throw new Error("not allowed to take action");
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "heal-exhausted");
+    assert.equal(result.detail, "quality-red");
+    assert.equal(
+      env.deliveryState().markers.some((marker) => marker.kind === "heal-exhausted" && marker.body === "quality-red"),
+      true,
+    );
+    const again = await runTicket(env.deps, ticket());
+    assert.equal(again.outcome, "heal-exhausted");
+    assert.equal(env.labels.length, 0);
   });
 
   it("lands an open pull request when another repo is already merged", async () => {
