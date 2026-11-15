@@ -1173,7 +1173,7 @@ describe("loop", () => {
     assert.equal(env.deliveryState().markers.some((marker) => marker.kind === "proof-receipt"), false);
   });
 
-  it("treats missing proof on a resumed land as blocked, without a capture marker", async () => {
+  it("starts one capture when a resumed land still has no proof", async () => {
     const env = harness(BUILDABLE);
     env.deps.lookupHead = () => "trunk";
     env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
@@ -1185,13 +1185,114 @@ describe("loop", () => {
       starts += 1;
       return { runId: `run-${starts}` };
     };
+    env.deps.worker.join = async () => ({ status: "finished", text: "no link" });
 
     const waiting = await runTicket(env.deps, ticket());
 
     assert.equal(waiting.outcome, "journey-missing");
     assert.equal(env.state(), "Todo");
-    assert.equal(starts, 0);
-    assert.equal(env.deliveryState().markers.some((marker) => marker.kind === "proof-receipt"), false);
+    assert.equal(starts, 2);
+    const proof = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}") as { attempted: boolean };
+    assert.equal(proof.attempted, true);
+  });
+
+  it("captures missing journey proof once after land in the v2 proof-receipt marker", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const env = harness(BUILDABLE);
+    const ground = audit("api", "**Journey evidence:** recorded");
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({ status: 0, stdout: proofLinesFor(stdin).join("\n") });
+    await seedLandResume(env, false, [{ repo: "api", sha: MERGED_SHA }], ground);
+    const prompts: string[] = [];
+    let starts = 0;
+    env.deps.worker.start = async (input) => {
+      starts += 1;
+      prompts.push(input.prompt);
+      return { runId: "proof-1" };
+    };
+    env.deps.worker.join = async () => ({ status: "finished" as const, text: `Walked \`${url}\`` });
+
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), pack.status.complete);
+    assert.equal(starts, 1);
+    assert.match(prompts[0] ?? "", /api landed commit `m{40}`/);
+    assert.match(prompts[0] ?? "", /does not change code, commit, push, open a pull request, or call the tracker/);
+    const body = env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "";
+    const proof = JSON.parse(body) as { schemaVersion: number; criteriaRevision: string; landed: { repo: string; sha: string }[]; attempted: boolean; validated: boolean; receipt: string };
+    assert.equal(proof.schemaVersion, 2);
+    assert.equal(proof.criteriaRevision, ticket().criteriaRevision);
+    assert.deepEqual(proof.landed, [{ repo: "api", sha: MERGED_SHA }]);
+    assert.equal(proof.attempted, true);
+    assert.equal(proof.validated, true);
+    assert.match(proof.receipt, /https:\/\/example\.test\/artifacts\/signup\.png/);
+
+    const again = await runTicket(env.deps, ticket({ stateName: pack.status.complete }));
+    assert.equal(again.outcome, "landed");
+    assert.equal(starts, 1);
+  });
+
+  it("reuses a failed capture receipt instead of starting a second worker", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const env = harness(BUILDABLE);
+    const ground = audit("api", "**Journey evidence:** recorded");
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({ status: 0, stdout: proofLinesFor(stdin).join("\n") });
+    await seedLandResume(env, false, [{ repo: "api", sha: MERGED_SHA }], ground);
+    let starts = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "proof-1" };
+    };
+    env.deps.worker.join = async () => ({ status: "failed" as const, text: `Walked \`${url}\`` });
+
+    const first = await runTicket(env.deps, ticket());
+    assert.equal(first.outcome, "journey-missing");
+    const captured = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}") as { attempted: boolean; validated: boolean; receipt: string };
+    assert.equal(captured.attempted, true);
+    assert.equal(captured.validated, false);
+    assert.match(captured.receipt, /https:\/\/example\.test\/artifacts\/signup\.png/);
+
+    const resumed = await runTicket(env.deps, ticket());
+    assert.equal(resumed.outcome, "landed");
+    assert.equal(env.state(), pack.status.complete);
+    assert.equal(starts, 1);
+    assert.equal(JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}").validated, true);
+  });
+
+  it("keeps a running capture lease and joins its exact landed proof on resume", async () => {
+    const url = "https://example.test/artifacts/signup.png";
+    const env = harness(BUILDABLE);
+    const ground = audit("api", "**Journey evidence:** recorded");
+    env.deps.pack = { ...pack, journeyCommand: "node scripts/journey-proof.mjs" };
+    env.deps.runPackCommand = (_command, _cwd, stdin) => ({ status: 0, stdout: proofLinesFor(stdin).join("\n") });
+    await seedLandResume(env, false, [{ repo: "api", sha: MERGED_SHA }], ground);
+    let starts = 0;
+    let joins = 0;
+    env.deps.worker.start = async () => {
+      starts += 1;
+      return { runId: "proof-1" };
+    };
+    env.deps.worker.join = async () => {
+      joins += 1;
+      return joins === 1
+        ? { status: "running" as const, text: "" }
+        : { status: "finished" as const, text: `Walked \`${url}\`` };
+    };
+
+    const first = await runTicket(env.deps, ticket());
+    assert.equal(first.outcome, "worker-running");
+    assert.equal(needsNextPage([first]), true);
+    const lease = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "delivery-lease")?.body ?? "{}") as { cursorRunId?: string };
+    assert.equal(lease.cursorRunId, "proof-1");
+
+    env.deps.nowMs = Date.now() + 3 * 60 * 60 * 1000;
+    const resumed = await runTicket(env.deps, ticket());
+    assert.equal(resumed.outcome, "landed");
+    assert.equal(env.state(), pack.status.complete);
+    assert.equal(starts, 1);
+    assert.equal(joins, 2);
+    assert.equal(JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}").validated, true);
   });
   it("treats a contents 200 as the route test and a 404 as a missing file", async () => {
     const present = harness(routeGround());
