@@ -66,13 +66,8 @@ import {
   type QualitySample,
 } from "./quality-cause.js";
 import {
-  exhaustedFailureType,
   failureTypeForHealKey,
-  healExhaustedNotice,
-  labelWriteRefused,
-  healCapFor,
   HealExhaustedError,
-  HEAL_EXHAUSTED_LABEL,
   healVerdict,
   ownerHealPrompt,
   shipNoSignature,
@@ -845,35 +840,10 @@ export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketR
   }
 }
 
-async function markHealExhausted(deps: LoopDeps, ticket: Ticket, type: string, reason = ""): Promise<void> {
-  if (!deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers.some((marker) => marker.kind === "heal-exhausted")) {
-    await writeMarker(deps, ticket, "heal-exhausted", type);
-    await deps.tracker.comment(ticket.identifier, healExhaustedNotice(type, reason));
-  }
-  const labels = new Set(ticket.labels.map((label) => label.toLowerCase()));
-  try {
-    if (!labels.has(HEAL_EXHAUSTED_LABEL)) {
-      await deps.tracker.addLabel(ticket.identifier, HEAL_EXHAUSTED_LABEL);
-      ticket.labels = [...ticket.labels, HEAL_EXHAUSTED_LABEL];
-    }
-    if (!labels.has(type.toLowerCase())) {
-      await deps.tracker.addLabel(ticket.identifier, type);
-      ticket.labels = [...ticket.labels, type];
-    }
-  } catch (error) {
-    if (!labelWriteRefused(error)) throw error;
-  }
-}
-
 async function executeTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketResult> {
 
   deliveryStateCache.delete(deps);
-  const opened = await readDeliveryState(deps, ticket);
-  const exhausted = exhaustedFailureType({ labels: ticket.labels, markers: opened.markers });
-  if (exhausted) {
-    await markHealExhausted(deps, ticket, exhausted);
-    return { identifier: ticket.identifier, outcome: "heal-exhausted", detail: exhausted };
-  }
+  await readDeliveryState(deps, ticket);
   const now = deps.nowMs ?? Date.now();
   const remaining = pageBudgetRemainingMs({
     nowMs: now,
@@ -3230,19 +3200,6 @@ async function applyOwnerHeal(
 ): Promise<HealVerdict> {
   if (healAlready(deps, ticket, key)) return "wait";
   const type = failureTypeForHealKey(key);
-  const markerBodies = deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers.filter((marker) => marker.kind === "owner-heal").map((marker) => marker.body) ?? [];
-  const ownerHealCount = markerBodies.filter((body) => {
-    try {
-      const parsed: unknown = JSON.parse(body);
-      return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && "type" in parsed && parsed.type === type;
-    } catch {
-      return false;
-    }
-  }).length;
-  if (ownerHealCount >= healCapFor(deps.pack.heal, type)) {
-    await markHealExhausted(deps, ticket, type, reason);
-    throw new HealExhaustedError(type);
-  }
   const home = agentHome(deps.pack);
   const prompt = ownerHealPrompt({
     reason,
@@ -4119,8 +4076,6 @@ async function shipOne(deps: LoopDeps, id: string, mode: "ship" | "continue"): P
   shipReleaseNotes.delete(deps);
   const ticket = await deps.tracker.get(id);
   const state = await readDeliveryState(deps, ticket);
-  const stopped = exhaustedFailureType({ labels: ticket.labels, markers: state.markers });
-  if (stopped) throw new HealExhaustedError(stopped);
   const deliveryStages = deps.pack.promotionStages.filter((stage) => stage.authorization === "deliver");
   const shipStages = shipStageList(deps);
   const texts = resumeProofTexts(deps, ticket);
