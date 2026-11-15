@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { DEFAULT_JOURNEY_SPEC, matchesJourneySpec } from "../../scripts/journey-proof.mjs";
+import { DEFAULT_JOURNEY_SPEC, matchesJourneySpec, proofLinesFor } from "../../scripts/journey-proof.mjs";
 import { interpretMintOutput, runMintCommand } from "../adapters/github-mint.ts";
 import { assertReferencedCredentials, stageAskpassEnv, stageGitPassword } from "./credentials.ts";
 import { noteMint } from "./credential-log.ts";
@@ -2625,6 +2625,38 @@ async function judgeStructuredJourney(
   return { ok: true };
 }
 
+/** One pack repo named on the line. Two names stay unresolved. */
+function soleRepoOnLine(line: string, repos: ReadonlySet<string>): string | null {
+  const found: string[] = [];
+  for (const name of repos) {
+    if (new RegExp(`(?:^|[^A-Za-z0-9_-])${name}(?=$|[^A-Za-z0-9_-])`).test(line)) found.push(name);
+  }
+  return found.length === 1 ? found[0] : null;
+}
+
+/**
+ * A journey path whose first segment is not a pack repo is that repo when the
+ * same line names exactly one. The journey command drops `test/e2e/...` on a
+ * customer-web line. This keeps the route test.
+ */
+function qualifyBareJourneyProof(text: string, deps: LoopDeps): string {
+  const repos = new Set(deps.pack.repos.map((repo) => repo.name));
+  const spec = deps.pack.journeySpec;
+  const extra: string[] = [];
+  for (const line of proofLinesFor(text, spec)) {
+    const token = line.match(/`([^`]+)`/)?.[1]?.trim() ?? "";
+    const slash = token.indexOf("/");
+    if (slash <= 0 || repos.has(token.slice(0, slash))) continue;
+    const at = text.indexOf(`\`${token}\``);
+    const start = at < 0 ? 0 : text.lastIndexOf("\n", at) + 1;
+    const end = at < 0 ? -1 : text.indexOf("\n", at);
+    const owner = soleRepoOnLine(text.slice(start, end === -1 ? text.length : end), repos);
+    if (!owner || !matchesJourneySpec(token, spec)) continue;
+    extra.push(`**Journey proof:** \`${owner}/${token}\``);
+  }
+  return extra.length > 0 ? `${text}\n${extra.join("\n")}` : text;
+}
+
 async function applyRecordedProof(
   deps: LoopDeps,
   ticket: Ticket,
@@ -2663,6 +2695,17 @@ async function applyRecordedProof(
     return { ok: true, recorded: true, proofReceipt: printed.stdout.trim() };
   }
   if (!printed.ok) {
+    const qualified = qualifyBareJourneyProof(evidence, deps);
+    if (qualified !== evidence) {
+      const qualifiedFiles = await journeyFileLookup(deps, `${qualified}\n${existing ?? ""}`, rows);
+      if (
+        proofSatisfies(deps, qualified, receipt, qualifiedFiles.onMerge) ||
+        proofSatisfies(deps, qualified, receipt, qualifiedFiles.onTargets)
+      ) {
+        noteEngine(deps, "proof ok");
+        return { ok: true, recorded: true, proofReceipt: qualified };
+      }
+    }
     await deps.tracker.comment(ticket.identifier, journeyTokenMissing(deps, ticket.identifier, printed));
     const missing: TicketResult = {
       identifier: ticket.identifier,

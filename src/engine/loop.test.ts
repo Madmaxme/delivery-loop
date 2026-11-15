@@ -2882,6 +2882,31 @@ describe("loop", () => {
     assert.equal(env.state(), pack.status.complete);
   });
 
+  it("accepts a bare journey path on the repo named in that line when the command prints nothing", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "development";
+    env.deps.pack = {
+      ...pack,
+      repos: [
+        { name: "api", url: "https://github.com/acme/api", trunk: "development" },
+        { name: "customer-web", url: "https://github.com/acme/customer-web", trunk: "development" },
+      ],
+      journeyCommand: "node scripts/journey-proof.mjs",
+      journeySpec: "{e2e,integration_test,journey,test/e2e}/**",
+    };
+    env.deps.runPackCommand = () => ({ status: 0, stdout: "" });
+    env.deps.journeyFileAt = ({ repo, ref, path }) =>
+      repo === "customer-web" && ref === "development" && path === "test/e2e/storefront-calendar.spec.ts";
+    const ground = audit(
+      "api",
+      "**Journey evidence:** recorded\nProof is a route test on the landed customer-web commit at `test/e2e/storefront-calendar.spec.ts`.",
+    );
+    await seedLandResume(env, false, [{ repo: "api", sha: "abc" }], ground);
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), pack.status.complete);
+  });
+
   it("reuses recorded proof that already matches the completion target", async () => {
     const env = harness(BUILDABLE);
     env.deps.lookupHead = () => "main-tip";
