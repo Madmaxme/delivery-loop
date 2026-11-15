@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parse } from "yaml";
 
+import { isDurableRecordingUrl } from "./recording-url.mjs";
+
 /**
  * Journey specs live under this pattern when the pack omits `journeySpec`.
  * A path outside the pattern is not journey proof.
@@ -74,8 +76,6 @@ export function matchesJourneySpec(path, pattern = DEFAULT_JOURNEY_SPEC) {
 }
 
 const ROUTE_SUFFIX = /(?:_test\.dart|\.test\.tsx?|\.spec\.tsx?|\.test\.js|\.spec\.js)$/;
-const RECORDING = /^https:\/\/\S+$/i;
-const RECORDING_SHAPE = /\.(?:png|jpe?g|webp|gif|mp4|webm|mov)(?:[?#]\S*)?$|\/artifacts\//i;
 
 /**
  * Spans inside one backtick. A fence of three or more backticks is a
@@ -117,7 +117,7 @@ export function proofLinesFor(text, pattern = DEFAULT_JOURNEY_SPEC) {
   for (const raw of backtickTokens(text)) {
     const token = raw.trim();
     if (!token || seen.has(token)) continue;
-    if (RECORDING.test(token) && RECORDING_SHAPE.test(token)) {
+    if (isDurableRecordingUrl(token)) {
       seen.add(token);
       lines.push(`**Journey proof:** \`${token}\``);
       continue;

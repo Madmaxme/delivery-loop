@@ -36,6 +36,14 @@ describe("journey proof", () => {
       "```",
     ].join("\n");
     assert.deepEqual(proofLinesFor(text), [`**Journey proof:** \`${url}\``]);
+    assert.deepEqual(
+      proofLinesFor("`https://us.posthog.com/embedded/Bi48yMpp9pFCZJMmGe_h3-gMDwlBrQ`"),
+      ["**Journey proof:** `https://us.posthog.com/embedded/Bi48yMpp9pFCZJMmGe_h3-gMDwlBrQ`"],
+    );
+    assert.deepEqual(
+      proofLinesFor("`https://cloud-agent-artifacts.s3.us-east-1.amazonaws.com/screenshot.png?X-Amz-Expires=900`"),
+      [],
+    );
   });
 
   it("prints a journey spec and leaves an api unit spec out", () => {
