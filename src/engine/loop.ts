@@ -68,6 +68,7 @@ import {
 import {
   exhaustedFailureType,
   failureTypeForHealKey,
+  healExhaustedNotice,
   labelWriteRefused,
   healCapFor,
   HealExhaustedError,
@@ -844,9 +845,10 @@ export async function runTicket(deps: LoopDeps, ticket: Ticket): Promise<TicketR
   }
 }
 
-async function markHealExhausted(deps: LoopDeps, ticket: Ticket, type: string): Promise<void> {
+async function markHealExhausted(deps: LoopDeps, ticket: Ticket, type: string, reason = ""): Promise<void> {
   if (!deliveryStateCache.get(deps)?.get(ticket.identifier)?.markers.some((marker) => marker.kind === "heal-exhausted")) {
     await writeMarker(deps, ticket, "heal-exhausted", type);
+    await deps.tracker.comment(ticket.identifier, healExhaustedNotice(type, reason));
   }
   const labels = new Set(ticket.labels.map((label) => label.toLowerCase()));
   try {
@@ -3232,7 +3234,7 @@ async function applyOwnerHeal(
     }
   }).length;
   if (ownerHealCount >= healCapFor(deps.pack.heal, type)) {
-    await markHealExhausted(deps, ticket, type);
+    await markHealExhausted(deps, ticket, type, reason);
     throw new HealExhaustedError(type);
   }
   const home = agentHome(deps.pack);
