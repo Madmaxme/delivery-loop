@@ -2860,14 +2860,13 @@ async function settleTrunk(
     const extra = captured.status === "text" ? captured.text : "";
     if (extra.trim()) {
       await rememberJourneyReceipt(deps, ticket, extra);
-      const again = await applyRecordedProof(
+      gate = await applyRecordedProof(
         deps,
         ticket,
         rows,
         declared,
         [receipt, extra].filter((part) => part.trim()).join("\n"),
       );
-      if (again.ok) gate = again;
     }
   }
   if (!gate.ok) return gate.result;
@@ -3851,7 +3850,8 @@ export function needsNextPage(results: TicketResult[]): boolean {
       result.outcome === "land-blocked" ||
       result.outcome === "ship-blocked" ||
       result.outcome === "skipped-page" ||
-      result.outcome === "worker-running",
+      result.outcome === "worker-running" ||
+      result.outcome === "journey-missing",
   );
 }
 
