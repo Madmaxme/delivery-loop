@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { matchesJourneySpec } from "../../scripts/journey-proof.mjs";
+import { isDurableRecordingUrl } from "../../scripts/recording-url.mjs";
 import type { InvariantHeading } from "../schema/pack.ts";
 
 export const VERDICTS = [
@@ -306,8 +307,6 @@ export function journeyEvidenceBlocksBuild(text: string): "missing" | "blocked" 
   return null;
 }
 
-const RECORDING_PROOF_RE = /^https:\/\/\S+$/i;
-const RECORDING_SHAPE_RE = /\.(?:png|jpe?g|webp|gif|mp4|webm|mov)(?:[?#]\S*)?$|\/artifacts\//i;
 const ROUTE_TEST_PROOF_RE =
   /^([^/\s]+)\/(\S*(?:_test\.dart|\.test\.tsx?|\.spec\.tsx?|\.test\.js|\.spec\.js))$/;
 
@@ -356,7 +355,7 @@ export function parseJourneyProofs(text: string, journeySpec?: string): JourneyP
   for (const match of text.matchAll(/\*\*Journey proof:\*\*\s*(.+)/gi)) {
     const tokens = [...match[1].matchAll(/`([^`]+)`/g)].map((item) => item[1].trim());
     for (const token of tokens) {
-      if (RECORDING_PROOF_RE.test(token) && RECORDING_SHAPE_RE.test(token)) {
+      if (isDurableRecordingUrl(token)) {
         proofs.push({ kind: "recording", url: token });
         continue;
       }

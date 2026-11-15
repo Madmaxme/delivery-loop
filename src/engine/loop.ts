@@ -485,7 +485,7 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "**Evidence:** not-applicable means nothing is already wrong. not-applicable is unfinished when a live system was read. A cited query without a killed alternative stays in intake.",
     "Every BUILDABLE handoff includes **Journey evidence:** recorded | not-applicable | blocked.",
     "not-applicable means the done-state is not a journey a person walks.",
-    `recorded means the done-state includes journey proof. Web proof is an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. The build handoff includes that raw URL in backticks and omits the **Journey proof:** prefix; the configured journey command prints the prefix. Mobile proof is **Journey proof:** a route test on the exact landed commit, \`repo/path_test.dart\` or \`repo/path.test.ts\`, whose path matches \`${deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC}\`. A sentence that names no token is not proof. A spec outside that pattern stays in intake. If the route test is not on the landed commit, the engine checks configured delivery-stage refs (or the repo trunk when refs are not configured); promotion receipts remain bound to the exact landed SHAs and criteria revision.`,
+    `recorded means the done-state includes journey proof. Web proof is an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. The build handoff includes that raw URL in backticks and omits the **Journey proof:** prefix; the configured journey command prints the prefix. Mobile proof is **Journey proof:** a route test on the exact landed commit, \`repo/path_test.dart\` or \`repo/path.test.ts\`, whose path matches \`${deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC}\`. A sentence that names no token is not proof. A PostHog replay or embedded link on posthog.com counts. A presigned link that expires does not. A spec outside that pattern stays in intake. If the route test is not on the landed commit, the engine checks configured delivery-stage refs (or the repo trunk when refs are not configured); promotion receipts remain bound to the exact landed SHAs and criteria revision.`,
     "blocked means that proof cannot be produced in this run. A missing line or blocked stays in intake and does not mark the ticket complete.",
     `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
     landRepoLine(deps.pack),
@@ -532,7 +532,7 @@ function buildPrompt(
       ? `Push these branches from each repo trunk: ${branches.join(", ")}. Include repo and branch in the handoff. Do not merge.`
       : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
     "Stay inside the allowlist. Run the validation commands.",
-    "When the handoff says **Journey evidence:** recorded, capture that journey on the running build and publish its evidence. A web journey is a screenshot or a short video of the done state with an https URL ending in png, jpg, jpeg, webp, gif, mp4, webm, or mov, or containing /artifacts/. Put that raw URL in backticks in BUILD_HANDOFF and omit only the **Journey proof:** prefix; the journey command prints that prefix. A mobile token is the route test on the exact landed commit whose path matches the journey-spec pattern. Use a non-mutating view or test data. The runner does not mark delivery complete without the required proof.",
+    "When the handoff says **Journey evidence:** recorded, this build walk is the proof. Use the computer on this agent. Open the running build that contains this change. A web journey publishes one durable https URL: a screenshot or a short video of the done state ending in png, jpg, jpeg, webp, gif, mp4, webm, or mov, a URL whose path contains /artifacts/, or a PostHog replay or embedded link on posthog.com. Put that raw URL in backticks in BUILD_HANDOFF and omit only the **Journey proof:** prefix; the journey command prints that prefix. A presigned link that expires is not proof. A sentence that names no URL is not proof. A mobile token is the route test on the exact landed commit whose path matches the journey-spec pattern. Use a non-mutating view or test data. The runner does not mark delivery complete without that proof, and it does not start a second worker to invent it.",
     retry,
   ].filter((part) => part.length > 0).join("\n\n");
 }
@@ -1401,18 +1401,6 @@ function publishedProofReceipt(deps: LoopDeps, ticket: Ticket): string | null {
   return proof?.validated ? proof.receipt : null;
 }
 
-
-async function writeJourneyProofAttempt(deps: LoopDeps, ticket: Ticket, landed: JourneyCommit[]): Promise<void> {
-  await writeMarker(deps, ticket, "proof-receipt", JSON.stringify({
-    schemaVersion: 2,
-    criteriaRevision: ticket.criteriaRevision,
-    landed,
-    pullRequests: [],
-    attempted: true,
-    validated: false,
-    receipt: "",
-  } satisfies JourneyProofReceipt));
-}
 
 async function rememberJourneyReceipt(deps: LoopDeps, ticket: Ticket, receipt: string): Promise<void> {
   const saved = receipt.trim();
@@ -2712,12 +2700,7 @@ async function applyRecordedProof(
       outcome: "journey-missing",
       detail: "recorded proof missing",
     };
-    const saved = journeyProofReceiptState(deps, ticket);
-    if (saved?.receipt.trim()) {
-      return { ok: false, result: await healUnparsedJourneyProof(deps, ticket, missing, printed) };
-    }
-    await healUnprovenJourney(deps, ticket, printed);
-    return { ok: false, result: missing };
+    return { ok: false, result: await healUnparsedJourneyProof(deps, ticket, missing, printed) };
   }
   const combined = [receipt, printed.stdout].filter((part) => part.trim()).join("\n");
   const proofReceipt = combined.trim() ? combined : declared;
@@ -2754,20 +2737,6 @@ async function healMissingJourney(deps: LoopDeps, ticket: Ticket, evidence: stri
   await applyOwnerHeal(deps, ticket, "heal:journey:missing", reason);
 }
 
-/** A recorded attempt at these landed SHAs, with no proof from the journey command, goes to heal. */
-async function healUnprovenJourney(deps: LoopDeps, ticket: Ticket, printed: Extract<JourneyCommandPrint, { ok: false }>): Promise<void> {
-  const proof = journeyProofReceiptState(deps, ticket);
-  if (!proof?.attempted) return;
-  const output = journeyCommandOutput(printed);
-  const reason = [
-    "A proof was recorded but the journey command returned none.",
-    `Command output: ${output || "(none)"}`,
-    `Receipt reference: ${proof.receipt.trim() || "(none)"}`,
-  ].join("\n");
-  const signature = shipNoSignature(reason) || "journey command returned none";
-  await applyOwnerHeal(deps, ticket, `heal:proof:${signature}`, reason);
-}
-
 async function publishCompletionProof(
   deps: LoopDeps,
   ticket: Ticket,
@@ -2780,63 +2749,6 @@ async function publishCompletionProof(
 }
 
 
-function proofPrompt(
-  ticket: Ticket,
-  declared: string,
-  rows: { repo: RepoSpec; sha: string }[],
-): string {
-  const landed = rows.map((row) => `${row.repo.name} landed commit \`${row.sha}\``).join("\n");
-  return [
-    universalConduct(),
-    `Capture journey proof for ${ticket.identifier}. The pull requests are already merged.`,
-    "The worker captures and publishes the journey proof; it does not change code, commit, push, open a pull request, or call the tracker.",
-    "Capture the journey on the running build for these exact landed commits. A web journey is a screenshot or short video of the done state. Publish an https URL ending in png, jpg, jpeg, webp, gif, mp4, webm, or mov, or containing /artifacts/. Put that raw URL in backticks in BUILD_HANDOFF and omit only the **Journey proof:** prefix. The journey command prints that prefix.",
-    "Use a non-mutating view or test data.",
-    landed,
-    declared,
-  ].filter((part) => part.trim().length > 0).join("\n\n");
-}
-
-async function runProofWorker(
-  deps: LoopDeps,
-  ticket: Ticket,
-  declared: string,
-  rows: { repo: RepoSpec; sha: string }[],
-): Promise<{ status: "text"; text: string } | { status: "running"; detail: string } | { status: "empty" }> {
-  const home = rows[0];
-  if (!home) return { status: "empty" };
-  let started: { runId: string };
-  try {
-    started = await deps.worker.start({
-      prompt: proofPrompt(ticket, declared, rows),
-      repoUrl: home.repo.url,
-      baseRef: home.sha,
-    });
-  } catch {
-    return { status: "empty" };
-  }
-  try {
-    await noteLiveRun(deps, ticket, "build", started.runId);
-  } catch {
-    return { status: "empty" };
-  }
-  let built: { status: string; text?: string };
-  try {
-    built = await deps.worker.join(started.runId);
-  } catch (error) {
-    const text = error instanceof Error ? error.message : "";
-    if (text.trim()) await rememberJourneyReceipt(deps, ticket, text);
-    return { status: "empty" };
-  }
-  const text = built.text ?? "";
-  if (built.status === "failed") {
-    if (text.trim()) await rememberJourneyReceipt(deps, ticket, text);
-    return { status: "empty" };
-  }
-  if (built.status === "running") return { status: "running", detail: `cursor_run=${started.runId}` };
-  return { status: "text", text };
-}
-
 async function settleTrunk(
   deps: LoopDeps,
   ticket: Ticket,
@@ -2845,7 +2757,6 @@ async function settleTrunk(
   doneDetail: string,
   declared = "",
   receipt = "",
-  proofWorker = false,
 ): Promise<TicketResult> {
   const candidates = rows.map((row) => ({ repo: row.repo.name, sha: row.sha }));
   await writeMarker(deps, ticket, "landed-commits", JSON.stringify(candidates));
@@ -2891,26 +2802,7 @@ async function settleTrunk(
     }
     return { identifier: ticket.identifier, outcome: "blocked", detail: stages.reason };
   }
-  let gate = await applyRecordedProof(deps, ticket, rows, declared, receipt);
-  if (!gate.ok && proofWorker && !journeyProofReceiptState(deps, ticket)?.attempted) {
-    const landed = rows.map((row) => ({ repo: row.repo.name, sha: row.sha }));
-    await writeJourneyProofAttempt(deps, ticket, landed);
-    const captured = await runProofWorker(deps, ticket, declared, rows);
-    if (captured.status === "running") {
-      return { identifier: ticket.identifier, outcome: "worker-running", detail: captured.detail };
-    }
-    const extra = captured.status === "text" ? captured.text : "";
-    if (extra.trim()) {
-      await rememberJourneyReceipt(deps, ticket, extra);
-      gate = await applyRecordedProof(
-        deps,
-        ticket,
-        rows,
-        declared,
-        [receipt, extra].filter((part) => part.trim()).join("\n"),
-      );
-    }
-  }
+  const gate = await applyRecordedProof(deps, ticket, rows, declared, receipt);
   if (!gate.ok) return gate.result;
   if (!hold) {
     await publishCompletionProof(deps, ticket, gate.recorded, gate.proofReceipt, rows.map((row) => ({ repo: row.repo.name, sha: row.sha, url: row.url })));
@@ -3128,7 +3020,6 @@ async function finishMerged(
   merged: MergedHead[],
   declared: string,
   receipt: string,
-  proofWorker = false,
 ): Promise<TicketResult> {
   return settleTrunk(
     deps,
@@ -3138,7 +3029,6 @@ async function finishMerged(
     merged.map((row) => row.url).join(" "),
     declared,
     receipt,
-    proofWorker,
   );
 }
 
@@ -3258,13 +3148,13 @@ async function resumeExistingPulls(deps: LoopDeps, ticket: Ticket): Promise<Tick
     if ("outcome" in landed) return landed;
     merged.push({ repo: pr.repo, sha: landed.mergedSha, url: pr.url });
   }
-  return finishMerged(deps, ticket, grant === "open", merged, texts.declared, texts.receipt, true);
+  return finishMerged(deps, ticket, grant === "open", merged, texts.declared, texts.receipt);
 }
 
 /**
  * A previous land already merged, or already saw there was nothing to merge.
  * Re-check that fact. A coding worker does not start while the recorded commit
- * is unchanged. Missing recorded proof starts one capture worker for that commit.
+ * is unchanged. Missing recorded proof heals that step. A second worker is not started.
  */
 async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket, body: string | null): Promise<TicketResult | null> {
   const marker = parseLandResume(body);
@@ -3291,7 +3181,6 @@ async function resumeMarkedLand(deps: LoopDeps, ticket: Ticket, body: string | n
     "landed commits unchanged",
     marker.declared || texts.declared,
     marker.receipt || texts.receipt,
-    true,
   );
 }
 

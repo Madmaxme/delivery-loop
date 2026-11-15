@@ -107,6 +107,13 @@ describe("journey evidence", () => {
       { kind: "recording", url: "https://example.test/artifacts/signup.mp4" },
       { kind: "route-test", repo: "api", path: "integration_test/signup_route_test.dart" },
     ]);
+    assert.deepEqual(parseJourneyProofs("**Journey proof:** `https://us.posthog.com/project/456367/replay/0190abcd`"), [
+      { kind: "recording", url: "https://us.posthog.com/project/456367/replay/0190abcd" },
+    ]);
+    assert.deepEqual(
+      parseJourneyProofs("**Journey proof:** `https://cloud-agent-artifacts.s3.us-east-1.amazonaws.com/screenshot.png?X-Amz-Expires=900`"),
+      [],
+    );
   });
 
   it("accepts not-applicable and a receipt that contains the recording", () => {
