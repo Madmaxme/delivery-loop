@@ -2472,8 +2472,7 @@ async function journeyFileLookup(
   for (const proof of proofs) {
     if (proof.kind !== "route-test") continue;
     const row = rows.find((item) => item.repo.name === proof.repo);
-    if (!row) continue;
-    await load(proof.repo, row.sha, proof.path);
+    if (row) await load(proof.repo, row.sha, proof.path);
     for (const ref of promotionRefs(deps, proof.repo)) await load(proof.repo, ref, proof.path);
   }
   const onMerge = (repo: string, path: string) => {
