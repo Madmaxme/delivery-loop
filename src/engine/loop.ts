@@ -1865,6 +1865,12 @@ function stageReceiptPasses(
   }
 }
 
+export function stageCommandFailure(command: string, status: number | null, output: string): string {
+  const detail = output.split("\n").map((line) => line.trim()).filter(Boolean).pop()?.replace(/\s+/g, " ").slice(0, 400) ?? "";
+  const exit = `${command} exited ${status ?? "unknown"}`;
+  return detail ? `${exit}: ${detail}` : exit;
+}
+
 async function runStageCommand(
   deps: LoopDeps,
   command: string,
@@ -1888,7 +1894,7 @@ async function runStageCommand(
     if (result.timedOut) return { stdout: result.stdout, failed: null, timedOut: true, outcome };
     return result.status === 0
       ? { stdout: result.stdout, failed: null, timedOut: false, outcome }
-      : { stdout: result.stdout, failed: `${command} exited ${result.status ?? "unknown"}`, timedOut: false, outcome };
+      : { stdout: result.stdout, failed: stageCommandFailure(command, result.status, result.output ?? ""), timedOut: false, outcome };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (message.includes("DELIVERY_LOOP_GITHUB_MINT")) throw error;

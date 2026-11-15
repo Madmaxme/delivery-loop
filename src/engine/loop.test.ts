@@ -10,7 +10,7 @@ import type { ProjectPack, PromotionStage } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
 import { proofLinesFor } from "../../scripts/journey-proof.mjs";
 import { gitAskpassPath } from "./credentials.ts";
-import { auditEligibility, candidateFetchEnvironment, ciFixLimit, deliver, deliveryExitCode, formatTicketProgress, repoCheckoutDir, runTicket, ship, shipSweep, sortByPack, sweep, needsNextPage, type LoopDeps, type StageVerifyInput } from "./loop.ts";
+import { auditEligibility, candidateFetchEnvironment, ciFixLimit, deliver, deliveryExitCode, formatTicketProgress, repoCheckoutDir, runTicket, ship, shipSweep, sortByPack, sweep, needsNextPage, stageCommandFailure, type LoopDeps, type StageVerifyInput } from "./loop.ts";
 import { classifyQualityCause } from "./quality-cause.ts";
 
 const pack: ProjectPack = {
@@ -2990,6 +2990,13 @@ describe("loop", () => {
     assert.equal(notices.length, 1);
     assert.match(notices[0], /quality-red reached its heal cap/);
     assert.match(notices[0], /Another page will not start/);
+  });
+
+  it("keeps the stage command error in the failure", () => {
+    assert.equal(
+      stageCommandFailure("promote", 1, "\napi development does not contain abc\n"),
+      "promote exited 1: api development does not contain abc",
+    );
   });
 
   it("lands an open pull request when another repo is already merged", async () => {
