@@ -2986,6 +2986,10 @@ describe("loop", () => {
     const again = await runTicket(env.deps, ticket());
     assert.equal(again.outcome, "heal-exhausted");
     assert.equal(env.labels.length, 0);
+    const notices = env.comments.filter((body) => body.startsWith("**Stopped.**"));
+    assert.equal(notices.length, 1);
+    assert.match(notices[0], /quality-red reached its heal cap/);
+    assert.match(notices[0], /Another page will not start/);
   });
 
   it("lands an open pull request when another repo is already merged", async () => {

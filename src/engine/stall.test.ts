@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import {
   DEFAULT_HEAL_CAP,
   exhaustedFailureType,
+  healExhaustedNotice,
   failureTypeForHealKey,
   healCapFor,
   healVerdict,
@@ -51,6 +52,13 @@ describe("stall", () => {
     assert.equal(exhaustedFailureType({
       markers: [{ kind: "heal-exhausted", body: "promote-failed" }],
     }), "promote-failed");
+    assert.equal(
+      healExhaustedNotice(
+        "promote-failed",
+        "qws-gha-workspace cannot read qws/verify/development. Terraform change for infra (not applied): diff",
+      ),
+      "**Stopped.** promote-failed reached its heal cap. qws-gha-workspace cannot read qws/verify/development. Another page will not start.",
+    );
   });
 
 

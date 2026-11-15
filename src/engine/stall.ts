@@ -109,6 +109,14 @@ export function exhaustedFailureType(input: {
   return HEAL_FAILURE_TYPES.find((type) => type === body) ?? "heal-exhausted";
 }
 
+/** One Linear comment. The first sentence of the reason, without a pasted diff. */
+export function healExhaustedNotice(type: string, reason: string): string {
+  const compact = reason.replace(/\s+/g, " ").trim();
+  const cut = compact.split(" Terraform change for infra")[0]?.trim() ?? "";
+  const why = cut.slice(0, 400);
+  return `**Stopped.** ${type} reached its heal cap.${why ? ` ${why}` : ""} Another page will not start.`;
+}
+
 /** Linear forbids this app from creating labels. The delivery-state marker still records the cap. */
 export function labelWriteRefused(error: unknown): boolean {
   const text = error instanceof Error ? error.message : String(error);
