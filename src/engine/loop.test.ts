@@ -2858,6 +2858,30 @@ describe("loop", () => {
     assert.match(proof.receipt, /api\/e2e\/signup\.spec\.ts/);
   });
 
+  it("counts a route test on another repo trunk when that repo is not in the landed rows", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.lookupHead = () => "development";
+    env.deps.pack = {
+      ...pack,
+      repos: [
+        { name: "api", url: "https://github.com/acme/api", trunk: "development" },
+        { name: "customer-web", url: "https://github.com/acme/customer-web", trunk: "development" },
+      ],
+      journeyCommand: "node scripts/journey-proof.mjs",
+      journeySpec: "{e2e,integration_test,journey,test/e2e}/**",
+    };
+    env.deps.runPackCommand = () => ({
+      status: 0,
+      stdout: "**Journey proof:** `customer-web/test/e2e/storefront-calendar.spec.ts`\n",
+    });
+    env.deps.journeyFileAt = ({ repo, ref, path }) =>
+      repo === "customer-web" && ref === "development" && path === "test/e2e/storefront-calendar.spec.ts";
+    await seedLandResume(env, false, [{ repo: "api", sha: "abc" }], audit("api", "**Journey evidence:** recorded"));
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), pack.status.complete);
+  });
+
   it("reuses recorded proof that already matches the completion target", async () => {
     const env = harness(BUILDABLE);
     env.deps.lookupHead = () => "main-tip";
