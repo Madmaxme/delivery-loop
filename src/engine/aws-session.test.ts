@@ -3,8 +3,11 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import {
+  assumeRoleInput,
   awsRoleForRefresh,
   ensureAwsSession,
+  githubOidcRequest,
+  readGithubOidcToken,
   resetAwsRoleMemory,
   roleArnFromAssumedArn,
   type AwsRunner,
@@ -70,6 +73,12 @@ describe("aws session", () => {
       seen.push({ args, hadOldSession: child.AWS_SESSION_TOKEN === "old-session" });
       if (args[1] === "get-caller-identity") throw expired;
       assert.equal(args[1], "assume-role-with-web-identity");
+      assert.equal(args.includes("--web-identity-token"), false);
+      assert.equal(args.includes("oidc-jwt"), false);
+      const inputArg = args[args.indexOf("--cli-input-json") + 1] ?? "";
+      assert.equal(inputArg.startsWith("file://"), true);
+      const input = JSON.parse(readFileSync(inputArg.slice("file://".length), "utf8")) as { WebIdentityToken?: string };
+      assert.equal(input.WebIdentityToken, "oidc-jwt");
       assert.equal(child.AWS_ACCESS_KEY_ID, undefined);
       assert.equal(child.AWS_SESSION_TOKEN, undefined);
       assert.equal(child.AWS_REGION, "us-east-1");
@@ -109,7 +118,9 @@ describe("aws session", () => {
     await ensureAwsSession(later, {
       run(args) {
         if (args[1] === "get-caller-identity") throw expired;
-        assert.equal(args[3], "arn:aws:iam::123456789012:role/qws-gha-workspace");
+        const inputArg = args[args.indexOf("--cli-input-json") + 1] ?? "";
+        const input = JSON.parse(readFileSync(inputArg.slice("file://".length), "utf8")) as { RoleArn?: string };
+        assert.equal(input.RoleArn, "arn:aws:iam::123456789012:role/qws-gha-workspace");
         return JSON.stringify({
           Credentials: { AccessKeyId: "ASIANEW", SecretAccessKey: "new-secret", SessionToken: "new-session" },
         });
@@ -174,6 +185,37 @@ describe("aws session", () => {
       },
     });
     assert.equal(calls, 0);
+  });
+
+  it("asks the OIDC provider the way the Actions client does", async () => {
+    const request = githubOidcRequest("https://oidc.example/token?api-version=2.0", "request-token");
+    assert.equal(request.headers.Authorization, "Bearer request-token");
+    assert.equal(request.headers["User-Agent"], "actions/oidc-client");
+    assert.equal(request.headers.Accept, "application/json");
+    const url = new URL(request.url);
+    assert.equal(url.searchParams.get("api-version"), "2.0");
+    assert.equal(url.searchParams.get("audience"), "sts.amazonaws.com");
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ value: "header.payload.sig" }), { status: 200 });
+    try {
+      assert.equal(await readGithubOidcToken({
+        ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc.example/token?api-version=2.0",
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: "request-token",
+      }), "header.payload.sig");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("puts the web identity token in the CLI input and not on the command line", () => {
+    const input = JSON.parse(assumeRoleInput("arn:aws:iam::123456789012:role/qws-gha-workspace", "header.payload.sig")) as {
+      RoleArn: string;
+      RoleSessionName: string;
+      WebIdentityToken: string;
+    };
+    assert.equal(input.RoleArn, "arn:aws:iam::123456789012:role/qws-gha-workspace");
+    assert.equal(input.RoleSessionName, "delivery-loop");
+    assert.equal(input.WebIdentityToken, "header.payload.sig");
   });
 
   it("renews the session before a stage command copies it", () => {
