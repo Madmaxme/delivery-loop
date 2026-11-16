@@ -64,6 +64,10 @@ describe("ported policy", () => {
     assert.equal(waiting.ready, false);
     const pack = { status: { intake: "Todo", complete: "Delivery Complete", shipped: "Shipped", hold: "Waiting" } } as ProjectPack;
     assert.equal(holdStatus(pack), "Waiting");
+    assert.throws(
+      () => holdStatus({ status: { intake: "Todo", complete: "Delivery Complete" } } as ProjectPack),
+      /status\.hold returned nothing/,
+    );
     assert.deepEqual(unblockingStates(pack), ["Delivery Complete", "Shipped", "Canceled", "Duplicate"]);
   });
 

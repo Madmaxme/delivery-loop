@@ -1,8 +1,9 @@
 /**
  * Delivery-loop policy: intake, graph readiness, leases, and the page budget.
- * Status names come from the project file. These defaults apply when a caller
- * does not pass its own.
+ * Status names come from the project file.
  */
+
+import { Read } from "./read.ts";
 
 /** `/sweep` intake — archived mid-states (In Progress, Ready for Dev) are not restored. */
 export const SWEEP_INTAKE_STATES = ["Todo"] as const;
@@ -1238,8 +1239,8 @@ export type StaleGraphPruneEdge = {
  */
 export function laterSliceSyncMove(
   stateName: string | null | undefined,
-  hold = "Hold",
-  intake = "Todo",
+  hold: string,
+  intake: string,
 ): string | null {
   const n = (stateName ?? "").trim().toLowerCase();
   if (n !== intake.trim().toLowerCase()) return null;
@@ -1249,8 +1250,8 @@ export function laterSliceSyncMove(
 /** In-slice overflow uses the same hold status. */
 export function currentSliceOverflowMove(
   stateName: string | null | undefined,
-  hold = "Hold",
-  intake = "Todo",
+  hold: string,
+  intake: string,
 ): string | null {
   return laterSliceSyncMove(stateName, hold, intake);
 }
@@ -1264,8 +1265,8 @@ export function formatDeliveryProgramContext(opts: {
   board?: ProgramBoard;
 }): string {
   const board = opts.board;
-  const hold = board?.hold?.trim() || "Hold";
-  const complete = board?.complete?.trim() || "Complete";
+  const hold = Read.required("status.hold", board?.hold).value;
+  const complete = Read.required("status.complete", board?.complete).value;
   const shipped = board?.shipped?.trim() || "";
   const backlog = board?.backlog?.trim() || "";
   const named = [backlog, hold, complete, shipped].filter(Boolean).join(" / ");

@@ -952,6 +952,7 @@ async function runHeldTicket(
         text: ground.text,
         priorComments: commentBodies(ticket, deps),
         completeStatus: deps.pack.status.complete,
+        holdStatus: deps.pack.status.hold,
         trunkCommit: verdict === "ALREADY SHIPPED" ? trunkCommitFlag(commits) : null,
         journeyProven:
           verdict === "ALREADY SHIPPED"

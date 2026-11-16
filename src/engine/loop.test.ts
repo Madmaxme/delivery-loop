@@ -24,7 +24,7 @@ const pack: ProjectPack = {
   eligibility: { mode: "none" },
   landingStrategy: "pull-request",
   promotionStages: [],
-  status: { intake: "Todo", complete: "Dev Complete" },
+  status: { intake: "Todo", complete: "Dev Complete", hold: "Shaping" },
   connectors: ["sentry"],
 };
 
@@ -1333,7 +1333,7 @@ describe("loop", () => {
     );
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "verdict");
-    assert.equal(env.state(), "Hold");
+    assert.equal(env.state(), "Shaping");
   });
 
   it("lands a buildable ticket after quality is green", async () => {
@@ -1375,7 +1375,7 @@ describe("loop", () => {
     const env = harness("**Verdict:** NEEDS RESCOPE\n\n**Harness packet:** no safe default remains.");
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "verdict");
-    assert.equal(env.state(), "Hold");
+    assert.equal(env.state(), "Shaping");
   });
 
   it("loads each ticket's project into the ground prompt", async () => {
@@ -1413,7 +1413,7 @@ describe("loop", () => {
     assert.match(prompt, /## Delivery program \(full project\)/);
     assert.match(prompt, /API-1 Todo/);
     assert.match(prompt, /Project: Billing/);
-    assert.match(prompt, /Hold \/ Dev Complete/);
+    assert.match(prompt, /Shaping \/ Dev Complete/);
   });
 
   it("stops one ticket when a connector is missing and continues the sweep", async () => {

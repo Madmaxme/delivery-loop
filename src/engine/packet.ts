@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { matchesJourneySpec } from "../../scripts/journey-proof.mjs";
 import { isDurableRecordingUrl } from "../../scripts/recording-url.mjs";
 import type { InvariantHeading } from "../schema/pack.ts";
+import { Read } from "./read.ts";
 
 export const VERDICTS = [
   "BUILDABLE",
@@ -396,23 +397,22 @@ export function parkStateForVerdict(input: {
   text: string;
   priorComments: readonly string[];
   completeStatus: string;
-  /** Status that does not clear blockers. Defaults to Hold. */
-  holdStatus?: string;
+  /** The install's `status.hold`. Read only when this verdict parks. */
+  holdStatus?: string | null;
   /** True when this ticket's commits are already on the named trunks. */
   trunkCommit?: boolean | null;
   /** True when recorded journey proof is already on the trunk or in the audit receipt. */
   journeyProven?: boolean | null;
 }): string | null {
-  const hold = input.holdStatus?.trim() || "Hold";
   if (input.verdict === "WRONG DIAGNOSIS") return "Canceled";
   if (input.verdict === "NEEDS RESCOPE") {
     const cited =
       /\*\*Harness packet:\*\*/i.test(input.text) ||
       input.priorComments.some((comment) => /\*\*Harness packet:\*\*/i.test(comment));
-    return cited ? hold : null;
+    return cited ? Read.required("status.hold", input.holdStatus).value : null;
   }
   if (input.verdict === "ALREADY SHIPPED") {
-    if (parseOutsideGrant(input.text) === "open") return hold;
+    if (parseOutsideGrant(input.text) === "open") return Read.required("status.hold", input.holdStatus).value;
     const journey = parseJourneyEvidence(input.text);
     if (journey !== "not-applicable" && journey !== "recorded") return null;
     if (journey === "recorded" && input.journeyProven !== true) return null;
