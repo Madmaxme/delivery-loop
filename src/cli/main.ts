@@ -35,6 +35,7 @@ import { createInstallationToken } from "../adapters/github-mint.js";
 import { githubRepoFromUrl } from "../adapters/types.js";
 import type { ForgeAdapter, LinearProgramTracker, TrackerAdapter, WorkerAdapter } from "../adapters/types.js";
 import { findConnector } from "../connectors/catalog.js";
+import { ensureAwsSession } from "../engine/aws-session.js";
 import { writeCredentialSummary } from "../engine/credential-log.js";
 import { assertReferencedCredentials, credentialAuditFailed, formatCredentialAudit, inspectCredentials } from "../engine/credentials.js";
 import { auditEligibility, deliver, deliveryExitCode, needsNextPage, repoCheckoutDir, ship, shipSweep, sweep, type TicketResult } from "../engine/loop.js";
@@ -519,6 +520,7 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     if (action === "ship" && !issue) throw new Error("ship needs a ticket id");
     const step = action === "sweep" ? "ship sweep" : "ship";
     const runShip = async () => {
+    await ensureAwsSession(process.env);
     assertReferencedCredentials(pack);
     const opened = openForge(pack, false, step);
     const github = pack.identity === "mint" ? await opened.tokens.mint() : undefined;
@@ -615,6 +617,7 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     process.env.DELIVERY_LOOP_PAGE_STARTED_MS || "",
   );
   const runLocal = async () => {
+  await ensureAwsSession(process.env);
   const deps = {
     pack,
     ...(await adaptersFor(pack, mode === "sweep" ? "sweep" : "deliver")),
