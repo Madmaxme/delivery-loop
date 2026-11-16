@@ -73,27 +73,36 @@ function remember(arn: string): void {
   if (role) rememberedRoleArn = role;
 }
 
+/** Same request the Actions OIDC client sends. The token stays out of the error text. */
+export function githubOidcRequest(requestUrl: string, requestToken: string): { url: string; headers: Record<string, string> } {
+  const url = new URL(requestUrl);
+  url.searchParams.set("audience", OIDC_AUDIENCE);
+  return {
+    url: url.toString(),
+    headers: {
+      Authorization: `Bearer ${requestToken}`,
+      Accept: "application/json",
+      "User-Agent": "actions/oidc-client",
+    },
+  };
+}
+
 export async function readGithubOidcToken(env: NodeJS.ProcessEnv): Promise<string> {
   const requestUrl = env.ACTIONS_ID_TOKEN_REQUEST_URL?.trim() ?? "";
   const requestToken = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN?.trim() ?? "";
   if (!requestUrl || !requestToken) throw new Error("aws session refresh failed");
-  let response: Response;
-  try {
-    const url = new URL(requestUrl);
-    url.searchParams.set("audience", OIDC_AUDIENCE);
-    response = await fetch(url, { headers: { Authorization: `bearer ${requestToken}` } });
-  } catch {
-    throw new Error("aws session refresh failed");
+  const request = githubOidcRequest(requestUrl, requestToken);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch(request.url, { headers: request.headers });
+      if (!response.ok) continue;
+      const body = await response.json() as { value?: unknown };
+      if (typeof body.value === "string" && body.value.trim()) return body.value;
+    } catch {
+      // The next attempt uses the same job request token.
+    }
   }
-  if (!response.ok) throw new Error("aws session refresh failed");
-  let body: { value?: unknown };
-  try {
-    body = await response.json() as { value?: unknown };
-  } catch {
-    throw new Error("aws session refresh failed");
-  }
-  if (typeof body.value !== "string" || !body.value.trim()) throw new Error("aws session refresh failed");
-  return body.value;
+  throw new Error("aws session refresh failed");
 }
 
 function assumeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -129,20 +138,28 @@ function parseAssumedCredentials(raw: string): { accessKeyId: string; secretAcce
   return { accessKeyId, secretAccessKey, sessionToken };
 }
 
+/**
+ * The CLI requires `WebIdentityToken` and ignores `--web-identity-token-file`.
+ * The token is a field in the input file, not a process argument.
+ */
+export function assumeRoleInput(roleArn: string, token: string): string {
+  return JSON.stringify({
+    RoleArn: roleArn,
+    RoleSessionName: "delivery-loop",
+    WebIdentityToken: token,
+  });
+}
+
 function assumeRole(roleArn: string, token: string, env: NodeJS.ProcessEnv, run: AwsRunner): string {
   const dir = mkdtempSync(join(tmpdir(), "aws-session-"));
-  const file = join(dir, "token");
+  const file = join(dir, "input.json");
   try {
-    writeFileSync(file, token, { mode: 0o600 });
+    writeFileSync(file, assumeRoleInput(roleArn, token), { mode: 0o600 });
     return run([
       "sts",
       "assume-role-with-web-identity",
-      "--role-arn",
-      roleArn,
-      "--role-session-name",
-      "delivery-loop",
-      "--web-identity-token-file",
-      file,
+      "--cli-input-json",
+      `file://${file}`,
       "--output",
       "json",
     ], assumeEnv(env));
