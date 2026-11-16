@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 
+import { Read } from "../engine/read.ts";
+
 import { GHA_HOSTED_PAGE_BUDGET_MINUTES } from "../engine/linear-harness-policy.ts";
 import { journeySpecPattern } from "../../scripts/journey-proof.mjs";
 
@@ -334,14 +336,13 @@ export type ProjectPack = {
   };
 };
 
-export function defaultStatus(): { intake: string; hold: string } {
-  return { intake: "Todo", hold: "Hold" };
+export function defaultStatus(): { intake: string } {
+  return { intake: "Todo" };
 }
 
-/** Status that keeps a ticket incomplete. Installs override `status.hold`. */
+/** Status that keeps a ticket incomplete. The install names it. */
 export function holdStatus(pack: ProjectPack): string {
-  const named = pack.status.hold?.trim();
-  return named || defaultStatus().hold;
+  return Read.required("status.hold", pack.status.hold).value;
 }
 
 export function closedStates(pack: ProjectPack): string[] {

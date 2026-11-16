@@ -167,6 +167,13 @@ describe("journey evidence", () => {
       "Delivery Complete",
     );
   });
+
+  it("parks on the install hold name and stops when that name is missing", () => {
+    const text = "**Verdict:** NEEDS RESCOPE\n**Harness packet:** no safe default remains.";
+    const input = { verdict: "NEEDS RESCOPE" as const, text, priorComments: [], completeStatus: "Dev Complete" };
+    assert.equal(parkStateForVerdict({ ...input, holdStatus: "Shaping" }), "Shaping");
+    assert.throws(() => parkStateForVerdict(input), /status\.hold returned nothing/);
+  });
 });
 
 describe("work order", () => {
