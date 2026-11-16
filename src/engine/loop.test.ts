@@ -577,10 +577,9 @@ describe("loop", () => {
       return start(input);
     };
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "land-blocked");
-    assert.equal(conflicts, 1);
-    assert.equal(env.deps.pageControl?.stop, true);
-    assert.equal(env.merged(), false);
+    assert.equal(result.outcome, "landed");
+    assert.equal(conflicts, 0);
+    assert.equal(env.merged(), true);
   });
 
   it("resumes a conflict on the next page when this page's budget is spent", async () => {
@@ -1999,7 +1998,7 @@ describe("loop", () => {
     };
     const extra = await runTicket(split.deps, ticket());
     assert.equal(extra.outcome, "quality-failed");
-    assert.deepEqual(criteriaSeen, [["first-path"], ["second-path"]]);
+    assert.deepEqual(criteriaSeen, [["first-path"], ["second-path"], ["second-path"]]);
     assert.equal(split.deliveryState().stageReceipts.some((item) => item.stageId === "stage-two"), false);
 
     split.deps.runPackCommand = (command, _cwd, stdin) => {
@@ -2205,7 +2204,7 @@ describe("loop", () => {
     };
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "blocked");
-    assert.deepEqual(commands, ["promote-first", "verify-first"]);
+    assert.deepEqual(commands, ["promote-first", "verify-first", "promote-first", "verify-first"]);
     assert.equal(env.state(), "Todo");
     assert.deepEqual(env.deliveryState().stageReceipts.map((receipt) => receipt.stageId), ["first"]);
   });
@@ -2239,6 +2238,44 @@ describe("loop", () => {
     assert.match(result.detail, /next page resumes/);
     assert.equal(needsNextPage([result]), true);
     assert.equal(env.state(), "Todo");
+  });
+
+  it("does not edit the owner when the promotion passes on the second read", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = {
+      ...pack,
+      promotionStages: [
+        { id: "first", target: "alpha", authorization: "deliver", promoteCommand: "promote-first", repos: ["api"], verifyCommand: "verify-first" },
+      ],
+    };
+    let heals = 0;
+    let verifies = 0;
+    env.deps.ownerHeal = async () => {
+      heals += 1;
+      return "**Heal:** edit";
+    };
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (command !== "verify-first") return { status: 0, stdout: "" };
+      verifies += 1;
+      const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
+      const outcome = verifies === 1 ? "blocked" : "passed";
+      return {
+        status: 0,
+        stdout: receiptFor({
+          stageId: input.stageId,
+          target: input.target,
+          criteriaRevision: input.criteriaRevision ?? "",
+          deployed: input.landedShas ?? [],
+          outcome,
+          reason: outcome === "blocked" ? "stale checkout" : "",
+        }),
+      };
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(verifies, 2);
+    assert.equal(heals, 0);
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), pack.status.complete);
   });
 
   it("verifies independent stages together and heals every blocked receipt", async () => {
@@ -2293,7 +2330,7 @@ describe("loop", () => {
     const result = await running;
     assert.equal(overlapped, true);
     assert.equal(result.outcome, "blocked");
-    assert.deepEqual(verifies.sort(), ["verify-first", "verify-second"]);
+    assert.deepEqual(verifies.sort(), ["verify-first", "verify-second", "verify-second"]);
     assert.match(prompts.join("\n"), /live evidence is unavailable/);
     assert.match(prompts.join("\n"), /single-charge: live log/);
     assert.equal(env.state(), "Todo");
@@ -2301,7 +2338,7 @@ describe("loop", () => {
     verifies.length = 0;
     const again = await runTicket(env.deps, ticket());
     assert.equal(again.outcome, "blocked");
-    assert.deepEqual(verifies, ["verify-second"]);
+    assert.deepEqual(verifies, ["verify-second", "verify-second"]);
   });
 
   it("sends a parked delivery stage to the heal path", async () => {
