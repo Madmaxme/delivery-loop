@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { DEFAULT_JOURNEY_SPEC, matchesJourneySpec, proofLinesFor } from "../../scripts/journey-proof.mjs";
 import { interpretMintOutput, runMintCommand } from "../adapters/github-mint.ts";
+import { ensureAwsSession } from "./aws-session.ts";
 import { assertReferencedCredentials, stageAskpassEnv, stageGitPassword } from "./credentials.ts";
 import { noteMint } from "./credential-log.ts";
 import { parseTypedStageOutcome, transientReason, transientWaitMs, type StageCommandResult } from "./step-outcome.ts";
@@ -1851,6 +1852,7 @@ async function runStageCommand(
 ): Promise<{ stdout: string; failed: string | null; timedOut: boolean; outcome: StageCommandResult | null }> {
   const run = deps.runPackCommand ?? spawnPackCommand;
   try {
+    await ensureAwsSession(process.env);
     const result = await runWithTransient(deps, async () => {
       const value = await Promise.resolve(run(
         command,
