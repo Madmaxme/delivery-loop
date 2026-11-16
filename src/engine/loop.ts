@@ -1516,6 +1516,7 @@ type StageProblem = {
   reason: string;
   evidence: string[];
   step?: string;
+  timedOut?: boolean;
 };
 
 type StageRun =
@@ -1892,7 +1893,7 @@ async function blockTimedOutStage(
     criteria: criteria.map((item) => ({ id: item.id, outcome: "blocked", evidence: [] })),
   }, stage, ticket, landedHere, criteria);
   await writeStageReceipt(deps, ticket, receipt);
-  return { outcome: "blocked", stage, reason, evidence: [] };
+  return { outcome: "blocked", stage, reason, evidence: [], timedOut: true };
 }
 
 async function finishTypedShipOutcome(
@@ -2775,7 +2776,11 @@ async function settleTrunk(
   }
   const order = parseWorkOrder(declared);
   if (!order) return { identifier: ticket.identifier, outcome: "invalid-packet", detail: "acceptance matrix missing from saved work order" };
-  const stages = await runPromotionStages(deps, ticket, "deliver", candidates, order.criteria);
+  let stages = await runPromotionStages(deps, ticket, "deliver", candidates, order.criteria);
+  // Read a failed delivery stage again before editing its owner. A timeout already spent its budget.
+  if (stages.outcome !== "complete" && stages.problems.every((problem) => problem.timedOut !== true)) {
+    stages = await runPromotionStages(deps, ticket, "deliver", candidates, order.criteria);
+  }
   if (stages.outcome !== "complete") {
     await writeMarker(deps, ticket, "land-resume", JSON.stringify({ kind: "wait", hold, rows: candidates, declared, receipt: carried } satisfies LandResume));
     let resumed = false;
@@ -3522,6 +3527,7 @@ async function commitLand(
 ): Promise<TicketResult | { mergedSha: string }> {
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
   const tries = { waits: 0, login: false };
+  const rechecked = new Set<string>();
   for (let step = 0; step < 8; step++) {
     try {
       const mergedSha = await deps.forge.squashMerge({
@@ -3536,6 +3542,11 @@ async function commitLand(
       return { mergedSha };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
+      const mergeKey = `heal:merge:${shipNoSignature(reason) || "merge"}`;
+      if (!rechecked.has(mergeKey)) {
+        rechecked.add(mergeKey);
+        continue;
+      }
       if (ownerOnlyLandFailure(error)) {
         const paused = pauseLand(
           ticket.identifier,
@@ -3550,7 +3561,7 @@ async function commitLand(
         deps,
         ticket,
         current,
-        `heal:merge:${shipNoSignature(reason) || "merge"}`,
+        mergeKey,
         reason,
         sleep,
         tries,
@@ -3579,16 +3590,22 @@ async function landPull(
   let unknown = 0;
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
   const tries = { waits: 0, login: false };
+  const rechecked = new Set<string>();
   for (let step = 0; step < 48; step++) {
     const quality = await waitForQuality(deps, current);
     if (quality.state === "failure") {
       const signature = shipNoSignature(quality.detail) || "quality";
+      const qualityKey = `heal:quality:${current.repo.name}:${signature}`;
+      if (!rechecked.has(qualityKey)) {
+        rechecked.add(qualityKey);
+        continue;
+      }
       const repair = await repairContext(deps, ticket, current);
       const paused = await healNo(
         deps,
         ticket,
         current,
-        `heal:quality:${current.repo.name}:${signature}`,
+        qualityKey,
         `Quality returned no on \`${current.repo.name}\` branch \`${current.branch}\`.\n${quality.detail}${repair}`,
         sleep,
         tries,
@@ -3598,6 +3615,11 @@ async function landPull(
     }
     const design = await readDesignCheck(deps, ticket, current);
     if (design && design.state !== "success") {
+      const designKey = `heal:quality:${current.repo.name}:design-${design.state}`;
+      if (!rechecked.has(designKey)) {
+        rechecked.add(designKey);
+        continue;
+      }
       if (design.state === "pending") {
         const earlyDesign = await explainQuality(deps, ticket, current, {
           state: "pending",
@@ -3619,6 +3641,13 @@ async function landPull(
         continue;
       }
     }
+    if (quality.state === "pending" || quality.state === "unscheduled") {
+      const pendingKey = `reread:${quality.state}:${shipNoSignature(quality.detail) || quality.state}`;
+      if (!rechecked.has(pendingKey)) {
+        rechecked.add(pendingKey);
+        continue;
+      }
+    }
     const early = await explainQuality(deps, ticket, current, quality);
     if (early) return early;
     const merge = await deps.forge.mergeability({
@@ -3632,11 +3661,16 @@ async function landPull(
     }
     if (merge.state === "conflict" || (merge.state === "behind" && updates >= MAX_BRANCH_UPDATES)) {
       const why = `The branch ${merge.state === "conflict" ? "conflicts with" : "is still behind"} \`${current.repo.trunk}\`. Hand off to heal.`;
+      const mergeKey = `heal:merge:${shipNoSignature(why) || merge.state}`;
+      if (!rechecked.has(mergeKey)) {
+        rechecked.add(mergeKey);
+        continue;
+      }
       const paused = await healNo(
         deps,
         ticket,
         current,
-        `heal:merge:${shipNoSignature(why) || merge.state}`,
+        mergeKey,
         why,
         sleep,
         tries,
