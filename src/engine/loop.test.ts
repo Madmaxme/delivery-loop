@@ -2962,6 +2962,58 @@ describe("loop", () => {
     assert.equal(proof.validated, true);
   });
 
+  it("reads the route test on the landed commit when the journey command prints nothing", async () => {
+    const root = mkdtempSync(join(tmpdir(), "journey-land-"));
+    try {
+      const repo = join(root, "api");
+      mkdirSync(join(repo, "test/e2e"), { recursive: true });
+      writeFileSync(join(repo, "test/e2e/orders.spec.ts"), "describe('API-1 orders', () => {});\n");
+      writeFileSync(join(repo, "test/pay.spec.ts"), "describe('API-1 unit', () => {});\n");
+      const git = (args: string[]) => {
+        const result = spawnSync("git", args, {
+          cwd: repo,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: "Test",
+            GIT_AUTHOR_EMAIL: "test@example.com",
+            GIT_COMMITTER_NAME: "Test",
+            GIT_COMMITTER_EMAIL: "test@example.com",
+          },
+        });
+        assert.equal(result.status, 0, result.stderr);
+      };
+      git(["init"]);
+      git(["add", "."]);
+      git(["commit", "-m", "orders journey"]);
+      const sha = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).stdout.trim();
+      const env = harness(BUILDABLE);
+      env.deps.cwd = root;
+      env.deps.lookupHead = () => sha;
+      env.deps.pack = {
+        ...pack,
+        journeyCommand: "node scripts/journey-proof.mjs",
+        journeySpec: "{e2e,integration_test,journey,test/e2e}/**",
+      };
+      env.deps.runPackCommand = () => ({ status: 0, stdout: "" });
+      let heals = 0;
+      env.deps.ownerHeal = async () => {
+        heals += 1;
+        return "**Heal:** wait";
+      };
+      await seedLandResume(env, false, [{ repo: "api", sha }], audit("api", "**Journey evidence:** recorded"));
+      const result = await runTicket(env.deps, ticket());
+      assert.equal(result.outcome, "landed");
+      assert.equal(env.state(), pack.status.complete);
+      assert.equal(heals, 0);
+      const proof = env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "";
+      assert.match(proof, /api\/test\/e2e\/orders\.spec\.ts/);
+      assert.equal(proof.includes("test/pay.spec.ts"), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("names the journey command when it prints no token", async () => {
     const env = harness(BUILDABLE);
     env.deps.lookupHead = () => "main-tip";
