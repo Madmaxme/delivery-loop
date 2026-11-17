@@ -3829,6 +3829,30 @@ describe("loop", () => {
     assert.match(missing.lines.join("\n"), /ship plan is required/);
     assert.equal(promoted, 0);
     env.deps.runPackCommand = (_command, _cwd, stdin) => {
+      const input = JSON.parse(stdin) as { phase?: string };
+      if (input.phase === "plan") {
+        return { status: 0, stdout: JSON.stringify({ outcome: "waiting", reason: "prod deploy at abc is not green" }) };
+      }
+      promoted += 1;
+      return { status: 0, stdout: "" };
+    };
+    const waiting = await ship(env.deps, "API-1");
+    assert.equal(waiting.exitCode, 0);
+    assert.match(waiting.lines.join("\n"), /waiting prod deploy at abc is not green/);
+    assert.doesNotMatch(waiting.lines.join("\n"), /ship plan is required/);
+    assert.equal(promoted, 0);
+    env.deps.ownerHeal = async () => "edit";
+    env.deps.runPackCommand = (_command, _cwd, stdin) => {
+      const input = JSON.parse(stdin) as { phase?: string };
+      if (input.phase === "plan") {
+        return { status: 1, stdout: JSON.stringify({ outcome: "broken", reason: "proof reader threw" }) };
+      }
+      return { status: 0, stdout: "" };
+    };
+    const edited = await ship(env.deps, "API-1");
+    assert.equal(edited.exitCode, 0);
+    assert.match(edited.lines.join("\n"), /RETRY proof reader threw/);
+    env.deps.runPackCommand = (_command, _cwd, stdin) => {
       const planned = shipPlan(stdin, ["API-9"]);
       if (planned) return planned;
       promoted += 1;
