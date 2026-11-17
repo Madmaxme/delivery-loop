@@ -2649,6 +2649,58 @@ function qualifyBareJourneyProof(text: string, deps: LoopDeps): string {
   return extra.length > 0 ? `${text}\n${extra.join("\n")}` : text;
 }
 
+const CITED_ROUTE_FILE = /(?:_test\.dart|\.test\.tsx?|\.spec\.tsx?|\.test\.js|\.spec\.js)$/;
+
+/**
+ * Route tests on the landed commit that name the ticket. The journey command
+ * reads the page checkout, which is behind that commit, and prints nothing.
+ * This read uses the landed SHA. A path outside the journey spec is not proof.
+ */
+function citedRouteTestsOnCommit(dir: string, sha: string, ticketId: string, spec: string | undefined): string[] {
+  if (!sha || !ticketId || !existsSync(join(dir, ".git"))) return [];
+  const have = spawnSync("git", ["-C", dir, "cat-file", "-e", `${sha}^{commit}`], { encoding: "utf8" });
+  if (have.status !== 0) {
+    spawnSync("git", ["-C", dir, "fetch", "--depth=1", "origin", sha], { encoding: "utf8", timeout: 8000 });
+    const again = spawnSync("git", ["-C", dir, "cat-file", "-e", `${sha}^{commit}`], { encoding: "utf8" });
+    if (again.status !== 0) {
+      spawnSync("git", ["-C", dir, "fetch", "origin", "HEAD"], { encoding: "utf8", timeout: 8000 });
+    }
+  }
+  const pattern = `(^|[^A-Za-z0-9])${ticketId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[^A-Za-z0-9])`;
+  const run = spawnSync(
+    "git",
+    ["-C", dir, "grep", "-l", "-I", "-E", pattern, sha, "--", "e2e", "integration_test", "journey", "test"],
+    { encoding: "utf8" },
+  );
+  if (run.status !== 0 || !run.stdout) return [];
+  const paths: string[] = [];
+  for (const line of run.stdout.split("\n")) {
+    const text = line.trim();
+    if (!text) continue;
+    const path = text.startsWith(`${sha}:`) ? text.slice(sha.length + 1) : text;
+    if (!CITED_ROUTE_FILE.test(path) || !matchesJourneySpec(path, spec)) continue;
+    paths.push(path);
+  }
+  paths.sort();
+  return paths;
+}
+
+async function proofFromLandedCommit(
+  deps: LoopDeps,
+  ticket: Ticket,
+  rows: { repo: RepoSpec; sha: string }[],
+): Promise<string | null> {
+  for (const row of rows) {
+    const dir = repoCheckoutDir(deps.cwd ?? process.cwd(), row.repo, deps.pack);
+    for (const path of citedRouteTestsOnCommit(dir, row.sha, ticket.identifier, deps.pack.journeySpec)) {
+      const found = await journeyFileState(deps, row.repo.name, row.sha, path);
+      if (found.state !== "present") continue;
+      return `**Journey proof:** \`${row.repo.name}/${path}\``;
+    }
+  }
+  return null;
+}
+
 async function applyRecordedProof(
   deps: LoopDeps,
   ticket: Ticket,
@@ -2697,6 +2749,11 @@ async function applyRecordedProof(
         noteEngine(deps, "proof ok");
         return { ok: true, recorded: true, proofReceipt: qualified };
       }
+    }
+    const cited = await proofFromLandedCommit(deps, ticket, rows);
+    if (cited) {
+      noteEngine(deps, "proof ok");
+      return { ok: true, recorded: true, proofReceipt: cited };
     }
     await deps.tracker.comment(ticket.identifier, journeyTokenMissing(deps, ticket.identifier, printed));
     const missing: TicketResult = {
