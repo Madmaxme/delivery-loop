@@ -1971,6 +1971,9 @@ async function runOneStage(
       releaseSet,
     }, commandTimeout);
     if (planned.timedOut) return blockTimedOutStage(deps, ticket, stage, commandKind, commandTimeout!, landedHere, expected);
+    if (planned.outcome && planned.outcome.outcome !== "passed" && planned.outcome.outcome !== "transient") {
+      return finishTypedShipOutcome(deps, ticket, stage, planned.outcome, landedHere, expected);
+    }
     const plan = parseShipPlan(planned.stdout ?? "");
     if (planned.failed || !plan) return { outcome: "failed", stage, reason: "ship plan is required", evidence: [] };
     noteShipRelease(deps, plan);
