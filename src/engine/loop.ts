@@ -3647,10 +3647,11 @@ async function landPull(
   pr: OpenPull,
   orderText: string,
 ): Promise<TicketResult | { headSha: string }> {
-  void orderText;
   let current = pr;
   let updates = 0;
   let unknown = 0;
+  let conflictFixes = 0;
+  let conflictHypothesis: string | null = null;
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
   const tries = { waits: 0, login: false };
   const rechecked = new Set<string>();
@@ -3677,7 +3678,22 @@ async function landPull(
       continue;
     }
     const design = await readDesignCheck(deps, ticket, current);
-    if (design && design.state !== "success") {
+    // A dirty pull request never schedules pull_request workflows, so a missing
+    // UI check is the conflict, not a failed design token run.
+    let conflictHidesDesign = false;
+    if (design?.state === "missing") {
+      const peek = await deps.forge.mergeability({
+        repoUrl: current.repo.url,
+        number: current.number,
+      });
+      const peekHead = peek.headSha || current.headSha;
+      if (peekHead !== current.headSha) {
+        current = { ...current, headSha: peekHead };
+        continue;
+      }
+      conflictHidesDesign = peek.state === "conflict";
+    }
+    if (design && design.state !== "success" && !conflictHidesDesign) {
       const designKey = `heal:quality:${current.repo.name}:design-${design.state}`;
       if (!rechecked.has(designKey)) {
         rechecked.add(designKey);
@@ -3704,15 +3720,17 @@ async function landPull(
         continue;
       }
     }
-    if (quality.state === "pending" || quality.state === "unscheduled") {
+    if ((quality.state === "pending" || quality.state === "unscheduled") && !conflictHidesDesign) {
       const pendingKey = `reread:${quality.state}:${shipNoSignature(quality.detail) || quality.state}`;
       if (!rechecked.has(pendingKey)) {
         rechecked.add(pendingKey);
         continue;
       }
     }
-    const early = await explainQuality(deps, ticket, current, quality);
-    if (early) return early;
+    if (!conflictHidesDesign) {
+      const early = await explainQuality(deps, ticket, current, quality);
+      if (early) return early;
+    }
     const merge = await deps.forge.mergeability({
       repoUrl: current.repo.url,
       number: current.number,
@@ -3729,16 +3747,31 @@ async function landPull(
         rechecked.add(mergeKey);
         continue;
       }
-      const paused = await healNo(
+      const limit = ciFixLimit(deps);
+      const spent = await spendFix(
         deps,
         ticket,
         current,
-        mergeKey,
-        why,
-        sleep,
-        tries,
+        conflictFixes,
+        limit,
+        conflictPrompt(
+          ticket,
+          orderText,
+          deps,
+          current,
+          conflictFixes + 1,
+          limit,
+          why,
+        ),
+        conflictHypothesis,
+        "runner",
       );
-      if (paused) return paused;
+      if ("outcome" in spent) return spent;
+      conflictFixes = spent.fixes;
+      conflictHypothesis = spent.hypothesis;
+      if (spent.headSha !== current.headSha) {
+        current = { ...current, headSha: spent.headSha };
+      }
       continue;
     }
     if (merge.state === "behind") {
