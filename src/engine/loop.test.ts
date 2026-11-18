@@ -582,6 +582,55 @@ describe("loop", () => {
     assert.equal(env.merged(), true);
   });
 
+  it("resolves a dirty pull request instead of healing a missing design check", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.sleep = async () => {};
+    env.deps.qualityNoRunMs = 0;
+    env.deps.pack = {
+      ...pack,
+      design: {
+        repos: [
+          {
+            name: "api",
+            check: "npm test",
+            checkName: "ui-primitives",
+            tokenFile: "tokens.css",
+          },
+        ],
+      },
+    };
+    let moved = false;
+    env.deps.lookupHead = () => (moved ? "def" : "abc");
+    const prompts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      if (input.prompt.includes("Resolve the merge conflict")) moved = true;
+      return start(input);
+    };
+    env.deps.forge.quality = async (input) =>
+      input.headSha === "def"
+        ? { state: "success", detail: "quality success" }
+        : { state: "pending", detail: "no Actions runs yet" };
+    env.deps.forge.designCheck = async (input) =>
+      input.headSha === "def"
+        ? { state: "success", detail: "ui-primitives success", headSha: input.headSha }
+        : {
+            state: "missing",
+            detail: `design check ui-primitives missing on ${input.headSha}`,
+            headSha: null,
+          };
+    env.deps.forge.mergeability = async () =>
+      moved
+        ? { state: "clean", headSha: "def" }
+        : { state: "conflict", headSha: "abc" };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.merged(), true);
+    assert.equal(prompts.some((prompt) => prompt.includes("Resolve the merge conflict")), true);
+    assert.equal(prompts.some((prompt) => prompt.includes("Design check returned no")), false);
+  });
+
   it("resumes a conflict on the next page when this page's budget is spent", async () => {
     const env = harness(BUILDABLE);
     env.deps.ciFixMax = 1;
