@@ -517,7 +517,7 @@ function dispatchOrRun(mode: string, argv: string[]): void {
     const pack = loadPack(packPath(process.cwd()));
     const issue = plan.issue;
     const action = plan.shipAction ?? "ship";
-    if (action === "ship" && !issue) throw new Error("ship needs a ticket id");
+    if (action === "ship" && !plan.shipAll && plan.issues.length === 0) throw new Error("ship needs a ticket id");
     const step = action === "sweep" ? "ship sweep" : "ship";
     const runShip = async () => {
     await ensureAwsSession(process.env);
@@ -533,7 +533,31 @@ function dispatchOrRun(mode: string, argv: string[]): void {
       if (joined.status === "failed") throw new Error(joined.text || "owner edit failed");
       return joined.text;
     };
-    const run = action === "sweep" ? shipSweep(deps) : ship(deps, issue ?? undefined, action === "continue" ? "continue" : "ship");
+    const run = action === "sweep"
+      ? shipSweep(deps)
+      : plan.shipAll
+        ? ship(deps, undefined, action === "continue" ? "continue" : "ship", { mode: "all" })
+        : (async () => {
+            const ids = plan.issues.length > 0 ? plan.issues : issue ? [issue] : [];
+            const lines: string[] = [];
+            let exitCode = 0;
+            let parked = false;
+            let shipped = true;
+            for (const id of ids) {
+              const result = await ship(
+                deps,
+                id,
+                action === "continue" ? "continue" : "ship",
+                { mode: "ids", ids: action === "continue" ? ids : [id] },
+              );
+              lines.push(...result.lines);
+              if (result.exitCode !== 0) exitCode = result.exitCode;
+              if (result.parked) parked = true;
+              if (result.shipped === false) shipped = false;
+              if (exitCode !== 0) break;
+            }
+            return { exitCode, lines, parked, shipped: shipped && exitCode === 0 };
+          })();
     return run.then(
       (result) => {
         for (const line of result.lines) console.log(line);

@@ -3579,6 +3579,51 @@ describe("loop", () => {
     assert.equal(promoted, 0);
   });
 
+  it("approves only the tickets named on the command", async () => {
+    const env = harness(BUILDABLE);
+    const stage: PromotionStage = {
+      id: "publish",
+      target: "artifact-zone",
+      authorization: "ship",
+      promoteCommand: "promote",
+      repos: ["api"],
+      verifyCommand: "verify",
+      parkSuccess: false,
+      writeStatus: false,
+      approval: { source: "selection" },
+    };
+    env.deps.pack = {
+      ...pack,
+      status: { ...pack.status, complete: "Delivery Complete" },
+      promotionStages: [stage],
+    };
+    assert.equal((await runTicket(env.deps, ticket())).outcome, "landed");
+    env.deps.tracker.get = async (id) => ticket({ identifier: id, stateName: "Delivery Complete" });
+    let promoted = 0;
+    env.deps.runPackCommand = (_command, _cwd, stdin) => {
+      const planned = shipPlan(stdin, ["API-1", "API-2"]);
+      if (planned) return planned;
+      promoted += 1;
+      return { status: 0, stdout: "" };
+    };
+    const blocked = await ship(env.deps, "API-1");
+    assert.equal(blocked.exitCode, 1);
+    assert.match(blocked.lines.join("\n"), /API-2 BLOCKED approval-missing/);
+    assert.equal(promoted, 0);
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      const input = JSON.parse(stdin) as { phase?: string; stageId: string; target?: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[]; selection?: string[] };
+      assert.deepEqual(input.selection, ["*"]);
+      const planned = shipPlan(stdin, ["API-1", "API-2"]);
+      if (planned) return planned;
+      if (command === "verify") {
+        return { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target ?? "", criteriaRevision: input.criteriaRevision ?? "", deployed: input.landedShas ?? [] }) };
+      }
+      return { status: 0, stdout: "" };
+    };
+    const whole = await ship(env.deps, "API-1", "ship", { mode: "all" });
+    assert.equal(whole.exitCode, 0);
+  });
+
   it("records a waiting marker and lets the next ship sweep run a fresh ship", async () => {
     const env = harness(BUILDABLE);
     const stage: PromotionStage = {
