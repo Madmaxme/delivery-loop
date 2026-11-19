@@ -166,7 +166,13 @@ export type ShipApprovalList = { source: "list"; issues: string[] };
 /** A ticket is approved when it carries this label. */
 export type ShipApprovalLabel = { source: "label"; label: string };
 
-export type ShipApproval = ShipApprovalList | ShipApprovalLabel;
+/**
+ * The tickets named on this ship command are the approved set.
+ * `ship all` approves every ticket the plan carries.
+ */
+export type ShipApprovalSelection = { source: "selection" };
+
+export type ShipApproval = ShipApprovalList | ShipApprovalLabel | ShipApprovalSelection;
 
 export type PromotionStage = {
   id: string;
@@ -190,6 +196,7 @@ export type PromotionStage = {
   /**
    * Required on a ship stage. `list` names the approved ticket ids.
    * `label` approves a ticket that carries that label.
+   * `selection` approves the tickets named on this ship command.
    */
   approval?: ShipApproval;
 };
@@ -548,7 +555,7 @@ function loadPromotionStages(value: unknown, path: string): PromotionStage[] {
 
 function loadShipApproval(value: unknown, path: string, index: number): ShipApproval {
   const where = `${path} promotionStages[${index}].approval`;
-  const expected = `${where} must be { source: list, issues } or { source: label, label }`;
+  const expected = `${where} must be { source: list, issues }, { source: label, label }, or { source: selection }`;
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(expected);
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort().join(",");
@@ -565,6 +572,7 @@ function loadShipApproval(value: unknown, path: string, index: number): ShipAppr
     typeof record.label === "string" && record.label.trim()) {
     return { source: "label", label: record.label.trim() };
   }
+  if (record.source === "selection" && keys === "source") return { source: "selection" };
   throw new Error(expected);
 }
 

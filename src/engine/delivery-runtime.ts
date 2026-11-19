@@ -14,6 +14,10 @@ export type DeliveryPlan = {
   mode: DeliveryMode;
   shipAction?: ShipAction;
   issue: string | null;
+  /** Ticket ids named on a ship command, in the order given. */
+  issues: string[];
+  /** `ship all` promotes each ship repo's trunk. */
+  shipAll: boolean;
   project: string | null;
   surface: string | null;
   noFillGraph: boolean;
@@ -79,6 +83,8 @@ export function planDeliveryInvocation(input: {
   }
 
   let issue: string | null = null;
+  const issues: string[] = [];
+  let shipAll = false;
   let projectParts: string[] = [];
   let surface: string | null = null;
   let noFillGraph = false;
@@ -91,6 +97,7 @@ export function planDeliveryInvocation(input: {
     if (a === "--issue") {
       const { value, next } = takeValue(rest, i);
       issue = value ? value.toUpperCase() : null;
+      if (issue && !issues.includes(issue)) issues.push(issue);
       i = next;
       continue;
     }
@@ -122,8 +129,14 @@ export function planDeliveryInvocation(input: {
       noPruneStaleGraph = true;
       continue;
     }
-    if (mode !== "sweep" && mode !== "audit" && /^[A-Z][A-Z0-9]*-\d+$/i.test(a) && !issue) {
-      issue = a.toUpperCase();
+    if (mode === "ship" && a.toLowerCase() === "all") {
+      shipAll = true;
+      continue;
+    }
+    if (mode !== "sweep" && mode !== "audit" && /^[A-Z][A-Z0-9]*-\d+$/i.test(a)) {
+      const id = a.toUpperCase();
+      if (!issues.includes(id)) issues.push(id);
+      if (!issue) issue = id;
       continue;
     }
     extras.push(a);
@@ -166,6 +179,8 @@ export function planDeliveryInvocation(input: {
     runtime,
     mode,
     issue,
+    issues,
+    shipAll,
     project,
     surface,
     noFillGraph,
@@ -179,7 +194,9 @@ export function planDeliveryInvocation(input: {
 
 export function ghaDispatchFields(plan: DeliveryPlan): Record<string, string> {
   const fields: Record<string, string> = { mode: plan.mode };
-  if (plan.issue) fields.issue = plan.issue;
+  if (plan.shipAll) fields.issue = "all";
+  else if (plan.issues.length > 0) fields.issue = plan.issues.join(" ");
+  else if (plan.issue) fields.issue = plan.issue;
   if (plan.project) fields.project = plan.project;
   if (plan.surface) fields.surface = plan.surface;
   if (plan.noFillGraph) fields.no_fill_graph = "true";

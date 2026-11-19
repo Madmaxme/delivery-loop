@@ -119,7 +119,7 @@ jobs:
                 elif [ "${{ inputs.ship_action }}" = "sweep" ]; then
                   delivery-loop ship sweep
                 else
-                  delivery-loop ship "$DELIVERY_LOOP_ISSUE"
+                  delivery-loop ship $DELIVERY_LOOP_ISSUE
                 fi
               else
                 delivery-loop deliver ${{ inputs.issue }}

@@ -1935,7 +1935,7 @@ async function runOneStage(
   authorization: "deliver" | "ship",
   scoped: { repo: string; sha: string }[],
   criteria: readonly AcceptanceCriterion[],
-  options: { continueStageId?: string; step?: string; releaseSet?: Record<string, string> },
+  options: { continueStageId?: string; step?: string; releaseSet?: Record<string, string>; selection?: ShipSelection },
 ): Promise<{ outcome: "passed"; stage: PromotionStage } | StageProblem> {
   const landedHere = sortedLanded(scoped);
   const expected = criteriaForStage(criteria, stage, scoped);
@@ -1969,6 +1969,7 @@ async function runOneStage(
       repo: planRepo.name,
       sourceSha: planSha,
       releaseSet,
+      ...(selectionIds(options.selection) ? { selection: selectionIds(options.selection) } : {}),
     }, commandTimeout);
     if (planned.timedOut) return blockTimedOutStage(deps, ticket, stage, commandKind, commandTimeout!, landedHere, expected);
     if (planned.outcome && planned.outcome.outcome !== "passed" && planned.outcome.outcome !== "transient") {
@@ -1980,7 +1981,7 @@ async function runOneStage(
     const missing: string[] = [];
     for (const carriedId of plan.carries) {
       const carried = carriedId === ticket.identifier ? ticket : await deps.tracker.get(carriedId);
-      if (!ticketApproved(carried, [stage])) missing.push(carried.identifier);
+      if (!ticketApproved(carried, [stage], options.selection)) missing.push(carried.identifier);
     }
     if (missing.length > 0) return { outcome: "failed", stage, reason: "approval-missing", evidence: missing };
   }
@@ -1996,6 +1997,7 @@ async function runOneStage(
       repo: row.name,
       sourceSha: source.sha,
       releaseSet,
+      ...(selectionIds(options.selection) ? { selection: selectionIds(options.selection) } : {}),
       ...(options.step ? { step: options.step } : {}),
     }, commandTimeout);
     if (promoted.timedOut) return blockTimedOutStage(deps, ticket, stage, commandKind, commandTimeout!, landedHere, expected);
@@ -2014,6 +2016,7 @@ async function runOneStage(
     landedShas: landedHere,
     criteria: expected,
     releaseSet,
+    ...(selectionIds(options.selection) ? { selection: selectionIds(options.selection) } : {}),
   };
   const verified = await runStageCommand(deps, stage.verifyCommand, verifyRepo, verifyInput, stage.verify?.timeoutMs);
   if (verified.timedOut) return blockTimedOutStage(deps, ticket, stage, "verify", stage.verify!.timeoutMs, landedHere, expected);
@@ -2056,7 +2059,7 @@ async function runPromotionStages(
   authorization: "deliver" | "ship",
   landed: { repo: string; sha: string }[],
   criteria: readonly AcceptanceCriterion[],
-  options: { continueStageId?: string; step?: string } = {},
+  options: { continueStageId?: string; step?: string; selection?: ShipSelection } = {},
 ): Promise<StageRun> {
   const stages = deps.pack.promotionStages.filter((stage) => stage.authorization === authorization);
   const allLanded = sortedLanded(landed);
@@ -2124,6 +2127,15 @@ function rememberVerdict(deps: LoopDeps, key: string, verdict: HealVerdict): voi
 }
 
 export type ShipRun = { exitCode: number; lines: string[]; parked: boolean; shipped?: boolean };
+
+/** The tickets this ship command named. `all` is the whole trunk. */
+export type ShipSelection = { mode: "ids"; ids: string[] } | { mode: "all" };
+
+function selectionIds(selection: ShipSelection | undefined): string[] | undefined {
+  if (!selection) return undefined;
+  if (selection.mode === "all") return ["*"];
+  return selection.ids;
+}
 
 export type ShipRetryMarker = {
   ticket: string;
@@ -4088,12 +4100,20 @@ function parseShipLock(state: DeliveryState): { runId: string; expiresAt: string
   }
 }
 
-function ticketApproved(ticket: Ticket, stages: readonly PromotionStage[]): boolean {
+function ticketApproved(
+  ticket: Ticket,
+  stages: readonly PromotionStage[],
+  selection?: ShipSelection,
+): boolean {
   if (stages.length === 0) return true;
   return stages.every((stage) => {
     const approval = stage.approval;
     if (!approval) return false;
     if (approval.source === "list") return approval.issues.includes(ticket.identifier);
+    if (approval.source === "selection") {
+      if (selection?.mode === "all") return true;
+      return selection?.mode === "ids" && selection.ids.includes(ticket.identifier);
+    }
     return ticket.labels.includes(approval.label);
   });
 }
@@ -4225,7 +4245,12 @@ async function finishShipBody(deps: LoopDeps, ticket: Ticket, id: string, result
   return { exitCode: 1, lines: [`${id} BLOCKED ${result.reason}`], parked: false, shipped: false };
 }
 
-async function shipOne(deps: LoopDeps, id: string, mode: "ship" | "continue"): Promise<ShipRun> {
+async function shipOne(
+  deps: LoopDeps,
+  id: string,
+  mode: "ship" | "continue",
+  selection?: ShipSelection,
+): Promise<ShipRun> {
   await probeConfiguredCredentials(deps);
   deliveryStateCache.delete(deps);
   shipReleaseNotes.delete(deps);
@@ -4266,7 +4291,7 @@ async function shipOne(deps: LoopDeps, id: string, mode: "ship" | "continue"): P
   }
   const retry = parseShipRetry(await readDeliveryState(deps, ticket));
   const step = mode === "continue" && retry?.outcome === "needs-step" ? retry.step : undefined;
-  const result = await runPromotionStages(deps, ticket, "ship", landed, order?.criteria ?? [], { continueStageId, step });
+  const result = await runPromotionStages(deps, ticket, "ship", landed, order?.criteria ?? [], { continueStageId, step, selection });
   return finishShipRun(deps, ticket, id, result);
 }
 
@@ -4333,11 +4358,18 @@ export async function ship(
   deps: LoopDeps,
   identifier?: string,
   mode: "ship" | "continue" = "ship",
+  selection?: ShipSelection,
 ): Promise<ShipRun> {
   const id = identifier?.trim() ?? "";
+  const chosen: ShipSelection | undefined = selection ?? (id ? { mode: "ids", ids: [id] } : undefined);
+  if (chosen?.mode === "all") {
+    const record = id || [...await releaseIds(deps)][0] || "";
+    if (!record) throw new Error("ship all needs a delivered ticket");
+    return shipOne(deps, record, mode === "continue" ? "continue" : "ship", chosen);
+  }
   if (!id) {
     if (mode === "continue") return shipContinueAll(deps);
     throw new Error("ship needs a ticket id");
   }
-  return shipOne(deps, id, mode);
+  return shipOne(deps, id, mode, chosen);
 }

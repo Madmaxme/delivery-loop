@@ -483,6 +483,8 @@ ${approval}`;
     assert.deepEqual(listed.promotionStages[0]?.approval, { source: "list", issues: ["API-1", "API-2"] });
     const labeled = loadPack(write(shipped.replace("promotionStages: []", stage("    approval:\n      source: label\n      label: approved"))));
     assert.deepEqual(labeled.promotionStages[0]?.approval, { source: "label", label: "approved" });
+    const selected = loadPack(write(shipped.replace("promotionStages: []", stage("    approval:\n      source: selection"))));
+    assert.deepEqual(selected.promotionStages[0]?.approval, { source: "selection" });
     const deliver = `promotionStages:
   - id: dev
     target: dev

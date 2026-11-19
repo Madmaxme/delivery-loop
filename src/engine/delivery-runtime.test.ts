@@ -128,6 +128,35 @@ describe("planDeliveryInvocation", () => {
     assert.deepEqual(ghaDispatchFields(plan), { mode: "audit", project: "Payments" });
   });
 
+  it("names one ticket, several tickets, or the whole trunk", () => {
+    const one = planDeliveryInvocation({
+      githubActions: true,
+      mode: "ship",
+      argv: ["QUI-1"],
+      shipAction: "ship",
+    });
+    assert.deepEqual(one.issues, ["QUI-1"]);
+    assert.equal(one.shipAll, false);
+    assert.equal(ghaDispatchFields(one).issue, "QUI-1");
+    const many = planDeliveryInvocation({
+      githubActions: true,
+      mode: "ship",
+      argv: ["QUI-1", "qui-2"],
+      shipAction: "ship",
+    });
+    assert.deepEqual(many.issues, ["QUI-1", "QUI-2"]);
+    assert.equal(ghaDispatchFields(many).issue, "QUI-1 QUI-2");
+    const all = planDeliveryInvocation({
+      githubActions: true,
+      mode: "ship",
+      argv: ["all"],
+      shipAction: "ship",
+    });
+    assert.equal(all.shipAll, true);
+    assert.deepEqual(all.issues, []);
+    assert.equal(ghaDispatchFields(all).issue, "all");
+  });
+
   it("serializes ship continuation separately from the ship mode", () => {
     const plan = planDeliveryInvocation({
       githubActions: false,
