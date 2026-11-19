@@ -569,6 +569,23 @@ design:
       assert.match(warnings[0] ?? "", /bots is ignored/);
     }
   });
+
+  it("reads contract edges and rejects a repo the pack does not name", () => {
+    const loaded = loadPack(write(`${base}
+contractEdges:
+  - producer: api
+    consumers: [api]
+`));
+    assert.deepEqual(loaded.contractEdges, [{ producer: "api", consumers: ["api"] }]);
+    assert.throws(
+      () => loadPack(write(`${base}
+contractEdges:
+  - producer: api
+    consumers: [missing]
+`)),
+      /consumers\[0\] must be a repo/,
+    );
+  });
 });
 
 function captureWarnings(run: () => void): string[] {
