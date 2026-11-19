@@ -201,6 +201,12 @@ export type PromotionStage = {
   approval?: ShipApproval;
 };
 
+/** One producer repo and the repos that consume its contract. */
+export type ContractEdge = {
+  producer: string;
+  consumers: string[];
+};
+
 export type JiraConfig = {
   apiBaseUrl: string;
   /** Env var containing the full Authorization header value; passed through unchanged. */
@@ -265,6 +271,11 @@ export type ProjectPack = {
    */
   workerHttp?: WorkerHttp;
   repos: RepoSpec[];
+  /**
+   * A ticket that includes the producer conflicts with a ticket that includes
+   * a consumer. Absent means no contract edges. Same-repo overlap is separate.
+   */
+  contractEdges?: ContractEdge[];
   /**
    * Repos whose commits must show a person. Absent repos keep the token's
    * own account, including a GitHub App.
@@ -426,7 +437,38 @@ export function loadPack(path: string): ProjectPack {
   raw.workerModel = loadWorkerModel(raw.workerModel, path);
   raw.workerHttp = loadWorkerHttp(raw.workerHttp, raw.worker, path);
   raw.transient = loadTransient(raw.transient, path);
+  raw.contractEdges = loadContractEdges(raw.contractEdges, path, raw.repos);
   return raw;
+}
+
+function loadContractEdges(
+  value: unknown,
+  path: string,
+  repos: readonly { name: string }[],
+): ContractEdge[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error(`${path} contractEdges must be a list`);
+  const names = new Set(repos.map((repo) => repo.name));
+  return value.map((edge, index) => {
+    if (!edge || typeof edge !== "object" || Array.isArray(edge)) {
+      throw new Error(`${path} contractEdges[${index}] needs a producer and consumers`);
+    }
+    const record = edge as Record<string, unknown>;
+    const producer = typeof record.producer === "string" ? record.producer.trim() : "";
+    if (!producer || !names.has(producer)) {
+      throw new Error(`${path} contractEdges[${index}].producer must be a repo`);
+    }
+    if (!Array.isArray(record.consumers) || record.consumers.length === 0) {
+      throw new Error(`${path} contractEdges[${index}].consumers must name repos`);
+    }
+    const consumers = record.consumers.map((name, consumerIndex) => {
+      if (typeof name !== "string" || !name.trim() || !names.has(name.trim())) {
+        throw new Error(`${path} contractEdges[${index}].consumers[${consumerIndex}] must be a repo`);
+      }
+      return name.trim();
+    });
+    return { producer, consumers };
+  });
 }
 
 function loadRunner(value: unknown, path: string): { runner: RunnerKind; identity?: "mint" } {

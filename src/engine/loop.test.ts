@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import type { DeliveryState, ForgeAdapter, LinearProgramTracker, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
-import type { ProjectPack, PromotionStage } from "../schema/pack.ts";
+import type { ContractEdge, ProjectPack, PromotionStage, RepoSpec } from "../schema/pack.ts";
 import type { CompileProgramResult } from "./linear-harness-policy.ts";
 import { proofLinesFor } from "../../scripts/journey-proof.mjs";
 import { gitAskpassPath } from "./credentials.ts";
@@ -4229,5 +4229,260 @@ describe("ci fix limit", () => {
       assert.equal(ciFixLimit({ ...env.deps, ciFixMax: 1 }), 1);
       assert.equal(ciFixLimit({ ...env.deps, ciFixMax: 0 }), 0);
     });
+  });
+});
+
+const PARALLEL_REPOS = ["api", "admin-web", "customer-web", "customer-app", "operator-app", "infra", "notes", "billing"];
+
+function parallelRepo(name: string): RepoSpec {
+  return { name, url: `https://github.com/acme/${name}`, trunk: "main" };
+}
+
+async function waitFor(ready: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (ready()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("timed out waiting for sweep");
+}
+
+function parallelSweep(input: {
+  rows: { id: string; repos: string | null }[];
+  edges?: ContractEdge[];
+  stopOn?: string;
+}) {
+  const revision = ticket().criteriaRevision;
+  const texts = new Map(input.rows.map((row) => [row.id, audit(row.repos ?? "api")]));
+  const status = new Map<string, string>();
+  const delivery = new Map<string, DeliveryState>();
+  const blank = (): DeliveryState => ({ schemaVersion: 2, markers: [], stageReceipts: [] });
+  for (const row of input.rows) {
+    if (!row.repos) continue;
+    delivery.set(row.id, {
+      ...blank(),
+      markers: [{
+        kind: "work-order",
+        body: JSON.stringify({ ground: texts.get(row.id), receipt: "", criteriaRevision: revision }),
+        createdAt: new Date(0).toISOString(),
+      }],
+    });
+  }
+  const tracker: TrackerAdapter = {
+    kind: "github",
+    async listIntake() {
+      return input.rows
+        .filter((row) => (status.get(row.id) ?? "Todo") === "Todo")
+        .map((row) => ticket({ id: row.id, identifier: row.id, title: row.id, body: row.id, stateName: "Todo" }));
+    },
+    async get(id) {
+      return ticket({ id, identifier: id, title: id, body: id, stateName: status.get(id) ?? "Todo" });
+    },
+    async comment() {},
+    async setState(id, next) {
+      status.set(id, next);
+    },
+    async addLabel() {},
+    async removeLabel() {},
+    stateStore: {
+      async readDeliveryState(id) {
+        return delivery.get(id) ?? blank();
+      },
+      async writeDeliveryState(id, next) {
+        delivery.set(id, next);
+      },
+    },
+  };
+  let active = 0;
+  let maxGround = 0;
+  const grounds: string[] = [];
+  const phase = new Map<string, number>();
+  let openGate: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    openGate = resolve;
+  });
+  const worker: WorkerAdapter = {
+    kind: "http",
+    async start(request) {
+      const id = /Ticket ([A-Za-z0-9-]+)/.exec(request.prompt)?.[1]
+        ?? /work order for ([A-Za-z0-9-]+)/.exec(request.prompt)?.[1];
+      if (!id) return { runId: `other:${grounds.length}` };
+      const step = (phase.get(id) ?? 0) + 1;
+      phase.set(id, step);
+      if (step === 1 && !grounds.includes(id)) {
+        grounds.push(id);
+        active += 1;
+        maxGround = Math.max(maxGround, active);
+      }
+      return { runId: `${id}:${step}` };
+    },
+    async join(runId) {
+      const [id, step] = runId.split(":");
+      if (step === "1") await gate;
+      return { status: "finished", branch: `delivery/${id}`, head: "abc", text: texts.get(id) ?? BUILDABLE };
+    },
+  };
+  const forge: ForgeAdapter = {
+    async directLand({ expectedHeadSha }) { return expectedHeadSha; },
+    async openPullRequest() {
+      return { number: 4, url: "https://github.com/acme/api/pull/4", headSha: "abc", branch: "delivery/api-1", created: true };
+    },
+    async quality() {
+      return { state: "success", detail: "quality success" };
+    },
+    async requestQualityRun() { return null; },
+    async mergeability() {
+      return { state: "clean", headSha: "abc" };
+    },
+    async updateBranch() {},
+    async compare() { return "ahead"; },
+    async squashMerge() {
+      active = Math.max(0, active - 1);
+      return "trunk";
+    },
+    async dispatch() {},
+  };
+  const deps: LoopDeps = {
+    pack: {
+      ...pack,
+      repos: PARALLEL_REPOS.map(parallelRepo),
+      contractEdges: input.edges ?? [],
+    },
+    tracker,
+    worker,
+    forge,
+    invariantsMarkdown: invariants,
+    maxQualityPolls: 1,
+    pageControl: { stop: false, healed: [] },
+    report() {},
+  };
+  const previousJoin = worker.join.bind(worker);
+  worker.join = async (runId) => {
+    const joined = await previousJoin(runId);
+    const id = runId.split(":")[0];
+    if (input.stopOn && id === input.stopOn && runId.endsWith(":1")) deps.pageControl!.stop = true;
+    return joined;
+  };
+  return {
+    grounds,
+    max: () => maxGround,
+    release: () => openGate(),
+    done: sweep(deps),
+  };
+}
+
+describe("parallel intake", () => {
+  const edges: ContractEdge[] = [{
+    producer: "api",
+    consumers: ["admin-web", "customer-web", "customer-app", "operator-app"],
+  }];
+
+  it("starts operator-app and infra together", async () => {
+    const run = parallelSweep({
+      rows: [{ id: "QUI-1", repos: "operator-app" }, { id: "QUI-2", repos: "infra" }],
+    });
+    await waitFor(() => run.grounds.length === 2);
+    assert.deepEqual([...run.grounds].sort(), ["QUI-1", "QUI-2"]);
+    run.release();
+    const results = await run.done;
+    assert.equal(run.max(), 2);
+    assert.deepEqual(results.map((row) => row.outcome), ["landed", "landed"]);
+  });
+
+  it("holds a second operator-app ticket until the first lands", async () => {
+    const run = parallelSweep({
+      rows: [{ id: "QUI-1", repos: "operator-app" }, { id: "QUI-2", repos: "operator-app" }],
+    });
+    await waitFor(() => run.grounds.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(run.grounds, ["QUI-1"]);
+    run.release();
+    const results = await run.done;
+    assert.equal(run.max(), 1);
+    assert.deepEqual(results.map((row) => row.outcome), ["landed", "landed"]);
+  });
+
+  it("holds api behind admin-web", async () => {
+    const run = parallelSweep({
+      rows: [{ id: "QUI-1", repos: "admin-web" }, { id: "QUI-2", repos: "api" }],
+      edges,
+    });
+    await waitFor(() => run.grounds.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(run.grounds, ["QUI-1"]);
+    run.release();
+    const results = await run.done;
+    assert.equal(run.max(), 1);
+    assert.deepEqual(results.map((row) => row.outcome), ["landed", "landed"]);
+  });
+
+  it("holds admin-web behind api", async () => {
+    const run = parallelSweep({
+      rows: [{ id: "QUI-1", repos: "api" }, { id: "QUI-2", repos: "admin-web" }],
+      edges,
+    });
+    await waitFor(() => run.grounds.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(run.grounds, ["QUI-1"]);
+    run.release();
+    await run.done;
+    assert.equal(run.max(), 1);
+  });
+
+  it("starts customer-web and operator-app together", async () => {
+    const run = parallelSweep({
+      rows: [{ id: "QUI-1", repos: "customer-web" }, { id: "QUI-2", repos: "operator-app" }],
+      edges,
+    });
+    await waitFor(() => run.grounds.length === 2);
+    assert.deepEqual([...run.grounds].sort(), ["QUI-1", "QUI-2"]);
+    run.release();
+    await run.done;
+    assert.equal(run.max(), 2);
+  });
+
+  it("runs a ticket with no recorded repos alone", async () => {
+    const run = parallelSweep({
+      rows: [{ id: "QUI-1", repos: null }, { id: "QUI-2", repos: "infra" }],
+    });
+    await waitFor(() => run.grounds.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(run.grounds, ["QUI-1"]);
+    run.release();
+    const results = await run.done;
+    assert.equal(run.max(), 1);
+    assert.deepEqual(results.map((row) => row.outcome), ["landed", "landed"]);
+  });
+
+  it("leaves a third disjoint ticket waiting until a slot frees", async () => {
+    const run = parallelSweep({
+      rows: [
+        { id: "QUI-1", repos: "infra" },
+        { id: "QUI-2", repos: "notes" },
+        { id: "QUI-3", repos: "billing" },
+      ],
+    });
+    await waitFor(() => run.grounds.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual([...run.grounds].sort(), ["QUI-1", "QUI-2"]);
+    run.release();
+    const results = await run.done;
+    assert.equal(run.max(), 2);
+    assert.equal(results.filter((row) => row.outcome === "landed").length, 3);
+  });
+
+  it("starts nothing further after a page stop", async () => {
+    const run = parallelSweep({
+      rows: [
+        { id: "QUI-1", repos: "infra" },
+        { id: "QUI-2", repos: "notes" },
+        { id: "QUI-3", repos: "billing" },
+      ],
+      stopOn: "QUI-1",
+    });
+    await waitFor(() => run.grounds.length === 2);
+    run.release();
+    const results = await run.done;
+    assert.deepEqual([...run.grounds].sort(), ["QUI-1", "QUI-2"]);
+    assert.equal(results.some((row) => row.identifier === "QUI-3"), false);
   });
 });

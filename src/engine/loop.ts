@@ -21,6 +21,7 @@ import {
   ticketFigmaUrls,
 } from "./design-gate.ts";
 import { releaseVersionFromTag } from "./engine-heal.ts";
+import { selectIntakeStarts, type IntakeCandidate } from "./intake-parallel.ts";
 import { isGithubActionsRunActive } from "./github-run-status.js";
 import {
   compileDeliveryProgramFromLinear,
@@ -3941,9 +3942,10 @@ async function loadProgram(deps: LoopDeps, projectName?: string | null): Promise
 const MAX_SWEEP_PASSES = 50;
 
 /**
- * Read the queue, run what is ready, and read it again when a ticket lands
- * or a verdict moves it. A ticket that was waiting on that one can run in
- * this same page. A pass that only skips blocked tickets stops.
+ * Read the queue and start every ready ticket whose recorded land repos are
+ * disjoint from the tickets already running. A ticket with no recorded repos
+ * runs alone. Read the queue again when a ticket lands or a verdict moves it.
+ * A pass that only skips blocked tickets stops.
  */
 async function probeConfiguredCredentials(deps: LoopDeps): Promise<void> {
   assertReferencedCredentials(deps.pack);
@@ -3956,6 +3958,11 @@ async function probeConfiguredCredentials(deps: LoopDeps): Promise<void> {
   }
 }
 
+async function intakeScope(deps: LoopDeps, ticket: Ticket): Promise<IntakeCandidate> {
+  await readDeliveryState(deps, ticket);
+  return { id: ticket.identifier, repos: recordedLandRepos(deps, ticket) };
+}
+
 export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
   await probeConfiguredCredentials(deps);
   if (!deps.pageControl) deps.pageControl = { stop: false, healed: [] };
@@ -3963,62 +3970,140 @@ export async function sweep(deps: LoopDeps): Promise<TicketResult[]> {
   const blocked = new Set<string>();
   const programs = new Map<string, CompileProgramResult | null>();
   const results: TicketResult[] = [];
+  const inFlight = new Map<string, Promise<TicketResult>>();
+  const scopeById = new Map<string, IntakeCandidate>();
+  const edges = deps.pack.contractEdges ?? [];
+
+  const settle = (result: TicketResult, moved: { value: boolean }): void => {
+    results.push(result);
+    if (result.outcome === "skipped-graph" || result.outcome === "blocked") {
+      blocked.add(result.identifier);
+      return;
+    }
+    settled.add(result.identifier);
+    if (result.outcome === "landed" || result.outcome === "verdict") {
+      blocked.clear();
+      moved.value = true;
+    }
+  };
+
+  const finishOne = async (moved: { value: boolean }): Promise<void> => {
+    const result = await Promise.race(inFlight.values());
+    inFlight.delete(result.identifier);
+    scopeById.delete(result.identifier);
+    settle(result, moved);
+  };
+
+  const drain = async (moved: { value: boolean }): Promise<void> => {
+    while (inFlight.size > 0) await finishOne(moved);
+  };
+
   for (let pass = 0; pass < MAX_SWEEP_PASSES; pass++) {
     const tickets = await deps.tracker.listIntake(
       deps.project ? { project: deps.project } : undefined,
     );
-    const pending = tickets.filter(
-      (ticket) => !settled.has(ticket.identifier) && !blocked.has(ticket.identifier),
-    );
-    if (pending.length === 0) break;
-    let moved = false;
-    for (const ticket of pending) {
+    const moved = { value: false };
+    let idle = false;
+    while (!idle) {
+      if (deps.pageControl?.stop) {
+        await drain(moved);
+        return results;
+      }
       const remaining = pageBudgetRemainingMs({
         nowMs: deps.nowMs ?? Date.now(),
         startedAtMs: deps.pageStartedAtMs ?? null,
       });
+      const waiting = tickets.filter(
+        (ticket) => !settled.has(ticket.identifier) && !blocked.has(ticket.identifier) && !inFlight.has(ticket.identifier),
+      );
       if (shouldStopForPageReserve({ remainingMs: remaining })) {
-        const result: TicketResult = {
-          identifier: ticket.identifier,
-          outcome: "skipped-page",
-          detail: "page reserve",
-        };
-        noteDone(deps, result);
-        results.push(result);
+        if (inFlight.size > 0) {
+          await finishOne(moved);
+          if (deps.pageControl?.stop) {
+            await drain(moved);
+            return results;
+          }
+          if (moved.value) break;
+          continue;
+        }
+        const next = waiting[0];
+        if (next) {
+          const result: TicketResult = {
+            identifier: next.identifier,
+            outcome: "skipped-page",
+            detail: "page reserve",
+          };
+          noteDone(deps, result);
+          results.push(result);
+        }
         return results;
       }
-      const key = (deps.project ?? ticket.projectName ?? "").trim();
-      let program = deps.program ?? null;
-      if (!program && key) {
-        if (!programs.has(key)) programs.set(key, await loadProgram(deps, key));
-        program = programs.get(key) ?? null;
+      const ready: Ticket[] = [];
+      for (const ticket of waiting) {
+        const graph = evaluateGraphReady(
+          ticket.identifier,
+          ticket.blockedBy,
+          unblockingStates(deps.pack),
+        );
+        if (!graph.ready) {
+          const result: TicketResult = {
+            identifier: ticket.identifier,
+            outcome: "skipped-graph",
+            detail: graph.reasons.join("; "),
+          };
+          noteDone(deps, result);
+          settle(result, moved);
+          continue;
+        }
+        ready.push(ticket);
       }
-      let result: TicketResult;
-      try {
-        result = await runTicket(program ? { ...deps, program } : deps, ticket);
-      } catch (error) {
-        result = {
-          identifier: ticket.identifier,
-          outcome: "worker-failed",
-          detail: error instanceof Error ? error.message : String(error),
-        };
-        noteDone(deps, result);
-      }
-      results.push(result);
-      if (deps.pageControl?.stop) return results;
-      if (result.outcome === "skipped-graph" || result.outcome === "blocked") {
-        blocked.add(ticket.identifier);
+      const candidates = await Promise.all(ready.map((ticket) => intakeScope(deps, ticket)));
+      const flying = [...inFlight.keys()].map((id) => scopeById.get(id)).filter((row): row is IntakeCandidate => Boolean(row));
+      const starts = selectIntakeStarts(candidates, flying, edges);
+      if (starts.length === 0) {
+        if (inFlight.size === 0) {
+          idle = true;
+          break;
+        }
+        await finishOne(moved);
+        if (deps.pageControl?.stop) {
+          await drain(moved);
+          return results;
+        }
+        if (moved.value) break;
         continue;
       }
-      settled.add(ticket.identifier);
-      if (result.outcome === "landed" || result.outcome === "verdict") {
-        blocked.clear();
-        moved = true;
-        break;
+      for (const id of starts) {
+        const ticket = ready.find((row) => row.identifier === id);
+        const candidate = candidates.find((row) => row.id === id);
+        if (!ticket || !candidate) continue;
+        scopeById.set(id, candidate);
+        const key = (deps.project ?? ticket.projectName ?? "").trim();
+        let program = deps.program ?? null;
+        if (!program && key) {
+          if (!programs.has(key)) programs.set(key, await loadProgram(deps, key));
+          program = programs.get(key) ?? null;
+        }
+        const runDeps = program ? { ...deps, program } : deps;
+        inFlight.set(id, (async () => {
+          try {
+            return await runTicket(runDeps, ticket);
+          } catch (error) {
+            const result: TicketResult = {
+              identifier: ticket.identifier,
+              outcome: "worker-failed",
+              detail: error instanceof Error ? error.message : String(error),
+            };
+            noteDone(deps, result);
+            return result;
+          }
+        })());
       }
     }
-    if (!moved) break;
+    if (idle && inFlight.size === 0) break;
+    if (!moved.value && inFlight.size === 0) break;
   }
+  await drain({ value: false });
   return results;
 }
 
