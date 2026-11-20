@@ -69,7 +69,9 @@ import {
 } from "./quality-cause.js";
 import {
   failureTypeForHealKey,
+  healCapFor,
   HealExhaustedError,
+  healExhaustedNotice,
   healVerdict,
   ownerHealPrompt,
   shipNoSignature,
@@ -292,9 +294,12 @@ export type TicketResult = {
   reasonCode?: string;
 };
 
-/** A landed ticket that is still missing proof does not exit 0. */
+/**
+ * A page that stopped so an edited trunk can load does not exit 0.
+ * A ticket that stays in intake is the heal running again, not a failed run.
+ */
 export function deliveryExitCode(result: { outcome: string }): number {
-  if (result.outcome === "journey-missing" || result.outcome === "land-blocked") return 1;
+  if (result.outcome === "land-blocked") return 1;
   return 0;
 }
 
@@ -2788,6 +2793,7 @@ async function applyRecordedProof(
     proofSatisfies(deps, provenText, proofReceipt, files.onTargets);
   const note = proven ? "" : journeyMissComment(deps, ticket.identifier, provenText, proofReceipt, files.unavailable);
   if (!proven) {
+    await healMissingJourney(deps, ticket, note);
     await deps.tracker.comment(ticket.identifier, note);
     return {
       ok: false,
@@ -2851,7 +2857,13 @@ async function settleTrunk(
     return { identifier: ticket.identifier, outcome: "trunk-waiting", detail: waiting.map((row) => `${row.repo} ${row.sha}`).join(" ") };
   }
   const order = parseWorkOrder(declared);
-  if (!order) return { identifier: ticket.identifier, outcome: "invalid-packet", detail: "acceptance matrix missing from saved work order" };
+  const shippedWithoutPacket =
+    !order &&
+    (parseVerdict(declared) === "ALREADY SHIPPED" || parseVerdict(receipt) === "ALREADY SHIPPED");
+  if (!order && !shippedWithoutPacket) {
+    return { identifier: ticket.identifier, outcome: "invalid-packet", detail: "acceptance matrix missing from saved work order" };
+  }
+  if (order) {
   let stages = await runPromotionStages(deps, ticket, "deliver", candidates, order.criteria);
   // Read a failed delivery stage again before editing its owner. A timeout already spent its budget.
   if (stages.outcome !== "complete" && stages.problems.every((problem) => problem.timedOut !== true)) {
@@ -2882,6 +2894,7 @@ async function settleTrunk(
       return { identifier: ticket.identifier, outcome: "blocked", detail: `stage ${stages.stage.id} parked: ${stages.reason}` };
     }
     return { identifier: ticket.identifier, outcome: "blocked", detail: stages.reason };
+  }
   }
   const gate = await applyRecordedProof(deps, ticket, rows, declared, receipt);
   if (!gate.ok) return gate.result;
@@ -3296,6 +3309,18 @@ function healAlready(deps: LoopDeps, ticket: Ticket, key: string): boolean {
  * A second call for the same key does not start a worker.
  * The page stops so the next page checks out the edited trunk.
  */
+function ownerHealMarkerType(body: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (parsed && typeof parsed === "object" && "type" in parsed && typeof parsed.type === "string") {
+      return parsed.type;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 async function applyOwnerHeal(
   deps: LoopDeps,
   ticket: Ticket,
@@ -3304,6 +3329,23 @@ async function applyOwnerHeal(
 ): Promise<HealVerdict> {
   if (healAlready(deps, ticket, key)) return "wait";
   const type = failureTypeForHealKey(key);
+  const state = await readDeliveryState(deps, ticket);
+  const attempts = state.markers.filter(
+    (marker) => marker.kind === "owner-heal" && ownerHealMarkerType(marker.body) === type,
+  );
+  const cap = healCapFor(deps.pack.heal, type);
+  if (attempts.length >= cap) {
+    if (!state.markers.some((marker) => marker.kind === "heal-exhausted")) {
+      const stopped = {
+        kind: "heal-exhausted",
+        body: type,
+        createdAt: new Date(deps.nowMs ?? Date.now()).toISOString(),
+      };
+      await writeDeliveryState(deps, ticket, { ...state, markers: [...state.markers, stopped] });
+      await deps.tracker.comment(ticket.identifier, healExhaustedNotice(type, reason));
+    }
+    throw new HealExhaustedError(type);
+  }
   const home = agentHome(deps.pack);
   const prompt = ownerHealPrompt({
     reason,
@@ -3322,16 +3364,17 @@ async function applyOwnerHeal(
     text = (await finishWorker(deps.worker, started.runId)).text;
   }
   const verdict = healVerdict(text);
-  if (verdict !== "edit") {
-    rememberVerdict(deps, key, verdict);
-    return verdict;
-  }
-  const state = await readDeliveryState(deps, ticket);
+  const recorded = await readDeliveryState(deps, ticket);
   await writeDeliveryState(deps, ticket, {
-    ...state,
-    markers: [...state.markers, { kind: "owner-heal", body: JSON.stringify({ key, type, reason }), createdAt: new Date(deps.nowMs ?? Date.now()).toISOString() }],
+    ...recorded,
+    markers: [...recorded.markers, {
+      kind: "owner-heal",
+      body: JSON.stringify({ key, type, reason }),
+      createdAt: new Date(deps.nowMs ?? Date.now()).toISOString(),
+    }],
   });
   rememberVerdict(deps, key, verdict);
+  if (verdict !== "edit") return verdict;
   if (!deps.pageControl) deps.pageControl = { stop: false, healed: [] };
   deps.pageControl.healed.push(key);
   deps.pageControl.stop = true;
