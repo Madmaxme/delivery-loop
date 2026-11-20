@@ -2690,7 +2690,7 @@ function citedRouteTestsOnCommit(dir: string, sha: string, ticketId: string, spe
   const pattern = `(^|[^A-Za-z0-9])${ticketId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[^A-Za-z0-9])`;
   const run = spawnSync(
     "git",
-    ["-C", dir, "grep", "-l", "-I", "-E", pattern, sha, "--", "e2e", "integration_test", "journey", "test"],
+    ["-C", dir, "grep", "-l", "-I", "-i", "-E", pattern, sha, "--", "e2e", "integration_test", "journey", "test"],
     { encoding: "utf8" },
   );
   if (run.status !== 0 || !run.stdout) return [];
@@ -2793,6 +2793,18 @@ async function applyRecordedProof(
     proofSatisfies(deps, provenText, proofReceipt, files.onTargets);
   const note = proven ? "" : journeyMissComment(deps, ticket.identifier, provenText, proofReceipt, files.unavailable);
   if (!proven) {
+    const cited = await proofFromLandedCommit(deps, ticket, rows);
+    if (cited) {
+      const recorded = `**Journey evidence:** recorded\n${cited}`;
+      const citedFiles = await journeyFileLookup(deps, recorded, rows);
+      const citedProven =
+        proofSatisfies(deps, recorded, recorded, citedFiles.onMerge) ||
+        proofSatisfies(deps, recorded, recorded, citedFiles.onTargets);
+      if (citedProven && citedFiles.unavailable.length === 0) {
+        noteEngine(deps, "proof ok");
+        return { ok: true, recorded: true, proofReceipt: cited };
+      }
+    }
     await healMissingJourney(deps, ticket, note);
     await deps.tracker.comment(ticket.identifier, note);
     return {
