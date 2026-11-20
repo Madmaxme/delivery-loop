@@ -2756,6 +2756,49 @@ describe("loop", () => {
     assert.equal(checked.includes("trunk:test/e2e/signup.spec.ts"), true);
   });
 
+  it("counts a landed journey-spec route test when task text names another path", async () => {
+    const root = mkdtempSync(join(tmpdir(), "journey-landed-"));
+    const dir = join(root, "api");
+    mkdirSync(join(dir, "test/e2e"), { recursive: true });
+    const git = (...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+    spawnSync("git", ["init", dir], { encoding: "utf8" });
+    git("config", "user.email", "dev@example.test");
+    git("config", "user.name", "Dev");
+    writeFileSync(join(dir, "test/e2e/onboarding_package_summaries_test.dart"), "const dir = 'api-1-package';\n");
+    git("add", ".");
+    const committed = git("commit", "-m", "route");
+    assert.equal(committed.status, 0, committed.stderr);
+    git("branch", "-M", "main");
+    const sha = git("rev-parse", "HEAD").stdout.trim();
+    const missing = "**Journey proof:** `api/integration_test/onboarding_network_package_copy_test.dart`";
+    const ground = [
+      BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded"),
+      missing,
+    ].join("\n");
+    const env = harness(ground);
+    env.deps.cwd = root;
+    env.deps.pack = {
+      ...pack,
+      journeyCommand: "node scripts/journey-proof.mjs",
+      journeySpec: "{e2e,integration_test,journey,test/e2e}/**",
+    };
+    env.deps.forge.squashMerge = async () => sha;
+    env.deps.runPackCommand = () => ({ status: 0, stdout: `${missing}\n` });
+    let heals = 0;
+    env.deps.ownerHeal = async () => {
+      heals += 1;
+      return "**Heal:** wait";
+    };
+    try {
+      const result = await runTicket(env.deps, ticket());
+      assert.equal(result.outcome, "landed");
+      assert.equal(heals, 0);
+      assert.equal(env.state(), pack.status.complete);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("persists the validated proof receipt before the completion status", async () => {
     const url = "https://example.test/artifacts/signup.mp4";
     const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** recorded"));
