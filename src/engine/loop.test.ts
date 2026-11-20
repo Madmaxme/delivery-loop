@@ -1203,12 +1203,14 @@ describe("loop", () => {
     assert.doesNotMatch(build, /real booking/);
   });
 
-  it("blocks missing post-land journey proof without starting an extra worker", async () => {
+  it("heals missing post-land journey proof once and does not start a second build", async () => {
     const ground = audit("api", "**Journey evidence:** recorded");
     const env = harness(ground);
+    const prompts: string[] = [];
     let starts = 0;
-    env.deps.worker.start = async () => {
+    env.deps.worker.start = async (input) => {
       starts += 1;
+      prompts.push(input.prompt);
       return { runId: `run-${starts}` };
     };
 
@@ -1217,7 +1219,8 @@ describe("loop", () => {
     assert.equal(result.outcome, "journey-missing");
     assert.equal(env.merged(), true);
     assert.equal(env.state(), "Todo");
-    assert.equal(starts, 2);
+    assert.equal(starts, 3);
+    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 1);
     assert.equal(env.deliveryState().markers.some((marker) => marker.kind === "proof-receipt"), false);
   });
 
@@ -2701,7 +2704,7 @@ describe("loop", () => {
     assert.match(result.detail, /unknown repo nope/);
     assert.equal(heals, 1);
     assert.notEqual(env.state(), pack.status.complete);
-    assert.equal(deliveryExitCode(result), 1);
+    assert.equal(deliveryExitCode(result), 0);
   });
 
   it("opens one heal and exits non-zero when proof is missing after land", async () => {
@@ -2716,7 +2719,7 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "journey-missing");
     assert.equal(heals, 1);
-    assert.equal(deliveryExitCode(result), 1);
+    assert.equal(deliveryExitCode(result), 0);
     assert.notEqual(env.state(), pack.status.complete);
     const again = await runTicket(env.deps, ticket());
     assert.equal(again.outcome, "journey-missing");
@@ -2843,6 +2846,54 @@ describe("loop", () => {
     assert.equal(result.outcome, "journey-missing");
     assert.equal(result.detail, "recorded proof missing");
     assert.equal(env.state(), "Todo");
+    assert.equal(needsNextPage([result]), true);
+  });
+
+  it("stops chaining when the missing-proof heal reaches its cap", async () => {
+    const ground = BUILDABLE.replace(
+      "**Journey evidence:** not-applicable",
+      "**Journey evidence:** recorded\n**Journey proof:** `api/test/pay.spec.ts`",
+    );
+    const env = harness(ground);
+    env.deps.journeyFileAt = () => true;
+    const marker = {
+      kind: "owner-heal",
+      body: JSON.stringify({ key: "heal:journey:missing", type: "other", reason: "missing" }),
+      createdAt: new Date(0).toISOString(),
+    };
+    const state = await env.deps.tracker.stateStore.readDeliveryState("API-1");
+    await env.deps.tracker.stateStore.writeDeliveryState("API-1", {
+      ...state,
+      markers: [marker, marker, marker],
+    });
+    let heals = 0;
+    env.deps.ownerHeal = async () => {
+      heals += 1;
+      return "**Heal:** wait";
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "heal-exhausted");
+    assert.equal(heals, 0);
+    assert.equal(needsNextPage([result]), false);
+    assert.equal(deliveryExitCode(result), 0);
+    assert.match(env.comments.join("\n"), /Stopped\./);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("completes an already-shipped ticket that has no build acceptance matrix", async () => {
+    const env = harness([
+      "**Verdict:** ALREADY SHIPPED",
+      "**Repos:** `api`",
+      "**Outside grant:** none",
+      "**Journey evidence:** not-applicable",
+      "**Prior request:** none",
+    ].join("\n"));
+    env.deps.ticketOnTrunk = () => "shipped";
+    env.deps.lookupHead = () => "shipped";
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(result.detail, "already on trunk");
+    assert.equal(env.state(), "Dev Complete");
   });
 
 
@@ -3180,7 +3231,7 @@ describe("loop", () => {
     assert.equal(env.merged(), false);
   });
 
-  it("keeps editing a red quality check after earlier attempts", async () => {
+  it("stops a red quality check when that failure type's cap is already spent", async () => {
     const env = harness(BUILDABLE);
     const prompts: string[] = [];
     const start = env.deps.worker.start.bind(env.deps.worker);
@@ -3191,10 +3242,9 @@ describe("loop", () => {
     env.deps.pack = { ...pack, heal: { caps: { "quality-red": 0 } } };
     env.deps.forge.quality = async () => ({ state: "failure", detail: "quality failure" });
     const result = await runTicket(env.deps, ticket({ labels: ["heal-exhausted", "quality-red"] }));
-    assert.equal(result.outcome, "land-blocked");
-    assert.match(result.detail, /procedure owner was edited/);
-    assert.equal(needsNextPage([result]), true);
-    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 1);
+    assert.equal(result.outcome, "heal-exhausted");
+    assert.equal(needsNextPage([result]), false);
+    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 0);
   });
 
   it("keeps the stage command error in the failure", () => {
