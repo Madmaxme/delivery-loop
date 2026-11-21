@@ -2928,7 +2928,7 @@ describe("loop", () => {
     assert.equal(env.state(), "Todo");
   });
 
-  it("walks an already-shipped blocked ticket once and does not complete on a sentence", async () => {
+  it("heals an already-shipped blocked ticket and does not start a second walk", async () => {
     const ground = [
       "**Verdict:** ALREADY SHIPPED",
       "**Repos:** `api`",
@@ -2952,16 +2952,9 @@ describe("loop", () => {
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "journey-missing");
     assert.equal(env.state(), "Todo");
-    assert.equal(prompts.length, 2);
-    assert.match(prompts[1] ?? "", /Open the running build/);
+    assert.equal(prompts.length, 1);
+    assert.doesNotMatch(prompts[0] ?? "", /Open the running build/);
     assert.equal(heals, 1);
-    prompts.length = 0;
-    heals = 0;
-    const again = await runTicket(env.deps, ticket());
-    assert.equal(again.outcome, "journey-missing");
-    assert.equal(prompts.filter((prompt) => /Open the running build/.test(prompt)).length, 0);
-    assert.equal(heals, 0);
-    assert.equal(env.state(), "Todo");
   });
 
   it("completes an already-shipped ticket that has no build acceptance matrix", async () => {

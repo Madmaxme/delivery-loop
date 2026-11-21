@@ -8,6 +8,7 @@ import {
   invariantExists,
   journeyEvidenceBlocksBuild,
   journeyEvidenceProven,
+  journeyRequiresProof,
   parseJourneyEvidence,
   parseJourneyProofs,
   parsePriorRequest,
@@ -95,6 +96,9 @@ describe("journey evidence", () => {
     assert.equal(parseJourneyEvidence("**Journey evidence:** blocked"), "blocked");
     assert.equal(journeyEvidenceBlocksBuild("**Journey evidence:** not-applicable"), null);
     assert.equal(journeyEvidenceBlocksBuild("**Journey evidence:** blocked"), null);
+    assert.equal(journeyRequiresProof("**Journey evidence:** blocked"), true);
+    assert.equal(journeyRequiresProof("**Journey evidence:** recorded"), true);
+    assert.equal(journeyRequiresProof("**Journey evidence:** not-applicable"), false);
     assert.equal(journeyEvidenceBlocksBuild("**Verdict:** BUILDABLE"), "missing");
   });
 

@@ -48,6 +48,7 @@ import {
   investigationBlocksBuild,
   journeyEvidenceBlocksBuild,
   journeyEvidenceProven,
+  journeyRequiresProof,
   parkStateForVerdict,
   parseJourneyEvidence,
   parseJourneyProofs,
@@ -524,7 +525,7 @@ function journeyWalkText(spec: string): string {
     "A presigned link that expires is not proof. A sentence that names no URL is not proof.",
     `A mobile token is the route test on the exact landed commit whose path matches \`${spec}\`.`,
     "Use a non-mutating view or test data.",
-    "The runner does not mark delivery complete without that proof. A missing proof is the same heal as any required step that returned no. One walk is recorded for the landed commits. A later run does not start another walk to paste a sentence.",
+    "The runner does not mark delivery complete without that proof. A missing proof is the same heal as any required step that returned no. A later run does not start a second worker to paste a sentence.",
   ].join(" ");
 }
 
@@ -988,7 +989,7 @@ async function runHeldTicket(
         commits !== null &&
         commits.length > 0 &&
         parseOutsideGrant(ground.text) !== "open" &&
-        (parseJourneyEvidence(ground.text) === "blocked" || parseJourneyEvidence(ground.text) === "recorded");
+        journeyRequiresProof(ground.text);
       if (unverified && commits) {
         await writeMarker(
           deps,
@@ -996,17 +997,7 @@ async function runHeldTicket(
           "work-order",
           JSON.stringify({ ground: ground.text, receipt: ground.text, criteriaRevision: ticket.criteriaRevision }),
         );
-        const walked = await walkLandedJourney(deps, ticket, commits, ground.text);
-        if (walked && "outcome" in walked) return walked;
-        return settleTrunk(
-          deps,
-          ticket,
-          false,
-          commits,
-          "already on trunk",
-          ground.text,
-          walked?.text ?? ground.text,
-        );
+        return settleTrunk(deps, ticket, false, commits, "already on trunk", ground.text, ground.text);
       }
       if (parked === deps.pack.status.complete && commits && commits.length > 0) {
         await writeMarker(deps, ticket, "work-order", JSON.stringify({ ground: ground.text, receipt: ground.text, criteriaRevision: ticket.criteriaRevision }));
@@ -2760,69 +2751,6 @@ async function proofFromLandedCommit(
   return null;
 }
 
-function verificationText(text: string): string {
-  if (parseJourneyEvidence(text) !== "blocked") return text;
-  return text.replace(/\*\*Journey evidence:\*\*\s*blocked\b/i, "**Journey evidence:** recorded");
-}
-
-/** One walk of the landed commits. A later run heals instead of starting another walk. */
-async function walkLandedJourney(
-  deps: LoopDeps,
-  ticket: Ticket,
-  rows: { repo: RepoSpec; sha: string }[],
-  declared: string,
-): Promise<TicketResult | { text: string } | null> {
-  const landed = rows.map((row) => ({ repo: row.repo.name, sha: row.sha }));
-  await writeMarker(deps, ticket, "landed-commits", JSON.stringify(landed));
-  if (journeyProofReceiptState(deps, ticket)?.attempted) return null;
-  await writeMarker(deps, ticket, "proof-receipt", JSON.stringify({
-    schemaVersion: 2,
-    criteriaRevision: ticket.criteriaRevision,
-    landed,
-    pullRequests: [],
-    attempted: true,
-    validated: false,
-    receipt: "",
-  } satisfies JourneyProofReceipt));
-  const home = rows[0];
-  if (!home) return null;
-  let started: { runId: string };
-  try {
-    started = await deps.worker.start({
-      prompt: [
-        universalConduct(),
-        `Verify ${ticket.identifier}. The code is already on the trunk. Do not open a pull request and do not call the tracker.`,
-        journeyWalkText(deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC),
-        rows.map((row) => `${row.repo.name} landed commit \`${row.sha}\``).join("\n"),
-        declared,
-      ].join("\n\n"),
-      repoUrl: home.repo.url,
-      baseRef: home.sha,
-    });
-  } catch {
-    return null;
-  }
-  try {
-    await noteLiveRun(deps, ticket, "build", started.runId);
-  } catch {
-    return null;
-  }
-  let built: { status: string; text?: string };
-  try {
-    built = await finishWorker(deps.worker, started.runId);
-  } catch (error) {
-    const text = error instanceof Error ? error.message : "";
-    if (text.trim()) await rememberJourneyReceipt(deps, ticket, text);
-    return null;
-  }
-  if (built.status === "running") {
-    return { identifier: ticket.identifier, outcome: "worker-running", detail: `cursor_run=${started.runId}` };
-  }
-  const text = built.text ?? "";
-  if (text.trim()) await rememberJourneyReceipt(deps, ticket, text);
-  return { text };
-}
-
 async function applyRecordedProof(
   deps: LoopDeps,
   ticket: Ticket,
@@ -2830,10 +2758,7 @@ async function applyRecordedProof(
   declared: string,
   receipt: string,
 ): Promise<RecordedProof> {
-  declared = verificationText(declared);
-  receipt = verificationText(receipt);
-  const recorded =
-    parseJourneyEvidence(declared) === "recorded" || parseJourneyEvidence(receipt) === "recorded";
+  const recorded = journeyRequiresProof(declared) || journeyRequiresProof(receipt);
   if (!recorded) return { ok: true, recorded: false, proofReceipt: receipt };
   const evidence = `${declared}\n${receipt}`;
   const existing = publishedProofReceipt(deps, ticket);

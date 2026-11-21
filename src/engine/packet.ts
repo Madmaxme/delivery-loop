@@ -272,6 +272,12 @@ export function parseJourneyEvidence(text: string): JourneyEvidence | null {
   return null;
 }
 
+/** `recorded` and `blocked` both wait on real proof. `not-applicable` does not. */
+export function journeyRequiresProof(text: string): boolean {
+  const kind = parseJourneyEvidence(text);
+  return kind === "recorded" || kind === "blocked";
+}
+
 const EVIDENCE_RE = /\*\*Evidence:\*\*\s*(queried|not-applicable)\b/i;
 const RUNTIME_EVIDENCE_RE = /\*\*Runtime evidence:\*\*\s*(queried|blocked|not-applicable)\b/i;
 const KILLED_ALTERNATIVES_RE = /\*\*Killed alternatives:\*\*\s*(.*)/i;
