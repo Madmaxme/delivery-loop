@@ -326,6 +326,7 @@ export function commitActorsFromTrustedRef(pack: ProjectPack): ProjectPack["comm
 function trackerFor(
   pack: ProjectPack,
   github?: { token: string; slot: "mint" | "gh-token" },
+  installation?: ReturnType<typeof createInstallationToken>,
 ): TrackerAdapter & Partial<LinearProgramTracker> {
   if (pack.tracker === "linear") {
     return linearTracker({
@@ -336,11 +337,22 @@ function trackerFor(
   }
   if (pack.tracker === "github") {
     const auth = github ?? { token: requireEnv("GH_TOKEN"), slot: "gh-token" as const };
+    const minted = pack.identity === "mint" && installation;
     return githubIssuesTracker({
       token: auth.token,
       slot: auth.slot,
       repo: pack.githubRepo ?? "",
       intakeLabel: pack.status.intake,
+      ...(minted
+        ? {
+            tokenNow: async () => (await installation.get()).token,
+            reacquire: async () => {
+              installation.invalidate();
+              await installation.get();
+              return true;
+            },
+          }
+        : {}),
     });
   }
   if (!pack.jira) throw new Error("Jira tracker configuration is missing");
@@ -350,6 +362,7 @@ function trackerFor(
 function openForge(pack: ProjectPack, withActors: boolean, step: string): {
   forge: ForgeAdapter;
   tokens: WorkerHttpToken;
+  installation: ReturnType<typeof createInstallationToken>;
 } {
   const checkoutDir = (repoUrl: string) => {
     const spec = pack.repos.find((repo) => repo.url === repoUrl);
@@ -377,9 +390,11 @@ function openForge(pack: ProjectPack, withActors: boolean, step: string): {
         });
   return {
     forge,
+    installation,
     tokens: {
       mint: () => installation.get(),
       forge: () => pack.identity === "mint" ? installation.get() : { token: forgeToken, slot: "gh-token" },
+      invalidate: () => installation.invalidate(),
     },
   };
 }
@@ -390,9 +405,9 @@ export async function adaptersFor(pack: ProjectPack, step: string): Promise<{
   forge: ForgeAdapter;
 }> {
   assertReferencedCredentials(pack);
-  const { forge, tokens } = openForge(pack, true, step);
+  const { forge, tokens, installation } = openForge(pack, true, step);
   const github = pack.identity === "mint" ? await tokens.mint() : undefined;
-  const tracker = trackerFor(pack, github);
+  const tracker = trackerFor(pack, github, installation);
   const worker = workerFor(pack, tokens, forge);
   return { tracker, worker, forge };
 }
@@ -407,6 +422,7 @@ function httpTokens(explicit?: WorkerHttpToken): WorkerHttpToken {
   return {
     mint: () => installation.get(),
     forge: () => ({ token, slot: "gh-token" }),
+    invalidate: () => installation.invalidate(),
   };
 }
 

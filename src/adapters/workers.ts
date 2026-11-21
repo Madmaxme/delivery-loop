@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
-import { credentialFetch, noteCredential, type CredentialNoteFn } from "../engine/credential-log.ts";
+import { credentialFetch, noteCredential, type CredentialNoteFn, type CredentialReacquire } from "../engine/credential-log.ts";
+import { liveCredential, reacquireEnv } from "../engine/credentials.ts";
 import {
   isAgentCapacityRefusal,
   orderedCursorApiKeys,
@@ -35,6 +36,8 @@ export type WorkerHttpToken = {
   mint(): Promise<InstallationToken>;
   /** Forge token, or the minted token when the runner identity is mint. The value is not written. */
   forge(): InstallationToken | Promise<InstallationToken>;
+  /** Drops the minted installation token so the next `mint` replaces it. */
+  invalidate?(): void;
 };
 
 function headerToken(name: string, value: string): string {
@@ -80,6 +83,35 @@ async function resolveHeaderMap(
     slots.push("worker-http");
   }
   return { headers, slot: credentialSlot(slots) };
+}
+
+function headerReacquire(
+  map: WorkerHttpHeaders | undefined,
+  env: Record<string, string | undefined>,
+  tokens: WorkerHttpToken | undefined,
+): CredentialReacquire | undefined {
+  const steps: CredentialReacquire[] = [];
+  const sources = new Set(Object.values(map ?? {}));
+  if ((sources.has("mint") || sources.has("gh-token")) && tokens?.invalidate) {
+    steps.push(async () => {
+      tokens.invalidate?.();
+      await tokens.mint();
+      return true;
+    });
+  }
+  for (const source of sources) {
+    if (source === "mint" || source === "gh-token") continue;
+    const renew = reacquireEnv(source, env);
+    if (renew) steps.push(renew);
+  }
+  if (steps.length === 0) return undefined;
+  return async () => {
+    let ok = false;
+    for (const step of steps) {
+      if (await step()) ok = true;
+    }
+    return ok;
+  };
 }
 
 /** `{id}` is replaced. A path with no placeholder gains the id as its last segment. */
@@ -316,7 +348,6 @@ export function httpWorker(opts: {
         return { runId: id };
       }
       if (!opts.startUrl) throw new Error("http worker start failed: no start");
-      const auth = await resolveHeaderMap(opts.startHeaders, opts.token, env, opts.tokens);
       const body: Record<string, unknown> = {
         id,
         prompt: input.prompt,
@@ -331,16 +362,21 @@ export function httpWorker(opts: {
           path: storePath,
         };
       }
+      const preview = await resolveHeaderMap(opts.startHeaders, opts.token, env, opts.tokens);
       const response = await credentialFetch(
-        auth.slot,
+        preview.slot,
         "worker-http-start",
-        () =>
-          fetchImpl(opts.startUrl, {
+        async () => {
+          const auth = await resolveHeaderMap(opts.startHeaders, opts.token, env, opts.tokens);
+          return fetchImpl(opts.startUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json", ...auth.headers },
             body: JSON.stringify(body),
-          }),
+          });
+        },
         note ?? noteCredential,
+        undefined,
+        headerReacquire(opts.startHeaders, env, opts.tokens),
       );
       await response.text().catch(() => undefined);
       if (!response.ok) throw new Error(`HTTP worker start failed: ${response.status}`);
@@ -375,12 +411,17 @@ export function httpWorker(opts: {
           await sleep(Math.min(pollMs, remaining));
           continue;
         }
-        const auth = await resolveHeaderMap(opts.statusHeaders, opts.token, env, opts.tokens);
+        const preview = await resolveHeaderMap(opts.statusHeaders, opts.token, env, opts.tokens);
         const response = await credentialFetch(
-          auth.slot,
+          preview.slot,
           "worker-http-status",
-          () => fetchImpl(url, { headers: auth.headers }),
+          async () => {
+            const auth = await resolveHeaderMap(opts.statusHeaders, opts.token, env, opts.tokens);
+            return fetchImpl(url, { headers: auth.headers });
+          },
           note ?? noteCredential,
+          undefined,
+          headerReacquire(opts.statusHeaders, env, opts.tokens),
         );
         if (!response.ok) {
           await response.text().catch(() => undefined);
@@ -415,26 +456,35 @@ export function copilotWorker(opts: {
   fetch?: FetchLike;
 }): WorkerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
-  const headers = {
-    Authorization: `Bearer ${opts.token}`,
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2026-03-10",
-    "Content-Type": "application/json",
-  };
+  const live = liveCredential("GH_TOKEN", opts.token);
+  function headers(): Record<string, string> {
+    return {
+      Authorization: `Bearer ${live.current()}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2026-03-10",
+      "Content-Type": "application/json",
+    };
+  }
   const base = `https://api.github.com/agents/repos/${opts.owner}/${opts.repo}/tasks`;
   return {
     kind: "copilot",
     async start(input) {
-      const response = await credentialFetch("gh-token", "copilot", () =>
-        fetchImpl(base, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            prompt: input.prompt,
-            base_ref: input.baseRef,
-            create_pull_request: false,
+      const response = await credentialFetch(
+        "gh-token",
+        "copilot",
+        () =>
+          fetchImpl(base, {
+            method: "POST",
+            headers: headers(),
+            body: JSON.stringify({
+              prompt: input.prompt,
+              base_ref: input.baseRef,
+              create_pull_request: false,
+            }),
           }),
-        }),
+        undefined,
+        undefined,
+        live.reacquire,
       );
       if (!response.ok) throw new Error(`Copilot task failed: ${response.status} ${await response.text()}`);
       const json = (await response.json()) as { id: string };
@@ -442,8 +492,13 @@ export function copilotWorker(opts: {
     },
     async join(runId) {
       return poll(async () => {
-        const response = await credentialFetch("gh-token", "copilot", () =>
-          fetchImpl(`${base}/${runId}`, { headers }),
+        const response = await credentialFetch(
+          "gh-token",
+          "copilot",
+          () => fetchImpl(`${base}/${runId}`, { headers: headers() }),
+          undefined,
+          undefined,
+          live.reacquire,
         );
         if (!response.ok) throw new Error(`Copilot status failed: ${response.status}`);
         const json = (await response.json()) as {
@@ -472,18 +527,21 @@ export function copilotWorker(opts: {
 
 export function codexWorker(opts: { apiKey: string; fetch?: FetchLike }): WorkerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
-  const headers = {
-    Authorization: `Bearer ${opts.apiKey}`,
-    "Content-Type": "application/json",
-    "OpenAI-Beta": "agents=v1",
-  };
+  const live = liveCredential("OPENAI_API_KEY", opts.apiKey);
+  function headers(): Record<string, string> {
+    return {
+      Authorization: `Bearer ${live.current()}`,
+      "Content-Type": "application/json",
+      "OpenAI-Beta": "agents=v1",
+    };
+  }
   return {
     kind: "codex",
     async start(input) {
       const response = await credentialFetch("codex", "codex", () =>
         fetchImpl("https://api.openai.com/v1/agents/sessions", {
           method: "POST",
-          headers,
+          headers: headers(),
           body: JSON.stringify({
           agent: { model: "gpt-5.4", instructions: "Follow the work order. Do not widen the change." },
           environment: {
@@ -494,6 +552,9 @@ export function codexWorker(opts: { apiKey: string; fetch?: FetchLike }): Worker
           input: [{ role: "user", content: [{ type: "input_text", text: input.prompt }] }],
         }),
       }),
+      undefined,
+      undefined,
+      live.reacquire,
       );
       if (!response.ok) throw new Error(`Codex session failed: ${response.status} ${await response.text()}`);
       const json = (await response.json()) as { id: string };
@@ -501,10 +562,16 @@ export function codexWorker(opts: { apiKey: string; fetch?: FetchLike }): Worker
     },
     async join(runId) {
       return poll(async () => {
-        const response = await credentialFetch("codex", "codex", () =>
-          fetchImpl(`https://api.openai.com/v1/agents/sessions/${runId}`, {
-            headers,
-          }),
+        const response = await credentialFetch(
+          "codex",
+          "codex",
+          () =>
+            fetchImpl(`https://api.openai.com/v1/agents/sessions/${runId}`, {
+              headers: headers(),
+            }),
+          undefined,
+          undefined,
+          live.reacquire,
         );
         if (!response.ok) throw new Error(`Codex status failed: ${response.status}`);
         const json = (await response.json()) as {
@@ -532,24 +599,30 @@ export function codexWorker(opts: { apiKey: string; fetch?: FetchLike }): Worker
 
 export function claudeWorker(opts: { apiKey: string; fetch?: FetchLike }): WorkerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
-  const headers = {
-    "x-api-key": opts.apiKey,
-    "anthropic-version": "2023-06-01",
-    "Content-Type": "application/json",
-  };
+  const live = liveCredential("ANTHROPIC_API_KEY", opts.apiKey);
+  function headers(): Record<string, string> {
+    return {
+      "x-api-key": live.current(),
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+    };
+  }
   return {
     kind: "claude",
     async start(input) {
       const response = await credentialFetch("claude", "claude", () =>
         fetchImpl("https://api.anthropic.com/v1/sessions", {
           method: "POST",
-          headers,
+          headers: headers(),
           body: JSON.stringify({
           model: "claude-sonnet-4-5",
           task: input.prompt,
           environment: { type: "repository", url: input.repoUrl, ref: input.baseRef },
         }),
       }),
+      undefined,
+      undefined,
+      live.reacquire,
       );
       if (!response.ok) throw new Error(`Claude session failed: ${response.status} ${await response.text()}`);
       const json = (await response.json()) as { id: string };
@@ -557,10 +630,16 @@ export function claudeWorker(opts: { apiKey: string; fetch?: FetchLike }): Worke
     },
     async join(runId) {
       return poll(async () => {
-        const response = await credentialFetch("claude", "claude", () =>
-          fetchImpl(`https://api.anthropic.com/v1/sessions/${runId}`, {
-            headers,
-          }),
+        const response = await credentialFetch(
+          "claude",
+          "claude",
+          () =>
+            fetchImpl(`https://api.anthropic.com/v1/sessions/${runId}`, {
+              headers: headers(),
+            }),
+          undefined,
+          undefined,
+          live.reacquire,
         );
         if (!response.ok) throw new Error(`Claude status failed: ${response.status}`);
         const json = (await response.json()) as {
@@ -801,6 +880,17 @@ export function cursorWorker(opts: {
               status,
               detail: modelId || undefined,
             });
+            if (status === 401 && !retried) {
+              const envName = current.slot === "fallback" ? "CURSOR_API_KEY_FALLBACK" : "CURSOR_API_KEY";
+              const renew = reacquireEnv(envName);
+              const next = renew?.() ? process.env[envName]?.trim() : "";
+              if (next) {
+                current.apiKey = next;
+                secrets.push(next);
+                retried = true;
+                continue;
+              }
+            }
             if (isLaunchServerError(status)) {
               if (!retried) {
                 retried = true;

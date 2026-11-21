@@ -417,4 +417,43 @@ describe("github mergeability", () => {
     await forge.probeCredentials?.();
     assert.equal(fetches, 0);
   });
+
+  it("mints a replacement installation token after HTTP 401 and does not mint again for 403", async () => {
+    const auths: string[] = [];
+    let mintCalls = 0;
+    const rejected = githubForge({
+      token: "",
+      identity: "mint",
+      mintCommand: "mint-installation-token",
+      runMint: () => {
+        mintCalls += 1;
+        return { status: 0, stdout: mintCalls === 1 ? "token-a" : "token-b" };
+      },
+      fetch: async (_url, init) => {
+        auths.push(new Headers(init?.headers).get("authorization") ?? "");
+        return new Response("no", { status: auths.length === 1 ? 401 : 200 });
+      },
+    });
+    await rejected.probeCredentials?.();
+    assert.deepEqual(auths, ["Bearer token-a", "Bearer token-b"]);
+
+    let forbiddenMints = 0;
+    let forbiddenFetches = 0;
+    const forbidden = githubForge({
+      token: "",
+      identity: "mint",
+      mintCommand: "mint-installation-token",
+      runMint: () => {
+        forbiddenMints += 1;
+        return { status: 0, stdout: "token-c" };
+      },
+      fetch: async () => {
+        forbiddenFetches += 1;
+        return new Response("no", { status: 403 });
+      },
+    });
+    await forbidden.probeCredentials?.();
+    assert.equal(forbiddenMints, 1);
+    assert.equal(forbiddenFetches, 1);
+  });
 });

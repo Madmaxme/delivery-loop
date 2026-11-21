@@ -72,9 +72,14 @@ export function createInstallationToken(opts: {
   /** When set, an empty or failed mint throws and names this step. There is no other token. */
   requireMint?: boolean;
   step?: string;
-}): { get(): Promise<InstallationToken> } {
+}): { get(): Promise<InstallationToken>; invalidate(): void } {
   let cached: MintedCredential | null = null;
+  let invalidated = false;
   return {
+    invalidate() {
+      cached = null;
+      invalidated = true;
+    },
     async get() {
       const command = opts.command().trim();
       if (!command) {
@@ -85,7 +90,8 @@ export function createInstallationToken(opts: {
       if (cached && !credentialDue(cached.expiresAtMs, now)) {
         return { token: cached.token, slot: "mint" };
       }
-      const refresh = cached !== null;
+      const refresh = cached !== null || invalidated;
+      invalidated = false;
       const result = (opts.runMint ?? runMintCommand)(command);
       const minted = result.status === 0 ? interpretMintOutput(result.stdout, now) : null;
       const ok = Boolean(minted && minted.expiresAtMs > now);

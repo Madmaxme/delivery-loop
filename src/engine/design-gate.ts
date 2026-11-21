@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { DesignCheckProbe, FetchLike, Ticket } from "../adapters/types.ts";
 import type { DesignRepo, DesignSpec } from "../schema/pack.ts";
 import { credentialFetch, type CredentialNoteFn } from "./credential-log.ts";
+import { liveCredential } from "./credentials.ts";
 
 const FIGMA_START_RE =
   /https?:\/\/(?:www\.)?figma\.com\/(?:file|design|proto|board|slides)\//gi;
@@ -282,25 +283,28 @@ export async function readFigmaFrame(
   token: string,
   fetchImpl: FetchLike,
   note?: CredentialNoteFn,
+  tokenEnv = "FIGMA_ACCESS_TOKEN",
 ): Promise<string> {
   const target = parseFigmaTarget(url);
   if (!target) return `unreadable figma url ${url}`;
   const path = target.nodeId
     ? `/v1/files/${encodeURIComponent(target.fileKey)}/nodes?ids=${encodeURIComponent(target.nodeId)}`
     : `/v1/files/${encodeURIComponent(target.fileKey)}?depth=1`;
+  const live = liveCredential(tokenEnv, token);
   let reason = "";
   const response = await credentialFetch(
     "figma",
     "figma",
     () =>
       fetchImpl(`https://api.figma.com${path}`, {
-        headers: { "X-Figma-Token": token },
+        headers: { "X-Figma-Token": live.current() },
       }),
     note,
     async (clone) => {
-      reason = figmaReasonText(await clone.text(), token);
+      reason = figmaReasonText(await clone.text(), live.current());
       return reason || undefined;
     },
+    live.reacquire,
   );
   if (!response.ok) {
     return reason ? `figma read failed: ${response.status} ${reason}` : `figma read failed: ${response.status}`;
@@ -345,7 +349,8 @@ export async function designRepairText(input: {
     const fetchImpl = input.figmaFetch ?? fetch;
     const blocks: string[] = [];
     for (const url of frames) {
-      const read = token ? await readFigmaFrame(url, token, fetchImpl).catch((error: unknown) => {
+      const tokenEnv = input.design?.figmaTokenEnv?.trim() || "FIGMA_ACCESS_TOKEN";
+      const read = token ? await readFigmaFrame(url, token, fetchImpl, undefined, tokenEnv).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         return `figma read failed: ${message}`;
       }) : "missing-credential: figma";

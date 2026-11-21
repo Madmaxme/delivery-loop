@@ -175,30 +175,51 @@ export function noteMint(input: {
   });
 }
 
+/** Runs once after HTTP 401. True means the next attempt must send a new credential. */
+export type CredentialReacquire = () => boolean | Promise<boolean>;
+
+/**
+ * One authenticated call.
+ *
+ * HTTP 401 is an invalid credential (RFC 6750 `invalid_token`): expired,
+ * revoked, or malformed. GitHub's expired installation token and Linear's
+ * rejected app token are both 401, and either can happen before the stated
+ * expiry. When `reacquire` is set it runs once and the call runs once more.
+ * The request closure must read the credential when it runs. A second 401
+ * is returned. HTTP 403 is a scope or permission denial, not a new
+ * credential, and is not retried. A static secret passes no `reacquire`.
+ */
 export async function credentialFetch(
   slot: string,
   endpoint: string,
   run: () => Promise<Response>,
   note: CredentialNoteFn = noteCredential,
   detailOf?: (response: Response) => Promise<string | undefined>,
+  reacquire?: CredentialReacquire,
 ): Promise<Response> {
-  let response: Response;
-  try {
-    response = await run();
-  } catch (error) {
-    note({ slot, endpoint, status: 0 });
-    throw error;
-  }
-  let detail: string | undefined;
-  if (!response.ok && detailOf) {
+  const once = async (refresh: boolean): Promise<Response> => {
+    let response: Response;
     try {
-      detail = await detailOf(response.clone());
-    } catch {
-      detail = undefined;
+      response = await run();
+    } catch (error) {
+      note({ slot, endpoint, status: 0 });
+      throw error;
     }
-  }
-  note({ slot, endpoint, status: response.status, detail });
-  return response;
+    let detail: string | undefined;
+    if (!response.ok && detailOf) {
+      try {
+        detail = await detailOf(response.clone());
+      } catch {
+        detail = undefined;
+      }
+    }
+    note({ slot, endpoint, status: response.status, detail, ...(refresh ? { refresh: true } : {}) });
+    return response;
+  };
+  const response = await once(false);
+  if (response.status !== 401 || !reacquire) return response;
+  if (!(await reacquire())) return response;
+  return once(true);
 }
 
 /** Isolated recorder for tests. It does not write to the process log. */

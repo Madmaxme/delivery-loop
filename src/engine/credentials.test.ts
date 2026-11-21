@@ -7,8 +7,10 @@ import type { ProjectPack } from "../schema/pack.ts";
 import { ownerHealPrompt } from "./stall.ts";
 import {
   credentialAuditFailed,
+  credentialMintEnv,
   formatCredentialAudit,
   inspectCredentials,
+  reacquireEnv,
   stageGitPassword,
   type CredentialInspection,
 } from "./credentials.ts";
@@ -114,6 +116,21 @@ describe("heal prompt", () => {
     const prompt = ownerHealPrompt({ reason: "no", tokenEnv: "COMMIT_ACTOR_TOKEN" });
     assert.match(prompt, /COMMIT_ACTOR_TOKEN/);
     assert.equal(/madmaxme/i.test(prompt), false);
+  });
+});
+
+describe("credential replacement", () => {
+  it("writes the minted value and does not keep the command output anywhere else", () => {
+    const env: NodeJS.ProcessEnv = {
+      [credentialMintEnv("LINEAR_API_KEY")]: "mint-linear",
+      LINEAR_API_KEY: "Bearer stale",
+    };
+    const renew = reacquireEnv("LINEAR_API_KEY", env, () => ({ status: 0, stdout: "Bearer fresh\n" }));
+    assert.equal(renew?.(), true);
+    assert.equal(env.LINEAR_API_KEY, "Bearer fresh");
+    assert.equal(reacquireEnv("FIGMA_ACCESS_TOKEN", env), undefined);
+    assert.equal(reacquireEnv("LINEAR_API_KEY", env, () => ({ status: 1, stdout: "Bearer nope" }))?.(), false);
+    assert.equal(env.LINEAR_API_KEY, "Bearer fresh");
   });
 });
 
