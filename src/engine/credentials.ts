@@ -195,14 +195,14 @@ export function stageGitPassword(
   return minted.token;
 }
 
-/** Env whose value is the shell command that prints a replacement credential. */
-export function credentialMintEnv(envName: string): string {
-  return `DELIVERY_LOOP_MINT_${envName}`;
-}
+/** One shell command for every credential. The slot name is its only argument. */
+export const CREDENTIAL_MINT_ENV = "DELIVERY_LOOP_MINT";
 
 /**
- * One replacement for `envName`. Absent when no mint command is configured.
- * The command's stdout is the new value. The value is not logged.
+ * One replacement for `envName`. Absent when `DELIVERY_LOOP_MINT` is unset.
+ * The command is run as `<DELIVERY_LOOP_MINT> <envName>`. Its stdout is the
+ * new value of that slot. The value is not logged. A command that exits
+ * non-zero leaves the slot unchanged.
  */
 export function reacquireEnv(
   envName: string,
@@ -210,10 +210,10 @@ export function reacquireEnv(
   runMint: (command: string) => MintRun = runMintCommand,
 ): CredentialReacquire | undefined {
   if (!ENV_NAME.test(envName)) return undefined;
-  const command = env[credentialMintEnv(envName)]?.trim() ?? "";
+  const command = env[CREDENTIAL_MINT_ENV]?.trim() ?? "";
   if (!command) return undefined;
   return () => {
-    const result = runMint(command);
+    const result = runMint(`${command} ${envName}`);
     const minted = result.status === 0 ? interpretMintOutput(result.stdout, Date.now()) : null;
     const token = minted?.token ?? "";
     noteMint({ exitStatus: result.status, ok: Boolean(token), refresh: true });

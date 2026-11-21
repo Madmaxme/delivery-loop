@@ -7,7 +7,6 @@ import type { ProjectPack } from "../schema/pack.ts";
 import { ownerHealPrompt } from "./stall.ts";
 import {
   credentialAuditFailed,
-  credentialMintEnv,
   formatCredentialAudit,
   inspectCredentials,
   reacquireEnv,
@@ -120,17 +119,29 @@ describe("heal prompt", () => {
 });
 
 describe("credential replacement", () => {
-  it("writes the minted value and does not keep the command output anywhere else", () => {
+  it("runs one mint command with the slot and writes only that slot", () => {
     const env: NodeJS.ProcessEnv = {
-      [credentialMintEnv("LINEAR_API_KEY")]: "mint-linear",
-      LINEAR_API_KEY: "Bearer stale",
+      DELIVERY_LOOP_MINT: "mint",
+      SLOT_A: "Bearer stale",
+      SLOT_B: "other",
     };
-    const renew = reacquireEnv("LINEAR_API_KEY", env, () => ({ status: 0, stdout: "Bearer fresh\n" }));
+    const calls: string[] = [];
+    const renew = reacquireEnv("SLOT_A", env, (command) => {
+      calls.push(command);
+      return { status: 0, stdout: "Bearer fresh\n" };
+    });
     assert.equal(renew?.(), true);
-    assert.equal(env.LINEAR_API_KEY, "Bearer fresh");
-    assert.equal(reacquireEnv("FIGMA_ACCESS_TOKEN", env), undefined);
-    assert.equal(reacquireEnv("LINEAR_API_KEY", env, () => ({ status: 1, stdout: "Bearer nope" }))?.(), false);
-    assert.equal(env.LINEAR_API_KEY, "Bearer fresh");
+    assert.deepEqual(calls, ["mint SLOT_A"]);
+    assert.equal(env.SLOT_A, "Bearer fresh");
+    assert.equal(env.SLOT_B, "other");
+    assert.equal(reacquireEnv("SLOT_B", {}), undefined);
+    const again = reacquireEnv("SLOT_B", env, (command) => {
+      calls.push(command);
+      return { status: 1, stdout: "Bearer nope" };
+    });
+    assert.equal(again?.(), false);
+    assert.deepEqual(calls, ["mint SLOT_A", "mint SLOT_B"]);
+    assert.equal(env.SLOT_B, "other");
   });
 });
 
