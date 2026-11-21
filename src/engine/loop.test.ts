@@ -1100,12 +1100,17 @@ describe("loop", () => {
     assert.equal(env.state(), "Todo");
   });
 
-  it("stays in intake when journey evidence is blocked", async () => {
+  it("builds a blocked journey and stays off complete until the walk is real", async () => {
     const env = harness(BUILDABLE.replace("**Journey evidence:** not-applicable", "**Journey evidence:** blocked"));
+    let heals = 0;
+    env.deps.ownerHeal = async () => {
+      heals += 1;
+      return "**Heal:** wait";
+    };
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "invalid-packet");
-    assert.equal(result.detail, "journey-blocked");
-    assert.equal(env.merged(), false);
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(heals, 1);
+    assert.equal(env.merged(), true);
     assert.equal(env.state(), "Todo");
   });
 
@@ -2920,6 +2925,42 @@ describe("loop", () => {
     assert.equal(needsNextPage([result]), false);
     assert.equal(deliveryExitCode(result), 0);
     assert.match(env.comments.join("\n"), /Stopped\./);
+    assert.equal(env.state(), "Todo");
+  });
+
+  it("walks an already-shipped blocked ticket once and does not complete on a sentence", async () => {
+    const ground = [
+      "**Verdict:** ALREADY SHIPPED",
+      "**Repos:** `api`",
+      "**Outside grant:** none",
+      "**Journey evidence:** blocked",
+      "**Prior request:** none",
+    ].join("\n");
+    const env = harness(ground);
+    env.deps.ticketOnTrunk = () => "shipped";
+    env.deps.lookupHead = () => "shipped";
+    const prompts: string[] = [];
+    env.deps.worker.start = async (input) => {
+      prompts.push(input.prompt);
+      return { runId: `run-${prompts.length}` };
+    };
+    let heals = 0;
+    env.deps.ownerHeal = async () => {
+      heals += 1;
+      return "**Heal:** wait";
+    };
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(env.state(), "Todo");
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[1] ?? "", /Open the running build/);
+    assert.equal(heals, 1);
+    prompts.length = 0;
+    heals = 0;
+    const again = await runTicket(env.deps, ticket());
+    assert.equal(again.outcome, "journey-missing");
+    assert.equal(prompts.filter((prompt) => /Open the running build/.test(prompt)).length, 0);
+    assert.equal(heals, 0);
     assert.equal(env.state(), "Todo");
   });
 

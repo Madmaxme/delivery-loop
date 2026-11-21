@@ -263,7 +263,7 @@ const JOURNEY_EVIDENCE_RE =
 /**
  * `not-applicable` means the done-state is not a journey a person walks.
  * `recorded` means it is, and dev-done waits on a proof token.
- * `blocked` means that proof cannot be produced in this run.
+ * `blocked` means this run did not produce the proof. The build still verifies it.
  * A missing line is null. The runner does not build and does not mark dev-done.
  */
 export function parseJourneyEvidence(text: string): JourneyEvidence | null {
@@ -300,11 +300,9 @@ export function investigationBlocksBuild(text: string): "unkilled" | null {
   return null;
 }
 
-/** Why a BUILDABLE handoff must not build. Null means the line allows a build. */
-export function journeyEvidenceBlocksBuild(text: string): "missing" | "blocked" | null {
-  const parsed = parseJourneyEvidence(text);
-  if (!parsed) return "missing";
-  if (parsed === "blocked") return "blocked";
+/** Why a BUILDABLE handoff must not build. Null means the line allows a build. `blocked` does not stop the build. */
+export function journeyEvidenceBlocksBuild(text: string): "missing" | null {
+  if (!parseJourneyEvidence(text)) return "missing";
   return null;
 }
 

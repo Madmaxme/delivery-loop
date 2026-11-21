@@ -89,11 +89,12 @@ describe("investigation", () => {
 });
 
 describe("journey evidence", () => {
-  it("blocks a missing line and a blocked line", () => {
+  it("blocks a missing line and lets a blocked line build", () => {
     assert.equal(parseJourneyEvidence("**Journey evidence:** recorded"), "recorded");
     assert.equal(parseJourneyEvidence("**Journey evidence:** not-applicable"), "not-applicable");
+    assert.equal(parseJourneyEvidence("**Journey evidence:** blocked"), "blocked");
     assert.equal(journeyEvidenceBlocksBuild("**Journey evidence:** not-applicable"), null);
-    assert.equal(journeyEvidenceBlocksBuild("**Journey evidence:** blocked"), "blocked");
+    assert.equal(journeyEvidenceBlocksBuild("**Journey evidence:** blocked"), null);
     assert.equal(journeyEvidenceBlocksBuild("**Verdict:** BUILDABLE"), "missing");
   });
 
