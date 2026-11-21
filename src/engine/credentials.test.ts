@@ -9,6 +9,7 @@ import {
   credentialAuditFailed,
   formatCredentialAudit,
   inspectCredentials,
+  reacquireEnv,
   stageGitPassword,
   type CredentialInspection,
 } from "./credentials.ts";
@@ -114,6 +115,33 @@ describe("heal prompt", () => {
     const prompt = ownerHealPrompt({ reason: "no", tokenEnv: "COMMIT_ACTOR_TOKEN" });
     assert.match(prompt, /COMMIT_ACTOR_TOKEN/);
     assert.equal(/madmaxme/i.test(prompt), false);
+  });
+});
+
+describe("credential replacement", () => {
+  it("runs one mint command with the slot and writes only that slot", () => {
+    const env: NodeJS.ProcessEnv = {
+      DELIVERY_LOOP_MINT: "mint",
+      SLOT_A: "Bearer stale",
+      SLOT_B: "other",
+    };
+    const calls: string[] = [];
+    const renew = reacquireEnv("SLOT_A", env, (command) => {
+      calls.push(command);
+      return { status: 0, stdout: "Bearer fresh\n" };
+    });
+    assert.equal(renew?.(), true);
+    assert.deepEqual(calls, ["mint SLOT_A"]);
+    assert.equal(env.SLOT_A, "Bearer fresh");
+    assert.equal(env.SLOT_B, "other");
+    assert.equal(reacquireEnv("SLOT_B", {}), undefined);
+    const again = reacquireEnv("SLOT_B", env, (command) => {
+      calls.push(command);
+      return { status: 1, stdout: "Bearer nope" };
+    });
+    assert.equal(again?.(), false);
+    assert.deepEqual(calls, ["mint SLOT_A", "mint SLOT_B"]);
+    assert.equal(env.SLOT_B, "other");
   });
 });
 

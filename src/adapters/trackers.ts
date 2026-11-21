@@ -3,7 +3,9 @@ import {
   credentialFetch,
   githubEndpointClass,
   type CredentialNoteFn,
+  type CredentialReacquire,
 } from "../engine/credential-log.ts";
+import { liveCredential, reacquireEnv } from "../engine/credentials.ts";
 import { figmaUrlsFromText } from "../engine/design-gate.ts";
 import type { IssueBlocker, LinearProgramSnapshot } from "../engine/linear-harness-policy.js";
 import type { JiraConfig } from "../schema/pack.ts";
@@ -289,13 +291,23 @@ type LinearIssue = {
 };
 
 export function linearTracker(opts: {
-  apiKey: string;
+  apiKey: string | (() => string);
   team: string;
   intakeState: string;
   fetch?: FetchLike;
   credentialNote?: CredentialNoteFn;
+  reacquire?: CredentialReacquire;
 }): TrackerAdapter & LinearProgramTracker {
   const fetchImpl = opts.fetch ?? fetch;
+  const presented = typeof opts.apiKey === "function" ? "" : opts.apiKey;
+  const live = liveCredential("LINEAR_API_KEY", presented);
+  const renew = opts.reacquire ?? live.reacquire;
+
+  function authorization(): string {
+    if (typeof opts.apiKey === "function") return opts.apiKey();
+    if (renew) return live.current() || presented;
+    return presented;
+  }
 
   async function gql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
     const response = await credentialFetch(
@@ -305,12 +317,14 @@ export function linearTracker(opts: {
         fetchImpl("https://api.linear.app/graphql", {
           method: "POST",
           headers: {
-            Authorization: opts.apiKey,
+            Authorization: authorization(),
             "Content-Type": "application/json",
           },
           body: JSON.stringify({ query, variables }),
         }),
       opts.credentialNote,
+      undefined,
+      renew,
     );
     if (!response.ok) {
       throw new Error(`Linear failed: ${response.status} ${await response.text()}`);
@@ -658,25 +672,37 @@ export function githubIssuesTracker(opts: {
   credentialNote?: CredentialNoteFn;
   /** `mint` when the runner identity is mint. The token value is not written. */
   slot?: "mint" | "gh-token";
+  /** Replaces the token after HTTP 401. The next request reads `GH_TOKEN` unless `tokenNow` is set. */
+  reacquire?: CredentialReacquire;
+  /** Reads the installation token when the runner identity is mint. */
+  tokenNow?: () => Promise<string>;
 }): TrackerAdapter {
   const fetchImpl = opts.fetch ?? fetch;
-  const headers = {
-    Authorization: `Bearer ${opts.token}`,
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-    "Content-Type": "application/json",
-  };
+  const live = liveCredential("GH_TOKEN", opts.token);
+  const renew = opts.reacquire ?? live.reacquire;
+
+  async function headers(): Promise<Record<string, string>> {
+    const token = opts.tokenNow ? await opts.tokenNow() : renew ? live.current() : opts.token;
+    return {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "Content-Type": "application/json",
+    };
+  }
 
   async function api(path: string, init?: RequestInit): Promise<unknown> {
     const response = await credentialFetch(
       opts.slot ?? "gh-token",
       githubEndpointClass(path),
-      () =>
+      async () =>
         fetchImpl(`https://api.github.com${path}`, {
           ...init,
-          headers: { ...headers, ...(init?.headers ?? {}) },
+          headers: { ...(await headers()), ...(init?.headers ?? {}) },
         }),
       opts.credentialNote,
+      undefined,
+      renew,
     );
     if (!response.ok) {
       throw new Error(`GitHub issues ${path} failed: ${response.status} ${await response.text()}`);
@@ -835,11 +861,15 @@ export function jiraTracker(opts: JiraConfig & {
   const authHeader = process.env[opts.authHeaderEnv];
   if (!authHeader?.trim()) throw new Error(`${opts.authHeaderEnv} is required`);
   const fetchImpl = opts.fetch ?? fetch;
-  const headers = {
-    Authorization: authHeader,
-    Accept: "application/json",
-    "Content-Type": "application/json",
-  };
+  const live = liveCredential(opts.authHeaderEnv, authHeader);
+
+  function headers(): Record<string, string> {
+    return {
+      Authorization: live.current(),
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    };
+  }
   const fields = ["summary", "description", "issuetype", "assignee", "status", "labels", "issuelinks", "attachment", opts.approvalFieldId];
 
   async function api(path: string, init?: RequestInit): Promise<unknown> {
@@ -848,9 +878,11 @@ export function jiraTracker(opts: JiraConfig & {
       "jira-rest",
       () => fetchImpl(`${baseUrl}${path}`, {
         ...init,
-        headers: { ...headers, ...(init?.headers ?? {}) },
+        headers: { ...headers(), ...(init?.headers ?? {}) },
       }),
       opts.credentialNote,
+      undefined,
+      live.reacquire,
     );
     if (!response.ok) throw new Error(`Jira REST request failed: ${response.status}`);
     if (response.status === 204) return null;

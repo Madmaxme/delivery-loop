@@ -8,6 +8,7 @@ import { cursorWorker } from "../adapters/workers.ts";
 import { readFigmaFrame } from "./design-gate.ts";
 import {
   createCredentialRecorder,
+  credentialFetch,
   credentialLogText,
   formatCredentialLine,
   githubEndpointClass,
@@ -215,5 +216,81 @@ describe("credential log", () => {
     );
     assert.deepEqual(rec.lines(), ["credential slot=mint endpoint=mint status=1"]);
     assert.equal(rec.lines().join("\n").includes(MINT), false);
+  });
+
+  it("retries HTTP 401 once and does not retry 403", async () => {
+    const rec = createCredentialRecorder();
+    let calls = 0;
+    const renewed = await credentialFetch(
+      "linear",
+      "linear-graphql",
+      async () => {
+        calls += 1;
+        return new Response("no", { status: calls === 1 ? 401 : 200 });
+      },
+      rec.note,
+      undefined,
+      () => true,
+    );
+    assert.equal(renewed.status, 200);
+    assert.equal(calls, 2);
+    assert.deepEqual(rec.lines(), [
+      "credential slot=linear endpoint=linear-graphql status=401",
+      "credential slot=linear endpoint=linear-graphql status=200 refresh=1",
+    ]);
+    let forbidden = 0;
+    const denied = await credentialFetch(
+      "linear",
+      "linear-graphql",
+      async () => {
+        forbidden += 1;
+        return new Response("no", { status: 403 });
+      },
+      rec.note,
+      undefined,
+      () => {
+        throw new Error("403 is not a new credential");
+      },
+    );
+    assert.equal(denied.status, 403);
+    assert.equal(forbidden, 1);
+  });
+
+  it("sends the replacement Linear credential on the retry and stops after a second 401", async () => {
+    const auths: string[] = [];
+    let key = "Bearer stale";
+    const tracker = linearTracker({
+      apiKey: () => key,
+      team: "QUI",
+      intakeState: "Todo",
+      reacquire: () => {
+        key = "Bearer fresh";
+        return true;
+      },
+      fetch: async (_url, init) => {
+        auths.push(new Headers(init?.headers).get("authorization") ?? "");
+        if (auths.length === 1) return new Response("no", { status: 401 });
+        return Response.json({ data: { issues: { nodes: [] } } });
+      },
+    });
+    assert.deepEqual(await tracker.listIntake(), []);
+    assert.deepEqual(auths, ["Bearer stale", "Bearer fresh"]);
+
+    const again: string[] = [];
+    let attempts = 0;
+    const stuck = linearTracker({
+      apiKey: "Bearer stale",
+      team: "QUI",
+      intakeState: "Todo",
+      reacquire: () => true,
+      fetch: async () => {
+        attempts += 1;
+        again.push("sent");
+        return new Response("no", { status: 401 });
+      },
+    });
+    await assert.rejects(() => stuck.listIntake(), /Linear failed: 401/);
+    assert.equal(attempts, 2);
+    assert.equal(again.length, 2);
   });
 });

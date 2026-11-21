@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 
 import { interpretMintOutput, runMintCommand, type MintRun } from "../adapters/github-mint.ts";
+import { noteMint, type CredentialReacquire } from "./credential-log.ts";
 import type { FetchLike } from "../adapters/types.ts";
 import type { ProjectPack } from "../schema/pack.ts";
 
@@ -192,6 +193,53 @@ export function stageGitPassword(
     throw new Error("stage: DELIVERY_LOOP_GITHUB_MINT did not return an installation token that is still valid.");
   }
   return minted.token;
+}
+
+/** One shell command for every credential. The slot name is its only argument. */
+export const CREDENTIAL_MINT_ENV = "DELIVERY_LOOP_MINT";
+
+/**
+ * One replacement for `envName`. Absent when `DELIVERY_LOOP_MINT` is unset.
+ * The command is run as `<DELIVERY_LOOP_MINT> <envName>`. Its stdout is the
+ * new value of that slot. The value is not logged. A command that exits
+ * non-zero leaves the slot unchanged.
+ */
+export function reacquireEnv(
+  envName: string,
+  env: NodeJS.ProcessEnv = process.env,
+  runMint: (command: string) => MintRun = runMintCommand,
+): CredentialReacquire | undefined {
+  if (!ENV_NAME.test(envName)) return undefined;
+  const command = env[CREDENTIAL_MINT_ENV]?.trim() ?? "";
+  if (!command) return undefined;
+  return () => {
+    const result = runMint(`${command} ${envName}`);
+    const minted = result.status === 0 ? interpretMintOutput(result.stdout, Date.now()) : null;
+    const token = minted?.token ?? "";
+    noteMint({ exitStatus: result.status, ok: Boolean(token), refresh: true });
+    if (!token) return false;
+    env[envName] = token;
+    return true;
+  };
+}
+
+/**
+ * The presented value, or the env value after a mint command exists.
+ * Call `current` inside the request so a 401 retry sends the replacement.
+ */
+export function liveCredential(
+  envName: string,
+  presented: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { current: () => string; reacquire?: CredentialReacquire } {
+  const reacquire = reacquireEnv(envName, env);
+  return {
+    current: () => {
+      if (!reacquire) return presented;
+      return env[envName]?.trim() || presented;
+    },
+    reacquire,
+  };
 }
 
 export function gitAskpassPath(): string {

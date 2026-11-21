@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { interpretDesignChecks, type DesignCheckRun } from "../engine/design-gate.ts";
+import { reacquireEnv } from "../engine/credentials.ts";
 import {
   credentialFetch,
   githubEndpointClass,
@@ -251,30 +252,54 @@ export function githubForge(opts: {
     return installation.get();
   }
 
+  async function authNow(slot: string): Promise<{ token: string; slot: string }> {
+    if (opts.identity === "mint") return bearer();
+    if (reacquireEnv("GH_TOKEN")) {
+      return { token: process.env.GH_TOKEN?.trim() || opts.token, slot: "gh-token" };
+    }
+    return { token: opts.token, slot };
+  }
+
+  function renewGithub(): (() => Promise<boolean>) | undefined {
+    if (opts.identity === "mint") {
+      if (!mintCommand()) return undefined;
+      return async () => {
+        installation.invalidate();
+        await installation.get();
+        return true;
+      };
+    }
+    return reacquireEnv("GH_TOKEN");
+  }
+
   async function callGithub(
     path: string,
     init?: RequestInit,
     slot = "gh-token",
     endpoint?: string,
   ): Promise<Response> {
-    const auth = opts.identity === "mint" ? await bearer() : { token: opts.token, slot };
-    const headers = {
-      Authorization: `Bearer ${auth.token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-      ...(opts.identity === "mint" ? { Authorization: `Bearer ${auth.token}` } : {}),
-    };
+    const first = await authNow(slot);
     return credentialFetch(
-      auth.slot,
+      first.slot,
       endpoint ?? githubEndpointClass(path),
-      () =>
-        fetchImpl(`https://api.github.com${path}`, {
+      async () => {
+        const auth = await authNow(slot);
+        const headers = {
+          Authorization: `Bearer ${auth.token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "Content-Type": "application/json",
+          ...(init?.headers ?? {}),
+          ...(opts.identity === "mint" ? { Authorization: `Bearer ${auth.token}` } : {}),
+        };
+        return fetchImpl(`https://api.github.com${path}`, {
           ...init,
           headers,
-        }),
+        });
+      },
       note,
+      undefined,
+      renewGithub(),
     );
   }
 
