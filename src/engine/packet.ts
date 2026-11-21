@@ -278,6 +278,16 @@ export function journeyRequiresProof(text: string): boolean {
   return kind === "recorded" || kind === "blocked";
 }
 
+/** Commit ids the handoff cites in backticks. A sentence is not a commit. */
+export function citedCommitShas(text: string): string[] {
+  const shas: string[] = [];
+  for (const match of text.matchAll(/`([0-9a-f]{7,40})`/gi)) {
+    const sha = match[1].toLowerCase();
+    if (!shas.includes(sha)) shas.push(sha);
+  }
+  return shas;
+}
+
 const EVIDENCE_RE = /\*\*Evidence:\*\*\s*(queried|not-applicable)\b/i;
 const RUNTIME_EVIDENCE_RE = /\*\*Runtime evidence:\*\*\s*(queried|blocked|not-applicable)\b/i;
 const KILLED_ALTERNATIVES_RE = /\*\*Killed alternatives:\*\*\s*(.*)/i;

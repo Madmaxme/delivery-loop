@@ -44,6 +44,7 @@ import {
 } from "./linear-harness-policy.js";
 import { confirmLandBranches, lookupRemoteHead, renderBranch } from "./land-branches.js";
 import {
+  citedCommitShas,
   invariantExists,
   investigationBlocksBuild,
   journeyEvidenceBlocksBuild,
@@ -715,16 +716,22 @@ function landingTargets(
   return targets.length ? targets : null;
 }
 
-function trunkCommitSha(dir: string, trunk: string, identifier: string): string | null {
+function trunkCommitSha(dir: string, trunk: string, identifier: string, text: string): string | null {
   if (!existsSync(join(dir, ".git"))) return null;
-  const result = spawnSync(
+  const named = spawnSync(
     "git",
     ["-C", dir, "log", trunk, "--grep", identifier, "-1", "--format=%H"],
     { encoding: "utf8" },
   );
-  if (result.status !== 0) return null;
-  const sha = result.stdout.trim();
-  return sha || null;
+  if (named.status === 0 && named.stdout.trim()) return named.stdout.trim();
+  for (const sha of citedCommitShas(text)) {
+    const resolved = spawnSync("git", ["-C", dir, "rev-parse", "--verify", `${sha}^{commit}`], { encoding: "utf8" });
+    if (resolved.status !== 0) continue;
+    const full = resolved.stdout.trim();
+    const ancestor = spawnSync("git", ["-C", dir, "merge-base", "--is-ancestor", full, trunk], { encoding: "utf8" });
+    if (ancestor.status === 0) return full;
+  }
+  return null;
 }
 
 /** Commits for the repos named in the audit. Null means a checkout was missing and none matched. */
@@ -746,7 +753,7 @@ function trunkTicketCommits(
     }
     const sha = deps.ticketOnTrunk
       ? deps.ticketOnTrunk({ repo: spec, identifier })
-      : trunkCommitSha(repoCheckoutDir(cwd, spec, deps.pack), spec.trunk, identifier);
+      : trunkCommitSha(repoCheckoutDir(cwd, spec, deps.pack), spec.trunk, identifier, text);
     if (sha) {
       rows.push({ repo: spec, sha });
       continue;
