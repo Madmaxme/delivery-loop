@@ -493,7 +493,7 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "Every BUILDABLE handoff includes **Journey evidence:** recorded | not-applicable | blocked.",
     "not-applicable means the done-state is not a journey a person walks.",
     `recorded means the done-state includes journey proof. Web proof is an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. The build handoff includes that raw URL in backticks and omits the **Journey proof:** prefix; the configured journey command prints the prefix. Mobile proof is **Journey proof:** a route test on the exact landed commit, \`repo/path_test.dart\` or \`repo/path.test.ts\`, whose path matches \`${deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC}\`. A sentence that names no token is not proof. A PostHog replay or embedded link on posthog.com counts. A presigned link that expires does not. A spec outside that pattern stays in intake. If the route test is not on the landed commit, the engine checks configured delivery-stage refs (or the repo trunk when refs are not configured); promotion receipts remain bound to the exact landed SHAs and criteria revision.`,
-    "blocked means that proof cannot be produced in this run. A missing line or blocked stays in intake and does not mark the ticket complete.",
+    "blocked means this run did not produce the proof. The build still verifies it, and the ticket stays off complete until the proof is real. A missing line stays in intake. not-applicable is the only line that skips the walk.",
     `Enabled connectors: ${deps.pack.connectors.join(", ") || "(none)"}`,
     landRepoLine(deps.pack),
     designPromptLines(ticket, deps),
@@ -513,6 +513,19 @@ function designPromptLines(ticket: Ticket, deps: LoopDeps): string {
   if (deps.figmaGroundBlock) lines.push(deps.figmaGroundBlock);
   else if (frames.length > 0) lines.push(frames.map((url) => `- ${url}`).join("\n"));
   return lines.join("\n\n");
+}
+
+function journeyWalkText(spec: string): string {
+  return [
+    "When the handoff says **Journey evidence:** recorded or blocked, this build walk is the verification.",
+    "Use the computer on this agent. Open the running build that contains this change.",
+    "A web journey publishes one durable https URL: a screenshot or a short video of the done state ending in png, jpg, jpeg, webp, gif, mp4, webm, or mov, a URL whose path contains /artifacts/, or a PostHog replay or embedded link on posthog.com.",
+    "Put that raw URL in backticks in BUILD_HANDOFF and omit only the **Journey proof:** prefix; the journey command prints that prefix.",
+    "A presigned link that expires is not proof. A sentence that names no URL is not proof.",
+    `A mobile token is the route test on the exact landed commit whose path matches \`${spec}\`.`,
+    "Use a non-mutating view or test data.",
+    "The runner does not mark delivery complete without that proof. A missing proof is the same heal as any required step that returned no. One walk is recorded for the landed commits. A later run does not start another walk to paste a sentence.",
+  ].join(" ");
 }
 
 function buildPrompt(
@@ -539,7 +552,7 @@ function buildPrompt(
       ? `Push these branches from each repo trunk: ${branches.join(", ")}. Include repo and branch in the handoff. Do not merge.`
       : "Stay inside the allowlist. Run the validation commands. Push a branch and report the branch name and commit. Do not merge.",
     "Stay inside the allowlist. Run the validation commands.",
-    "When the handoff says **Journey evidence:** recorded, this build walk is the proof. Use the computer on this agent. Open the running build that contains this change. A web journey publishes one durable https URL: a screenshot or a short video of the done state ending in png, jpg, jpeg, webp, gif, mp4, webm, or mov, a URL whose path contains /artifacts/, or a PostHog replay or embedded link on posthog.com. Put that raw URL in backticks in BUILD_HANDOFF and omit only the **Journey proof:** prefix; the journey command prints that prefix. A presigned link that expires is not proof. A sentence that names no URL is not proof. A mobile token is the route test on the exact landed commit whose path matches the journey-spec pattern. Use a non-mutating view or test data. The runner does not mark delivery complete without that proof, and it does not start a second worker to invent it.",
+    journeyWalkText(deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC),
     retry,
   ].filter((part) => part.length > 0).join("\n\n");
 }
@@ -969,6 +982,32 @@ async function runHeldTicket(
               )
             : null,
       });
+      const unverified =
+        verdict === "ALREADY SHIPPED" &&
+        parked === null &&
+        commits !== null &&
+        commits.length > 0 &&
+        parseOutsideGrant(ground.text) !== "open" &&
+        (parseJourneyEvidence(ground.text) === "blocked" || parseJourneyEvidence(ground.text) === "recorded");
+      if (unverified && commits) {
+        await writeMarker(
+          deps,
+          ticket,
+          "work-order",
+          JSON.stringify({ ground: ground.text, receipt: ground.text, criteriaRevision: ticket.criteriaRevision }),
+        );
+        const walked = await walkLandedJourney(deps, ticket, commits, ground.text);
+        if (walked && "outcome" in walked) return walked;
+        return settleTrunk(
+          deps,
+          ticket,
+          false,
+          commits,
+          "already on trunk",
+          ground.text,
+          walked?.text ?? ground.text,
+        );
+      }
       if (parked === deps.pack.status.complete && commits && commits.length > 0) {
         await writeMarker(deps, ticket, "work-order", JSON.stringify({ ground: ground.text, receipt: ground.text, criteriaRevision: ticket.criteriaRevision }));
         return settleTrunk(
@@ -1001,11 +1040,10 @@ async function runHeldTicket(
 
   const journey = journeyEvidenceBlocksBuild(ground.text);
   if (journey) {
-    const reason =
-      journey === "blocked"
-        ? "BUILDABLE **Journey evidence:** blocked does not build. The ticket stays in intake."
-        : "BUILDABLE requires **Journey evidence:** recorded | not-applicable | blocked. The ticket stays in intake.";
-    await deps.tracker.comment(ticket.identifier, reason);
+    await deps.tracker.comment(
+      ticket.identifier,
+      "BUILDABLE requires **Journey evidence:** recorded | not-applicable | blocked. The ticket stays in intake.",
+    );
     return { identifier: ticket.identifier, outcome: "invalid-packet", detail: `journey-${journey}` };
   }
 
@@ -2722,6 +2760,69 @@ async function proofFromLandedCommit(
   return null;
 }
 
+function verificationText(text: string): string {
+  if (parseJourneyEvidence(text) !== "blocked") return text;
+  return text.replace(/\*\*Journey evidence:\*\*\s*blocked\b/i, "**Journey evidence:** recorded");
+}
+
+/** One walk of the landed commits. A later run heals instead of starting another walk. */
+async function walkLandedJourney(
+  deps: LoopDeps,
+  ticket: Ticket,
+  rows: { repo: RepoSpec; sha: string }[],
+  declared: string,
+): Promise<TicketResult | { text: string } | null> {
+  const landed = rows.map((row) => ({ repo: row.repo.name, sha: row.sha }));
+  await writeMarker(deps, ticket, "landed-commits", JSON.stringify(landed));
+  if (journeyProofReceiptState(deps, ticket)?.attempted) return null;
+  await writeMarker(deps, ticket, "proof-receipt", JSON.stringify({
+    schemaVersion: 2,
+    criteriaRevision: ticket.criteriaRevision,
+    landed,
+    pullRequests: [],
+    attempted: true,
+    validated: false,
+    receipt: "",
+  } satisfies JourneyProofReceipt));
+  const home = rows[0];
+  if (!home) return null;
+  let started: { runId: string };
+  try {
+    started = await deps.worker.start({
+      prompt: [
+        universalConduct(),
+        `Verify ${ticket.identifier}. The code is already on the trunk. Do not open a pull request and do not call the tracker.`,
+        journeyWalkText(deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC),
+        rows.map((row) => `${row.repo.name} landed commit \`${row.sha}\``).join("\n"),
+        declared,
+      ].join("\n\n"),
+      repoUrl: home.repo.url,
+      baseRef: home.sha,
+    });
+  } catch {
+    return null;
+  }
+  try {
+    await noteLiveRun(deps, ticket, "build", started.runId);
+  } catch {
+    return null;
+  }
+  let built: { status: string; text?: string };
+  try {
+    built = await finishWorker(deps.worker, started.runId);
+  } catch (error) {
+    const text = error instanceof Error ? error.message : "";
+    if (text.trim()) await rememberJourneyReceipt(deps, ticket, text);
+    return null;
+  }
+  if (built.status === "running") {
+    return { identifier: ticket.identifier, outcome: "worker-running", detail: `cursor_run=${started.runId}` };
+  }
+  const text = built.text ?? "";
+  if (text.trim()) await rememberJourneyReceipt(deps, ticket, text);
+  return { text };
+}
+
 async function applyRecordedProof(
   deps: LoopDeps,
   ticket: Ticket,
@@ -2729,6 +2830,8 @@ async function applyRecordedProof(
   declared: string,
   receipt: string,
 ): Promise<RecordedProof> {
+  declared = verificationText(declared);
+  receipt = verificationText(receipt);
   const recorded =
     parseJourneyEvidence(declared) === "recorded" || parseJourneyEvidence(receipt) === "recorded";
   if (!recorded) return { ok: true, recorded: false, proofReceipt: receipt };
