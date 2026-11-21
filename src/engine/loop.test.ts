@@ -2928,6 +2928,40 @@ describe("loop", () => {
     assert.equal(env.state(), "Todo");
   });
 
+  it("heals an already-shipped blocked ticket whose commit does not name the ticket", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cited-trunk-"));
+    const repo = join(dir, "api");
+    mkdirSync(repo);
+    const git = (args: string[]) => spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+    git(["init", "-b", "main"]);
+    git(["config", "user.email", "test@example.com"]);
+    git(["config", "user.name", "Test"]);
+    writeFileSync(join(repo, "note.txt"), "shipped\n");
+    git(["add", "note.txt"]);
+    git(["commit", "-m", "Treat a blank optional request field as absent"]);
+    const sha = git(["rev-parse", "HEAD"]).stdout.trim();
+    const ground = [
+      "**Verdict:** ALREADY SHIPPED",
+      "**Repos:** `api`",
+      "**Outside grant:** none",
+      "**Journey evidence:** blocked",
+      `The landed commit is \`${sha.slice(0, 7)}\`.`,
+    ].join("\n");
+    const env = harness(ground);
+    env.deps.cwd = dir;
+    env.deps.lookupHead = () => sha;
+    let heals = 0;
+    env.deps.ownerHeal = async () => {
+      heals += 1;
+      return "**Heal:** wait";
+    };
+    const result = await runTicket(env.deps, ticket());
+    rmSync(dir, { recursive: true, force: true });
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(heals, 1);
+    assert.equal(env.state(), "Todo");
+  });
+
   it("heals an already-shipped blocked ticket and does not start a second walk", async () => {
     const ground = [
       "**Verdict:** ALREADY SHIPPED",

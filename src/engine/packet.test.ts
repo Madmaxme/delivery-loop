@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import {
+  citedCommitShas,
   invariantExists,
   journeyEvidenceBlocksBuild,
   journeyEvidenceProven,
@@ -99,6 +100,8 @@ describe("journey evidence", () => {
     assert.equal(journeyRequiresProof("**Journey evidence:** blocked"), true);
     assert.equal(journeyRequiresProof("**Journey evidence:** recorded"), true);
     assert.equal(journeyRequiresProof("**Journey evidence:** not-applicable"), false);
+    assert.deepEqual(citedCommitShas("api `8e7ddff9` is on trunk. The word cafe is not."), ["8e7ddff9"]);
+    assert.deepEqual(citedCommitShas("no backtick sha"), []);
     assert.equal(journeyEvidenceBlocksBuild("**Verdict:** BUILDABLE"), "missing");
   });
 
