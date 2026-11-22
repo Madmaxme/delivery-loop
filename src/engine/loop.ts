@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,8 +76,11 @@ import {
   healExhaustedNotice,
   healVerdict,
   ownerHealPrompt,
+  ownerHealOutcome,
   shipNoSignature,
   type HealVerdict,
+  type OwnerHealOutcome,
+  type OwnerRepairCandidate,
 } from "./stall.js";
 
 export type LoopDeps = {
@@ -115,12 +118,15 @@ export type LoopDeps = {
   /**
    * An explicit command may open the same owner edit; sweep otherwise uses
    */
-  ownerHeal?: (input: { prompt: string; repoUrl: string; baseRef: string }) => Promise<void | string>;
+  ownerHeal?: (input: { prompt: string; repoUrl: string; baseRef: string; identifier: string; criteriaRevision: string; deadline: number }) => Promise<OwnerHealOutcome | import("../adapters/types.js").WorkerResult | string | void>;
+  /** Client policy, not a landing implementation. The engine owns the mutation. */
+  validateOwnerRepair?: (input: { identifier: string; criteriaRevision: string; repo: RepoSpec; candidate: OwnerRepairCandidate; base: string }) => Promise<void>;
   /** Runs `qualityCommand` when `check` is `command`. Default runs it in the checkout. */
   runCommand?: (
     command: string,
     cwd: string,
     env?: NodeJS.ProcessEnv,
+    timeoutMs?: number,
   ) => { status: number | null; stdout?: string; stderr?: string };
   /**
    * Figma REST token. `null` means the token is absent. Unset reads
@@ -3046,6 +3052,7 @@ function runQualityAtCommit(
   repo: RepoSpec,
   branch: string,
   expectedSha: string,
+  deadline: number = Date.now() + 600_000,
 ): { status: number | null; stdout?: string; stderr?: string } {
   const sourceDir = repoCheckoutDir(deps.cwd ?? process.cwd(), repo, deps.pack);
   if (!existsSync(join(sourceDir, ".git"))) return { status: 1, stderr: `${repo.name} has no git checkout for candidate quality` };
@@ -3079,12 +3086,15 @@ function runQualityAtCommit(
     if (checked.status !== 0 || checked.stdout?.trim() !== expectedSha) {
       return { status: 1, stderr: `isolated worktree does not match candidate ${expectedSha}` };
     }
-    const modules = join(sourceDir, "node_modules");
-    if (existsSync(modules) && !existsSync(join(worktree, "node_modules"))) {
-      symlinkSync(modules, join(worktree, "node_modules"), "dir");
-    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { status: 1, stdout: "", stderr: "Candidate quality deadline exhausted" };
     const run = deps.runCommand ?? defaultRunCommand;
-    result = run(deps.pack.qualityCommand, worktree, commandEnvironment(deps.pack));
+    result = run(deps.pack.qualityCommand, worktree, { ...commandEnvironment(deps.pack), CI: "true" }, Math.min(600_000, remaining));
+    const after = spawnSync("git", ["rev-parse", "HEAD"], { cwd: worktree, encoding: "utf8", timeout: 30_000 });
+    const dirty = spawnSync("git", ["status", "--porcelain"], { cwd: worktree, encoding: "utf8", timeout: 30_000 });
+    if (after.status !== 0 || after.stdout.trim() !== expectedSha || dirty.status !== 0 || dirty.stdout.trim()) {
+      result = { status: 1, stdout: "", stderr: "Candidate quality changed the accepted code identity or source" };
+    }
   } finally {
     if (added) {
       const removed = git(["worktree", "remove", "--force", worktree]);
@@ -3402,23 +3412,54 @@ async function applyOwnerHeal(
   });
   const eligibility = await checkEligibility(deps, ticket);
   if (eligibility.outcome !== "eligible") throw new EligibilityGateError(eligibility);
-  let text = "";
-  if (deps.ownerHeal) {
-    text = (await deps.ownerHeal({ prompt, repoUrl: home.url, baseRef: home.trunk })) ?? "";
-  } else {
-    const started = await deps.worker.start({ prompt, repoUrl: home.url, baseRef: home.trunk });
-    await noteLiveRun(deps, ticket, "build", started.runId);
-    text = (await finishWorker(deps.worker, started.runId)).text;
+  const deadline = Date.now() + 3_600_000;
+  const attempt = `${type}:${attempts.length + 1}:${ticket.criteriaRevision}`;
+  // Reserve before dispatch: malformed, interrupted and empty replies still spent an attempt.
+  await writeDeliveryState(deps, ticket, {
+    ...state,
+    markers: [...state.markers, {
+      kind: "owner-heal",
+      body: JSON.stringify({ key, type, reason, attempt, status: "started" }),
+      createdAt: new Date(deps.nowMs ?? Date.now()).toISOString(),
+    }],
+  });
+  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const pendingMarker = state.markers.find((marker) => marker.kind === "owner-repair-pending");
+  const pending = pendingMarker ? JSON.parse(pendingMarker.body) as { key: string; revision: string; base: string; candidate: OwnerRepairCandidate } : undefined;
+  if (pending && (pending.key !== key || pending.revision !== ticket.criteriaRevision)) {
+    throw new Error("Pending owner repair belongs to different requirements or a different failure");
   }
-  const verdict = healVerdict(text);
+  const base = pending?.base ?? lookup(home.url, home.trunk);
+  let outcome: OwnerHealOutcome;
+  if (pending) {
+    outcome = ownerHealOutcome({ verdict: "edit", candidate: pending.candidate }, home.url);
+  } else {
+    const response = deps.ownerHeal
+      ? await deps.ownerHeal({ prompt, repoUrl: home.url, baseRef: home.trunk, identifier: ticket.identifier, criteriaRevision: ticket.criteriaRevision, deadline })
+      : await (async () => {
+        const started = await deps.worker.start({ prompt, repoUrl: home.url, baseRef: home.trunk });
+        await noteLiveRun(deps, ticket, "build", started.runId);
+        return finishWorker(deps.worker, started.runId);
+      })();
+    outcome = ownerHealOutcome(response, home.url);
+    if (outcome.verdict === "edit") {
+      if (!base || !/^[a-f0-9]{40}$/.test(base)) throw new Error("Owner trunk identity is unavailable");
+      await writeMarker(deps, ticket, "owner-repair-pending", JSON.stringify({ key, revision: ticket.criteriaRevision, base, candidate: outcome.candidate }));
+    }
+  }
+  const verdict = outcome.verdict;
+  if (outcome.verdict === "edit") {
+    if (!base || !/^[a-f0-9]{40}$/.test(base)) throw new Error("Owner trunk identity is unavailable");
+    await landOwnerRepair(deps, ticket, outcome.candidate, base, deadline);
+  }
   const recorded = await readDeliveryState(deps, ticket);
   await writeDeliveryState(deps, ticket, {
     ...recorded,
-    markers: [...recorded.markers, {
-      kind: "owner-heal",
-      body: JSON.stringify({ key, type, reason }),
-      createdAt: new Date(deps.nowMs ?? Date.now()).toISOString(),
-    }],
+    markers: recorded.markers.map((marker) => {
+      if (marker.kind !== "owner-heal") return marker;
+      const body = JSON.parse(marker.body) as { attempt?: string };
+      return body.attempt === attempt ? { ...marker, body: JSON.stringify({ ...body, verdict, status: "finished" }) } : marker;
+    }),
   });
   rememberVerdict(deps, key, verdict);
   if (verdict !== "edit") return verdict;
@@ -3426,6 +3467,63 @@ async function applyOwnerHeal(
   deps.pageControl.healed.push(key);
   deps.pageControl.stop = true;
   return "edit";
+}
+
+/** Native owner landing updates native state and its cache; adapters never rebind releases. */
+export async function landOwnerRepair(
+  deps: LoopDeps,
+  ticket: Ticket,
+  candidate: OwnerRepairCandidate,
+  base: string,
+  deadline: number,
+): Promise<void> {
+  const home = agentHome(deps.pack);
+  ownerHealOutcome({ verdict: "edit", candidate }, home.url);
+  if (deps.pack.landingStrategy !== "fast-forward") {
+    throw new Error("Owner repair cannot bypass the configured pull-request landing route");
+  }
+  if (!/^[a-f0-9]{40}$/.test(base) || !Number.isFinite(deadline) || deadline <= Date.now()) throw new Error("Invalid owner repair base or deadline");
+  const repo = deps.pack.repos.find((entry) => entry.url === home.url && entry.trunk === home.trunk);
+  if (!repo || candidate.repoUrl !== repo.url || candidate.branch === repo.trunk || candidate.head === base) {
+    throw new Error("Owner edit requires a changed candidate for a configured owner repository");
+  }
+  const lookup = deps.lookupHead ?? lookupRemoteHead;
+  const checkpoint = async () => {
+    if (Date.now() >= deadline) throw new Error("Owner repair deadline exhausted");
+    const fresh = await deps.tracker.get(ticket.identifier);
+    if (fresh.criteriaRevision !== ticket.criteriaRevision) throw new Error("Owner repair requirements changed");
+    if (lookup(repo.url, candidate.branch) !== candidate.head) throw new Error("Published owner candidate moved");
+  };
+  await checkpoint();
+  const trunk = lookup(repo.url, repo.trunk);
+  if (trunk !== base && trunk !== candidate.head) throw new Error("Owner trunk moved; candidate must be rebuilt before landing");
+  await deps.validateOwnerRepair?.({ identifier: ticket.identifier, criteriaRevision: ticket.criteriaRevision, repo, candidate, base });
+  const checked = runQualityAtCommit(deps, repo, candidate.branch, candidate.head, deadline);
+  if (checked.status !== 0) throw new Error(`${repo.name}: owner candidate quality returned no`);
+  await checkpoint();
+  if (lookup(repo.url, repo.trunk) !== trunk) throw new Error("Owner trunk moved during quality");
+  if (trunk !== candidate.head) {
+    const compared = await deps.forge.compare({ repoUrl: repo.url, base, head: candidate.head });
+    if (compared !== "ahead" || !deps.forge.directLand) throw new Error("Owner candidate cannot be fast-forwarded");
+    const landed = await deps.forge.directLand({ repoUrl: repo.url, branch: candidate.branch, base: repo.trunk, expectedHeadSha: candidate.head, expectedBaseSha: base });
+    if (landed !== candidate.head) throw new Error("Owner landing returned a different code identity");
+  }
+  await checkpoint();
+  if (lookup(repo.url, repo.trunk) !== candidate.head) throw new Error("Owner repair is not on the actual trunk");
+  const state = await readDeliveryState(deps, ticket);
+  const replaceRows = (rows: { repo: string; sha: string }[]) => rows.map((row) => row.repo === repo.name ? { ...row, sha: candidate.head } : row);
+  const markers = state.markers.filter((marker) => marker.kind !== "owner-repair-pending").map((marker) => {
+    if (marker.kind === "landed-commits") {
+      const rows = JSON.parse(marker.body) as { repo: string; sha: string }[];
+      return { ...marker, body: JSON.stringify(replaceRows(rows)) };
+    }
+    if (marker.kind === "land-resume") {
+      const resume = parseLandResume(marker.body);
+      if (resume?.kind === "wait") return { ...marker, body: JSON.stringify({ ...resume, rows: replaceRows(resume.rows) }) };
+    }
+    return marker;
+  });
+  await writeDeliveryState(deps, ticket, { ...state, markers });
 }
 
 function pauseLand(identifier: string, url: string, reason: string, tail = "The sweep continues with the next ticket."): TicketResult {
@@ -3502,7 +3600,7 @@ async function spendFix(
         current.url,
         healed === "edit"
           ? "The procedure owner was edited. The next page resumes this branch."
-          : "This page already edited that owner. The next page edits it again.",
+          : `Owner healing returned ${healed}; no owner edit was landed. The branch remains blocked.`,
         "",
       );
       await deps.tracker.comment(ticket.identifier, paused.detail);
@@ -3575,9 +3673,7 @@ async function healNo(
     const paused = pauseLand(
       ticket.identifier,
       current.url,
-      healAlready(deps, ticket, key)
-        ? "The procedure owner was edited. The next page resumes this branch."
-        : "This page already edited that owner. The next page edits it again.",
+      "The procedure owner was edited. The next page resumes this branch.",
       "",
     );
     await deps.tracker.comment(ticket.identifier, paused.detail);
@@ -3918,8 +4014,9 @@ function defaultRunCommand(
   command: string,
   cwd: string,
   env: NodeJS.ProcessEnv = process.env,
+  timeoutMs = 600_000,
 ): { status: number | null; stdout: string; stderr: string } {
-  const result = spawnSync(command, { shell: true, cwd, encoding: "utf8", env });
+  const result = spawnSync(command, { shell: true, cwd, encoding: "utf8", env, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };

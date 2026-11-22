@@ -8,6 +8,7 @@ import {
   failureTypeForHealKey,
   healCapFor,
   healVerdict,
+  ownerHealOutcome,
   shipNoSignature,
   stallOwner,
 } from "./stall.ts";
@@ -74,6 +75,39 @@ describe("stall", () => {
     assert.equal(healVerdict("**Heal:** wait"), "wait");
     assert.equal(healVerdict("**Heal:** login"), "login");
     assert.equal(healVerdict("**Heal:** edit"), "edit");
-    assert.equal(healVerdict("**Verdict:** BUILDABLE"), "edit");
+    assert.throws(() => healVerdict("**Verdict:** BUILDABLE"), /exactly one named/);
+  });
+
+  it("fails closed on absent, malformed, or conflicting owner outcomes", () => {
+    for (const text of ["", "unknown", "**Heal:** edited", "**Heal:** wait\nHeal: edit", "Heal: wait\nHeal: wait"]) {
+      assert.throws(() => healVerdict(text), /exactly one named/);
+    }
+    for (const verdict of ["edit", "wait", "login"] as const) {
+      assert.equal(healVerdict(`Heal: ${verdict}`), verdict);
+      assert.equal(healVerdict(`**Heal:** ${verdict}\nA separate explanation.`), verdict);
+    }
+  });
+
+  it("requires exact committed candidates and never infers an edit from text", () => {
+    for (const repoUrl of ["https://example.test/first", "https://another.test/second"]) {
+      for (const value of [undefined, "", "**Heal:** edit", { text: "Heal: edit" }, { verdict: "edit" }]) {
+        assert.throws(() => ownerHealOutcome(value, repoUrl));
+      }
+      assert.deepEqual(ownerHealOutcome("Heal: wait", repoUrl), { verdict: "wait" });
+      assert.deepEqual(ownerHealOutcome({ verdict: "login" }, repoUrl), { verdict: "login" });
+      const candidate = { repoUrl, branch: "repair/T-1", head: "a".repeat(40) };
+      assert.deepEqual(ownerHealOutcome({ verdict: "edit", candidate }, repoUrl), { verdict: "edit", candidate });
+      assert.throws(() => ownerHealOutcome({ verdict: "edit", candidate: { ...candidate, repoUrl: "foreign" } }, repoUrl), /repositories/);
+      assert.throws(() => ownerHealOutcome({ verdict: "edit", candidate: { ...candidate, head: "short" } }, repoUrl), /exact committed/);
+      assert.throws(() => ownerHealOutcome({ verdict: "wait", candidate }, repoUrl), /non-edit/);
+      assert.throws(() => ownerHealOutcome({ verdict: "wait", branches: [{ repoUrl, branch: candidate.branch }] }, repoUrl), /non-edit/);
+      assert.throws(() => ownerHealOutcome({ verdict: "wait", branches: "unknown" }, repoUrl), /Invalid owner branch list/);
+      assert.throws(() => ownerHealOutcome({ verdict: "edit", candidate, branches: {} }, repoUrl), /Invalid owner branch list/);
+      assert.throws(() => ownerHealOutcome({ verdict: "edit", candidate, head: "b".repeat(40) }, repoUrl), /Conflicting owner heads/);
+      assert.throws(() => ownerHealOutcome({ verdict: "edit", candidate, branch: "other" }, repoUrl), /Conflicting owner branches/);
+      assert.throws(() => ownerHealOutcome({ verdict: "edit", candidate: { ...candidate, branch: "refs/heads/main" } }, repoUrl), /Invalid owner repair branch/);
+      assert.throws(() => ownerHealOutcome({ status: "failed", text: "Heal: wait" }, repoUrl), /not finished/);
+      assert.throws(() => ownerHealOutcome({ verdict: "edit", text: "Heal: wait", candidate }, repoUrl), /Conflicting owner heal verdicts/);
+    }
   });
 });

@@ -44,6 +44,18 @@ The worker's acceptance matrix is grounded once as ordered criteria with stable 
 
 ## State and criteria changes
 
+### Owner repairs
+
+Owner landing honors the install's declared landing route. A pull-request-only
+owner cannot be directly fast-forwarded by the repair hook. Its review and release
+workflow remains required; an open pull request is not an edit checkpoint.
+
+The engine reserves a durable, capped owner-heal attempt before dispatch. Empty, unknown, conflicting, or interrupted replies do not bypass that budget. A reply must name exactly one `edit`, `wait`, or `login`; there is no default edit. Plain and bold named verdicts share the same validated contract. Wait and login cannot carry changed owner code.
+
+An edit requires a finished worker's exact repository, published branch, and full committed SHA. The worker proposes that candidate; it does not land the owner trunk. The engine validates current criteria, unchanged candidate and base heads, any client policy hook, and uncached quality in its own clean exact-SHA checkout before an expected-head/base fast-forward. An optional native `ownerHeal` hook returns the candidate, not an assertion that it landed. Clients may veto through `validateOwnerRepair`; they do not replace landing or patch the engine's cached state.
+
+Only verified trunk landing produces an edited-owner checkpoint. The engine rebinds its own cached landed and resume markers to that exact owner SHA, preserving unrelated repositories, receipt text, history, and stage receipts. Preserved receipts are not proof for the changed release: promotion and every applicable acceptance check must pass again at the new identity. A durable `owner-repair-pending` candidate can be reused without another model dispatch; it is retired only after the checked landing and state handoff. The existing heal cap is never reset by installing a new version.
+
 Every tracker adapter provides a v2 `stateStore` for `DeliveryState { schemaVersion: 2, markers, stageReceipts }`. Linear and GitHub persist it as a hidden `delivery-loop-state:v2` base64url JSON comment; Jira uses the `delivery-loop.state.v2` issue property. V1 run-state comments and markers are not read or migrated by the engine. Drain or explicitly abandon active v1 runs before upgrading.
 
 The state store holds resumable work markers, the active promotion stage, landed SHAs, and stage receipts. Receipts are valid only for the current ticket `criteriaRevision`; when criteria change, stale work-order state and receipts are invalidated before continuing. A Jira status transition re-reads the issue and refuses to write if its criteria revision changed. Jira comments remain for user-visible blocker or product-decision messages, not Delivery Loop's run-state store.

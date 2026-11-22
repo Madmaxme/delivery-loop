@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 
 import type { DeliveryState, ForgeAdapter, LinearProgramTracker, Ticket, TrackerAdapter, WorkerAdapter } from "../adapters/types.ts";
 import type { ContractEdge, ProjectPack, PromotionStage, RepoSpec } from "../schema/pack.ts";
@@ -83,12 +83,15 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
       },
     },
   };
+  let workerPrompt = "";
   const worker: WorkerAdapter = {
     kind: "http",
-    async start() {
+    async start(input) {
+      workerPrompt = input.prompt;
       return { runId: "run-1" };
     },
     async join() {
+      if (workerPrompt.startsWith("A required step returned no.")) return { status: "finished", text: "**Heal:** wait" };
       return { status: "finished", branch: opts?.branch ?? "delivery/api-1", head: "abc", text };
     },
   };
@@ -144,9 +147,52 @@ function harness(text: string, opts?: { quality?: "success" | "failure" | "pendi
       forge,
       invariantsMarkdown: invariants,
       maxQualityPolls: 1,
+      sleep: async () => {},
       report() {},
     },
   };
+}
+
+const ownerTestDirectories: string[] = [];
+afterEach(() => {
+  for (const directory of ownerTestDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
+
+function committedOwnerRepair(env: { deps: LoopDeps }) {
+  const directory = mkdtempSync(join(tmpdir(), "delivery-loop-owner-handoff-"));
+  ownerTestDirectories.push(directory);
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git("init", "-b", "main");
+  git("config", "user.name", "Owner contract test");
+  git("config", "user.email", "owner@example.test");
+  writeFileSync(join(directory, "owner-contract.txt"), "base\n");
+  git("add", "owner-contract.txt");
+  git("commit", "-m", "Owner base");
+  const base = git("rev-parse", "HEAD");
+  const branch = "engine-heal/API-1";
+  git("checkout", "-b", branch);
+  writeFileSync(join(directory, "owner-contract.txt"), "repair\n");
+  git("commit", "-am", "Owner repair");
+  const head = git("rev-parse", "HEAD");
+  const repo = env.deps.pack.repos[0];
+  env.deps.cwd = directory;
+  env.deps.pack = { ...env.deps.pack, agent: { url: repo.url, trunk: repo.trunk }, qualityCommand: "test -f owner-contract.txt && git diff --exit-code" };
+  const previousLookup = env.deps.lookupHead;
+  env.deps.lookupHead = (url, ref) => url === repo.url && (ref === repo.trunk || ref === branch)
+    ? git("rev-parse", ref)
+    : previousLookup?.(url, ref) ?? "abc";
+  env.deps.ownerHeal = async () => ({ verdict: "edit", candidate: { repoUrl: repo.url, branch, head } });
+  env.deps.forge.directLand = async (input) => {
+    assert.equal(input.expectedBaseSha, base);
+    assert.equal(input.expectedHeadSha, head);
+    git("update-ref", `refs/heads/${repo.trunk}`, head, base);
+    return head;
+  };
+  return { base, head };
 }
 
 async function seedLandResume(
@@ -312,6 +358,60 @@ function routeGround(): string {
 }
 
 describe("loop", () => {
+  it("reserves malformed owner replies before dispatch and stops at the durable cap", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = { ...pack, check: "command", runner: "local", heal: { maxAttempts: 2 } };
+    env.deps.ciFixMax = 1;
+    env.deps.lookupHead = () => null;
+    env.deps.runCommand = () => ({ status: 1 });
+    let dispatches = 0;
+    env.deps.ownerHeal = async () => { dispatches += 1; return undefined; };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const invalid = await runTicket(env.deps, ticket());
+      assert.match(invalid.detail, /no outcome/, JSON.stringify({ invalid, dispatches }));
+      const reservations = env.deliveryState().markers.filter((marker) => marker.kind === "owner-heal");
+      assert.equal(reservations.length, attempt + 1);
+      assert(reservations.every((marker) => JSON.parse(marker.body).status === "started"));
+      assert.equal(env.merged(), false);
+      assert.equal(env.state(), "Todo");
+    }
+    const exhausted = await runTicket(env.deps, ticket());
+    assert.equal(exhausted.outcome, "heal-exhausted");
+    assert.equal(dispatches, 2);
+    assert.equal(env.deliveryState().markers.filter((marker) => marker.kind === "owner-heal").length, 2);
+  });
+
+  it("reuses a durable owner candidate without another model and updates the native cached release", async () => {
+    const env = harness(BUILDABLE);
+    env.deps.pack = { ...pack, landingStrategy: "fast-forward", promotionStages: [{ id: "first", target: "alpha", authorization: "deliver", promoteCommand: "promote-first", repos: ["api"], verifyCommand: "verify-first" }] };
+    const repair = committedOwnerRepair(env);
+    await seedLandResume(env, false, [{ repo: "api", sha: repair.base }]);
+    const response = env.deps.ownerHeal!;
+    let dispatches = 0;
+    env.deps.ownerHeal = async (input) => { dispatches += 1; return response(input); };
+    let qualityFails = true;
+    env.deps.runCommand = () => ({ status: qualityFails ? 1 : 0 });
+    env.deps.runPackCommand = (command, _cwd, stdin) => {
+      if (command !== "verify-first") return { status: 0, stdout: "" };
+      const input = JSON.parse(stdin);
+      return { status: 0, stdout: receiptFor({ stageId: input.stageId, target: input.target, criteriaRevision: input.criteriaRevision, deployed: input.landedShas, outcome: "blocked", reason: "live evidence is unavailable" }) };
+    };
+    await assert.rejects(runTicket(env.deps, ticket()), /owner candidate quality returned no/);
+    assert.equal(dispatches, 1);
+    assert(env.deliveryState().markers.some((marker) => marker.kind === "owner-repair-pending"));
+    qualityFails = false;
+    const resumed = await runTicket(env.deps, ticket());
+    assert.equal(resumed.outcome, "land-blocked");
+    assert.match(resumed.detail, /owner was edited/);
+    assert.equal(dispatches, 1);
+    assert(!env.deliveryState().markers.some((marker) => marker.kind === "owner-repair-pending"));
+    const landed = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "landed-commits")!.body);
+    assert.deepEqual(landed, [{ repo: "api", sha: repair.head }]);
+    const resume = JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "land-resume")!.body);
+    assert.deepEqual(resume.rows, landed);
+    assert.equal(env.state(), "Todo");
+  });
+
   it("runs policy with normalized input but no mutation credentials before the lease and worker", async () => {
     const env = harness("**Verdict:** NEEDS DIAGNOSIS");
     env.deps.pack = {
@@ -551,7 +651,7 @@ describe("loop", () => {
     env.deps.runCommand = () => ({ status: 1 });
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
-    assert.match(result.detail, /next page resumes/);
+    assert.match(result.detail, /still returning no.*next page heals again/i);
     assert.equal(needsNextPage([result]), true);
     assert.equal(env.merged(), false);
   });
@@ -638,7 +738,7 @@ describe("loop", () => {
     env.deps.forge.mergeability = async () => ({ state: "conflict", headSha: "abc" });
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
-    assert.match(result.detail, /next page resumes/);
+    assert.match(result.detail, /returned wait; no owner edit was landed/i);
     assert.equal(needsNextPage([result]), true);
     assert.equal(env.merged(), false);
     assert.equal(env.state(), "Todo");
@@ -685,7 +785,7 @@ describe("loop", () => {
     assert.equal(env.state(), "Todo");
   });
 
-  it("stops the page after a refused merge edits the runner", async () => {
+  it("does not bypass a pull-request-only owner route after a refused merge", async () => {
     const env = harness(BUILDABLE);
     env.deps.ciFixMax = 1;
     env.deps.tracker.listIntake = async () => [ticket(), ticket({ identifier: "API-2", id: "2" })];
@@ -708,14 +808,16 @@ describe("loop", () => {
       merged += 1;
       return "trunk";
     };
+    committedOwnerRepair(env);
     const results = await sweep(env.deps);
     assert.deepEqual(
       results.map((row) => row.outcome),
-      ["land-blocked"],
+      ["worker-failed", "landed"],
     );
-    assert.equal(env.deps.pageControl?.stop, true);
-    assert.equal(merged, 0);
-    assert.equal(needsNextPage(results), true);
+    assert.match(results[0].detail, /cannot bypass the configured pull-request landing route/);
+    assert.notEqual(env.deps.pageControl?.stop, true);
+    assert.equal(merged, 1);
+    assert.equal(needsNextPage(results), false);
   });
 
   it("probes configured credentials once at the start of a sweep", async () => {
@@ -868,12 +970,9 @@ describe("loop", () => {
       healing = input.prompt.includes("Fix that owner");
       return start(input);
     };
-    env.deps.worker.join = async () => ({
-      status: "finished",
-      branch: "delivery/api-1",
-      head: "abc",
-      text: healing ? "**Heal:** wait" : BUILDABLE,
-    });
+    env.deps.worker.join = async () => healing
+      ? { status: "finished", text: "**Heal:** wait" }
+      : { status: "finished", branch: "delivery/api-1", head: "abc", text: BUILDABLE };
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "quality-pending");
     assert.equal(env.comments.some((body) => /still running/.test(body)), true);
@@ -887,9 +986,10 @@ describe("loop", () => {
     env.deps.pack = { ...pack, branchTemplate: "cursor/{issue}-{repo}" };
     env.deps.lookupHead = (_url, branch) => (branch === "cursor/api-1-api" ? "abc1234" : null);
     const prompts: string[] = [];
+    const start = env.deps.worker.start.bind(env.deps.worker);
     env.deps.worker.start = async (input) => {
       prompts.push(input.prompt);
-      return { runId: "run-1" };
+      return start(input);
     };
     const result = await runTicket(env.deps, ticket());
     const fix = prompts.find((text) => text.includes("Fix that owner"));
@@ -897,11 +997,11 @@ describe("loop", () => {
     assert.match(fix ?? "", /cursor\/api-1-api/);
     assert.equal(prompts.some((text) => text.includes("Push these branches")), false);
     assert.equal(result.outcome, "land-blocked");
-    assert.match(result.detail, /next page resumes/);
+    assert.match(result.detail, /still returning no.*next page heals again/i);
     assert.equal(env.merged(), false);
   });
 
-  it("merges after a quality fix pushes a new head", async () => {
+  it("does not claim an owner edit merely because an unverified branch head moved", async () => {
     const env = harness(BUILDABLE);
     env.deps.ciFixMax = 2;
     let head = "abc";
@@ -911,13 +1011,14 @@ describe("loop", () => {
       const state = input.headSha === "def" || input.headSha === "trunk" ? "success" : "failure";
       return { state, detail: `quality ${state}` };
     };
+    const start = env.deps.worker.start.bind(env.deps.worker);
     env.deps.worker.start = async (input) => {
       if (input.prompt.includes("Fix that owner")) head = "def";
-      return { runId: "run-1" };
+      return start(input);
     };
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
-    assert.equal(env.deps.pageControl?.stop, true);
+    assert.notEqual(env.deps.pageControl?.stop, true);
     assert.equal(env.merged(), false);
   });
 
@@ -933,12 +1034,9 @@ describe("loop", () => {
       if (input.prompt.includes("Push these branches")) builds += 1;
       return start(input);
     };
-    env.deps.worker.join = async () => ({
-      status: "finished",
-      branch: "delivery/api-1",
-      head: "abc",
-      text: healing ? "**Heal:** wait" : BUILDABLE,
-    });
+    env.deps.worker.join = async () => healing
+      ? { status: "finished", text: "**Heal:** wait" }
+      : { status: "finished", branch: "delivery/api-1", head: "abc", text: BUILDABLE };
     const result = await runTicket(env.deps, ticket());
     assert.equal(builds, 0);
     assert.equal(result.outcome, "quality-pending");
@@ -998,8 +1096,8 @@ describe("loop", () => {
       committedAt: "2020-01-01T00:00:00.000Z",
     });
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "land-blocked");
-    assert.equal(env.deps.pageControl?.stop, true);
+    assert.equal(result.outcome, "quality-unscheduled");
+    assert.notEqual(env.deps.pageControl?.stop, true);
     assert.equal(needsNextPage([result]), true);
     assert.equal(env.merged(), false);
   });
@@ -1143,6 +1241,7 @@ describe("loop", () => {
     let joins = 0;
     env.deps.worker.join = async () => {
       joins += 1;
+      if (joins > 2) return { status: "finished", text: "**Heal:** wait" };
       const text = joins === 1 ? ground : "**Journey evidence:** recorded\nThe journey was walked.";
       return { status: "finished", branch: "delivery/api-1", head: "abc", text };
     };
@@ -1191,12 +1290,9 @@ describe("loop", () => {
       prompts.push(input.prompt);
       return { runId: "run-1" };
     };
-    env.deps.worker.join = async () => ({
-      status: "finished" as const,
-      branch: "delivery/api-1",
-      head: "abc",
-      text: prompts.length < 2 ? ground : "Walked `https://example.test/artifacts/signup.png`",
-    });
+    env.deps.worker.join = async () => prompts.at(-1)?.startsWith("A required step returned no.")
+      ? { status: "finished", text: "**Heal:** wait" }
+      : { status: "finished", branch: "delivery/api-1", head: "abc", text: prompts.length < 2 ? ground : "Walked `https://example.test/artifacts/signup.png`" };
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "journey-missing");
     const build = prompts[1] ?? "";
@@ -1213,9 +1309,11 @@ describe("loop", () => {
     const env = harness(ground);
     const prompts: string[] = [];
     let starts = 0;
+    const start = env.deps.worker.start.bind(env.deps.worker);
     env.deps.worker.start = async (input) => {
       starts += 1;
       prompts.push(input.prompt);
+      await start(input);
       return { runId: `run-${starts}` };
     };
 
@@ -1242,11 +1340,12 @@ describe("loop", () => {
       prompts.push(input.prompt);
       return { runId: `run-${starts}` };
     };
-    env.deps.worker.join = async () => ({ status: "finished", text: "edited the owner" });
+    env.deps.worker.join = async () => ({ status: "finished", text: "**Heal:** wait" });
 
     const waiting = await runTicket(env.deps, ticket());
 
     assert.equal(waiting.outcome, "land-blocked");
+    assert.doesNotMatch(waiting.detail, /owner was edited/i);
     assert.equal(needsNextPage([waiting]), true);
     assert.equal(env.state(), "Todo");
     assert.equal(starts, 1);
@@ -1292,10 +1391,11 @@ describe("loop", () => {
       starts += 1;
       return { runId: `run-${starts}` };
     };
-    env.deps.worker.join = async () => ({ status: "finished", text: "edited the owner" });
+    env.deps.worker.join = async () => ({ status: "finished", text: "**Heal:** wait" });
 
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
+    assert.doesNotMatch(result.detail, /owner was edited/i);
     assert.equal(needsNextPage([result]), true);
     assert.equal(starts, 1);
     assert.equal(JSON.parse(env.deliveryState().markers.find((marker) => marker.kind === "proof-receipt")?.body ?? "{}").validated, undefined);
@@ -1790,7 +1890,7 @@ describe("loop", () => {
         'test -z "$AWS_ACCESS_KEY_ID"',
         'test -z "$AWS_SECRET_ACCESS_KEY"',
         'test -z "$DELIVERY_LOOP_GITHUB_MINT"',
-        'test "$CI" = "1"',
+        'test "$CI" = "true"',
         'test -n "$PATH"',
         'test "$(cat candidate.txt)" = "candidate"',
         'printf "quality\\n" >> "$QUALITY_EVENT_FILE"',
@@ -2270,11 +2370,13 @@ describe("loop", () => {
     const env = harness(BUILDABLE);
     env.deps.pack = {
       ...pack,
+      landingStrategy: "fast-forward",
       promotionStages: [
         { id: "first", target: "alpha", authorization: "deliver", promoteCommand: "promote-first", repos: ["api"], verifyCommand: "verify-first" },
       ],
     };
-    env.deps.ownerHeal = async () => "**Heal:** edit";
+    const repair = committedOwnerRepair(env);
+    await seedLandResume(env, false, [{ repo: "api", sha: repair.base }]);
     env.deps.runPackCommand = (command, _cwd, stdin) => {
       if (command !== "verify-first") return { status: 0, stdout: "" };
       const input = JSON.parse(stdin) as { stageId: string; target: string; criteriaRevision?: string; landedShas?: { repo: string; sha: string }[] };
@@ -2626,7 +2728,7 @@ describe("loop", () => {
     env.deps.forge.quality = async () => ({ state: "failure", detail: "quality failure" });
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
-    assert.match(result.detail, /next page resumes/);
+    assert.doesNotMatch(result.detail, /procedure owner was edited/i);
     assert.equal(env.deliveryState().markers.some((marker) => marker.kind === "owner-heal"), true);
     assert.equal(starts, 3);
     assert.equal(env.merged(), false);
@@ -2634,23 +2736,28 @@ describe("loop", () => {
 
   it("does not adopt a commit that repeats the previous hypothesis", async () => {
     const env = harness(BUILDABLE);
-    env.deps.ciFixMax = 3;
+    env.deps.ciFixMax = 2;
     env.deps.sleep = async () => {};
-    let reads = 0;
-    env.deps.forge.quality = async (input) => {
-      reads += 1;
-      if (reads > 3) return { state: "success", detail: "quality success" };
-      return { state: "failure", detail: `quality failure ${input.headSha}` };
-    };
+    env.deps.forge.quality = async () => ({ state: "success", detail: "quality is green" });
     let lookups = 0;
+    let publishedHead = "abc";
+    env.deps.forge.mergeability = async () => ({ state: "conflict", headSha: publishedHead });
     env.deps.lookupHead = (_url, branch) => {
       if (branch === "main") return "trunk";
       lookups += 1;
-      return `sha-${lookups}`;
+      publishedHead = `sha-${lookups}`;
+      return publishedHead;
     };
     let joins = 0;
+    let lastPrompt = "";
+    const start = env.deps.worker.start.bind(env.deps.worker);
+    env.deps.worker.start = async (input) => {
+      lastPrompt = input.prompt;
+      return start(input);
+    };
     env.deps.worker.join = async () => {
       joins += 1;
+      if (lastPrompt.startsWith("A required step returned no.")) return { status: "finished", text: "**Heal:** wait" };
       return {
         status: "finished",
         branch: "delivery/api-1",
@@ -2666,8 +2773,9 @@ describe("loop", () => {
     };
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
-    assert.equal(env.deps.pageControl?.stop, true);
-    assert.equal(joins, 3);
+    assert.notEqual(env.deps.pageControl?.stop, true);
+    assert(env.comments.some((body) => /Repeated hypothesis is not a fix/.test(body)), JSON.stringify({ result, joins, lookups, comments: env.comments }));
+    assert.equal(lookups, 1, "The repeated hypothesis must not look up or adopt another commit");
     assert.equal(env.merged(), false);
   });
 
@@ -3298,7 +3406,7 @@ describe("loop", () => {
   });
 
 
-  it("edits the install once when the quality check does not match the workflow", async () => {
+  it("requests the install owner without claiming an edit when that owner waits", async () => {
     const env = harness(BUILDABLE);
     const prompts: string[] = [];
     const start = env.deps.worker.start.bind(env.deps.worker);
@@ -3314,8 +3422,8 @@ describe("loop", () => {
     env.deps.forge.quality = async () => ({ state: "failure", detail: "quality failure" });
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
-    assert.match(result.detail, /procedure owner was edited/);
-    assert.equal(env.deps.pageControl?.stop, true);
+    assert.doesNotMatch(result.detail, /procedure owner was edited/);
+    assert.notEqual(env.deps.pageControl?.stop, true);
     const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
     assert.equal(heals.length, 1);
     assert.match(heals[0], /owner of the behavior/);
@@ -3323,7 +3431,7 @@ describe("loop", () => {
     assert.equal(env.merged(), false);
   });
 
-  it("edits the runner once when a conflict is still stuck after the fix budget", async () => {
+  it("requests the runner owner without claiming an edit when that owner waits", async () => {
     const env = harness(BUILDABLE);
     env.deps.ciFixMax = 0;
     const prompts: string[] = [];
@@ -3335,7 +3443,7 @@ describe("loop", () => {
     env.deps.forge.mergeability = async () => ({ state: "conflict", headSha: "abc" });
     const result = await runTicket(env.deps, ticket());
     assert.equal(result.outcome, "land-blocked");
-    assert.equal(env.deps.pageControl?.stop, true);
+    assert.notEqual(env.deps.pageControl?.stop, true);
     const heals = prompts.filter((prompt) => prompt.includes("Fix that owner"));
     assert.equal(heals.length, 1);
     assert.match(heals[0], /package that executes this loop/);
@@ -4096,7 +4204,7 @@ describe("loop", () => {
     assert.match(waiting.lines.join("\n"), /waiting prod deploy at abc is not green/);
     assert.doesNotMatch(waiting.lines.join("\n"), /ship plan is required/);
     assert.equal(promoted, 0);
-    env.deps.ownerHeal = async () => "edit";
+    env.deps.ownerHeal = async () => "**Heal:** wait";
     env.deps.runPackCommand = (_command, _cwd, stdin) => {
       const input = JSON.parse(stdin) as { phase?: string };
       if (input.phase === "plan") {

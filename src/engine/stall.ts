@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { engineHealBumpInstruction } from "./engine-heal.ts";
 import type { QualityCause } from "./quality-cause.js";
 
@@ -38,13 +39,50 @@ export function shipNoSignature(tail: string): string {
   return picked.replace(/[A-Za-z0-9_-]{24,}/g, "").replace(/\s+/g, " ").trim().slice(0, 120);
 }
 
-/** What the heal decided. The runner does not keep its own list of failures. */
+/** A named verdict is not evidence that changed owner code was landed. */
 export type HealVerdict = "edit" | "wait" | "login";
 
 export function healVerdict(text: string): HealVerdict {
-  const named = text.match(/\*\*Heal:\*\*\s*(edit|wait|login)\b/i)?.[1]?.toLowerCase();
-  if (named === "wait" || named === "login" || named === "edit") return named;
-  return "edit";
+  const named = [...text.matchAll(/^(?:\*\*Heal:\*\*|Heal:)\s*(edit|wait|login)\s*$/gim)];
+  assert.equal(named.length, 1, "Owner healing requires exactly one named verdict");
+  return named[0][1].toLowerCase() as HealVerdict;
+}
+
+export type OwnerRepairCandidate = { repoUrl: string; branch: string; head: string };
+export type OwnerHealOutcome =
+  | { verdict: "wait" | "login" }
+  | { verdict: "edit"; candidate: OwnerRepairCandidate };
+
+/** A transport may carry text, but it cannot assert that an edit was landed. */
+export function ownerHealOutcome(value: unknown, repoUrl: string): OwnerHealOutcome {
+  assert(value !== null && value !== undefined, "Owner heal returned no outcome");
+  if (typeof value === "string") {
+    const verdict = healVerdict(value);
+    assert(verdict !== "edit", "An edit verdict requires a committed owner candidate");
+    return { verdict };
+  }
+  assert(typeof value === "object", "Invalid owner heal outcome");
+  const row = value as Record<string, unknown>;
+  assert(row.status === undefined || row.status === "finished", "Owner worker has not finished");
+  assert(row.branches === undefined || Array.isArray(row.branches), "Invalid owner branch list");
+  const verdict = typeof row.text === "string" ? healVerdict(row.text) : row.verdict;
+  assert(row.verdict === undefined || row.verdict === verdict, "Conflicting owner heal verdicts");
+  assert(["edit", "wait", "login"].includes(String(verdict)), "Invalid owner heal verdict");
+  if (verdict !== "edit") {
+    assert(!row.head && !row.branch && !row.candidate && (!Array.isArray(row.branches) || row.branches.length === 0), "A non-edit outcome cannot carry changed owner code");
+    return { verdict: verdict as "wait" | "login" };
+  }
+  const candidate = (row.candidate ?? { repoUrl, branch: row.branch, head: row.head }) as Record<string, unknown>;
+  assert(candidate.repoUrl === repoUrl, "Owner repair changed repositories");
+  assert(typeof candidate.branch === "string" && /^[\w./-]+$/.test(candidate.branch) && !candidate.branch.startsWith("-") && !candidate.branch.startsWith("refs/") && !candidate.branch.includes(".."), "Invalid owner repair branch");
+  assert(typeof candidate.head === "string" && /^[a-f0-9]{40}$/.test(candidate.head), "An edit verdict requires an exact committed owner head");
+  assert(row.head === undefined || row.head === candidate.head, "Conflicting owner heads");
+  assert(row.branch === undefined || row.branch === candidate.branch, "Conflicting owner branches");
+  if (Array.isArray(row.branches)) {
+    const reported = row.branches[0] as Record<string, unknown> | undefined;
+    assert(row.branches.length === 1 && reported?.repoUrl === repoUrl && reported?.branch === candidate.branch, "Owner repair has ambiguous repositories");
+  }
+  return { verdict: "edit", candidate: candidate as OwnerRepairCandidate };
 }
 
 /**
@@ -149,7 +187,7 @@ export function ownerHealPrompt(input: {
     `Name the branch \`${branch}\` and label the pull request \`engine-heal\`.`,
     bumped,
     "The pull_request quality check gates that head. The engine-heal workflow does not push a commit. It waits until that check is green, squash-merges, reads the version from the merged package.json, and tags that commit. A pull request without the bump gets a comment and stops. Clients install the tag. They do not install main.",
-    "When the owner is anything else, land that owner's trunk before you finish.",
+    "When the owner is anything else, commit and publish one repair candidate on its own branch. The controller owns quality, landing, and release-state updates. Do not land trunk or change delivery state from the worker.",
     "This step runs again when you return.",
     "An open pull request is not landed.",
     token
@@ -158,7 +196,7 @@ export function ownerHealPrompt(input: {
   ].join(" ");
   const decide = [
     "Answer with one line: **Heal:** edit, **Heal:** wait, or **Heal:** login.",
-    "edit changes the owner above. Land that trunk, unless the owner is the package that executes this loop. That edit opens the engine-heal pull request and does not merge to main.",
+    "edit requires a committed repair candidate with its exact branch and head in the worker result. An edit sentence without changed code is invalid. Engine-package edits use the engine-heal pull request and are not an assertion of installation or completion.",
     "wait means the step is not broken. Do not edit. The step runs again.",
     "login means the login was rejected. Do not edit. The login is replaced and the step runs again.",
   ].join(" ");
