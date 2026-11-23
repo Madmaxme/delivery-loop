@@ -12,6 +12,7 @@ export const VERDICTS = [
   "NEEDS RESCOPE",
   "WRONG DIAGNOSIS",
   "ALREADY SHIPPED",
+  "DUPLICATE",
 ] as const;
 
 export type Verdict = (typeof VERDICTS)[number];
@@ -90,6 +91,26 @@ export function parseVerdict(text: string): Verdict | null {
   const raw = (labeled?.[1] ?? "").trim().toUpperCase();
   if (raw && (VERDICTS as readonly string[]).includes(raw)) return raw as Verdict;
   return null;
+}
+
+const RING_JOIN_RE = /\*\*RING join:\*\*\s*(none|[A-Za-z]+-\d+)/i;
+
+/**
+ * Another open ticket named as the owner of this incident.
+ * Wording of the title is not the key. `none` and this ticket's own id are not foreign.
+ */
+export function foreignRingJoin(text: string, identifier: string): string | null {
+  const raw = text.match(RING_JOIN_RE)?.[1] ?? "";
+  if (!raw || raw.toLowerCase() === "none") return null;
+  const target = raw.toUpperCase();
+  if (target === identifier.trim().toUpperCase()) return null;
+  return target;
+}
+
+/** A foreign RING join cancels this card. The named ticket stays the owner. */
+export function verdictForGround(identifier: string, text: string): Verdict | null {
+  if (foreignRingJoin(text, identifier)) return "DUPLICATE";
+  return parseVerdict(text);
 }
 
 function packetBody(text: string): string {
@@ -418,7 +439,7 @@ export function parkStateForVerdict(input: {
   /** True when recorded journey proof is already on the trunk or in the audit receipt. */
   journeyProven?: boolean | null;
 }): string | null {
-  if (input.verdict === "WRONG DIAGNOSIS") return "Canceled";
+  if (input.verdict === "WRONG DIAGNOSIS" || input.verdict === "DUPLICATE") return "Canceled";
   if (input.verdict === "NEEDS RESCOPE") {
     const cited =
       /\*\*Harness packet:\*\*/i.test(input.text) ||
