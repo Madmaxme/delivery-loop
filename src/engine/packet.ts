@@ -405,7 +405,9 @@ export function parseJourneyProofs(text: string, journeySpec?: string): JourneyP
 }
 
 /**
- * `recorded` is proven when every cited proof is real.
+ * `recorded` and `blocked` are proven when every cited proof is real.
+ * `blocked` means the grounding run had not published the token yet. The build
+ * receipt is that token, and the file check is the same one `recorded` uses.
  * A recording URL is in the build receipt. A route test is on the commit and matches `journeySpec`.
  * A spec outside that pattern is not proof. `not-applicable` is proven.
  */
@@ -417,7 +419,7 @@ export function journeyEvidenceProven(
 ): boolean {
   const evidence = parseJourneyEvidence(declared);
   if (evidence === "not-applicable") return true;
-  if (evidence !== "recorded") return false;
+  if (evidence !== "recorded" && evidence !== "blocked") return false;
   const proofs = parseJourneyProofs(`${declared}\n${receipt}`, journeySpec);
   if (proofs.length === 0) return false;
   return proofs.every((proof) => {

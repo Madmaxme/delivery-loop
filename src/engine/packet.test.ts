@@ -147,6 +147,22 @@ describe("journey evidence", () => {
     assert.equal(journeyEvidenceProven(declared, declared, () => false), false);
   });
 
+  it("accepts a blocked line when the route test is on the commit", () => {
+    const declared =
+      "**Journey evidence:** blocked\n**Journey proof:** `operator-app/test/e2e/create_booking_client_name_lookup_journey_test.dart`";
+    assert.equal(
+      journeyEvidenceProven(
+        declared,
+        declared,
+        (repo, path) =>
+          repo === "operator-app" && path === "test/e2e/create_booking_client_name_lookup_journey_test.dart",
+        "{e2e,integration_test,journey,test/e2e}/**",
+      ),
+      true,
+    );
+    assert.equal(journeyEvidenceProven(declared, declared, () => false, "{e2e,integration_test,journey,test/e2e}/**"), false);
+  });
+
   it("accepts a journey spec and leaves an api unit spec out", () => {
     const text = [
       "**Journey proof:** `api/test/pay.spec.ts`",
