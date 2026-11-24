@@ -495,6 +495,7 @@ function groundPrompt(ticket: Ticket, deps: LoopDeps): string {
     "A cited query is the start of the investigation. While two records disagree, the verdict stays NEEDS DIAGNOSIS. A code change waits until a probe shows the outside system did what we asked and this repository's code did something else.",
     "**Evidence:** not-applicable means nothing is already wrong. not-applicable is unfinished when a live system was read. A cited query without a killed alternative stays in intake.",
     "Every BUILDABLE handoff includes **Journey evidence:** recorded | not-applicable | blocked.",
+    "A criterion is an outcome a person finishes on that journey. The proof performs that outcome. Showing that the reported symptom is gone is not that proof.",
     "not-applicable means the done-state is not a journey a person walks.",
     `recorded means the done-state includes journey proof. Web proof is an https recording or screenshot URL (png, jpg, jpeg, webp, gif, mp4, webm, mov, or an /artifacts/ URL) in the build receipt. The build handoff includes that raw URL in backticks and omits the **Journey proof:** prefix; the configured journey command prints the prefix. Mobile proof is **Journey proof:** a route test on the exact landed commit, \`repo/path_test.dart\` or \`repo/path.test.ts\`, whose path matches \`${deps.pack.journeySpec?.trim() || DEFAULT_JOURNEY_SPEC}\`. A sentence that names no token is not proof. A PostHog replay or embedded link on posthog.com counts. A presigned link that expires does not. A spec outside that pattern stays in intake. If the route test is not on the landed commit, the engine checks configured delivery-stage refs (or the repo trunk when refs are not configured); promotion receipts remain bound to the exact landed SHAs and criteria revision.`,
     "blocked means this run did not produce the proof. The build still verifies it, and the ticket stays off complete until the proof is real. A missing line stays in intake. not-applicable is the only line that skips the walk.",
@@ -522,6 +523,7 @@ function designPromptLines(ticket: Ticket, deps: LoopDeps): string {
 function journeyWalkText(spec: string): string {
   return [
     "When the handoff says **Journey evidence:** recorded or blocked, this build walk is the verification.",
+    "A criterion is an outcome a person finishes on that journey. The proof performs that outcome. Showing that the reported symptom is gone is not that proof.",
     "Use the computer on this agent. Open the running build that contains this change.",
     "A web journey publishes one durable https URL: a screenshot or a short video of the done state ending in png, jpg, jpeg, webp, gif, mp4, webm, or mov, a URL whose path contains /artifacts/, or a PostHog replay or embedded link on posthog.com.",
     "Put that raw URL in backticks in BUILD_HANDOFF and omit only the **Journey proof:** prefix; the journey command prints that prefix.",

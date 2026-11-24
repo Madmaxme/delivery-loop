@@ -514,6 +514,8 @@ describe("loop", () => {
     assert.match(prompt, /Normalize every acceptance criterion into one table/);
     assert.match(prompt, /Build and stage verification reuse the same IDs and text/);
     assert.match(prompt, /Journey evidence/);
+    assert.match(prompt, /A criterion is an outcome a person finishes on that journey/);
+    assert.match(prompt, /Showing that the reported symptom is gone is not that proof/);
     assert.match(prompt, /Land repos: api/);
     assert.match(prompt, /directory the agent was started in is not a land repo/);
     assert.match(prompt, /The install owns the concrete proof/);
