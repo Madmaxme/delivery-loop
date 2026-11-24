@@ -1156,6 +1156,19 @@ describe("loop", () => {
     assert.equal(env.comments.some((body) => /LAND_WAIT|JOURNEY_RECEIPT|PROOF_ATTEMPT/.test(body)), false);
   });
 
+  it("marks completion when a blocked ground's route test is on the merge commit", async () => {
+    const ground = BUILDABLE.replace(
+      "**Journey evidence:** not-applicable",
+      "**Journey evidence:** blocked\n**Journey proof:** `api/integration_test/signup_route_test.dart`",
+    );
+    const env = harness(ground);
+    env.deps.journeyFileAt = ({ repo, ref, path }) =>
+      repo === "api" && ref === "trunk" && path === "integration_test/signup_route_test.dart";
+    const result = await runTicket(env.deps, ticket());
+    assert.equal(result.outcome, "landed");
+    assert.equal(env.state(), "Dev Complete");
+  });
+
   it("marks completion when the route test is on the merge commit", async () => {
     const ground = BUILDABLE.replace(
       "**Journey evidence:** not-applicable",
