@@ -1,6 +1,6 @@
 {
   "name": "@delivery-loop/cli",
-  "version": "2.2.31",
+  "version": "2.2.32",
   "description": "Autonomous ticket loop. Conduct rules, a durable runner, and swappable coding agents.",
   "type": "module",
   "bin": {

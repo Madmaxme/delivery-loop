@@ -20,6 +20,8 @@ import {
   investigationBlocksBuild,
   priorRequestBlocksBuild,
   parkStateForVerdict,
+  foreignRingJoin,
+  verdictForGround,
 } from "./packet.ts";
 
 const PACKET = `
@@ -173,6 +175,24 @@ describe("journey evidence", () => {
         text: text.replace("recorded", "not-applicable"),
       }),
       "Delivery Complete",
+    );
+  });
+
+  it("cancels a card that names another ticket as the incident owner", () => {
+    const text = "**Verdict:** BUILDABLE\n**RING join:** QUI-1900\n";
+    assert.equal(foreignRingJoin(text, "QUI-1901"), "QUI-1900");
+    assert.equal(foreignRingJoin(text, "QUI-1900"), null);
+    assert.equal(foreignRingJoin("**RING join:** none", "QUI-1901"), null);
+    assert.equal(verdictForGround("QUI-1901", text), "DUPLICATE");
+    assert.equal(parseVerdict("**Verdict:** DUPLICATE\n"), "DUPLICATE");
+    assert.equal(
+      parkStateForVerdict({
+        verdict: "DUPLICATE",
+        text,
+        priorComments: [],
+        completeStatus: "Deployed to Dev",
+      }),
+      "Canceled",
     );
   });
 

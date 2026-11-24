@@ -58,6 +58,7 @@ import {
   parseOutsideGrant,
   parsePriorRequest,
   parseVerdict,
+  verdictForGround,
   parseWorkOrder,
   priorRequestBlocksBuild,
   repoNames,
@@ -428,7 +429,8 @@ const GENERIC_GROUND = [
   "Check the ticket against the code. Do not edit files. Do not call the tracker.",
   "Reply with one handoff:",
   "<!-- GROUNDING_HANDOFF",
-  "VERDICT: BUILDABLE | NEEDS DIAGNOSIS | NEEDS RESCOPE | WRONG DIAGNOSIS | ALREADY SHIPPED",
+  "VERDICT: BUILDABLE | NEEDS DIAGNOSIS | NEEDS RESCOPE | WRONG DIAGNOSIS | ALREADY SHIPPED | DUPLICATE",
+  "DUPLICATE when **RING join:** names another open ticket for this same incident. Title wording is not the key.",
   "COMMENT:",
   "BUILD_PACKET:",
   "**Repos:** `name`",
@@ -963,7 +965,7 @@ async function runHeldTicket(
     };
   }
 
-  const verdict: Verdict | null = parseVerdict(ground.text);
+  const verdict: Verdict | null = verdictForGround(ticket.identifier, ground.text);
   if (verdict !== "BUILDABLE") {
     await deps.tracker.comment(
       ticket.identifier,
