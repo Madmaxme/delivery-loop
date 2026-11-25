@@ -64,7 +64,7 @@ export const HEAL_FAILURE_TYPES = [
 
 export type HealFailureType = (typeof HEAL_FAILURE_TYPES)[number];
 
-/** Attempts recorded on the ticket before the runner stops that failure type. */
+/** Recorded attempts of one failure type. The count does not take the ticket out of the loop. */
 export const DEFAULT_HEAL_CAP = 3;
 
 export const HEAL_EXHAUSTED_LABEL = "heal-exhausted";

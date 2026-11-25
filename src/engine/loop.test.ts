@@ -2912,7 +2912,7 @@ describe("loop", () => {
     assert.equal(needsNextPage([result]), true);
   });
 
-  it("stops chaining when the missing-proof heal reaches its cap", async () => {
+  it("keeps healing a missing proof after earlier attempts", async () => {
     const ground = BUILDABLE.replace(
       "**Journey evidence:** not-applicable",
       "**Journey evidence:** recorded\n**Journey proof:** `api/test/pay.spec.ts`",
@@ -2935,11 +2935,9 @@ describe("loop", () => {
       return "**Heal:** wait";
     };
     const result = await runTicket(env.deps, ticket());
-    assert.equal(result.outcome, "heal-exhausted");
-    assert.equal(heals, 0);
-    assert.equal(needsNextPage([result]), false);
-    assert.equal(deliveryExitCode(result), 0);
-    assert.match(env.comments.join("\n"), /Stopped\./);
+    assert.equal(result.outcome, "journey-missing");
+    assert.equal(heals, 1);
+    assert.equal(needsNextPage([result]), true);
     assert.equal(env.state(), "Todo");
   });
 
@@ -3357,7 +3355,7 @@ describe("loop", () => {
     assert.equal(env.merged(), false);
   });
 
-  it("stops a red quality check when that failure type's cap is already spent", async () => {
+  it("heals a red quality check again after earlier attempts", async () => {
     const env = harness(BUILDABLE);
     const prompts: string[] = [];
     const start = env.deps.worker.start.bind(env.deps.worker);
@@ -3368,9 +3366,9 @@ describe("loop", () => {
     env.deps.pack = { ...pack, heal: { caps: { "quality-red": 0 } } };
     env.deps.forge.quality = async () => ({ state: "failure", detail: "quality failure" });
     const result = await runTicket(env.deps, ticket({ labels: ["heal-exhausted", "quality-red"] }));
-    assert.equal(result.outcome, "heal-exhausted");
-    assert.equal(needsNextPage([result]), false);
-    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 0);
+    assert.equal(result.outcome, "land-blocked");
+    assert.equal(needsNextPage([result]), true);
+    assert.equal(prompts.filter((prompt) => prompt.includes("Fix that owner")).length, 1);
   });
 
   it("keeps the stage command error in the failure", () => {
