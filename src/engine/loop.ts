@@ -72,9 +72,7 @@ import {
 } from "./quality-cause.js";
 import {
   failureTypeForHealKey,
-  healCapFor,
   HealExhaustedError,
-  healExhaustedNotice,
   healVerdict,
   ownerHealPrompt,
   shipNoSignature,
@@ -3359,19 +3357,8 @@ function healAlready(deps: LoopDeps, ticket: Ticket, key: string): boolean {
  * One edit of the owner of a step that returned no.
  * A second call for the same key does not start a worker.
  * The page stops so the next page checks out the edited trunk.
+ * Earlier attempts do not take the ticket out of the loop.
  */
-function ownerHealMarkerType(body: string): string | null {
-  try {
-    const parsed: unknown = JSON.parse(body);
-    if (parsed && typeof parsed === "object" && "type" in parsed && typeof parsed.type === "string") {
-      return parsed.type;
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
 async function applyOwnerHeal(
   deps: LoopDeps,
   ticket: Ticket,
@@ -3380,23 +3367,6 @@ async function applyOwnerHeal(
 ): Promise<HealVerdict> {
   if (healAlready(deps, ticket, key)) return "wait";
   const type = failureTypeForHealKey(key);
-  const state = await readDeliveryState(deps, ticket);
-  const attempts = state.markers.filter(
-    (marker) => marker.kind === "owner-heal" && ownerHealMarkerType(marker.body) === type,
-  );
-  const cap = healCapFor(deps.pack.heal, type);
-  if (attempts.length >= cap) {
-    if (!state.markers.some((marker) => marker.kind === "heal-exhausted")) {
-      const stopped = {
-        kind: "heal-exhausted",
-        body: type,
-        createdAt: new Date(deps.nowMs ?? Date.now()).toISOString(),
-      };
-      await writeDeliveryState(deps, ticket, { ...state, markers: [...state.markers, stopped] });
-      await deps.tracker.comment(ticket.identifier, healExhaustedNotice(type, reason));
-    }
-    throw new HealExhaustedError(type);
-  }
   const home = agentHome(deps.pack);
   const prompt = ownerHealPrompt({
     reason,
@@ -4006,7 +3976,7 @@ async function waitForQuality(
 /**
  * One predicate for sweep and for a single-ticket deliver.
  * A resume, a pending check, or an owner edit ends this page and the runner
- * starts the next one. A heal that has reached its cap does not.
+ * starts the next one. A repeated failure stays in that chain.
  */
 export function needsNextPage(results: TicketResult[]): boolean {
   return results.some(
